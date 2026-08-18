@@ -1,0 +1,9 @@
+.env
+.secrets/
+secrets/
+wallets.json
+accounts.local.json
+.idea/
+.vscode/
+bin/
+coverage.out

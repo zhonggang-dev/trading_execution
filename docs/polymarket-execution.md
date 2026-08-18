@@ -1,0 +1,83 @@
+# Polymarket CLOB V2 执行适配器
+
+实现位置：`internal/adapter/polymarket`。该包只完成凭证选择、订单构造、签名、HTTP 调用、精度校验、限流与错误归一化，不包含 probability、Edge、止盈止损或仓位算法。
+
+## 钱包和凭证边界
+
+每个 `execution_account_id` 必须精确映射到一个 `TradingAccount`：
+
+- `DigestSigner`：EOA、本地 signer、HSM 或 KMS 的统一签名接口；
+- `FunderAddress`：实际持有 pUSD/shares 的钱包；
+- `SignatureType`：EOA、POLY_PROXY、GNOSIS_SAFE；
+- API key、base64url secret、passphrase：用于 L2 HMAC；
+- 不存在默认钱包或 fallback，找不到账户直接拒绝。
+
+`StaticCredentialProvider` 适用于由进程外 secrets 系统注入后的账户对象。代码不把私钥、API secret、签名或完整签名请求写入订单日志；attempt 只保存非敏感 SHA-256 fingerprint。
+
+设置非零 `BuilderCode` 时，还必须把 Builder Profile/Market Info 中当前的 maker/taker builder fee
+bps 注入 `TradingClientParams`。成交账本会把 maker order 的 `fee_rate_bps` 和配置费率归一为
+独立 builder fee；平台 fee 与 builder fee 分开保存后再计算真实净现金。
+
+当前支持 V2 signature type `0/1/2`。`POLY_1271 (3)` 使用官方 V2 特有的 Solady/EIP-1271 包装签名，当前会 fail closed；在完成 deposit-wallet 合约一致性测试以前，不能把它误当普通 EIP-712 签名。
+
+## 签名和请求
+
+适配器只连接 CLOB protocol V2，并在首次下单前检查 `/version == 2`。订单 EIP-712 domain 为：
+
+```text
+name              = Polymarket CTF Exchange
+version           = 2
+chainId           = 137
+verifyingContract = standard V2 exchange 或 neg-risk V2 exchange
+```
+
+签名结构包含 `salt/maker/signer/tokenId/makerAmount/takerAmount/side/signatureType/timestamp/metadata/builder`。`expiration` 只进入提交 JSON，不进入 V2 typed data。
+
+每个 L2 请求使用 `POLY_ADDRESS/POLY_SIGNATURE/POLY_TIMESTAMP/POLY_API_KEY/POLY_PASSPHRASE`。HMAC 消息为 `timestamp + method + requestPath + exactBodyBytes`。JSON 只序列化一次，HMAC 和 HTTP 共用相同的 byte slice，避免字段顺序或空格变化导致鉴权失败。
+
+## 精度与最小金额
+
+价格、shares 和金额始终使用十进制字符串及 `big.Rat/big.Int`，不经过 `float32/float64`。
+
+- price 必须是最新 tick size 的整数倍；
+- shares 当前最多 2 位小数，与官方 V2 rounding table 一致；
+- `price × shares` 必须能按对应 tick 的 amount precision 精确表达；
+- raw maker/taker amount 使用 6 位 token decimals；
+- size 必须不低于 `/book.min_order_size`；
+- BUY notional 默认不得低于 `1 pUSD`，可配置但不能为零；
+- FAK/FOK 使用更严格的 marketable-order amount precision；
+- 不合法的策略数量直接拒绝，Go 不会为了通过交易所校验而静默改小 shares 或改变方向。
+
+旧 `execute.py` 用 float 先算 USD、再除以价格、再交给 SDK 二次 round-down，可能把 `16.90` 变成 `16.89`。新实现直接生成 6-decimal 整数，例如 `16.90 shares → 16900000`，彻底移除双重舍入。
+
+支持 `GTC/GTD/FAK/FOK`。Polymarket 没有 IOC 类型，收到 IOC 会明确返回 `ORDER_TYPE_UNSUPPORTED`，不会私自把它改成 FAK。
+
+## HTTP、限流和错误
+
+默认参数：单请求 5 秒超时、8 QPS、burst 4；均可注入配置。适配器没有对 POST/DELETE 自动重试。
+
+- `Kind=INVALID/REJECTED`：能够证明没有接受，可进入 `REJECTED`；
+- `Kind=AMBIGUOUS`：请求可能已到达 CLOB，必须进入 `UNKNOWN`；
+- `Kind=UNAVAILABLE`：只读调用暂时不可用；
+- `Code`：鉴权、余额/allowance、精度、最小金额、FAK/FOK、rate limit、server error 等统一码。
+
+签名完成后，适配器已知道 EIP-712 order hash。POST 超时时，这个预期 order ID 会随 `VenueError` 返回并持久化，reconciler 可以用它查询 `/data/order/{id}`，不需要再次下单。
+
+## API 能力
+
+已实现签名并提交 BUY/SELL、取消、单订单查询、分页 open orders、分页 trades/fills、tick size、neg risk，以及 `ORDER_STATUS_*` 和 placement `live/matched/delayed/unmatched` 的归一化。适配器兼容 CLOB raw API 的 bare-array 与分页 envelope，也兼容下单响应里的 raw `success/orderID/tradeIDs` 和 SDK 归一化 `ok/orderId/tradeIds` 字段。
+
+POST 返回 `matched/delayed` 和 order 的累计 `size_matched` 都不能直接作为权威成交。适配器的
+`FillSource` 只从 `/data/trades` 生成 taker 或 maker 分量；trade 明细尚未可见时继续保留预占并
+轮询，不用限价、`makingAmount/takingAmount` 或 placement status 伪造成交。
+
+CLOB 的 `MATCHED/size_matched` 只用于订单观察。资金、仓位和订单累计成交以真实 trade 为依据，
+并且当前权威账本只在 trade status 为 `CONFIRMED` 时入账。完整语义见
+[`fills-and-position-ledger.md`](fills-and-position-ledger.md)。
+
+官方对照：
+
+- <https://docs.polymarket.com/api-reference/authentication>
+- <https://docs.polymarket.com/trading/orders/create>
+- <https://docs.polymarket.com/trading/orders/overview>
+- <https://github.com/Polymarket/py-clob-client-v2>

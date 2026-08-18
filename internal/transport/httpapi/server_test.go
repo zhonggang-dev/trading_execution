@@ -1,0 +1,323 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
+	"github.com/UniPat-AI/trading_execution/internal/adapter/paper"
+	"github.com/UniPat-AI/trading_execution/internal/adapter/risk"
+	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/service/execution"
+	"github.com/UniPat-AI/trading_execution/internal/service/positionexit"
+	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
+)
+
+// TestHTTPOrderLifecycleAndAuthentication 验证 HTTP Order Lifecycle And Authentication 场景下的行为。
+func TestHTTPOrderLifecycleAndAuthentication(t *testing.T) {
+	server := testServer(t, "test-secret")
+
+	health := httptest.NewRequest(http.MethodGet, "/health/live", nil)
+	healthResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(healthResponse, health)
+	if healthResponse.Code != http.StatusOK {
+		t.Fatalf("health status = %d", healthResponse.Code)
+	}
+
+	unauthorized := httptest.NewRequest(http.MethodPost, "/api/v1/orders", strings.NewReader(validRequestJSON))
+	unauthorizedResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(unauthorizedResponse, unauthorized)
+	if unauthorizedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want 401", unauthorizedResponse.Code)
+	}
+
+	created := performRequest(t, server, http.MethodPost, "/api/v1/orders", validRequestJSON, "test-secret")
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var createBody struct {
+		Data domain.Order `json:"data"`
+		Meta struct {
+			Replay bool `json:"idempotent_replay"`
+		} `json:"meta"`
+	}
+	decodeResponse(t, created, &createBody)
+	if createBody.Data.Status != domain.OrderStatusOpen || createBody.Meta.Replay {
+		t.Fatalf("create response = %#v", createBody)
+	}
+
+	replayed := performRequest(t, server, http.MethodPost, "/api/v1/orders", validRequestJSON, "test-secret")
+	if replayed.Code != http.StatusOK || !strings.Contains(replayed.Body.String(), `"idempotent_replay":true`) {
+		t.Fatalf("replay status = %d, body = %s", replayed.Code, replayed.Body.String())
+	}
+
+	canceled := performRequest(t, server, http.MethodPost, "/api/v1/orders/"+createBody.Data.ID+"/cancel", "", "test-secret")
+	if canceled.Code != http.StatusOK || !strings.Contains(canceled.Body.String(), `"status":"CANCELLED"`) {
+		t.Fatalf("cancel status = %d, body = %s", canceled.Code, canceled.Body.String())
+	}
+
+	events := performRequest(t, server, http.MethodGet, "/api/v1/orders/"+createBody.Data.ID+"/events", "", "test-secret")
+	if events.Code != http.StatusOK || !strings.Contains(events.Body.String(), `"to_status":"CANCELLED"`) {
+		t.Fatalf("events status = %d, body = %s", events.Code, events.Body.String())
+	}
+	attempts := performRequest(t, server, http.MethodGet, "/api/v1/orders/"+createBody.Data.ID+"/attempts", "", "test-secret")
+	if attempts.Code != http.StatusOK || !strings.Contains(attempts.Body.String(), `"kind":"SUBMIT"`) || !strings.Contains(attempts.Body.String(), `"kind":"CANCEL"`) {
+		t.Fatalf("attempts status = %d, body = %s", attempts.Code, attempts.Body.String())
+	}
+}
+
+// TestHTTPAuthenticationRequiresBearerScheme 验证鉴权不会把裸令牌或其他认证方案误当成 Bearer Token。
+func TestHTTPAuthenticationRequiresBearerScheme(t *testing.T) {
+	server := testServer(t, "test-secret")
+	for _, authorization := range []string{"test-secret", "Basic test-secret"} {
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/orders/missing", nil)
+		request.Header.Set("Authorization", authorization)
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("authorization %q status = %d, want 401", authorization, response.Code)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/orders/missing", nil)
+	request.Header.Set("Authorization", "bearer test-secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("case-insensitive bearer status = %d, want 404", response.Code)
+	}
+}
+
+// TestHTTPRejectsUnknownFieldsAndNumericDecimals 验证 HTTP Rejects Unknown Fields And Numeric Decimals 场景下的行为。
+func TestHTTPRejectsUnknownFieldsAndNumericDecimals(t *testing.T) {
+	server := testServer(t, "")
+	tests := []string{
+		strings.Replace(validRequestJSON, `"size":"10"`, `"size":10`, 1),
+		strings.Replace(validRequestJSON, `"strategy_id":"strategy-1"`, `"strategy_id":"strategy-1","probability":0.7`, 1),
+	}
+	for _, body := range tests {
+		response := performRequest(t, server, http.MethodPost, "/api/v1/orders", body, "")
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+	}
+}
+
+// fakePositionExitJob 表示后端使用的 fakePositionExitJob 类型。
+type fakePositionExitJob struct {
+	decisionAt time.Time
+}
+
+// Run 执行测试模拟流程。
+func (job *fakePositionExitJob) Run(_ context.Context, decisionAt time.Time) (positionexit.RunResult, error) {
+	job.decisionAt = decisionAt
+	return positionexit.RunResult{DecisionAt: decisionAt, Runs: []positionexit.BindingRunResult{}}, nil
+}
+
+// TestPositionExitJobEndpointUsesDedicatedTokenAndBoundary 验证 Position Exit Job Endpoint Uses Dedicated Token And Boundary 场景下的行为。
+func TestPositionExitJobEndpointUsesDedicatedTokenAndBoundary(t *testing.T) {
+	job := &fakePositionExitJob{}
+	server, err := New(Params{
+		Service: baseExecutionService(t), PositionExitJob: job,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), JobToken: "job-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"xxl_log_id":321,"scheduled_at":"2026-08-18T12:00:00Z"}`
+	unauthorized := performRequest(t, server, http.MethodPost, "/internal/jobs/position-exit-evaluation/run", body, "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthorized.Code)
+	}
+	response := performRequest(t, server, http.MethodPost, "/internal/jobs/position-exit-evaluation/run", body, "job-secret")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"xxl_log_id":321`) {
+		t.Fatalf("job response status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !job.decisionAt.Equal(time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("job decision_at = %s", job.decisionAt)
+	}
+}
+
+// fakeReconciliationJob 表示后端使用的 fakeReconciliationJob 类型。
+type fakeReconciliationJob struct {
+	accountID string
+	trigger   domain.ReconciliationTrigger
+	orderID   string
+}
+
+// fakeTradeHistoryService 表示后端使用的 fakeTradeHistoryService 类型。
+type fakeTradeHistoryService struct {
+	filter domain.TradeHistoryFilter
+	calls  int
+}
+
+// List 记录交易历史筛选条件并返回模拟成交页面。
+func (service *fakeTradeHistoryService) List(_ context.Context, filter domain.TradeHistoryFilter) (domain.TradeHistoryPage, error) {
+	service.filter = filter
+	service.calls++
+	return domain.TradeHistoryPage{
+		Items: []domain.TradeRecord{{
+			FillKey: "fill-key-1", VenueTradeID: "venue-trade-1", OrderID: "order-1",
+			ExecutionAccountID: "account-1", ModelID: "model-v2", StrategyID: "multfactor_v2",
+			MarketID: "market-1", TokenID: "token-1", Side: domain.SideSell,
+			Shares: "10", Price: "0.62", GrossNotional: "6.2", TotalFee: "0.01",
+			NetCashDelta: "6.19", RealizedPnL: "1.19",
+			MatchedAt:   time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC),
+			ConfirmedAt: time.Date(2026, 8, 18, 12, 1, 0, 0, time.UTC),
+		}},
+		Summary: domain.TradeHistorySummary{
+			TradeCount: 1, BuyNotional: "0", SellNotional: "6.2", NetCashFlow: "6.19", TotalFee: "0.01", RealizedPnL: "1.19",
+		},
+		Total: 1, Limit: filter.Limit, Offset: filter.Offset,
+	}, nil
+}
+
+// TestTradeHistoryEndpointAuthenticatesAndValidatesFilters 验证交易历史接口鉴权并校验筛选参数。
+func TestTradeHistoryEndpointAuthenticatesAndValidatesFilters(t *testing.T) {
+	history := &fakeTradeHistoryService{}
+	server, err := New(Params{
+		Service: baseExecutionService(t), TradeHistory: history,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), APIToken: "console-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized := performRequest(t, server, http.MethodGet, "/api/v1/trades", "", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthorized.Code)
+	}
+	invalid := performRequest(t, server, http.MethodGet, "/api/v1/trades?limit=101", "", "console-secret")
+	if invalid.Code != http.StatusBadRequest || history.calls != 0 {
+		t.Fatalf("invalid status=%d calls=%d body=%s", invalid.Code, history.calls, invalid.Body.String())
+	}
+	response := performRequest(t, server, http.MethodGet,
+		"/api/v1/trades?limit=25&offset=5&side=sell&model_id=model-v2&strategy_id=multfactor_v2&execution_account_id=account-1&from=2026-08-18T00:00:00Z&q=venue-trade",
+		"", "console-secret")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"realized_pnl":"1.19"`) {
+		t.Fatalf("trade response status=%d body=%s", response.Code, response.Body.String())
+	}
+	if history.calls != 1 || history.filter.Side != domain.SideSell || history.filter.Limit != 25 || history.filter.Offset != 5 || history.filter.From == nil {
+		t.Fatalf("captured filter = %#v, calls=%d", history.filter, history.calls)
+	}
+}
+
+// RunAccount 执行测试模拟流程。
+func (job *fakeReconciliationJob) RunAccount(
+	_ context.Context,
+	accountID string,
+	trigger domain.ReconciliationTrigger,
+	orderID string,
+) (reconciliation.Result, error) {
+	job.accountID, job.trigger, job.orderID = accountID, trigger, orderID
+	return reconciliation.Result{Run: domain.ReconciliationRun{
+		RunID: "recon-1", ExecutionAccountID: accountID, Trigger: trigger,
+		Status: domain.ReconciliationRunCompleted, Summary: map[string]int{},
+	}}, nil
+}
+
+// TestReconciliationEndpointUsesJobToken 验证 Reconciliation Endpoint Uses Job Token 场景下的行为。
+func TestReconciliationEndpointUsesJobToken(t *testing.T) {
+	job := &fakeReconciliationJob{}
+	server, err := New(Params{
+		Service: baseExecutionService(t), Reconciliation: job,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), JobToken: "job-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"execution_account_id":"account-1","trigger":"ASSET_DRIFT","focus_order_id":"order-1"}`
+	unauthorized := performRequest(t, server, http.MethodPost, "/internal/jobs/reconciliation/run", body, "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthorized.Code)
+	}
+	response := performRequest(t, server, http.MethodPost, "/internal/jobs/reconciliation/run", body, "job-secret")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"COMPLETED"`) {
+		t.Fatalf("reconciliation response status=%d body=%s", response.Code, response.Body.String())
+	}
+	if job.accountID != "account-1" || job.trigger != domain.ReconciliationTriggerAssetDrift || job.orderID != "order-1" {
+		t.Fatalf("reconciliation input = %#v", job)
+	}
+}
+
+// testServer 实现当前测试场景所需的辅助行为。
+func testServer(t *testing.T, token string) *Server {
+	t.Helper()
+	service := baseExecutionService(t)
+	server, err := New(Params{
+		Service:  service,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		APIToken: token,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return server
+}
+
+// baseExecutionService 构建测试使用的基础领域对象。
+func baseExecutionService(t *testing.T) *execution.Service {
+	t.Helper()
+	guard, err := risk.NewStaticGuard(risk.StaticGuardParams{
+		MaxOrderSize:     "100",
+		MaxOrderNotional: "100",
+	})
+	if err != nil {
+		t.Fatalf("NewStaticGuard() error = %v", err)
+	}
+	service, err := execution.New(execution.Params{
+		Repository:      memory.NewOrderRepository(),
+		Venue:           paper.NewVenue("polymarket-paper"),
+		Guard:           guard,
+		MarketValidator: paper.NewMarketValidator(),
+		Reservations:    paper.NewReservationManager(),
+	})
+	if err != nil {
+		t.Fatalf("execution.New() error = %v", err)
+	}
+	return service
+}
+
+// performRequest 发送测试请求并返回记录的响应。
+func performRequest(t *testing.T, server *Server, method, path, body, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	return response
+}
+
+// decodeResponse 解码测试响应到目标结构。
+func decodeResponse(t *testing.T, response *httptest.ResponseRecorder, target any) {
+	t.Helper()
+	if err := json.Unmarshal(response.Body.Bytes(), target); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+}
+
+const validRequestJSON = `{
+  "model_id":"model-1",
+  "strategy_id":"strategy-1",
+  "execution_account_id":"account-model-1-strategy-1",
+  "signal_id":"signal-1",
+  "client_order_id":"client-1",
+  "venue":"polymarket-paper",
+  "market_id":"market-1",
+  "condition_id":"condition-1",
+  "token_id":"token-1",
+  "side":"BUY",
+  "type":"LIMIT",
+  "price":"0.50",
+  "size":"10",
+  "time_in_force":"GTC"
+}`
