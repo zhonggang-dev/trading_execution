@@ -47,27 +47,37 @@ type tradeHistoryService interface {
 	List(context.Context, domain.TradeHistoryFilter) (domain.TradeHistoryPage, error)
 }
 
+// readinessChecker verifies dependencies required to safely serve requests.
+// It must be read-only and bounded by the request context.
+type readinessChecker interface {
+	Check(context.Context) error
+}
+
 // Params 表示后端使用的 Params 类型。
 type Params struct {
-	Service         executionService
-	PositionExitJob positionExitJob
-	Reconciliation  reconciliationJob
-	TradeHistory    tradeHistoryService
-	Logger          *slog.Logger
-	APIToken        string
-	JobToken        string
+	Service          executionService
+	PositionExitJob  positionExitJob
+	Reconciliation   reconciliationJob
+	TradeHistory     tradeHistoryService
+	Readiness        readinessChecker
+	ReadinessTimeout time.Duration
+	Logger           *slog.Logger
+	APIToken         string
+	JobToken         string
 }
 
 // Server 表示后端使用的 Server 类型。
 type Server struct {
-	service         executionService
-	positionExitJob positionExitJob
-	reconciliation  reconciliationJob
-	tradeHistory    tradeHistoryService
-	logger          *slog.Logger
-	apiToken        string
-	jobToken        string
-	handler         http.Handler
+	service          executionService
+	positionExitJob  positionExitJob
+	reconciliation   reconciliationJob
+	tradeHistory     tradeHistoryService
+	readinessChecker readinessChecker
+	readinessTimeout time.Duration
+	logger           *slog.Logger
+	apiToken         string
+	jobToken         string
+	handler          http.Handler
 }
 
 // New 校验依赖和配置后创建当前服务实例。
@@ -78,14 +88,22 @@ func New(params Params) (*Server, error) {
 	if params.Logger == nil {
 		params.Logger = slog.Default()
 	}
+	if params.ReadinessTimeout == 0 {
+		params.ReadinessTimeout = 2 * time.Second
+	}
+	if params.ReadinessTimeout < 100*time.Millisecond || params.ReadinessTimeout > 30*time.Second {
+		return nil, fmt.Errorf("HTTP readiness timeout must be between 100ms and 30s")
+	}
 	server := &Server{
-		service:         params.Service,
-		positionExitJob: params.PositionExitJob,
-		reconciliation:  params.Reconciliation,
-		tradeHistory:    params.TradeHistory,
-		logger:          params.Logger,
-		apiToken:        strings.TrimSpace(params.APIToken),
-		jobToken:        strings.TrimSpace(params.JobToken),
+		service:          params.Service,
+		positionExitJob:  params.PositionExitJob,
+		reconciliation:   params.Reconciliation,
+		tradeHistory:     params.TradeHistory,
+		readinessChecker: params.Readiness,
+		readinessTimeout: params.ReadinessTimeout,
+		logger:           params.Logger,
+		apiToken:         strings.TrimSpace(params.APIToken),
+		jobToken:         strings.TrimSpace(params.JobToken),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", server.liveness)
@@ -127,8 +145,17 @@ func (server *Server) liveness(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// readiness 读取并核对 iness。
-func (server *Server) readiness(writer http.ResponseWriter, _ *http.Request) {
+// readiness verifies serving dependencies without conflating them with process liveness.
+func (server *Server) readiness(writer http.ResponseWriter, request *http.Request) {
+	if server.readinessChecker != nil {
+		ctx, cancel := context.WithTimeout(request.Context(), server.readinessTimeout)
+		defer cancel()
+		if err := server.readinessChecker.Check(ctx); err != nil {
+			server.logger.Error("readiness dependency check failed", "error", err)
+			writeJSON(writer, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+			return
+		}
+	}
 	writeJSON(writer, http.StatusOK, map[string]string{"status": "ready"})
 }
 

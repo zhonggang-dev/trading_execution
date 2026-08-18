@@ -71,8 +71,8 @@ Prediction / Strategy service
             -> paper adapter（当前）
             -> Polymarket CLOB V2 adapter（已实现，live 尚未装配）
        -> OrderRepository port
-            -> memory adapter（当前）
-            -> PostgreSQL order/event/attempt adapter（已实现）
+            -> memory adapter（仅 local 且未配置数据库）
+            -> PostgreSQL order/event/attempt adapter（非 local 当前实现）
 ```
 
 `internal/domain.OrderIntent` 是策略与执行之间的契约。它故意不包含
@@ -82,20 +82,28 @@ Venue adapter 使用 execution account 选择对应钱包和签名器，Python �
 
 ## 当前安全状态
 
-基础框架只支持 `EXECUTION_MODE=paper`，paper adapter 不发起任何网络请求。多钱包 secret
+服务当前只支持 `EXECUTION_MODE=paper`，paper adapter 不发起任何网络请求。非 local 环境强制
+配置 PostgreSQL，并把订单、事件、外部操作尝试、幂等键和资金预占持久化；服务启动时会恢复
+未完成订单，`/health/ready` 会实际检查数据库连接和必需 schema。paper venue 的标识可从持久化
+订单确定性恢复，因此重启后仍可查询和撤单；paper 撤单同步释放预占，live 则必须等待成交终局
+对账，不能复用这个快速路径。
+
+多钱包 secret
 加载、EOA signer、L1 create/derive、L2 HMAC 和只读 `cmd/walletcheck` 已经实现；它可以验证真实
 钱包凭证但不能下单。Polymarket CLOB V2 adapter、PostgreSQL 订单/Fill/资金/仓位账本和 outbox
 也已经实现，但尚未在 `cmd/server` 中整体装配，因此 `EXECUTION_MODE=live` 仍会拒绝启动。
 启用实盘前还需要：
 
 1. 接入生产 secrets/HSM，并为实际钱包类型完成签名验收；`POLY_1271` 当前 fail closed；
-2. 运行 migrations，装配 PostgreSQL order/reservation/fill/outbox adapters 和 coordinator；
+2. 在 live composition 中装配 Polymarket Venue、FillLedger、outbox dispatcher、启动/持续
+   reconciliation 和 Position Exit；PostgreSQL order/reservation 与启动恢复 coordinator 已装配；
 3. 将已实现的 `riskcontrol.Service` 接到真实余额、仓位和订单数据源，并补齐同事务敞口检查、
    pending 对账、kill switch 控制面和可观测性；
 4. 在 live composition 中启用已实现的 cancel Fill finality/grace worker，并增加 BUY 最大手续费
    预占 buffer；禁止旧累计 Reconcile 与新 Fill ledger 同时消费同一成交。
 
-内存 Repository 只用于本地开发；重启会丢失订单和幂等记录，不能用于实盘。
+内存 Repository 只用于 local 且未配置数据库的开发模式；重启会丢失订单和幂等记录，不能用于
+共享测试或实盘。非 local 环境缺少 `TRADING_EXECUTION_DATABASE_URL` 时会直接拒绝启动。
 
 ## 本地运行
 

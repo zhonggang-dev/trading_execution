@@ -289,6 +289,39 @@ func TestCancelIsIdempotentAfterTerminalState(t *testing.T) {
 	}
 }
 
+// TestPaperCancellationCanReleaseImmediately verifies that a synchronous paper
+// venue does not leave collateral frozen for a reconciliation job that cannot
+// observe any external state.
+func TestPaperCancellationCanReleaseImmediately(t *testing.T) {
+	venue := &fakeVenue{}
+	reservations := paper.NewReservationManager()
+	service, err := execution.New(execution.Params{
+		Repository:              memory.NewOrderRepository(),
+		Venue:                   venue,
+		Guard:                   allowGuard{},
+		MarketValidator:         allowMarketValidator{},
+		Reservations:            reservations,
+		ImmediateCancelFinality: true,
+		Now:                     func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) },
+		NewID:                   func() string { return "ord-paper-cancel" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(context.Background(), validIntent("client-paper-cancel"))
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	canceled, err := service.Cancel(context.Background(), result.Order.ID)
+	if err != nil || canceled.Status != domain.OrderStatusCanceled {
+		t.Fatalf("Cancel() = %#v, %v", canceled, err)
+	}
+	reservation, ok := reservations.Get(result.Order.ID)
+	if !ok || reservation.Status != domain.ReservationStatusReleased {
+		t.Fatalf("reservation = %#v, %v; want immediately released", reservation, ok)
+	}
+}
+
 // TestReservationRejectionNeverCallsVenue 验证 Reservation Rejection Never Calls Venue 场景下的行为。
 func TestReservationRejectionNeverCallsVenue(t *testing.T) {
 	venue := &fakeVenue{}

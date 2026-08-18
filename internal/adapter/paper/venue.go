@@ -53,7 +53,11 @@ func (venue *Venue) Cancel(_ context.Context, order domain.Order) (port.VenueOrd
 	defer venue.mu.Unlock()
 	venueOrder, exists := venue.orders[order.VenueOrderID]
 	if !exists {
-		return port.VenueOrder{}, fmt.Errorf("paper venue order %q not found", order.VenueOrderID)
+		var err error
+		venueOrder, err = venue.restore(order)
+		if err != nil {
+			return port.VenueOrder{}, err
+		}
 	}
 	if venueOrder.State != port.VenueOrderFilled {
 		venueOrder.State = port.VenueOrderCancelled
@@ -67,10 +71,38 @@ func (venue *Venue) Cancel(_ context.Context, order domain.Order) (port.VenueOrd
 // Get 按标识查询并返回当前组件管理的记录。
 func (venue *Venue) Get(_ context.Context, order domain.Order) (port.VenueOrder, error) {
 	venue.mu.RLock()
-	defer venue.mu.RUnlock()
 	venueOrder, exists := venue.orders[order.VenueOrderID]
+	venue.mu.RUnlock()
 	if !exists {
-		return port.VenueOrder{}, fmt.Errorf("paper venue order %q not found", order.VenueOrderID)
+		return venue.restore(order)
 	}
 	return venueOrder, nil
+}
+
+// restore reconstructs a deterministic paper venue observation from the
+// durable order. Paper orders have no remote venue state, so this makes
+// refresh and cancel safe across process restarts without pretending to be a
+// live exchange adapter.
+func (venue *Venue) restore(order domain.Order) (port.VenueOrder, error) {
+	expectedID := "paper-" + order.ID
+	if order.ID == "" || order.VenueOrderID != expectedID {
+		return port.VenueOrder{}, fmt.Errorf("paper venue order %q not found", order.VenueOrderID)
+	}
+	state := port.VenueOrderLive
+	rawStatus := "paper-live"
+	switch order.Status {
+	case domain.OrderStatusFilled:
+		state, rawStatus = port.VenueOrderFilled, "paper-filled"
+	case domain.OrderStatusPartiallyFilled:
+		state, rawStatus = port.VenueOrderPartiallyFilled, "paper-partially-filled"
+	case domain.OrderStatusCancelled:
+		state, rawStatus = port.VenueOrderCancelled, "paper-cancelled"
+	case domain.OrderStatusRejected:
+		state, rawStatus = port.VenueOrderRejected, "paper-rejected"
+	}
+	return port.VenueOrder{
+		ID: expectedID, State: state, RawStatus: rawStatus,
+		FilledSize: order.FilledSize, AverageFillPrice: order.AverageFillPrice,
+		ObservedAt: venue.now().UTC(),
+	}, nil
 }

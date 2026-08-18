@@ -33,6 +33,7 @@ type Params struct {
 	Reservations            port.AssetReservationManager
 	Reconciliation          port.ReconciliationTriggerer
 	CancelFillFinalityGrace time.Duration
+	ImmediateCancelFinality bool
 	MaxReconcileAttempts    int
 	Now                     func() time.Time
 	NewID                   func() string
@@ -47,6 +48,7 @@ type Service struct {
 	reservations            port.AssetReservationManager
 	reconciliation          port.ReconciliationTriggerer
 	cancelFillFinalityGrace time.Duration
+	immediateCancelFinality bool
 	maxReconcileAttempts    int
 	now                     func() time.Time
 	newID                   func() string
@@ -89,6 +91,7 @@ func New(params Params) (*Service, error) {
 		reservations:            params.Reservations,
 		reconciliation:          params.Reconciliation,
 		cancelFillFinalityGrace: params.CancelFillFinalityGrace,
+		immediateCancelFinality: params.ImmediateCancelFinality,
 		maxReconcileAttempts:    params.MaxReconcileAttempts,
 		now:                     params.Now,
 		newID:                   params.NewID,
@@ -446,6 +449,13 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 
 // holdCancellationFinality 保留撤单后的资产预占并触发成交终局对账。
 func (service *Service) holdCancellationFinality(ctx context.Context, order domain.Order) error {
+	if service.immediateCancelFinality {
+		if _, err := service.reservations.Reconcile(ctx, order); err != nil {
+			uncertainErr := service.reservations.MarkUncertain(ctx, order, "IMMEDIATE_CANCEL_RECONCILIATION_FAILED: "+err.Error())
+			return errors.Join(fmt.Errorf("release immediately cancelled reservation: %w", err), uncertainErr)
+		}
+		return nil
+	}
 	err := service.reservations.MarkUncertain(ctx, order, "CANCEL_FILL_FINALITY_PENDING")
 	service.triggerReconciliation(order, domain.ReconciliationTriggerCancelUnknown)
 	return err

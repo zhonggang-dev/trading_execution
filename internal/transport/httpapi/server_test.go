@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -20,6 +21,10 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/positionexit"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 )
+
+type fakeReadiness struct{ err error }
+
+func (checker fakeReadiness) Check(context.Context) error { return checker.err }
 
 // TestHTTPOrderLifecycleAndAuthentication 验证 HTTP Order Lifecycle And Authentication 场景下的行为。
 func TestHTTPOrderLifecycleAndAuthentication(t *testing.T) {
@@ -71,6 +76,30 @@ func TestHTTPOrderLifecycleAndAuthentication(t *testing.T) {
 	attempts := performRequest(t, server, http.MethodGet, "/api/v1/orders/"+createBody.Data.ID+"/attempts", "", "test-secret")
 	if attempts.Code != http.StatusOK || !strings.Contains(attempts.Body.String(), `"kind":"SUBMIT"`) || !strings.Contains(attempts.Body.String(), `"kind":"CANCEL"`) {
 		t.Fatalf("attempts status = %d, body = %s", attempts.Code, attempts.Body.String())
+	}
+}
+
+// TestReadinessFailsClosed verifies that a dependency failure cannot be
+// reported as ready while liveness remains independent.
+func TestReadinessFailsClosed(t *testing.T) {
+	server, err := New(Params{
+		Service: baseExecutionService(t), Readiness: fakeReadiness{err: errors.New("database unavailable")},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	readyRequest := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+	readyResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(readyResponse, readyRequest)
+	if readyResponse.Code != http.StatusServiceUnavailable || !strings.Contains(readyResponse.Body.String(), `"status":"not_ready"`) {
+		t.Fatalf("readiness status = %d, body = %s", readyResponse.Code, readyResponse.Body.String())
+	}
+	liveRequest := httptest.NewRequest(http.MethodGet, "/health/live", nil)
+	liveResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(liveResponse, liveRequest)
+	if liveResponse.Code != http.StatusOK {
+		t.Fatalf("liveness status = %d", liveResponse.Code)
 	}
 }
 

@@ -10,13 +10,16 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/paper"
 	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/risk"
 	"github.com/UniPat-AI/trading_execution/internal/config"
+	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
+	"github.com/UniPat-AI/trading_execution/internal/service/ordercoordinator"
 	"github.com/UniPat-AI/trading_execution/internal/service/tradehistory"
 	"github.com/UniPat-AI/trading_execution/internal/transport/httpapi"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -39,7 +42,37 @@ func run() error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.App.LogLevel}))
 	slog.SetDefault(logger)
 
-	repository := memory.NewOrderRepository()
+	database, err := openDatabase(cfg)
+	if err != nil {
+		return err
+	}
+	if database != nil {
+		defer database.Close()
+	}
+
+	var repository port.OrderRepository = memory.NewOrderRepository()
+	var reservations port.AssetReservationManager = paper.NewReservationManager()
+	var readiness *postgresadapter.HealthChecker
+	if database != nil {
+		repository, err = postgresadapter.NewOrderRepository(database)
+		if err != nil {
+			return err
+		}
+		reservations, err = postgresadapter.NewReservationManager(postgresadapter.ReservationManagerParams{DB: database})
+		if err != nil {
+			return err
+		}
+		readiness, err = postgresadapter.NewHealthChecker(database)
+		if err != nil {
+			return err
+		}
+		readinessContext, cancel := context.WithTimeout(context.Background(), cfg.Database.ConnectTimeout)
+		readinessErr := readiness.Check(readinessContext)
+		cancel()
+		if readinessErr != nil {
+			return fmt.Errorf("database readiness check: %w", readinessErr)
+		}
+	}
 	venue := paper.NewVenue(cfg.Execution.Venue)
 	guard, err := risk.NewStaticGuard(risk.StaticGuardParams{
 		AllowMarketOrders: cfg.Execution.AllowMarketOrders,
@@ -54,25 +87,29 @@ func run() error {
 		Venue:           venue,
 		Guard:           guard,
 		MarketValidator: paper.NewMarketValidator(),
-		Reservations:    paper.NewReservationManager(),
+		Reservations:    reservations,
+		// The paper venue is synchronous and cannot produce late external fills.
+		// Live venues must keep this false and wait for reconciliation finality.
+		ImmediateCancelFinality: cfg.Execution.Mode == "paper",
 	})
 	if err != nil {
 		return err
 	}
-	tradeHistoryService, database, err := buildTradeHistoryService(cfg)
+	tradeHistoryService, err := buildTradeHistoryService(database)
 	if err != nil {
 		return err
 	}
-	if database != nil {
-		defer database.Close()
-	}
-	httpAPI, err := httpapi.New(httpapi.Params{
+	httpParams := httpapi.Params{
 		Service:      executionService,
 		TradeHistory: tradeHistoryService,
 		Logger:       logger,
 		APIToken:     cfg.HTTP.APIToken,
 		JobToken:     cfg.HTTP.JobToken,
-	})
+	}
+	if readiness != nil {
+		httpParams.Readiness = readiness
+	}
+	httpAPI, err := httpapi.New(httpParams)
 	if err != nil {
 		return err
 	}
@@ -83,6 +120,24 @@ func run() error {
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
 		WriteTimeout:      cfg.HTTP.WriteTimeout,
 		IdleTimeout:       cfg.HTTP.IdleTimeout,
+	}
+
+	rootContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if database != nil {
+		coordinator, err := ordercoordinator.New(ordercoordinator.Params{
+			Repository: repository, Execution: executionService,
+			PollInterval: cfg.Execution.CoordinatorInterval,
+			BatchSize:    cfg.Execution.CoordinatorBatchSize,
+		})
+		if err != nil {
+			return err
+		}
+		go runOrderCoordinator(
+			rootContext, logger, coordinator, cfg.Execution.CoordinatorInterval,
+			cfg.Execution.Mode == "live",
+		)
 	}
 
 	serverErrors := make(chan error, 1)
@@ -97,8 +152,6 @@ func run() error {
 		serverErrors <- server.ListenAndServe()
 	}()
 
-	rootContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	select {
 	case <-rootContext.Done():
 		shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
@@ -116,33 +169,73 @@ func run() error {
 	}
 }
 
-// buildTradeHistoryService 根据数据库配置装配纸交易或 PostgreSQL 交易历史服务。
-func buildTradeHistoryService(cfg config.Config) (*tradehistory.Service, *sql.DB, error) {
+// openDatabase opens and validates the single PostgreSQL pool shared by all
+// durable repositories. Production configuration validation requires it.
+func openDatabase(cfg config.Config) (*sql.DB, error) {
 	if cfg.Database.URL == "" {
-		service, err := tradehistory.New(memory.NewTradeHistoryRepository())
-		return service, nil, err
+		return nil, nil
 	}
 	database, err := sql.Open("pgx", cfg.Database.URL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open trade history database: %w", err)
+		return nil, fmt.Errorf("open execution database: %w", err)
 	}
-	database.SetMaxOpenConns(8)
-	database.SetMaxIdleConns(4)
+	database.SetMaxOpenConns(16)
+	database.SetMaxIdleConns(8)
+	database.SetConnMaxLifetime(30 * time.Minute)
+	database.SetConnMaxIdleTime(5 * time.Minute)
 	connectContext, cancel := context.WithTimeout(context.Background(), cfg.Database.ConnectTimeout)
 	defer cancel()
 	if err := database.PingContext(connectContext); err != nil {
 		database.Close()
-		return nil, nil, fmt.Errorf("connect trade history database: %w", err)
+		return nil, fmt.Errorf("connect execution database: %w", err)
+	}
+	return database, nil
+}
+
+// buildTradeHistoryService uses the same authoritative database as order and
+// accounting writes; local mode keeps the explicit empty in-memory view.
+func buildTradeHistoryService(database *sql.DB) (*tradehistory.Service, error) {
+	if database == nil {
+		return tradehistory.New(memory.NewTradeHistoryRepository())
 	}
 	repository, err := postgresadapter.NewTradeHistoryRepository(database)
 	if err != nil {
-		database.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	service, err := tradehistory.New(repository)
 	if err != nil {
-		database.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	return service, database, nil
+	return service, nil
+}
+
+// runOrderCoordinator always performs one startup recovery scan. Live mode
+// then continues refreshing ambiguous/open venue orders; paper mode stops
+// after recovery because its deterministic venue has no external state to
+// poll and repeated observations would only grow the audit log.
+func runOrderCoordinator(
+	ctx context.Context,
+	logger *slog.Logger,
+	coordinator *ordercoordinator.Coordinator,
+	interval time.Duration,
+	continuous bool,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		result := coordinator.Sweep(ctx)
+		for _, err := range result.Errors {
+			if !errors.Is(err, context.Canceled) {
+				logger.Error("order coordinator sweep failed", "error", err)
+			}
+		}
+		if !continuous {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }

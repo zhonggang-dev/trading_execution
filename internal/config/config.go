@@ -46,11 +46,13 @@ type Database struct {
 
 // Execution 表示后端使用的 Execution 类型。
 type Execution struct {
-	Mode              string
-	Venue             string
-	AllowMarketOrders bool
-	MaxOrderSize      domain.Decimal
-	MaxOrderNotional  domain.Decimal
+	Mode                 string
+	Venue                string
+	AllowMarketOrders    bool
+	MaxOrderSize         domain.Decimal
+	MaxOrderNotional     domain.Decimal
+	CoordinatorInterval  time.Duration
+	CoordinatorBatchSize int
 }
 
 // Load 从环境变量加载并校验服务配置。
@@ -95,6 +97,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	coordinatorInterval, err := duration("ORDER_COORDINATOR_INTERVAL", 2*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	coordinatorBatchSize, err := integer("ORDER_COORDINATOR_BATCH_SIZE", 100, 1, 1000)
+	if err != nil {
+		return Config{}, err
+	}
 	config := Config{
 		App: App{
 			Name:     env("APP_NAME", "trading_execution"),
@@ -116,11 +126,13 @@ func Load() (Config, error) {
 			ConnectTimeout: databaseConnectTimeout,
 		},
 		Execution: Execution{
-			Mode:              strings.ToLower(env("EXECUTION_MODE", "paper")),
-			Venue:             strings.ToLower(env("EXECUTION_VENUE", "polymarket-paper")),
-			AllowMarketOrders: allowMarketOrders,
-			MaxOrderSize:      maxOrderSize,
-			MaxOrderNotional:  maxOrderNotional,
+			Mode:                 strings.ToLower(env("EXECUTION_MODE", "paper")),
+			Venue:                strings.ToLower(env("EXECUTION_VENUE", "polymarket-paper")),
+			AllowMarketOrders:    allowMarketOrders,
+			MaxOrderSize:         maxOrderSize,
+			MaxOrderNotional:     maxOrderNotional,
+			CoordinatorInterval:  coordinatorInterval,
+			CoordinatorBatchSize: coordinatorBatchSize,
 		},
 	}
 	if err := config.Validate(); err != nil {
@@ -142,6 +154,12 @@ func (config Config) Validate() error {
 	}
 	if config.App.Env != "local" && len(config.HTTP.APIToken) < 32 {
 		return fmt.Errorf("EXECUTION_API_TOKEN must contain at least 32 bytes outside local environment")
+	}
+	if config.App.Env != "local" && strings.TrimSpace(config.Database.URL) == "" {
+		return fmt.Errorf("TRADING_EXECUTION_DATABASE_URL is required outside local environment")
+	}
+	if config.Execution.CoordinatorInterval < 100*time.Millisecond || config.Execution.CoordinatorInterval > time.Minute {
+		return fmt.Errorf("ORDER_COORDINATOR_INTERVAL must be between 100ms and 1m")
 	}
 	return nil
 }
@@ -176,6 +194,19 @@ func boolean(key string, fallback bool) (bool, error) {
 	parsed, err := strconv.ParseBool(value)
 	if err != nil {
 		return false, fmt.Errorf("%s must be a boolean", key)
+	}
+	return parsed, nil
+}
+
+// integer reads a bounded integer configuration value.
+func integer(key string, fallback, minimum, maximum int) (int, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < minimum || parsed > maximum {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", key, minimum, maximum)
 	}
 	return parsed, nil
 }

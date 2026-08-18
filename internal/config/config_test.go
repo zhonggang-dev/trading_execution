@@ -39,6 +39,17 @@ func TestLoadRequiresProductionToken(t *testing.T) {
 	}
 }
 
+// TestLoadRequiresProductionDatabase ensures non-local deployments cannot
+// silently fall back to volatile order and reservation repositories.
+func TestLoadRequiresProductionDatabase(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("EXECUTION_API_TOKEN", strings.Repeat("x", 32))
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "TRADING_EXECUTION_DATABASE_URL") {
+		t.Fatalf("Load() error = %v, want database validation", err)
+	}
+}
+
 // clearConfigEnvironment 实现当前测试场景所需的辅助行为。
 func clearConfigEnvironment(t *testing.T) {
 	t.Helper()
@@ -48,6 +59,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"DATABASE_CONNECT_TIMEOUT", "TRADING_EXECUTION_DATABASE_URL",
 		"EXECUTION_API_TOKEN", "EXECUTION_MODE", "EXECUTION_VENUE", "EXECUTION_ALLOW_MARKET_ORDERS",
 		"EXECUTION_MAX_ORDER_SIZE", "EXECUTION_MAX_ORDER_NOTIONAL",
+		"ORDER_COORDINATOR_INTERVAL", "ORDER_COORDINATOR_BATCH_SIZE",
 	} {
 		t.Setenv(key, "")
 	}
