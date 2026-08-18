@@ -304,9 +304,9 @@ func updateReservationForFill(
 		    settled_shares=$4::numeric, settled_notional=$5::numeric, settled_fees=$6::numeric,
 		    status=$7,
 		    uncertain_reason=CASE WHEN $7='RECONCILIATION_REQUIRED' THEN uncertain_reason ELSE '' END,
-		    last_venue_observed_at=$8,
-		    revision=revision+1, updated_at=$9,
-		    released_at=CASE WHEN $10::boolean THEN $9 ELSE NULL END
+		    last_venue_observed_at=$8::timestamptz,
+		    revision=revision+1, updated_at=$9::timestamptz,
+		    released_at=CASE WHEN $10::boolean THEN $9::timestamptz ELSE NULL::timestamptz END
 		WHERE order_id=$1 AND revision=$11`,
 		reservation.OrderID, targetBalance.String(), targetShares.String(), cumulativeShares.String(),
 		cumulativeNotional.String(), cumulativeFees.String(), string(status), nullTime(fill.VenueUpdatedAt),
@@ -413,7 +413,7 @@ func closeTargetLot(ctx context.Context, tx *sql.Tx, fill domain.Fill, lot lotBa
 		SET remaining_shares=$2::numeric,
 		    remaining_cost=CASE WHEN $3::boolean THEN 0 ELSE $4::numeric END,
 		    status=CASE WHEN $3::boolean THEN 'CLOSED' ELSE 'OPEN' END,
-		    closed_at=CASE WHEN $3::boolean THEN $5 ELSE NULL END
+		    closed_at=CASE WHEN $3::boolean THEN $5::timestamptz ELSE NULL::timestamptz END
 		WHERE lot_id=$1 AND remaining_shares=$6::numeric AND remaining_cost=$7::numeric`,
 		lot.id, newShares.String(), closed, newCost.String(), fill.ObservedAt, lot.shares.String(), lot.cost.String())
 	if err != nil {
@@ -430,7 +430,7 @@ func closeTargetLot(ctx context.Context, tx *sql.Tx, fill domain.Fill, lot lotBa
 		INSERT INTO position_lot_closures (
 			closure_id, closing_fill_key, lot_id, closed_shares, allocated_cost,
 			allocated_net_proceeds, realized_pnl, closed_at
-		) VALUES ($1,$2,$3,$4::numeric,$5::numeric,$6::numeric,$7::numeric,$8)`,
+		) VALUES ($1,$2,$3,$4::numeric,$5::numeric,$6::numeric,$7::numeric,$8::timestamptz)`,
 		"closure:"+fill.Key+":"+lot.id, fill.Key, lot.id, fill.Shares.String(), allocatedCost.String(),
 		fill.NetCashDelta.String(), realized.String(), fill.ObservedAt)
 	if err != nil {
