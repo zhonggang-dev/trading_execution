@@ -22,8 +22,7 @@ type Params struct {
 	HTTPClient  *http.Client
 }
 
-// Client implements the execution-facing Market Universe Service contract:
-// GET /api/v1/markets/by-condition/{condition_id}.
+// Client 实现面向交易执行的 Market Universe Service 契约，通过 condition_id 查询权威 Market 数据。
 type Client struct {
 	baseURL     *url.URL
 	bearerToken string

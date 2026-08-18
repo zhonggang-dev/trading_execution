@@ -7,9 +7,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 )
 
-// MarketValidator is an explicit paper-only bypass. Keeping it as a named
-// adapter prevents the live service from accidentally running without market
-// validation.
+// MarketValidator 表示显式的模拟模式校验旁路，命名适配器可防止实盘在缺少 Market 校验时意外启动。
 type MarketValidator struct {
 	now func() time.Time
 }

@@ -7,9 +7,7 @@ import (
 	"strings"
 )
 
-// Decimal is a base-10 number carried as a JSON string. Trading APIs must not
-// use float64 for prices, sizes, or filled quantities because binary rounding
-// can alter an order.
+// Decimal 表示以 JSON 字符串传输的十进制数，避免 float64 的二进制舍入改变价格、数量或成交结果。
 type Decimal string
 
 // ParseDecimal 解析并规范化一个十进制字符串。

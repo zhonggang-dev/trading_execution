@@ -7,8 +7,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
-// TradeHistoryRepository is the safe paper-mode view. Paper order status is
-// never converted into a fake Fill, so this repository remains empty.
+// TradeHistoryRepository 表示安全的模拟模式交易视图，不会把模拟订单状态转换成虚假成交，因此始终为空。
 type TradeHistoryRepository struct{}
 
 var _ port.TradeHistoryRepository = (*TradeHistoryRepository)(nil)

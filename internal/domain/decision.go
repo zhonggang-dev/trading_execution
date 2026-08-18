@@ -38,8 +38,7 @@ type PredictionModel struct {
 	PromptVersion    string `json:"prompt_version,omitempty"`
 }
 
-// Prediction is one producer result. Repeated predictions for one condition
-// stay independent all the way into the strategy request.
+// Prediction 表示单个模型生产者的预测结果，同一 condition 的多条预测在进入策略请求前始终保持独立。
 type Prediction struct {
 	PredictionID   string              `json:"prediction_id"`
 	SourceJobID    string              `json:"source_job_id"`
@@ -144,8 +143,7 @@ const (
 	OrderBookStatusError   OrderBookStatus = "ERROR"
 )
 
-// OrderBookSnapshot is a normalized, top-N market-data observation. It is the
-// strategy snapshot, not the fresh quote used by the execution guard.
+// OrderBookSnapshot 表示标准化的前 N 档市场数据观察结果，供策略使用而不是执行风控读取的最新报价。
 type OrderBookSnapshot struct {
 	MarketID     string          `json:"market_id"`
 	ConditionID  string          `json:"condition_id"`
@@ -175,8 +173,7 @@ func (book OrderBookSnapshot) Validate() error {
 	if book.ObservedAt.IsZero() {
 		return fmt.Errorf("orderbook observed_at is required")
 	}
-	// Zero is accepted for execution-only fresh-book adapters that predate the
-	// strategy depth contract. Strategy requests validate exactly 15 separately.
+	// 仅供执行使用的旧版最新盘口适配器允许 DepthLimit 为零，策略请求会另行严格校验 15 档深度。
 	if book.DepthLimit < 0 || book.DepthLimit > StrategyOrderBookDepth {
 		return fmt.Errorf("orderbook depth_limit must be between 0 and %d", StrategyOrderBookDepth)
 	}
@@ -260,8 +257,10 @@ const (
 
 // MidPriceSampling 表示后端使用的 MidPriceSampling 类型。
 type MidPriceSampling string
+
 // MidPriceMissingValuePolicy 表示后端使用的 MidPriceMissingValuePolicy 类型。
 type MidPriceMissingValuePolicy string
+
 // MidPriceTimestampSemantics 表示后端使用的 MidPriceTimestampSemantics 类型。
 type MidPriceTimestampSemantics string
 
@@ -271,16 +270,14 @@ const (
 	MidPriceTimestampSemanticsIntervalEndUTC MidPriceTimestampSemantics = "INTERVAL_END_UTC"
 )
 
-// MidPricePoint is one Polymarket /prices-history point. P maps directly from
-// upstream `p`; only the timestamp is normalized to its UTC minute interval
-// end. No bid/ask midpoint, resampling, interpolation, or forward fill occurs.
+// MidPricePoint 表示 Polymarket /prices-history 的一个原始点，P 直接映射上游 p，仅将时间规范到 UTC 分钟区间末端。
+// 该过程不重新计算买卖盘中点，也不进行重采样、插值或前向填充。
 type MidPricePoint struct {
 	IntervalEndAt time.Time `json:"interval_end_at"`
 	P             Decimal   `json:"p"`
 }
 
-// MidPriceHistory is the frozen historical midpoint series for one outcome
-// token. The requested window is always bounded by the cycle decision time.
+// MidPriceHistory 表示单个 Outcome Token 的冻结历史中间价序列，请求窗口始终以周期决策时间为上界。
 type MidPriceHistory struct {
 	MarketID           string                     `json:"market_id"`
 	ConditionID        string                     `json:"condition_id"`
@@ -359,9 +356,7 @@ func (history MidPriceHistory) Validate() error {
 	return nil
 }
 
-// StrategyExecutionContext is a server-owned binding. ModelID identifies the
-// prediction producer, StrategyID selects Python strategy code, and
-// ExecutionAccountID selects the isolated execution account/wallet in Go.
+// StrategyExecutionContext 表示服务端维护的执行绑定：ModelID 标识预测生产者，StrategyID 选择 Python 策略，ExecutionAccountID 选择隔离账户。
 type StrategyExecutionContext struct {
 	ModelID            string `json:"model_id"`
 	StrategyID         string `json:"strategy_id"`
@@ -393,8 +388,7 @@ func CanonicalStrategyID(value string) string {
 	}
 }
 
-// StrategyPositionLot is the per-fill position view sent to Python. Shares is
-// the exact remaining quantity of this lot, never a netted token position.
+// StrategyPositionLot 表示发送给 Python 的逐成交仓位批次，Shares 是该批次的精确剩余数量而不是 Token 净仓位。
 type StrategyPositionLot struct {
 	LotID        string    `json:"lot_id"`
 	MarketID     string    `json:"market_id"`
@@ -541,18 +535,14 @@ const (
 	StrategyReasonHold48H         StrategyReasonCode = "HOLD_48H"
 )
 
-// StrategyEvidence copies the values that made the strategy decide. Metrics
-// remain string decimals so strategy-specific factors can evolve without
-// changing execution precision or the transport schema.
+// StrategyEvidence 保存形成策略决策的证据值，Metrics 使用字符串小数以保持执行精度和传输协议稳定。
 type StrategyEvidence struct {
 	Probability float64           `json:"probability"`
 	Edge        Decimal           `json:"edge,omitempty"`
 	Metrics     map[string]string `json:"metrics,omitempty"`
 }
 
-// StrategyOrderParams contains only strategy-owned order choices. Venue,
-// strategy identity, signal identity, and client_order_id are assigned by
-// Trading Execution from the authenticated request/response context.
+// StrategyOrderParams 只包含策略负责的订单选择，交易所、策略身份、信号身份和 client_order_id 由执行服务根据认证上下文赋值。
 type StrategyOrderParams struct {
 	Side        Side        `json:"side"`
 	Type        OrderType   `json:"type"`
@@ -562,8 +552,7 @@ type StrategyOrderParams struct {
 	ExpiresAt   *time.Time  `json:"expires_at,omitempty"`
 }
 
-// StrategyEvaluation is required once for every prediction/outcome tuple.
-// SKIP is a first-class audited decision, not an omitted order.
+// StrategyEvaluation 表示每个预测与 Outcome 组合的评估结果，SKIP 是可审计的正式决策而不是被省略的订单。
 type StrategyEvaluation struct {
 	DecisionID   string               `json:"decision_id"`
 	PredictionID string               `json:"prediction_id"`
@@ -578,8 +567,7 @@ type StrategyEvaluation struct {
 	Order        *StrategyOrderParams `json:"order,omitempty"`
 }
 
-// StrategyExit is a submitted SELL for one specific position lot. Omitting a
-// lot from exits means HOLD; Python does not need to manufacture a no-op order.
+// StrategyExit 表示针对某个指定仓位批次提交的 SELL；未出现在 exits 中的批次视为 HOLD。
 type StrategyExit struct {
 	DecisionID string               `json:"decision_id"`
 	LotID      string               `json:"lot_id"`

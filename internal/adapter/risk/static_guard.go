@@ -16,8 +16,7 @@ type StaticGuardParams struct {
 	MaxOrderNotional  domain.Decimal
 }
 
-// StaticGuard contains execution-owned hard limits. Alpha decisions and
-// dynamic sizing stay in the strategy service.
+// StaticGuard 包含执行模块持有的静态硬限制，Alpha 决策和动态仓位计算仍由策略服务负责。
 type StaticGuard struct {
 	params StaticGuardParams
 }

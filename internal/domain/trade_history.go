@@ -11,10 +11,8 @@ const (
 	MaxTradeHistoryLimit     = 100
 )
 
-// TradeRecord is one confirmed, booked Polymarket fill enriched with the
-// strategy identity and lot-level accounting needed by the operations UI.
-// It intentionally contains no wallet address, credential, signature, or raw
-// venue payload.
+// TradeRecord 表示一笔已确认且已入账的 Polymarket 成交，并包含运维页面需要的策略身份和批次账本信息。
+// 该模型不会暴露钱包地址、凭证、签名或交易所原始响应。
 type TradeRecord struct {
 	FillKey            string        `json:"fill_key"`
 	Venue              string        `json:"venue"`

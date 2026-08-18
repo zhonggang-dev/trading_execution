@@ -30,9 +30,7 @@ type CredentialBootstrapParams struct {
 	Now        func() time.Time
 }
 
-// CredentialBootstrapper implements Polymarket L1 authentication. It is kept
-// separate from TradingClient because creating an API key changes remote
-// credential state and must be explicitly enabled by the operator.
+// CredentialBootstrapper 实现 Polymarket L1 认证；创建 API Key 会修改远端凭证状态，因此与 TradingClient 分离并要求运维显式启用。
 type CredentialBootstrapper struct {
 	baseURL    *url.URL
 	httpClient *http.Client

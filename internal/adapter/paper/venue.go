@@ -10,8 +10,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
-// Venue implements deterministic paper execution. It never performs network
-// calls and therefore cannot place a real order.
+// Venue 实现确定性的模拟交易，不发起网络请求，因此不会提交真实订单。
 type Venue struct {
 	name   string
 	mu     sync.RWMutex

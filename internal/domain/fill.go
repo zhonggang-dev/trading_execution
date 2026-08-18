@@ -26,9 +26,7 @@ const (
 	LiquidityRoleTaker LiquidityRole = "TAKER"
 )
 
-// Fill is one order's component of a Polymarket trade. A single venue trade
-// can reference one taker order and several maker orders, so identity is
-// (venue, venue_fill_id, order_id), not venue_fill_id alone.
+// Fill 表示一个订单在 Polymarket 交易中的成交分量，唯一身份由 venue、venue_fill_id 和 order_id 共同确定。
 type Fill struct {
 	Key                string        `json:"fill_key"`
 	Venue              string        `json:"venue"`

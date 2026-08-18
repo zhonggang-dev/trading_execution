@@ -18,8 +18,7 @@ import (
 
 const defaultLookback = 48 * time.Hour
 
-// OrderRefresher delegates all lifecycle changes to the existing audited
-// state machine. Reconciliation never writes execution_orders directly.
+// OrderRefresher 将所有生命周期变更交给已有的可审计状态机，对账模块不会直接写 execution_orders。
 type OrderRefresher interface {
 	Refresh(context.Context, string) (domain.Order, error)
 	FinalizeCancellation(context.Context, string) (domain.Order, error)

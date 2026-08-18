@@ -24,8 +24,7 @@ type OrderBookParams struct {
 	Now        func() time.Time
 }
 
-// OrderBookSource reads public CLOB books, normalizes ordering, and keeps the
-// same top-15 depth used by the old live service.
+// OrderBookSource 读取公开 CLOB 订单簿、规范排序，并保持与旧实盘服务一致的前 15 档深度。
 type OrderBookSource struct {
 	baseURL    *url.URL
 	httpClient *http.Client

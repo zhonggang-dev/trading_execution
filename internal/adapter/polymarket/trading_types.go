@@ -24,8 +24,7 @@ type APICredentials struct {
 	Passphrase string
 }
 
-// DigestSigner is intentionally small so production can use an HSM/KMS-backed
-// implementation. The execution adapter never needs to read a private key.
+// DigestSigner 定义精简的摘要签名接口，以支持 HSM/KMS 实现并避免执行适配器读取私钥。
 type DigestSigner interface {
 	Address() string
 	SignDigest(ctx context.Context, digest []byte) ([]byte, error)
@@ -75,8 +74,7 @@ type CredentialProvider interface {
 	Account(ctx context.Context, executionAccountID string) (TradingAccount, error)
 }
 
-// StaticCredentialProvider is suitable for injected secrets and tests. It
-// copies account records and never falls back from one wallet to another.
+// StaticCredentialProvider 适用于注入式密钥和测试，返回账户副本且绝不在不同钱包之间回退。
 type StaticCredentialProvider struct {
 	mu       sync.RWMutex
 	accounts map[string]TradingAccount

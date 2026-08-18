@@ -18,8 +18,7 @@ const (
 	TransitionTriggerOperator       OrderTransitionTrigger = "OPERATOR"
 )
 
-// OrderEvent is an immutable audit record. It intentionally stores normalized
-// outcome metadata rather than signed request bodies or credentials.
+// OrderEvent 表示不可变订单审计记录，只保存标准化结果元数据，不保存签名请求体或凭证。
 type OrderEvent struct {
 	ID              string                 `json:"event_id"`
 	OrderID         string                 `json:"order_id"`
@@ -61,9 +60,7 @@ const (
 	AttemptOutcomeFailed    OrderAttemptOutcome = "FAILED"
 )
 
-// OrderAttempt records exactly one state-changing venue call or one
-// reconciliation pass. RequestFingerprint is a SHA-256 of the non-secret
-// canonical request identity; signatures and credentials are never persisted.
+// OrderAttempt 表示一次改变状态的交易所调用或一次对账，指纹仅基于非敏感规范请求且不持久化签名和凭证。
 type OrderAttempt struct {
 	ID                 string              `json:"attempt_id"`
 	OrderID            string              `json:"order_id"`

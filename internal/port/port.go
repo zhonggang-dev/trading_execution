@@ -81,25 +81,20 @@ type Venue interface {
 	Get(ctx context.Context, order domain.Order) (VenueOrder, error)
 }
 
-// FillSource reads real trade records. Order placement status is deliberately
-// not part of this interface and can never manufacture a Fill.
+// FillSource 读取真实成交记录；订单提交状态不属于此接口，也不能据此构造成交记录。
 type FillSource interface {
 	ListOrderFills(ctx context.Context, order domain.Order) ([]domain.Fill, error)
 }
 
-// FillLedger is the production accounting boundary. Record must atomically
-// deduplicate the venue fill, update a CONFIRMED fill's order/reservation,
-// cash, position snapshot, lots and audit events, and write its outbox event.
-// Non-final MATCHED/MINED/RETRYING observations are stored but not booked.
+// FillLedger 定义生产环境的成交记账边界，负责原子去重并更新订单、预占、资金、仓位批次、审计事件和 Outbox。
+// MATCHED、MINED 和 RETRYING 等非最终状态只保存观察结果，不进入资金与仓位账本。
 type FillLedger interface {
 	Record(ctx context.Context, order domain.Order, fill domain.Fill) (domain.FillApplication, error)
 	GetFill(ctx context.Context, fillKey string) (domain.Fill, error)
 	ListOrderFills(ctx context.Context, orderID string) ([]domain.Fill, error)
 }
 
-// TradeHistoryRepository exposes a read-only view over confirmed, booked
-// fills. Implementations must apply one filter consistently to rows, totals,
-// and aggregates so the operations console cannot show contradictory numbers.
+// TradeHistoryRepository 提供已确认且已入账成交的只读视图，并保证明细、总数和汇总使用同一筛选条件。
 type TradeHistoryRepository interface {
 	ListTradeHistory(ctx context.Context, filter domain.TradeHistoryFilter) (domain.TradeHistoryPage, error)
 }
@@ -113,16 +108,12 @@ type PositionLedger interface {
 	MarkPosition(ctx context.Context, mark domain.PositionMark) (domain.Position, error)
 }
 
-// StrategyPositionSource provides the exact open lots for one isolated
-// execution account. Strategy exits are lot-addressed rather than net-position
-// addressed, so implementations must not aggregate rows by token.
+// StrategyPositionSource 提供单个隔离执行账户的精确开放批次，退出策略按批次寻址，禁止按 Token 合并。
 type StrategyPositionSource interface {
 	ListOpenLots(ctx context.Context, executionAccountID string) ([]domain.PositionLot, error)
 }
 
-// PositionExitTradeSource returns open lots together with the active
-// reservations for those exact lots. It must never derive availability from
-// a token-level net position alone.
+// PositionExitTradeSource 返回开放批次及其有效预占，不能仅根据 Token 净仓位推导可卖数量。
 type PositionExitTradeSource interface {
 	ListOpenPositionExitTrades(ctx context.Context, executionAccountID string) ([]domain.PositionExitTrade, error)
 }
@@ -133,8 +124,7 @@ type FundsLedger interface {
 	ListAccountEvents(ctx context.Context, executionAccountID string) ([]domain.AccountEvent, error)
 }
 
-// ReconciliationOrderRepository exposes only orders created by this service.
-// External CLOB orders are never inserted here merely to make totals match.
+// ReconciliationOrderRepository 只暴露本服务创建的订单，不能为了对齐数量而写入外部 CLOB 订单。
 type ReconciliationOrderRepository interface {
 	ListForReconciliation(ctx context.Context, executionAccountID string, updatedAfter time.Time) ([]domain.Order, error)
 }
@@ -169,8 +159,7 @@ type ReconciliationRecorder interface {
 	Complete(ctx context.Context, run domain.ReconciliationRun) error
 }
 
-// ReconciliationTriggerer is intentionally fire-and-forget at the order path.
-// A process crash before delivery is covered by the startup sweep.
+// ReconciliationTriggerer 在订单路径中以异步方式触发对账，进程崩溃造成的遗漏由启动扫描补偿。
 type ReconciliationTriggerer interface {
 	Trigger(executionAccountID string, trigger domain.ReconciliationTrigger, focusOrderID string)
 }
@@ -276,63 +265,47 @@ type FillSynchronizer interface {
 	SyncOrder(ctx context.Context, orderID string) (FillSyncResult, error)
 }
 
-// AssetReservationManager is the authoritative balance/position concurrency
-// boundary. A live implementation must perform every method in PostgreSQL
-// transactions using execution-account row locks; Redis locks are not safe for
-// this responsibility.
+// AssetReservationManager 定义资金与仓位并发预占的权威边界，实盘实现必须在 PostgreSQL 事务中锁定执行账户行。
 type AssetReservationManager interface {
-	// Reserve atomically checks and locks BUY collateral or SELL shares. The
-	// operation is idempotent by client_order_id and rejects a changed order.
+	// Reserve 原子检查并锁定 BUY 资金或 SELL 份额，按 client_order_id 保证幂等并拒绝语义被修改的订单。
 	Reserve(ctx context.Context, order domain.Order) (domain.AssetReservation, error)
-	// Reconcile consumes cumulative fills and releases only the amount that is
-	// no longer needed. Terminal CANCELLED/REJECTED orders release the unfilled
-	// remainder; FILLED orders settle the reservation.
+	// Reconcile 消费累计成交并只释放不再需要的预占；取消或拒绝释放未成交部分，完全成交则完成结算。
 	Reconcile(ctx context.Context, order domain.Order) (domain.AssetReservation, error)
-	// MarkUncertain retains collateral after an ambiguous venue outcome.
+	// MarkUncertain 在交易所结果不明确时继续保留预占资产。
 	MarkUncertain(ctx context.Context, order domain.Order, reason string) error
 }
 
-// HardRiskSource returns one consistent account-level view. A live adapter
-// must include positions plus pending/accepted/open order reservations. A
-// snapshot read alone is not a concurrency boundary: the live integration
-// must serialize check-and-reserve by execution account in durable storage.
+// HardRiskSource 返回一致的账户级风险视图，实盘实现必须包含仓位和活动订单预占，并在持久层串行执行检查与预占。
 type HardRiskSource interface {
 	Snapshot(ctx context.Context, intent domain.OrderIntent, observedAt time.Time) (domain.HardRiskSnapshot, error)
 }
 
-// MarketUniverse resolves authoritative execution metadata by condition_id.
+// MarketUniverse 根据 condition_id 解析权威 Market 执行元数据。
 type MarketUniverse interface {
 	FindByCondition(ctx context.Context, conditionID string) (market domain.MarketSnapshot, found bool, err error)
 }
 
-// MarketValidator performs the final market identity, state, tick, snapshot,
-// and live-price checks immediately before a new order is claimed.
+// MarketValidator 在订单被接收前完成 Market 身份、状态、tick、快照和实时价格的最终校验。
 type MarketValidator interface {
 	Validate(ctx context.Context, intent domain.OrderIntent) (domain.MarketValidation, error)
 }
 
-// PredictionSource reads persisted probabilities through prediction_infra's
-// point-in-time HTTP API.
+// PredictionSource 通过 prediction_infra 的时点 HTTP 接口读取已持久化的概率数据。
 type PredictionSource interface {
 	Snapshot(ctx context.Context, decisionAt time.Time, lookback time.Duration) (domain.PredictionSnapshot, error)
 }
 
-// OrderBookSource captures one normalized top-N book for every requested
-// outcome token. A partial response is allowed and is represented explicitly in
-// the strategy request as MISSING.
+// OrderBookSource 为每个 Outcome Token 获取标准化的前 N 档订单簿，部分失败在策略请求中显式标记为 MISSING。
 type OrderBookSource interface {
 	Capture(ctx context.Context, decisionAt time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, error)
 }
 
-// MidPriceHistorySource returns one frozen Polymarket midpoint series for each
-// requested outcome token. Implementations may read a rolling cache or call
-// /batch-prices-history; per-token failures are represented in-band.
+// MidPriceHistorySource 返回每个 Outcome Token 的冻结 Polymarket 中间价序列，单 Token 失败通过响应字段表达。
 type MidPriceHistorySource interface {
 	Capture(ctx context.Context, decisionAt time.Time, lookback time.Duration, targets []domain.BookTarget) ([]domain.MidPriceHistory, error)
 }
 
-// StrategyClient sends one model/strategy/execution-account-scoped frozen
-// input to the external strategy service and receives audited evaluations.
+// StrategyClient 向外部策略服务发送按模型、策略和执行账户隔离的冻结输入，并接收可审计的评估结果。
 type StrategyClient interface {
 	Decide(ctx context.Context, request domain.StrategyDecisionRequest) (domain.StrategyDecisionResponse, error)
 }
@@ -342,8 +315,7 @@ type PositionExitStrategyClient interface {
 	EvaluatePositionExits(ctx context.Context, request domain.PositionExitRequest) (domain.PositionExitResponse, error)
 }
 
-// PositionExitRecorder freezes the exact per-lot input before Python is
-// called, and freezes its output before any SELL reaches execution.
+// PositionExitRecorder 在调用 Python 前冻结逐批次输入，并在任何 SELL 进入执行前冻结策略输出。
 type PositionExitRecorder interface {
 	GetInput(ctx context.Context, cycleID string) (domain.PositionExitRequest, error)
 	ClaimInput(ctx context.Context, request domain.PositionExitRequest) (stored domain.PositionExitRequest, created bool, err error)
@@ -351,15 +323,11 @@ type PositionExitRecorder interface {
 	ClaimOutput(ctx context.Context, response domain.PositionExitResponse) (stored domain.PositionExitResponse, created bool, err error)
 }
 
-// DecisionRecorder durably records the exact input before strategy evaluation
-// and the exact strategy output before any order reaches a venue.
+// DecisionRecorder 在策略评估前持久化精确输入，并在订单进入交易所前持久化完整策略输出。
 type DecisionRecorder interface {
-	// ClaimInput atomically creates the cycle input or returns the exact input
-	// already stored for that cycle. A different input for the same cycle must
-	// return an idempotency conflict.
+	// ClaimInput 原子创建周期输入或返回已保存的相同输入；同一周期出现不同输入时返回幂等冲突。
 	ClaimInput(ctx context.Context, request domain.StrategyDecisionRequest) (stored domain.StrategyDecisionRequest, created bool, err error)
-	// ClaimOutput provides the same guarantee before any returned SUBMIT action
-	// is converted into an OrderIntent.
+	// ClaimOutput 在 SUBMIT 动作转换成 OrderIntent 前提供相同的幂等保证。
 	ClaimOutput(ctx context.Context, response domain.StrategyDecisionResponse) (stored domain.StrategyDecisionResponse, created bool, err error)
 }
 

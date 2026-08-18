@@ -2,16 +2,14 @@ package domain
 
 import "time"
 
-// MarketOutcome is the authoritative outcome/token mapping returned by Market
-// Universe Service. The index is the stable bridge for Yes/No and A/B markets.
+// MarketOutcome 表示 Market Universe Service 返回的权威 Outcome 与 Token 映射，Index 用于稳定关联二元市场结果。
 type MarketOutcome struct {
 	Index   int    `json:"index"`
 	Name    string `json:"name"`
 	TokenID string `json:"token_id"`
 }
 
-// MarketSnapshot is the latest execution-facing market metadata. It is not the
-// strategy orderbook snapshot.
+// MarketSnapshot 表示供交易执行使用的最新 Market 元数据，不等同于策略订单簿快照。
 type MarketSnapshot struct {
 	MarketID        string          `json:"market_id"`
 	ConditionID     string          `json:"condition_id"`
@@ -27,8 +25,7 @@ type MarketSnapshot struct {
 	ObservedAt      time.Time       `json:"observed_at"`
 }
 
-// MarketValidation is the immutable execution-time evidence persisted with an
-// order and passed to the Venue adapter.
+// MarketValidation 表示随订单持久化并传给交易所适配器的不可变执行时校验证据。
 type MarketValidation struct {
 	Mode                 string    `json:"mode"`
 	ValidatedAt          time.Time `json:"validated_at"`

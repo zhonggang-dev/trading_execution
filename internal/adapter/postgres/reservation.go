@@ -17,10 +17,7 @@ import (
 
 const defaultTransactionAttempts = 3
 
-// ReservationManager is the PostgreSQL authority for cash and share
-// reservations. Every transaction locks execution_accounts first, then the
-// reservation and (for SELL) position row. Using one lock order prevents the
-// common BUY/SELL deadlocks while serializing all orders for one wallet.
+// ReservationManager 表示 PostgreSQL 中资金与份额预占的权威实现，每个事务按执行账户、预占、SELL 仓位的顺序加锁以避免死锁。
 type ReservationManager struct {
 	db          *sql.DB
 	now         func() time.Time

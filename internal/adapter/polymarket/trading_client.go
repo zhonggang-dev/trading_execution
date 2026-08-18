@@ -131,9 +131,7 @@ type OpenOrderFilter struct {
 	TokenID string
 }
 
-// AccountProbe is the non-secret result of an authenticated wallet check.
-// A successful probe proves the configured signer/API credentials can read the
-// account's private CLOB order endpoint; it does not submit or cancel orders.
+// AccountProbe 表示不含敏感信息的钱包认证检查结果，只证明签名器和 API 凭证可读取私有 CLOB 订单接口。
 type AccountProbe struct {
 	ExecutionAccountID string
 	SignerAddress      string

@@ -32,9 +32,7 @@ type MidPriceHistoryParams struct {
 	Now               func() time.Time
 }
 
-// MidPriceHistorySource reads Polymarket's historical midpoint series. The
-// upstream `p` value is already the midpoint and is mapped directly to
-// MidPricePoint.P without another bid/ask calculation.
+// MidPriceHistorySource 读取 Polymarket 历史中间价序列，直接把上游 p 映射到 MidPricePoint.P，不重新计算买卖盘中点。
 type MidPriceHistorySource struct {
 	baseURL         *url.URL
 	httpClient      *http.Client

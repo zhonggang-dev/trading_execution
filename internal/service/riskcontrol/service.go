@@ -20,8 +20,7 @@ type Params struct {
 	Now           func() time.Time
 }
 
-// Service is the Go-owned hard-risk gate. It only accepts or rejects the
-// original intent; it never changes side, price, size, market, or account.
+// Service 表示 Go 侧硬风控门禁，只接受或拒绝原始意图，不修改方向、价格、数量、Market 或账户。
 type Service struct {
 	source        port.HardRiskSource
 	maxFutureSkew time.Duration

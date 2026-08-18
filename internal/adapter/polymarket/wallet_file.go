@@ -13,13 +13,8 @@ import (
 
 const maxWalletFileBytes = 4 << 20
 
-// WalletAccountSpec is the on-disk secret shape accepted by Trading
-// Execution. The loader also accepts the old live service's wallets.json map,
-// where the map key becomes execution_account_id and address is used as the
-// funder address.
-//
-// Secret values are deliberately not exposed again after a TradingAccount has
-// been built. Callers must never log this structure.
+// WalletAccountSpec 表示 Trading Execution 接受的磁盘密钥结构，也兼容旧实盘 wallets.json 映射。
+// 映射键会转换为 execution_account_id，address 用作 funder_address；TradingAccount 创建后不再暴露敏感值，调用方不得记录该结构。
 type WalletAccountSpec struct {
 	ExecutionAccountID string  `json:"execution_account_id"`
 	Address            string  `json:"address"`

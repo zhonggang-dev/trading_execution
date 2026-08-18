@@ -10,8 +10,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
-// OrderRepository is intended for local development and contract tests only.
-// A production adapter must persist the idempotency claim and order atomically.
+// OrderRepository 表示仅适用于本地开发和契约测试的内存仓库，生产实现必须原子持久化幂等声明与订单。
 type OrderRepository struct {
 	mu              sync.RWMutex
 	byID            map[string]domain.Order

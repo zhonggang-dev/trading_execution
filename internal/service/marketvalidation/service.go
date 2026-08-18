@@ -28,8 +28,7 @@ type Params struct {
 	Now                    func() time.Time
 }
 
-// Service performs fail-closed market checks using authoritative metadata and
-// a fresh orderbook. It contains no strategy rules.
+// Service 使用权威 Market 元数据和最新订单簿执行失败关闭校验，不包含任何策略规则。
 type Service struct {
 	universe               port.MarketUniverse
 	orderBooks             port.OrderBookSource

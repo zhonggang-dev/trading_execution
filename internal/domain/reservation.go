@@ -2,9 +2,7 @@ package domain
 
 import "time"
 
-// ReservationStatus describes the durable collateral state for an order. An
-// uncertain reservation deliberately keeps its remaining collateral locked
-// until venue reconciliation proves that it is safe to release.
+// ReservationStatus 表示订单的持久化资产预占状态，结果不明确时持续锁定剩余资产直到对账证明可以释放。
 type ReservationStatus string
 
 const (
@@ -14,9 +12,8 @@ const (
 	ReservationStatusReconciliationRequired ReservationStatus = "RECONCILIATION_REQUIRED"
 )
 
-// AssetReservation is the execution-owned view of cash or shares locked for
-// one order. BUY locks balance at worst_price * size; SELL locks size shares.
-// Fill fields are cumulative so repeated venue observations are idempotent.
+// AssetReservation 表示执行模块为单个订单锁定的资金或份额；BUY 按 worst_price 乘数量锁定资金，SELL 锁定份额。
+// 成交字段使用累计口径，以保证重复读取交易所状态时仍然幂等。
 type AssetReservation struct {
 	OrderID                  string            `json:"order_id"`
 	ClientOrderID            string            `json:"client_order_id"`

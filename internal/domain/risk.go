@@ -2,8 +2,7 @@ package domain
 
 import "time"
 
-// HardRiskLimits are execution-owned monetary and freshness ceilings. They are
-// independent of alpha rules such as edge, longshot, take-profit, or stop-loss.
+// HardRiskLimits 表示执行模块持有的资金与数据新鲜度上限，独立于 Edge、longshot 和止盈止损等策略规则。
 type HardRiskLimits struct {
 	PolicyID               string        `json:"policy_id"`
 	MaxOrderNotional       Decimal       `json:"max_order_notional"`
@@ -16,8 +15,7 @@ type HardRiskLimits struct {
 	MaxStateAge            time.Duration `json:"max_state_age"`
 }
 
-// TradingControls is the current kill-switch/pause view for the exact order
-// context queried from the risk source.
+// TradingControls 表示当前订单上下文对应的 Kill Switch 和暂停控制状态。
 type TradingControls struct {
 	GlobalKillSwitch       bool   `json:"global_kill_switch"`
 	ExecutionAccountPaused bool   `json:"execution_account_paused"`
@@ -26,8 +24,7 @@ type TradingControls struct {
 	Reason                 string `json:"reason,omitempty"`
 }
 
-// RiskPosition is a current wallet position attributed to its originating
-// strategy. RiskValue is the execution system's conservative monetary value.
+// RiskPosition 表示按来源策略归属的钱包当前仓位，RiskValue 是执行系统采用的保守风险金额。
 type RiskPosition struct {
 	StrategyID      string  `json:"strategy_id"`
 	MarketID        string  `json:"market_id"`
@@ -38,8 +35,7 @@ type RiskPosition struct {
 	RiskValue       Decimal `json:"risk_value"`
 }
 
-// RiskOpenOrder contains only active, non-terminal orders. WorstPrice is used
-// to reserve exposure for BUY orders.
+// RiskOpenOrder 表示活动且未终结的订单，BUY 订单使用 WorstPrice 计算预占风险敞口。
 type RiskOpenOrder struct {
 	OrderID       string  `json:"order_id"`
 	ClientOrderID string  `json:"client_order_id"`
@@ -51,8 +47,7 @@ type RiskOpenOrder struct {
 	WorstPrice    Decimal `json:"worst_price"`
 }
 
-// HardRiskSnapshot must represent one consistent view of wallet balance,
-// positions, active orders, daily turnover, controls, and limits.
+// HardRiskSnapshot 表示钱包余额、仓位、活动订单、每日交易额、控制状态和限额的一致性快照。
 type HardRiskSnapshot struct {
 	SnapshotID          string          `json:"snapshot_id"`
 	ExecutionAccountID  string          `json:"execution_account_id"`

@@ -54,9 +54,7 @@ const (
 	OrderStatusReconciling     OrderStatus = "RECONCILING"
 	OrderStatusManualReview    OrderStatus = "MANUAL_REVIEW"
 
-	// Deprecated aliases keep local development adapters source-compatible.
-	// New code must use the lifecycle names above because ACCEPTED/SUBMITTED/
-	// OPEN/FAILED erase execution-critical distinctions.
+	// 以下废弃别名仅用于保持本地开发适配器的源码兼容；新代码必须使用上面的完整生命周期状态。
 	OrderStatusAccepted  = OrderStatusReceived
 	OrderStatusSubmitted = OrderStatusSubmitting
 	OrderStatusOpen      = OrderStatusLive
@@ -64,9 +62,7 @@ const (
 	OrderStatusFailed    = OrderStatusManualReview
 )
 
-// OrderIntent is the complete boundary between a strategy and execution. It
-// deliberately contains no probability, edge threshold, or position-sizing
-// formula; those decisions belong to the strategy service.
+// OrderIntent 表示策略与执行之间的完整边界，不包含概率、Edge 阈值或仓位计算公式等策略决策。
 type OrderIntent struct {
 	ModelID            string            `json:"model_id"`
 	StrategyID         string            `json:"strategy_id"`

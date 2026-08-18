@@ -15,8 +15,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
-// PositionExitClient deliberately has a separate endpoint from entry
-// decisions. This keeps a scheduled exit retry from re-running entry logic.
+// PositionExitClient 使用独立于入场决策的退出接口，避免定时退出重试时重复运行入场逻辑。
 type PositionExitClient struct {
 	endpoint    *url.URL
 	bearerToken string

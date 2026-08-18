@@ -10,9 +10,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
-// ReservationManager is an in-memory paper-only implementation. It models the
-// reservation lifecycle for local execution wiring but is intentionally not a
-// balance authority and must never be used in live mode.
+// ReservationManager 表示仅供模拟模式使用的内存预占实现，不提供权威余额且禁止用于实盘。
 type ReservationManager struct {
 	mu           sync.Mutex
 	reservations map[string]domain.AssetReservation
