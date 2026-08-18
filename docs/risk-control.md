@@ -90,5 +90,6 @@ Go 不会为了让订单满足限额而缩小 size、调整 price、把 BUY 改�
 live。表结构、锁顺序、部分成交和失败处理见 [`asset-reservations.md`](asset-reservations.md)。
 
 当前 server 仍是 paper 模式，使用静态 guard；`riskcontrol.Service` 已实现并满足 `port.Guard`
-接口，PostgreSQL 资金/仓位预占 adapter 也已实现，但真实 PostgreSQL OrderRepository、数据库
-连接、余额/仓位同步与 Venue 对账尚未接入。接入完成前配置层继续拒绝 live 启动。
+接口。非 local composition 已经使用真实 PostgreSQL OrderRepository 和资金/仓位预占 adapter，
+不会再因重启丢失订单或幂等键；但 live 所需的余额/仓位同步、hard-risk PostgreSQL 数据源、
+Polymarket Venue、Fill ledger 和持续对账尚未整体装配。接入完成前配置层继续拒绝 live 启动。

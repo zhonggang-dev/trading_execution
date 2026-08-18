@@ -95,7 +95,8 @@ go run ./cmd/walletcheck
 必须同时满足以下条件：
 
 1. PostgreSQL migrations 已在目标库执行并核对历史余额、成本和 lots；
-2. order repository、资金/shares 预占、Fill ledger 使用同一数据库事务边界；
+2. order repository 和资金/shares 预占已经持久化；还需把真实 Fill ledger 装入同一 live
+   composition，并验证 Fill 与订单/预占/仓位/outbox 的单事务边界；
 3. Market Universe、最新盘口、硬风控和 Kill Switch 都接入真实数据；
 4. submit timeout、Cancel Race 和 `/data/trades` 延迟由 reconciliation coordinator 接管；
 5. 使用小额专用钱包完成 signature type、allowance、BUY/SELL、部分成交和撤单验收。
