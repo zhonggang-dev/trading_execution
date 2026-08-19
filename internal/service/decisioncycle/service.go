@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -853,6 +854,8 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		"strategy_reason_code":     string(evaluation.ReasonCode),
 		"strategy_reference_price": book.Asks[0].Price.String(),
 		"strategy_worst_price":     evaluation.Order.WorstPrice.String(),
+		"predicted_probability":    strconv.FormatFloat(evaluation.Evidence.Probability, 'f', -1, 64),
+		"market_question":          prediction.Question,
 		"model_id":                 request.Context.ModelID,
 		"execution_account_id":     request.Context.ExecutionAccountID,
 	}

@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
+	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/positionexit"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 )
@@ -48,8 +51,12 @@ type tradeHistoryService interface {
 	List(context.Context, domain.TradeHistoryFilter) (domain.TradeHistoryPage, error)
 }
 
-// readinessChecker verifies dependencies required to safely serve requests.
-// It must be read-only and bounded by the request context.
+// liveOperationsService 提供已经在后台完成聚合的实盘只读快照。
+type liveOperationsService interface {
+	Snapshot(context.Context) (domain.LiveOperationsSnapshot, error)
+}
+
+// readinessChecker 以只读方式检查安全提供请求所需的依赖。
 type readinessChecker interface {
 	Check(context.Context) error
 }
@@ -60,11 +67,13 @@ type Params struct {
 	PositionExitJob  positionExitJob
 	Reconciliation   reconciliationJob
 	TradeHistory     tradeHistoryService
+	LiveOperations   liveOperationsService
 	Readiness        readinessChecker
 	ReadinessTimeout time.Duration
 	Logger           *slog.Logger
 	APIToken         string
 	JobToken         string
+	ReadOnlyToken    string
 }
 
 // Server 表示后端使用的 Server 类型。
@@ -73,11 +82,13 @@ type Server struct {
 	positionExitJob  positionExitJob
 	reconciliation   reconciliationJob
 	tradeHistory     tradeHistoryService
+	liveOperations   liveOperationsService
 	readinessChecker readinessChecker
 	readinessTimeout time.Duration
 	logger           *slog.Logger
 	apiToken         string
 	jobToken         string
+	readOnlyToken    string
 	handler          http.Handler
 }
 
@@ -100,11 +111,13 @@ func New(params Params) (*Server, error) {
 		positionExitJob:  params.PositionExitJob,
 		reconciliation:   params.Reconciliation,
 		tradeHistory:     params.TradeHistory,
+		liveOperations:   params.LiveOperations,
 		readinessChecker: params.Readiness,
 		readinessTimeout: params.ReadinessTimeout,
 		logger:           params.Logger,
 		apiToken:         strings.TrimSpace(params.APIToken),
 		jobToken:         strings.TrimSpace(params.JobToken),
+		readOnlyToken:    strings.TrimSpace(params.ReadOnlyToken),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", server.liveness)
@@ -117,6 +130,9 @@ func New(params Params) (*Server, error) {
 	mux.Handle("GET /api/v1/orders/{order_id}/attempts", server.authenticate(http.HandlerFunc(server.attempts)))
 	if server.tradeHistory != nil {
 		mux.Handle("GET /api/v1/trades", server.authenticate(http.HandlerFunc(server.trades)))
+	}
+	if server.liveOperations != nil {
+		mux.Handle("GET /api/v1/live-operations", server.authenticateReadOnly(http.HandlerFunc(server.getLiveOperations)))
 	}
 	if server.positionExitJob != nil {
 		token := server.jobToken
@@ -148,7 +164,7 @@ func (server *Server) liveness(writer http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// readiness verifies serving dependencies without conflating them with process liveness.
+// readiness 检查服务依赖，不把依赖健康与进程存活混为一谈。
 func (server *Server) readiness(writer http.ResponseWriter, request *http.Request) {
 	if server.readinessChecker != nil {
 		ctx, cancel := context.WithTimeout(request.Context(), server.readinessTimeout)
@@ -266,6 +282,24 @@ func (server *Server) trades(writer http.ResponseWriter, request *http.Request) 
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{"data": page})
+}
+
+// getLiveOperations 直接返回后台原子快照，不在请求路径串行调用外部交易接口。
+func (server *Server) getLiveOperations(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Cache-Control", "no-store")
+	snapshot, err := server.liveOperations.Snapshot(request.Context())
+	if err == nil {
+		writeJSON(writer, http.StatusOK, map[string]any{"data": snapshot})
+		return
+	}
+	requestID := liveOperationsRequestID(request)
+	if errors.Is(err, liveoperations.ErrSnapshotUnavailable) {
+		server.logger.Warn("live operations snapshot unavailable", "request_id", requestID, "error", err)
+		writeLiveOperationsError(writer, http.StatusServiceUnavailable, "LIVE_SNAPSHOT_UNAVAILABLE", "无法获取完整实盘快照", requestID)
+		return
+	}
+	server.logger.Error("live operations snapshot failed", "request_id", requestID, "error", err)
+	writeLiveOperationsError(writer, http.StatusInternalServerError, "INTERNAL_ERROR", "实盘快照读取失败", requestID)
 }
 
 // parseTradeHistoryFilter 解析并校验交易历史 HTTP 查询参数。
@@ -434,6 +468,36 @@ func (server *Server) authenticate(next http.Handler) http.Handler {
 	return server.authenticateToken(server.apiToken, next)
 }
 
+// authenticateReadOnly 只接受独立只读令牌，执行令牌访问该路由时明确返回无读取权限。
+func (server *Server) authenticateReadOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if server.readOnlyToken == "" {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		supplied, valid := bearerToken(request)
+		if !valid {
+			writeLiveOperationsError(writer, http.StatusUnauthorized, "UNAUTHORIZED", "只读 Token 缺失或无效", liveOperationsRequestID(request))
+			return
+		}
+		if secureTokenEqual(supplied, server.readOnlyToken) {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		if server.hasNonReadToken(supplied) {
+			writeLiveOperationsError(writer, http.StatusForbidden, "READ_PERMISSION_REQUIRED", "Token 没有实盘监控读取权限", liveOperationsRequestID(request))
+			return
+		}
+		writeLiveOperationsError(writer, http.StatusUnauthorized, "UNAUTHORIZED", "只读 Token 缺失或无效", liveOperationsRequestID(request))
+	})
+}
+
+// hasNonReadToken 判断调用方是否拿着有效但不具备监控读取权限的令牌。
+func (server *Server) hasNonReadToken(supplied string) bool {
+	return (server.apiToken != "" && secureTokenEqual(supplied, server.apiToken)) ||
+		(server.jobToken != "" && secureTokenEqual(supplied, server.jobToken))
+}
+
 // authenticateToken 严格校验 Bearer 鉴权方案和令牌后再放行请求。
 func (server *Server) authenticateToken(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -453,6 +517,21 @@ func (server *Server) authenticateToken(token string, next http.Handler) http.Ha
 		}
 		next.ServeHTTP(writer, request)
 	})
+}
+
+// bearerToken 严格解析 Authorization Bearer 令牌。
+func bearerToken(request *http.Request) (string, bool) {
+	scheme, supplied, found := strings.Cut(strings.TrimSpace(request.Header.Get("Authorization")), " ")
+	if !found || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	supplied = strings.TrimSpace(supplied)
+	return supplied, supplied != ""
+}
+
+// secureTokenEqual 使用常量时间比较两个令牌。
+func secureTokenEqual(left string, right string) bool {
+	return len(left) == len(right) && subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
 }
 
 // logRequests 记录 HTTP 请求状态和耗时。
@@ -517,6 +596,23 @@ func writeError(writer http.ResponseWriter, status int, code, message string) {
 			"message": message,
 		},
 	})
+}
+
+// writeLiveOperationsError 写入需求约定的实盘监控顶层错误结构。
+func writeLiveOperationsError(writer http.ResponseWriter, status int, code string, message string, requestID string) {
+	writeJSON(writer, status, map[string]string{"code": code, "message": message, "requestId": requestID})
+}
+
+// liveOperationsRequestID 复用可信格式的请求标识，缺失时生成不含业务信息的随机标识。
+func liveOperationsRequestID(request *http.Request) string {
+	if value := strings.TrimSpace(request.Header.Get("X-Request-ID")); value != "" && len(value) <= 128 {
+		return value
+	}
+	random := make([]byte, 12)
+	if _, err := rand.Read(random); err == nil {
+		return "req-" + hex.EncodeToString(random)
+	}
+	return "req-unavailable"
 }
 
 // errorCode 从领域拒绝或交易所错误中提取稳定错误码。

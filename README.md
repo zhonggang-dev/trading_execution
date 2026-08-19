@@ -137,6 +137,8 @@ make wallet-check
 
 ## API
 
+实盘只读监控使用独立接口 `GET /api/v1/live-operations`，由后台每 5～15 秒聚合钱包、Data API、CLOB 和 Ledger 后原子更新，不在前端请求路径串行访问交易所。完整字段口径、错误结构和部署配置见 [实盘监控聚合接口](docs/live-operations.md)。
+
 ```text
 GET  /health/live
 GET  /health/ready

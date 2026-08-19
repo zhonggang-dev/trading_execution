@@ -85,7 +85,10 @@ func run() error {
 	)
 	if cfg.Execution.Mode == "live" {
 		startupContext, cancel := context.WithTimeout(rootContext, cfg.Polymarket.StartupTimeout)
-		live, err = buildLiveRuntime(startupContext, cfg, database, databaseReadiness, guard, logger)
+		live, err = buildLiveRuntime(buildLiveRuntimeParams{
+			ctx: startupContext, cfg: cfg, database: database,
+			databaseReadiness: databaseReadiness, guard: guard, logger: logger,
+		})
 		cancel()
 		if err != nil {
 			return err
@@ -106,17 +109,21 @@ func run() error {
 		return err
 	}
 	httpParams := httpapi.Params{
-		Service:      executionService,
-		TradeHistory: tradeHistoryService,
-		Logger:       logger,
-		APIToken:     cfg.HTTP.APIToken,
-		JobToken:     cfg.HTTP.JobToken,
+		Service:       executionService,
+		TradeHistory:  tradeHistoryService,
+		Logger:        logger,
+		APIToken:      cfg.HTTP.APIToken,
+		JobToken:      cfg.HTTP.JobToken,
+		ReadOnlyToken: cfg.HTTP.ReadOnlyToken,
 	}
 	if readiness != nil {
 		httpParams.Readiness = readiness
 	}
 	if reconciliationService != nil {
 		httpParams.Reconciliation = reconciliationService
+	}
+	if live != nil {
+		httpParams.LiveOperations = live.operations
 	}
 	httpAPI, err := httpapi.New(httpParams)
 	if err != nil {
@@ -146,10 +153,10 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		go runOrderCoordinator(
-			rootContext, logger, coordinator, cfg.Execution.CoordinatorInterval,
-			cfg.Execution.Mode == "live",
-		)
+		go runOrderCoordinator(orderCoordinatorRunParams{
+			ctx: rootContext, logger: logger, coordinator: coordinator,
+			interval: cfg.Execution.CoordinatorInterval, continuous: cfg.Execution.Mode == "live",
+		})
 	}
 
 	serverErrors := make(chan error, 1)
@@ -185,14 +192,8 @@ type readinessChecker interface {
 	Check(context.Context) error
 }
 
-// buildPaperRuntime preserves the deterministic paper composition. When a
-// database is configured, orders and reservations remain durable, but no live
-// wallet, CLOB, heartbeat, or reconciliation dependency is installed.
-func buildPaperRuntime(
-	cfg config.Config,
-	database *sql.DB,
-	guard port.Guard,
-) (port.OrderRepository, *execution.Service, error) {
+// buildPaperRuntime 装配确定性的模拟交易链路；配置数据库时仍持久化订单和预占。
+func buildPaperRuntime(cfg config.Config, database *sql.DB, guard port.Guard) (port.OrderRepository, *execution.Service, error) {
 	var repository port.OrderRepository = memory.NewOrderRepository()
 	var reservations port.AssetReservationManager = paper.NewReservationManager()
 	if database != nil {
@@ -203,8 +204,7 @@ func buildPaperRuntime(
 		}
 		reservations, err = postgresadapter.NewReservationManager(postgresadapter.ReservationManagerParams{
 			DB: database,
-			// Paper fills have no venue fees; keep the pre-live reservation
-			// behavior instead of applying the production fee uncertainty cap.
+			// 模拟成交没有交易所费用，因此保持上线前的零费率预占行为。
 			MaxBuyFeeRateBPS: "0",
 		})
 		if err != nil {
@@ -218,7 +218,7 @@ func buildPaperRuntime(
 		Guard:           guard,
 		MarketValidator: paper.NewMarketValidator(),
 		Reservations:    reservations,
-		// The paper venue is synchronous and cannot produce late external fills.
+		// 模拟交易所同步返回结果，不会产生延迟出现的外部成交。
 		ImmediateCancelFinality: true,
 	})
 	if err != nil {
@@ -227,8 +227,7 @@ func buildPaperRuntime(
 	return repository, service, nil
 }
 
-// openDatabase opens and validates the single PostgreSQL pool shared by all
-// durable repositories. Production configuration validation requires it.
+// openDatabase 打开并验证所有持久化仓储共享的 PostgreSQL 连接池。
 func openDatabase(cfg config.Config) (*sql.DB, error) {
 	if cfg.Database.URL == "" {
 		return nil, nil
@@ -250,8 +249,7 @@ func openDatabase(cfg config.Config) (*sql.DB, error) {
 	return database, nil
 }
 
-// buildTradeHistoryService uses the same authoritative database as order and
-// accounting writes; local mode keeps the explicit empty in-memory view.
+// buildTradeHistoryService 使用订单和账本写入所依赖的同一权威数据库构建成交历史服务。
 func buildTradeHistoryService(database *sql.DB) (*tradehistory.Service, error) {
 	if database == nil {
 		return tradehistory.New(memory.NewTradeHistoryRepository())
@@ -267,31 +265,31 @@ func buildTradeHistoryService(database *sql.DB) (*tradehistory.Service, error) {
 	return service, nil
 }
 
-// runOrderCoordinator always performs one startup recovery scan. Live mode
-// then continues refreshing ambiguous/open venue orders; paper mode stops
-// after recovery because its deterministic venue has no external state to
-// poll and repeated observations would only grow the audit log.
-func runOrderCoordinator(
-	ctx context.Context,
-	logger *slog.Logger,
-	coordinator *ordercoordinator.Coordinator,
-	interval time.Duration,
-	continuous bool,
-) {
-	ticker := time.NewTicker(interval)
+// orderCoordinatorRunParams 收拢订单协调器后台循环参数。
+type orderCoordinatorRunParams struct {
+	ctx         context.Context
+	logger      *slog.Logger
+	coordinator *ordercoordinator.Coordinator
+	interval    time.Duration
+	continuous  bool
+}
+
+// runOrderCoordinator 启动订单恢复扫描，并在实盘模式持续刷新开放或不确定订单。
+func runOrderCoordinator(params orderCoordinatorRunParams) {
+	ticker := time.NewTicker(params.interval)
 	defer ticker.Stop()
 	for {
-		result := coordinator.Sweep(ctx)
+		result := params.coordinator.Sweep(params.ctx)
 		for _, err := range result.Errors {
 			if !errors.Is(err, context.Canceled) {
-				logger.Error("order coordinator sweep failed", "error", err)
+				params.logger.Error("order coordinator sweep failed", "error", err)
 			}
 		}
-		if !continuous {
+		if !params.continuous {
 			return
 		}
 		select {
-		case <-ctx.Done():
+		case <-params.ctx.Done():
 			return
 		case <-ticker.C:
 		}

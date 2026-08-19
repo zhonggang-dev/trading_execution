@@ -99,6 +99,17 @@ type TradeHistoryRepository interface {
 	ListTradeHistory(ctx context.Context, filter domain.TradeHistoryFilter) (domain.TradeHistoryPage, error)
 }
 
+// LiveOperationsRepository 在同一个 PostgreSQL 可重复读事务中构建实盘监控所需的本地权威视图。
+type LiveOperationsRepository interface {
+	LoadLiveOperations(ctx context.Context, query domain.LiveOperationsQuery) (domain.LiveOperationsLocalState, error)
+}
+
+// LiveOperationsStatusWriter 持久化业务线程 heartbeat 和同一轮完整漏斗。
+type LiveOperationsStatusWriter interface {
+	ReportLiveWorker(ctx context.Context, state domain.LiveWorkerState) error
+	ReportLiveFunnel(ctx context.Context, report domain.LiveFunnelReport) error
+}
+
 // PositionLedger 表示后端使用的 PositionLedger 类型。
 type PositionLedger interface {
 	GetPosition(ctx context.Context, executionAccountID, tokenID string) (domain.Position, error)
