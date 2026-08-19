@@ -77,6 +77,30 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	protocol, err := client.ProbeProtocol(ctx, 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("CLOB V2 protocol preflight: %w", err)
+	}
+	logger.Info("Polymarket CLOB V2 protocol checked",
+		"version", protocol.Version,
+		"server_time", protocol.ServerTime,
+		"clock_skew_ms", protocol.ClockSkew.Milliseconds(),
+	)
+	geoblock, err := polymarket.NewGeoblockClient(polymarket.GeoblockClientParams{
+		URL:     env("POLYMARKET_GEOBLOCK_URL", "https://polymarket.com/api/geoblock"),
+		Timeout: requestTimeout,
+	})
+	if err != nil {
+		return err
+	}
+	eligibility, err := polymarket.NewCLOBEligibilityChecker(polymarket.CLOBEligibilityCheckerParams{
+		Geoblock:           geoblock,
+		ClosedOnly:         client,
+		APIExemptCountries: commaSeparated(env("POLYMARKET_FRONTEND_ONLY_API_COUNTRIES", "JP")),
+	})
+	if err != nil {
+		return err
+	}
 
 	for _, account := range accounts {
 		probe, probeErr := client.ProbeAccount(ctx, account.ExecutionAccountID)
@@ -90,9 +114,51 @@ func run() error {
 			"signature_type", uint8(probe.SignatureType),
 			"open_orders", probe.OpenOrderCount,
 		)
+		funding, fundingErr := client.ProbeFunding(ctx, account.ExecutionAccountID)
+		if fundingErr != nil {
+			return fmt.Errorf("execution account %q: CLOB collateral probe: %w", account.ExecutionAccountID, fundingErr)
+		}
+		logger.Info("Polymarket wallet collateral checked",
+			"execution_account_id", funding.ExecutionAccountID,
+			"collateral_balance_positive", funding.CollateralBalancePositive,
+			"allowance_contracts", funding.AllowanceContractCount,
+			"all_allowances_positive", funding.AllAllowancesPositive,
+			"required_v2_allowances_positive", funding.RequiredAllowancesPositive,
+		)
+		if !funding.CollateralBalancePositive {
+			return fmt.Errorf("execution account %q: CLOB collateral balance is not positive", account.ExecutionAccountID)
+		}
+		if !funding.RequiredAllowancesPositive {
+			return fmt.Errorf("execution account %q: the standard or neg-risk CLOB V2 collateral allowance is absent or zero", account.ExecutionAccountID)
+		}
+		placement, placementErr := eligibility.Check(ctx, account.ExecutionAccountID)
+		if placementErr != nil {
+			return fmt.Errorf("execution account %q: placement eligibility: %w", account.ExecutionAccountID, placementErr)
+		}
+		logger.Info("Polymarket account eligibility checked",
+			"execution_account_id", account.ExecutionAccountID,
+			"country", placement.Country,
+			"region", placement.Region,
+			"reason", placement.Reason,
+			"eligible", !placement.Blocked,
+		)
+		if placement.Blocked {
+			return fmt.Errorf("execution account %q: Polymarket reports placement unavailable (%s)", account.ExecutionAccountID, placement.Reason)
+		}
 	}
 	logger.Info("Polymarket wallet check completed", "accounts", len(accounts), "orders_mutated", false)
 	return nil
+}
+
+func commaSeparated(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }
 
 // env 读取环境变量并在为空时返回默认值。

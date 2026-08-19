@@ -19,16 +19,18 @@ const defaultTransactionAttempts = 3
 
 // ReservationManager 表示 PostgreSQL 中资金与份额预占的权威实现，每个事务按执行账户、预占、SELL 仓位的顺序加锁以避免死锁。
 type ReservationManager struct {
-	db          *sql.DB
-	now         func() time.Time
-	maxAttempts int
+	db               *sql.DB
+	now              func() time.Time
+	maxAttempts      int
+	maxBuyFeeRateBPS domain.Decimal
 }
 
 // ReservationManagerParams 表示后端使用的 ReservationManagerParams 类型。
 type ReservationManagerParams struct {
-	DB          *sql.DB
-	Now         func() time.Time
-	MaxAttempts int
+	DB               *sql.DB
+	Now              func() time.Time
+	MaxAttempts      int
+	MaxBuyFeeRateBPS domain.Decimal
 }
 
 var _ port.AssetReservationManager = (*ReservationManager)(nil)
@@ -47,13 +49,22 @@ func NewReservationManager(params ReservationManagerParams) (*ReservationManager
 	if params.MaxAttempts < 1 {
 		return nil, fmt.Errorf("transaction attempts must be positive")
 	}
-	return &ReservationManager{db: params.DB, now: params.Now, maxAttempts: params.MaxAttempts}, nil
+	if params.MaxBuyFeeRateBPS.IsEmpty() {
+		return nil, fmt.Errorf("maximum BUY fee rate bps is required")
+	}
+	if sign, err := params.MaxBuyFeeRateBPS.Sign(); err != nil || sign < 0 {
+		return nil, fmt.Errorf("maximum BUY fee rate bps must be a non-negative decimal")
+	}
+	return &ReservationManager{
+		db: params.DB, now: params.Now, maxAttempts: params.MaxAttempts,
+		maxBuyFeeRateBPS: params.MaxBuyFeeRateBPS,
+	}, nil
 }
 
 // Reserve 幂等检查并原子预占订单所需的资金或份额。
 func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Order) (domain.AssetReservation, error) {
 	order = domain.CloneOrder(order)
-	fingerprint, reservePrice, err := validateReservationOrder(order)
+	fingerprint, worstPrice, err := validateReservationOrder(order)
 	if err != nil {
 		return domain.AssetReservation{}, err
 	}
@@ -62,11 +73,33 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 		if err := lockExecutionAccount(ctx, tx, order.Intent.ExecutionAccountID); err != nil {
 			return domain.AssetReservation{}, err
 		}
+		reserveUnitPrice := worstPrice
+		if order.Intent.Side == domain.SideBuy {
+			reserveUnitPrice, err = numeric(ctx, tx, `
+				SELECT ($1::numeric * (1 + $2::numeric / 10000))::text`,
+				worstPrice.String(), manager.maxBuyFeeRateBPS.String())
+			if err != nil {
+				return domain.AssetReservation{}, fmt.Errorf("calculate fee-protected BUY reserve: %w", err)
+			}
+		}
 
 		existing, err := selectReservationByClientOrderID(ctx, tx, order.Intent.ClientOrderID, true)
 		if err == nil {
 			if err := verifyReservation(existing, order, fingerprint); err != nil {
 				return domain.AssetReservation{}, err
+			}
+			if requiresAtomicLiveRisk(order) {
+				authorization, authErr := manager.authorizeLiveRisk(
+					ctx, tx, order, now, reserveUnitPrice, existing.OrderID,
+				)
+				if authErr != nil {
+					return domain.AssetReservation{}, authErr
+				}
+				if existing.RiskPolicyID != authorization.policyID ||
+					existing.RiskPolicyVersion != authorization.policyVersion ||
+					!existing.DailyRiskNotional.Equal(authorization.dailyRiskNotional) {
+					return domain.AssetReservation{}, reject("RISK_AUTHORIZATION_CHANGED", "the existing live reservation was authorized by different risk state")
+				}
 			}
 			return existing.AssetReservation, nil
 		}
@@ -105,6 +138,13 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 		if !errors.Is(err, sql.ErrNoRows) {
 			return domain.AssetReservation{}, fmt.Errorf("check active token reservation: %w", err)
 		}
+		authorization := liveRiskAuthorization{}
+		if requiresAtomicLiveRisk(order) {
+			authorization, err = manager.authorizeLiveRisk(ctx, tx, order, now, reserveUnitPrice, "")
+			if err != nil {
+				return domain.AssetReservation{}, err
+			}
+		}
 
 		switch order.Intent.Side {
 		case domain.SideBuy:
@@ -116,12 +156,12 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 				    updated_at = $4
 				WHERE execution_account_id = $1
 				  AND available_balance >= ($2::numeric * $3::numeric)`,
-				order.Intent.ExecutionAccountID, reservePrice.String(), order.Intent.Size.String(), now)
+				order.Intent.ExecutionAccountID, reserveUnitPrice.String(), order.Intent.Size.String(), now)
 			if err != nil {
 				return domain.AssetReservation{}, fmt.Errorf("reserve buy balance: %w", err)
 			}
 			if !oneRow(result) {
-				return domain.AssetReservation{}, reject("INSUFFICIENT_AVAILABLE_BALANCE", "available balance is below worst-price order notional")
+				return domain.AssetReservation{}, reject("INSUFFICIENT_AVAILABLE_BALANCE", "available balance is below worst-price order notional plus the configured maximum BUY fee buffer")
 			}
 		case domain.SideSell:
 			// Lock explicitly so concurrent SELL reservations cannot both observe
@@ -186,7 +226,9 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 				requested_shares, reserve_unit_price,
 				initial_reserved_balance, remaining_reserved_balance,
 				initial_reserved_shares, remaining_reserved_shares,
-				settled_shares, settled_notional, status, created_at, updated_at
+				settled_shares, settled_notional,
+				risk_policy_id, risk_policy_version, risk_day, daily_risk_notional,
+				status, created_at, updated_at
 			) VALUES (
 				$1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9,
 				$10::numeric, $11::numeric,
@@ -194,12 +236,15 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 				CASE WHEN $9 = 'BUY' THEN $10::numeric * $11::numeric ELSE 0 END,
 				CASE WHEN $9 = 'SELL' THEN $10::numeric ELSE 0 END,
 				CASE WHEN $9 = 'SELL' THEN $10::numeric ELSE 0 END,
-				0, 0, 'ACTIVE', $12, $12
+				0, 0, $13, $14, NULLIF($15, '')::date, $16::numeric,
+				'ACTIVE', $12, $12
 			)`,
 			order.ID, order.Intent.ClientOrderID, fingerprint,
 			order.Intent.ExecutionAccountID, order.Intent.StrategyID, order.Intent.MarketID,
 			order.Intent.TokenID, order.Intent.TargetLotID, string(order.Intent.Side), order.Intent.Size.String(),
-			reservePrice.String(), now)
+			reserveUnitPrice.String(), now,
+			authorization.policyID, authorization.policyVersion,
+			authorization.riskDay, decimalOrZero(authorization.dailyRiskNotional))
 		if err != nil {
 			return domain.AssetReservation{}, fmt.Errorf("insert asset reservation: %w", err)
 		}
@@ -570,6 +615,7 @@ const reservationColumns = `
 	initial_reserved_balance::text, remaining_reserved_balance::text,
 	initial_reserved_shares::text, remaining_reserved_shares::text,
 	settled_shares::text, settled_notional::text, settled_fees::text,
+	risk_policy_id, risk_policy_version, COALESCE(risk_day::text, ''), daily_risk_notional::text,
 	status, uncertain_reason, created_at, updated_at, released_at, revision, intent_fingerprint`
 
 // storedReservation 表示后端使用的 storedReservation 类型。
@@ -614,6 +660,7 @@ func scanReservation(row rowScanner) (storedReservation, error) {
 		&reservation.InitialReservedBalance, &reservation.RemainingReservedBalance,
 		&reservation.InitialReservedShares, &reservation.RemainingReservedShares,
 		&reservation.SettledShares, &reservation.SettledNotional, &reservation.SettledFees,
+		&reservation.RiskPolicyID, &reservation.RiskPolicyVersion, &reservation.RiskDay, &reservation.DailyRiskNotional,
 		&status, &reservation.UncertainReason, &reservation.CreatedAt, &reservation.UpdatedAt,
 		&releasedAt, &reservation.Revision, &fingerprint,
 	)

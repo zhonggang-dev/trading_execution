@@ -200,11 +200,13 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 				runErrors = append(runErrors, err)
 				continue
 			}
-			request, err = buildRequest(
-				item.binding, decisionAt, service.now().UTC(), predictionSnapshot.SnapshotID,
-				predictionsForExitModel(predictionSnapshot.Predictions, item.binding.ModelID),
-				item.trades, marketByCondition, bookByToken, historyByToken,
-			)
+			request, err = buildRequest(buildRequestParams{
+				binding: item.binding, decisionAt: decisionAt, generatedAt: service.now().UTC(),
+				predictionSnapshotID: predictionSnapshot.SnapshotID,
+				predictions:          predictionsForExitModel(predictionSnapshot.Predictions, item.binding.ModelID),
+				trades:               item.trades, marketByCondition: marketByCondition,
+				bookByToken: bookByToken, historyByToken: historyByToken,
+			})
 			if err == nil {
 				request, _, err = service.recorder.ClaimInput(ctx, request)
 			}
@@ -231,7 +233,8 @@ func (service *Service) prepareBinding(ctx context.Context, binding domain.Strat
 	cycle := cycleID(binding, decisionAt)
 	stored, err := service.recorder.GetInput(ctx, cycle)
 	if err == nil {
-		if validateErr := validateInput(stored, cycle, binding, decisionAt); validateErr != nil {
+		params := validateInputParams{request: stored, expectedCycleID: cycle, expectedContext: binding, expectedDecisionAt: decisionAt}
+		if validateErr := validateInput(params); validateErr != nil {
 			return preparedBinding{binding: binding, err: validateErr}
 		}
 		return preparedBinding{binding: binding, request: stored, stored: true}
@@ -271,10 +274,7 @@ func (service *Service) prepareBinding(ctx context.Context, binding domain.Strat
 }
 
 // captureMarketSnapshots 采集 Market Snapshots。
-func (service *Service) captureMarketSnapshots(
-	ctx context.Context,
-	targets []domain.BookTarget,
-) (map[string]domain.MarketSnapshot, error) {
+func (service *Service) captureMarketSnapshots(ctx context.Context, targets []domain.BookTarget) (map[string]domain.MarketSnapshot, error) {
 	result := make(map[string]domain.MarketSnapshot)
 	for _, target := range targets {
 		if _, exists := result[target.ConditionID]; exists {
@@ -315,11 +315,7 @@ func (service *Service) captureMarketSnapshots(
 }
 
 // captureMarketData 采集 Market Data。
-func (service *Service) captureMarketData(
-	ctx context.Context,
-	decisionAt time.Time,
-	targets []domain.BookTarget,
-) ([]domain.OrderBookSnapshot, []domain.MidPriceHistory, error) {
+func (service *Service) captureMarketData(ctx context.Context, decisionAt time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, []domain.MidPriceHistory, error) {
 	if len(targets) == 0 {
 		return []domain.OrderBookSnapshot{}, []domain.MidPriceHistory{}, nil
 	}
@@ -349,7 +345,10 @@ func (service *Service) captureMarketData(
 	if err != nil {
 		return nil, nil, err
 	}
-	histories, err := alignHistories(targets, historyResult.value, decisionAt, service.lookback, service.now().UTC())
+	histories, err := alignHistories(alignHistoriesParams{
+		targets: targets, histories: historyResult.value, decisionAt: decisionAt,
+		lookback: service.lookback, fetchedAt: service.now().UTC(),
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -359,7 +358,8 @@ func (service *Service) captureMarketData(
 // runBinding 校验单个账户的退出响应并持久化后逐笔提交卖出意图。
 func (service *Service) runBinding(ctx context.Context, request domain.PositionExitRequest) (BindingRunResult, error) {
 	run := BindingRunResult{Context: request.Context, Request: request, Intents: []IntentResult{}}
-	if err := validateInput(request, request.CycleID, request.Context, request.DecisionAt); err != nil {
+	inputParams := validateInputParams{request: request, expectedCycleID: request.CycleID, expectedContext: request.Context, expectedDecisionAt: request.DecisionAt}
+	if err := validateInput(inputParams); err != nil {
 		return run, err
 	}
 	if len(request.Trades) == 0 {
@@ -372,7 +372,8 @@ func (service *Service) runBinding(ctx context.Context, request domain.PositionE
 		if err != nil {
 			return run, fmt.Errorf("request Python position exit decision: %w", err)
 		}
-		if _, err := validateResponse(request, response, service.venue, service.now().UTC()); err != nil {
+		responseParams := validateResponseParams{request: request, response: response, venue: service.venue, now: service.now().UTC()}
+		if _, err := validateResponse(responseParams); err != nil {
 			return run, err
 		}
 		response, _, err = service.recorder.ClaimOutput(ctx, response)
@@ -383,7 +384,8 @@ func (service *Service) runBinding(ctx context.Context, request domain.PositionE
 		return run, fmt.Errorf("read stored position exit output: %w", err)
 	}
 	run.Response = response
-	intents, err := validateResponse(request, response, service.venue, service.now().UTC())
+	responseParams := validateResponseParams{request: request, response: response, venue: service.venue, now: service.now().UTC()}
+	intents, err := validateResponse(responseParams)
 	if err != nil {
 		return run, err
 	}
@@ -402,31 +404,34 @@ func (service *Service) runBinding(ctx context.Context, request domain.PositionE
 	return run, errors.Join(executionErrors...)
 }
 
+// buildRequestParams 收拢构建持仓退出冻结请求所需的账户、行情和预测快照。
+type buildRequestParams struct {
+	binding              domain.StrategyExecutionContext
+	decisionAt           time.Time
+	generatedAt          time.Time
+	predictionSnapshotID string
+	predictions          []domain.Prediction
+	trades               []domain.PositionExitTrade
+	marketByCondition    map[string]domain.MarketSnapshot
+	bookByToken          map[string]domain.OrderBookSnapshot
+	historyByToken       map[string]domain.MidPriceHistory
+}
+
 // buildRequest 为单个账户构建内容寻址的冻结持仓退出请求。
-func buildRequest(
-	binding domain.StrategyExecutionContext,
-	decisionAt time.Time,
-	generatedAt time.Time,
-	predictionSnapshotID string,
-	predictions []domain.Prediction,
-	trades []domain.PositionExitTrade,
-	marketByCondition map[string]domain.MarketSnapshot,
-	bookByToken map[string]domain.OrderBookSnapshot,
-	historyByToken map[string]domain.MidPriceHistory,
-) (domain.PositionExitRequest, error) {
+func buildRequest(params buildRequestParams) (domain.PositionExitRequest, error) {
 	targets := make(map[string]domain.BookTarget)
-	for _, trade := range trades {
+	for _, trade := range params.trades {
 		targets[trade.TokenID] = targetForTrade(trade)
 	}
 	marketData := make([]domain.PositionExitMarketData, 0, len(targets))
 	for _, target := range sortedTargets(targets) {
-		market := marketByCondition[target.ConditionID]
+		market := params.marketByCondition[target.ConditionID]
 		item, err := (domain.PositionExitMarketDataParams{
 			MarketID: target.MarketID, ConditionID: target.ConditionID,
 			OutcomeIndex: target.OutcomeIndex, TokenID: target.TokenID,
 			MarketStatus: positionExitMarketStatus(market), ClosedAt: market.ClosedAt,
 			MarketObservedAt: market.ObservedAt.UTC(),
-			OrderBook:        bookByToken[target.TokenID], MidPriceHistory: historyByToken[target.TokenID],
+			OrderBook:        params.bookByToken[target.TokenID], MidPriceHistory: params.historyByToken[target.TokenID],
 		}).Build()
 		if err != nil {
 			return domain.PositionExitRequest{}, err
@@ -434,11 +439,19 @@ func buildRequest(
 		marketData = append(marketData, item)
 	}
 	return (domain.PositionExitRequestParams{
-		CycleID: cycleID(binding, decisionAt), DecisionAt: decisionAt, GeneratedAt: generatedAt,
-		Context: binding, PredictionSnapshotID: predictionSnapshotID,
-		Predictions: predictions,
-		Trades:      trades, MarketData: marketData,
+		CycleID: cycleID(params.binding, params.decisionAt), DecisionAt: params.decisionAt, GeneratedAt: params.generatedAt,
+		Context: params.binding, PredictionSnapshotID: params.predictionSnapshotID,
+		Predictions: params.predictions,
+		Trades:      params.trades, MarketData: marketData,
 	}).Build()
+}
+
+// validateInputParams 收拢冻结持仓退出请求及其预期身份。
+type validateInputParams struct {
+	request            domain.PositionExitRequest
+	expectedCycleID    string
+	expectedContext    domain.StrategyExecutionContext
+	expectedDecisionAt time.Time
 }
 
 // predictionsForExitModel 筛选属于指定退出模型的预测记录。
@@ -471,14 +484,10 @@ func positionExitMarketStatus(market domain.MarketSnapshot) domain.PositionExitM
 }
 
 // validateInput 校验 Input 的字段和业务约束。
-func validateInput(
-	request domain.PositionExitRequest,
-	expectedCycleID string,
-	expectedContext domain.StrategyExecutionContext,
-	expectedDecisionAt time.Time,
-) error {
-	if request.SchemaVersion != domain.PositionExitInputSchemaVersion || request.CycleID != expectedCycleID ||
-		request.InputID == "" || !request.Context.Equal(expectedContext) || !request.DecisionAt.Equal(expectedDecisionAt) || request.GeneratedAt.IsZero() {
+func validateInput(params validateInputParams) error {
+	request := params.request
+	if request.SchemaVersion != domain.PositionExitInputSchemaVersion || request.CycleID != params.expectedCycleID ||
+		request.InputID == "" || !request.Context.Equal(params.expectedContext) || !request.DecisionAt.Equal(params.expectedDecisionAt) || request.GeneratedAt.IsZero() {
 		return fmt.Errorf("claimed position exit input identity is invalid")
 	}
 	constraints := request.ExecutionConstraints
@@ -545,18 +554,22 @@ func validateInput(
 	return nil
 }
 
+// validateResponseParams 收拢退出响应校验及订单意图构建所需的环境信息。
+type validateResponseParams struct {
+	request  domain.PositionExitRequest
+	response domain.PositionExitResponse
+	venue    string
+	now      time.Time
+}
+
 // validateResponse 校验 Response 的字段和业务约束。
-func validateResponse(
-	request domain.PositionExitRequest,
-	response domain.PositionExitResponse,
-	venue string,
-	now time.Time,
-) ([]domain.OrderIntent, error) {
+func validateResponse(params validateResponseParams) ([]domain.OrderIntent, error) {
+	request, response := params.request, params.response
 	if response.SchemaVersion != domain.PositionExitOutputSchemaVersion || response.CycleID != request.CycleID ||
 		response.InputID != request.InputID || !response.Context.Equal(request.Context) {
 		return nil, fmt.Errorf("%w: schema, cycle, input, or context mismatch", ErrInvalidResponse)
 	}
-	if response.DecidedAt.IsZero() || response.DecidedAt.Before(request.DecisionAt) || response.DecidedAt.After(now.Add(responseClockLeeway)) {
+	if response.DecidedAt.IsZero() || response.DecidedAt.Before(request.DecisionAt) || response.DecidedAt.After(params.now.Add(responseClockLeeway)) {
 		return nil, fmt.Errorf("%w: decided_at is invalid", ErrInvalidResponse)
 	}
 	if len(response.Evaluations) != len(request.Trades) {
@@ -610,7 +623,10 @@ func validateResponse(
 			if requiredHold != "" {
 				return nil, fmt.Errorf("%w: lot %q cannot SELL with %s input", ErrInvalidResponse, trade.LotID, requiredHold)
 			}
-			intent, err := buildSellIntent(request, response.DecidedAt, evaluation, trade, marketData, venue)
+			intent, err := buildSellIntent(buildSellIntentParams{
+				request: request, signalAt: response.DecidedAt, evaluation: evaluation,
+				trade: trade, marketData: marketData, venue: params.venue,
+			})
 			if err != nil {
 				return nil, fmt.Errorf("%w: lot %q: %v", ErrInvalidResponse, trade.LotID, err)
 			}
@@ -622,15 +638,20 @@ func validateResponse(
 	return intents, nil
 }
 
+// buildSellIntentParams 收拢一笔卖出意图所需的冻结请求、策略评估和行情证据。
+type buildSellIntentParams struct {
+	request    domain.PositionExitRequest
+	signalAt   time.Time
+	evaluation domain.PositionExitEvaluation
+	trade      domain.PositionExitTrade
+	marketData domain.PositionExitMarketData
+	venue      string
+}
+
 // buildSellIntent 根据已验证的退出评估构建卖出订单意图。
-func buildSellIntent(
-	request domain.PositionExitRequest,
-	signalAt time.Time,
-	evaluation domain.PositionExitEvaluation,
-	trade domain.PositionExitTrade,
-	marketData domain.PositionExitMarketData,
-	venue string,
-) (domain.OrderIntent, error) {
+func buildSellIntent(params buildSellIntentParams) (domain.OrderIntent, error) {
+	request, evaluation := params.request, params.evaluation
+	trade, marketData := params.trade, params.marketData
 	if evaluation.Order == nil {
 		return domain.OrderIntent{}, fmt.Errorf("SELL requires order parameters")
 	}
@@ -662,12 +683,12 @@ func buildSellIntent(
 	outcomeIndex := trade.OutcomeIndex
 	negRisk := trade.NegRisk
 	snapshotAt := book.SourceAt.UTC()
-	signalAt = signalAt.UTC()
+	signalAt := params.signalAt.UTC()
 	intent, err := (domain.OrderIntentParams{
 		ModelID: request.Context.ModelID, StrategyID: request.Context.StrategyID,
 		ExecutionAccountID: request.Context.ExecutionAccountID,
 		SignalID:           evaluation.DecisionID, ClientOrderID: clientOrderID(request.CycleID, evaluation.LotID, evaluation.DecisionID),
-		Venue: venue, MarketID: trade.MarketID, ConditionID: trade.ConditionID,
+		Venue: params.venue, MarketID: trade.MarketID, ConditionID: trade.ConditionID,
 		OutcomeIndex: &outcomeIndex, OutcomeName: trade.OutcomeName, TokenID: trade.TokenID,
 		TargetLotID: trade.LotID, ExpectedNegRisk: &negRisk,
 		MarketSnapshotAt: &snapshotAt, SignalAt: &signalAt,
@@ -685,6 +706,15 @@ func buildSellIntent(
 		},
 	}).Build()
 	return intent, err
+}
+
+// alignHistoriesParams 收拢持仓退出中间价历史对齐所需的目标和时间窗口。
+type alignHistoriesParams struct {
+	targets    []domain.BookTarget
+	histories  []domain.MidPriceHistory
+	decisionAt time.Time
+	lookback   time.Duration
+	fetchedAt  time.Time
 }
 
 // requiredHoldReason 检查并要求 d Hold Reason 完整。
@@ -769,38 +799,32 @@ func alignBooks(targets []domain.BookTarget, books []domain.OrderBookSnapshot, o
 }
 
 // alignHistories 按目标身份对齐 Histories。
-func alignHistories(
-	targets []domain.BookTarget,
-	histories []domain.MidPriceHistory,
-	decisionAt time.Time,
-	lookback time.Duration,
-	fetchedAt time.Time,
-) ([]domain.MidPriceHistory, error) {
-	byToken := make(map[string]domain.MidPriceHistory, len(histories))
-	for _, history := range histories {
+func alignHistories(params alignHistoriesParams) ([]domain.MidPriceHistory, error) {
+	byToken := make(map[string]domain.MidPriceHistory, len(params.histories))
+	for _, history := range params.histories {
 		if _, exists := byToken[history.TokenID]; exists {
 			return nil, fmt.Errorf("mid-price source returned duplicate token %q", history.TokenID)
 		}
 		byToken[history.TokenID] = history
 	}
-	result := make([]domain.MidPriceHistory, 0, len(targets))
-	for _, target := range targets {
+	result := make([]domain.MidPriceHistory, 0, len(params.targets))
+	for _, target := range params.targets {
 		history, found := byToken[target.TokenID]
 		if !found {
 			history = domain.MidPriceHistory{
 				MarketID: target.MarketID, ConditionID: target.ConditionID,
 				OutcomeIndex: target.OutcomeIndex, TokenID: target.TokenID,
 				Status:      domain.MidPriceHistoryStatusMissing,
-				WindowStart: decisionAt.Add(-lookback), WindowEnd: decisionAt,
+				WindowStart: params.decisionAt.Add(-params.lookback), WindowEnd: params.decisionAt,
 				FidelitySeconds: 60, Sampling: domain.MidPriceSamplingUpstreamRaw,
 				MissingValues:      domain.MidPriceMissingValuePolicyNoFill,
 				TimestampSemantics: domain.MidPriceTimestampSemanticsIntervalEndUTC,
-				FetchedAt:          fetchedAt, MidPrices: []domain.MidPricePoint{}, ErrorCode: "SOURCE_DID_NOT_RETURN_TOKEN",
+				FetchedAt:          params.fetchedAt, MidPrices: []domain.MidPricePoint{}, ErrorCode: "SOURCE_DID_NOT_RETURN_TOKEN",
 			}
 		} else if history.MarketID != target.MarketID || history.ConditionID != target.ConditionID || history.OutcomeIndex != target.OutcomeIndex {
 			return nil, fmt.Errorf("mid-price token %q has mismatched market identity", target.TokenID)
 		}
-		if !history.WindowStart.Equal(decisionAt.Add(-lookback)) || !history.WindowEnd.Equal(decisionAt) {
+		if !history.WindowStart.Equal(params.decisionAt.Add(-params.lookback)) || !history.WindowEnd.Equal(params.decisionAt) {
 			return nil, fmt.Errorf("mid-price token %q has mismatched 48h window", target.TokenID)
 		}
 		if err := history.Validate(); err != nil {

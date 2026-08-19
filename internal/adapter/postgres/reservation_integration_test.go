@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -101,7 +102,7 @@ func TestReservationManagerPostgresIntegration(t *testing.T) {
 		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
 	}
 	db := newIntegrationDatabase(t, databaseURL)
-	manager, err := NewReservationManager(ReservationManagerParams{DB: db})
+	manager, err := NewReservationManager(ReservationManagerParams{DB: db, MaxBuyFeeRateBPS: "0"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +160,7 @@ func TestReservationManagerPostgresIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if reservation.RemainingReservedBalance != "56.0" && reservation.RemainingReservedBalance != "56" {
+		if !reservation.RemainingReservedBalance.Equal("56") {
 			t.Fatalf("remaining buy reserve = %s, want 56", reservation.RemainingReservedBalance)
 		}
 		assertAccount(t, db, "account-partial-buy", "79.0", "23.0", "56.0")
@@ -303,6 +304,336 @@ func TestReservationManagerPostgresIntegration(t *testing.T) {
 	})
 }
 
+func TestReconciliationRecorderClosesPreviouslyOpenFingerprint(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	insertAccount(t, db, "account-reconciliation-resolution", "0xresolution", "10", "10", "0")
+	recorder, err := NewReconciliationRecorder(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	firstRun, err := (domain.ReconciliationRunParams{
+		RunID: "run-open-fingerprint", ExecutionAccountID: "account-reconciliation-resolution",
+		Trigger: domain.ReconciliationTriggerScheduled, StartedAt: now,
+	}).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.Start(context.Background(), firstRun); err != nil {
+		t.Fatal(err)
+	}
+	openIssue := domain.ReconciliationIssue{
+		IssueID: "issue-open-fingerprint", RunID: firstRun.RunID, Fingerprint: "stable-fingerprint",
+		ExecutionAccountID: firstRun.ExecutionAccountID, Type: domain.ReconciliationIssueBalanceDrift,
+		Resolution: domain.ReconciliationResolutionRetry, Status: domain.ReconciliationIssueOpen,
+		Details: "balance evidence is temporarily inconsistent", ObservedAt: now,
+	}
+	if err := recorder.RecordIssue(context.Background(), openIssue); err != nil {
+		t.Fatal(err)
+	}
+	completed := now.Add(time.Second)
+	firstRun.Status, firstRun.CompletedAt = domain.ReconciliationRunAttentionRequired, &completed
+	if err := recorder.Complete(context.Background(), firstRun); err != nil {
+		t.Fatal(err)
+	}
+
+	secondRun, err := (domain.ReconciliationRunParams{
+		RunID: "run-resolved-fingerprint", ExecutionAccountID: firstRun.ExecutionAccountID,
+		Trigger: domain.ReconciliationTriggerScheduled, StartedAt: now.Add(2 * time.Second),
+	}).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.Start(context.Background(), secondRun); err != nil {
+		t.Fatal(err)
+	}
+	resolvedAt := now.Add(3 * time.Second)
+	resolvedIssue := openIssue
+	resolvedIssue.IssueID = "issue-resolved-fingerprint"
+	resolvedIssue.RunID = secondRun.RunID
+	resolvedIssue.Resolution = domain.ReconciliationResolutionAutomatic
+	resolvedIssue.Status = domain.ReconciliationIssueResolved
+	resolvedIssue.Details = "fresh evidence now matches"
+	resolvedIssue.ObservedAt = resolvedAt
+	resolvedIssue.ResolvedAt = &resolvedAt
+	if err := recorder.RecordIssue(context.Background(), resolvedIssue); err != nil {
+		t.Fatal(err)
+	}
+	var openCount, resolvedCount int
+	if err := db.QueryRow(`SELECT count(*) FILTER (WHERE status='OPEN'), count(*) FILTER (WHERE status='RESOLVED')
+		FROM reconciliation_issues WHERE execution_account_id=$1 AND fingerprint=$2`,
+		firstRun.ExecutionAccountID, openIssue.Fingerprint).Scan(&openCount, &resolvedCount); err != nil {
+		t.Fatal(err)
+	}
+	if openCount != 0 || resolvedCount != 1 {
+		t.Fatalf("issue counts open=%d resolved=%d, want 0/1", openCount, resolvedCount)
+	}
+}
+
+// TestAtomicLiveRiskPostgresIntegration verifies that LIVE_CHECK orders are
+// fail-closed and that account-scoped limits are checked inside the same row
+// lock transaction as the balance reservation.
+func TestAtomicLiveRiskPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	manager, err := NewReservationManager(ReservationManagerParams{
+		DB: db, Now: func() time.Time { return now }, MaxBuyFeeRateBPS: "0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("migration defaults the global kill switch to on", func(t *testing.T) {
+		accountID := "account-live-default-kill"
+		insertAccount(t, db, accountID, "0xlivedefaultkill", "100", "100", "0")
+		provisionLiveRisk(t, db, liveRiskFixture{
+			accountID: accountID, now: now, binding: true,
+			maxOrder: "100", maxMarket: "100", maxStrategy: "100",
+			maxWallet: "100", maxDaily: "100",
+		})
+		_, err := manager.Reserve(context.Background(), liveIntegrationOrder(
+			"default-kill", accountID, "token-default-kill", "10", "0.5", now,
+		))
+		assertRejectionCode(t, err, "GLOBAL_KILL_SWITCH")
+		assertAccount(t, db, accountID, "100", "100", "0")
+	})
+
+	if _, err := db.Exec(`
+		UPDATE execution_risk_global_control
+		SET kill_switch=FALSE, reason='', version=version+1, updated_at=$1
+		WHERE singleton=TRUE`, now); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("risk control version cannot move backwards", func(t *testing.T) {
+		if _, err := db.Exec(`
+			UPDATE execution_risk_global_control
+			SET version=version-1
+			WHERE singleton=TRUE`); err == nil || !strings.Contains(err.Error(), "version must not decrease") {
+			t.Fatalf("version downgrade error=%v, want rejection", err)
+		}
+	})
+
+	t.Run("model strategy account binding is explicit", func(t *testing.T) {
+		accountID := "account-live-binding"
+		insertAccount(t, db, accountID, "0xlivebinding", "100", "100", "0")
+		provisionLiveRisk(t, db, liveRiskFixture{
+			accountID: accountID, now: now, binding: false,
+			maxOrder: "100", maxMarket: "100", maxStrategy: "100",
+			maxWallet: "100", maxDaily: "100",
+		})
+		_, err := manager.Reserve(context.Background(), liveIntegrationOrder(
+			"binding", accountID, "token-binding", "10", "0.5", now,
+		))
+		assertRejectionCode(t, err, "STRATEGY_ACCOUNT_BINDING_DENIED")
+		assertAccount(t, db, accountID, "100", "100", "0")
+	})
+
+	t.Run("concurrent pending orders cannot overbook daily limit", func(t *testing.T) {
+		accountID := "account-live-daily"
+		insertAccount(t, db, accountID, "0xlivedaily", "1000", "1000", "0")
+		provisionLiveRisk(t, db, liveRiskFixture{
+			accountID: accountID, now: now, binding: true,
+			maxOrder: "100", maxMarket: "1000", maxStrategy: "1000",
+			maxWallet: "1000", maxDaily: "75",
+		})
+		orders := []domain.Order{
+			liveIntegrationOrder("daily-a", accountID, "token-daily-a", "100", "0.5", now),
+			liveIntegrationOrder("daily-b", accountID, "token-daily-b", "100", "0.5", now),
+		}
+		assertConcurrentRiskLimit(t, manager, orders, "DAILY_TRADED_NOTIONAL_EXCEEDED")
+		assertAccount(t, db, accountID, "1000", "950", "50")
+		var authorized int
+		if err := db.QueryRow(`
+			SELECT count(*) FROM asset_reservations
+			WHERE execution_account_id=$1 AND risk_policy_id <> ''
+			  AND daily_risk_notional=50`, accountID).Scan(&authorized); err != nil || authorized != 1 {
+			t.Fatalf("authorized daily reservations=%d err=%v, want 1", authorized, err)
+		}
+	})
+
+	t.Run("concurrent buys cannot overbook market exposure", func(t *testing.T) {
+		accountID := "account-live-market"
+		insertAccount(t, db, accountID, "0xlivemarket", "1000", "1000", "0")
+		provisionLiveRisk(t, db, liveRiskFixture{
+			accountID: accountID, now: now, binding: true,
+			maxOrder: "100", maxMarket: "75", maxStrategy: "1000",
+			maxWallet: "1000", maxDaily: "1000",
+		})
+		orders := []domain.Order{
+			liveIntegrationOrder("market-a", accountID, "token-market-a", "100", "0.5", now),
+			liveIntegrationOrder("market-b", accountID, "token-market-b", "100", "0.5", now),
+		}
+		assertConcurrentRiskLimit(t, manager, orders, "MAX_MARKET_EXPOSURE_EXCEEDED")
+		assertAccount(t, db, accountID, "1000", "950", "50")
+	})
+
+	t.Run("submit trigger rechecks kill switch after reservation", func(t *testing.T) {
+		accountID := "account-live-submit-gate"
+		insertAccount(t, db, accountID, "0xlivesubmitgate", "100", "100", "0")
+		provisionLiveRisk(t, db, liveRiskFixture{
+			accountID: accountID, now: now, binding: true,
+			maxOrder: "100", maxMarket: "100", maxStrategy: "100",
+			maxWallet: "100", maxDaily: "100",
+		})
+		repository, err := NewOrderRepository(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		order := liveIntegrationOrder("submit-gate", accountID, "token-submit-gate", "10", "0.5", now)
+		order.Status = domain.OrderStatusReceived
+		order.CreatedAt, order.UpdatedAt, order.Revision = now, now, 1
+		stored, created, err := repository.Create(context.Background(), order)
+		if err != nil || !created {
+			t.Fatalf("create live order: created=%v err=%v", created, err)
+		}
+		stored, event := applyIntegrationTransition(t, stored, domain.OrderStatusValidating, domain.TransitionTriggerValidation, now, "")
+		if err := repository.Transition(context.Background(), stored, event); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.Reserve(context.Background(), stored); err != nil {
+			t.Fatalf("reserve live order: %v", err)
+		}
+		stored, event = applyIntegrationTransition(t, stored, domain.OrderStatusReserved, domain.TransitionTriggerReservation, now, "")
+		if err := repository.Transition(context.Background(), stored, event); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`
+			UPDATE execution_risk_global_control
+			SET kill_switch=TRUE, reason='TEST_KILL', version=version+1, updated_at=$1
+			WHERE singleton=TRUE`, now); err != nil {
+			t.Fatal(err)
+		}
+		attempt := domain.OrderAttempt{
+			ID: "attempt:submit-gate:1", OrderID: stored.ID, Sequence: 1,
+			Kind: domain.OrderAttemptSubmit, Outcome: domain.AttemptOutcomeStarted,
+			StartedAt: now,
+		}
+		stored, event = applyIntegrationTransition(t, stored, domain.OrderStatusSubmitting, domain.TransitionTriggerSubmit, now, attempt.ID)
+		if err := repository.StartAttempt(context.Background(), stored, event, attempt); err == nil ||
+			!strings.Contains(err.Error(), "GLOBAL_KILL_SWITCH") {
+			t.Fatalf("submit gate error=%v, want GLOBAL_KILL_SWITCH", err)
+		}
+	})
+}
+
+type liveRiskFixture struct {
+	accountID                        string
+	now                              time.Time
+	binding                          bool
+	maxOrder, maxMarket, maxStrategy string
+	maxWallet, maxDaily              string
+}
+
+func provisionLiveRisk(t *testing.T, db *sql.DB, fixture liveRiskFixture) {
+	t.Helper()
+	// One model/strategy pair is intentionally bound to exactly one account.
+	// Subtests reuse the pair, so release the previous fixture binding first.
+	if _, err := db.Exec(`
+		DELETE FROM execution_strategy_bindings
+		WHERE model_id='model-a' AND strategy_id='multfactor_v1'`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := db.Exec(`
+		INSERT INTO execution_risk_policies (
+			execution_account_id, policy_id, enabled,
+			max_order_notional, max_market_exposure, max_strategy_exposure,
+			max_wallet_exposure, max_daily_traded_notional,
+			max_price_age_ms, max_signal_age_ms, max_state_age_ms, daily_timezone
+		) VALUES ($1,$2,TRUE,$3::numeric,$4::numeric,$5::numeric,$6::numeric,$7::numeric,
+			60000,60000,60000,'UTC')`,
+		fixture.accountID, "policy-"+fixture.accountID, fixture.maxOrder, fixture.maxMarket,
+		fixture.maxStrategy, fixture.maxWallet, fixture.maxDaily)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		INSERT INTO execution_risk_controls (
+			execution_account_id, control_scope, control_key, paused, reason
+		) VALUES ($1,'ACCOUNT','',FALSE,'')`, fixture.accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixture.binding {
+		_, err = db.Exec(`
+			INSERT INTO execution_strategy_bindings (
+				model_id, strategy_id, execution_account_id, enabled
+			) VALUES ('model-a','multfactor_v1',$1,TRUE)`, fixture.accountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = db.Exec(`
+		INSERT INTO reconciliation_runs (
+			run_id, execution_account_id, trigger, status, summary, started_at, completed_at
+		) VALUES ($1,$2,'SCHEDULED','COMPLETED','{}'::jsonb,$3,$4)`,
+		"risk-run-"+fixture.accountID, fixture.accountID,
+		fixture.now.Add(-2*time.Second), fixture.now.Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func liveIntegrationOrder(orderID, accountID, tokenID, size, worstPrice string, now time.Time) domain.Order {
+	order := integrationOrder(orderID, accountID, tokenID, domain.SideBuy, size, worstPrice)
+	marketAt := now.Add(-time.Second)
+	signalAt := now.Add(-time.Second)
+	order.Intent.MarketSnapshotAt = &marketAt
+	order.Intent.SignalAt = &signalAt
+	order.MarketValidation = &domain.MarketValidation{
+		Mode: liveMarketValidationMode, ValidatedAt: now, WorstPrice: order.Intent.WorstPrice,
+	}
+	return order
+}
+
+func assertConcurrentRiskLimit(t *testing.T, manager *ReservationManager, orders []domain.Order, rejectionCode string) {
+	t.Helper()
+	errorsChannel := make(chan error, len(orders))
+	var waitGroup sync.WaitGroup
+	for _, order := range orders {
+		waitGroup.Add(1)
+		go func(value domain.Order) {
+			defer waitGroup.Done()
+			_, err := manager.Reserve(context.Background(), value)
+			errorsChannel <- err
+		}(order)
+	}
+	waitGroup.Wait()
+	close(errorsChannel)
+	successes, rejections := 0, 0
+	for err := range errorsChannel {
+		if err == nil {
+			successes++
+			continue
+		}
+		var rejection *port.Rejection
+		if errors.As(err, &rejection) && rejection.Code == rejectionCode {
+			rejections++
+			continue
+		}
+		t.Fatalf("unexpected concurrent live risk error: %v", err)
+	}
+	if successes != 1 || rejections != 1 {
+		t.Fatalf("successes=%d rejections=%d, want one of each", successes, rejections)
+	}
+}
+
+func assertRejectionCode(t *testing.T, err error, code string) {
+	t.Helper()
+	var rejection *port.Rejection
+	if !errors.As(err, &rejection) || rejection.Code != code {
+		t.Fatalf("error=%v, want rejection %s", err, code)
+	}
+}
+
 // TestFillAndPositionLedgerPostgresIntegration 验证 Fill And Position Ledger Postgres Integration 场景下的行为。
 func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
@@ -315,7 +646,7 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reservations, err := NewReservationManager(ReservationManagerParams{DB: db})
+	reservations, err := NewReservationManager(ReservationManagerParams{DB: db, MaxBuyFeeRateBPS: "0"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,11 +666,15 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	buy := integrationOrder("ledger-buy", "account-fill-ledger", "token-ledger", domain.SideBuy, "10", "0.6")
+	buy.Intent.Venue = "paper"
 	buy = createAcknowledgedIntegrationOrder(t, ctx, repository, reservations, buy, "0xbuy-ledger", now)
 
 	matched := domain.Fill{
 		VenueFillID: "trade-buy-1", LiquidityRole: domain.LiquidityRoleMaker,
 		Status: domain.FillStatusMatched, Shares: "4", Price: "0.5",
+		GrossNotional: "2", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
+		FeeSource: "TEST_AUTHORITATIVE_SETTLEMENT",
 		MatchedAt: now.Add(10 * time.Second), VenueUpdatedAt: now.Add(10 * time.Second),
 		ObservedAt: now.Add(11 * time.Second),
 	}
@@ -377,6 +712,9 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	second, err := processor.Process(ctx, duplicate.Order, domain.Fill{
 		VenueFillID: "trade-buy-2", LiquidityRole: domain.LiquidityRoleMaker,
 		Status: domain.FillStatusConfirmed, Shares: "6", Price: "0.4",
+		GrossNotional: "2.4", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
+		FeeSource: "TEST_AUTHORITATIVE_SETTLEMENT",
 		MatchedAt: now.Add(13 * time.Second), VenueUpdatedAt: secondConfirmedAt,
 		ObservedAt: secondConfirmedAt, ConfirmedAt: &secondConfirmedAt,
 	})
@@ -399,6 +737,7 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	}
 
 	sell := integrationOrder("ledger-sell", "account-fill-ledger", "token-ledger", domain.SideSell, "4", "0.3")
+	sell.Intent.Venue = "paper"
 	sell.Intent.TargetLotID = lots[0].LotID
 	sell.Intent.TimeInForce = domain.TimeInForceFAK
 	sell = createAcknowledgedIntegrationOrder(t, ctx, repository, reservations, sell, "0xsell-ledger", now.Add(20*time.Second))
@@ -406,6 +745,9 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	sold, err := processor.Process(ctx, sell, domain.Fill{
 		VenueFillID: "trade-sell-1", LiquidityRole: domain.LiquidityRoleMaker,
 		Status: domain.FillStatusConfirmed, Shares: "3.999", Price: "0.7",
+		GrossNotional: "2.7993", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
+		FeeSource: "TEST_AUTHORITATIVE_SETTLEMENT",
 		MatchedAt: now.Add(30 * time.Second), VenueUpdatedAt: sellConfirmedAt,
 		ObservedAt: sellConfirmedAt, ConfirmedAt: &sellConfirmedAt,
 	})
@@ -476,6 +818,208 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	if err != nil || len(events) != 5 || events[4].EventType != domain.PositionEventSettled ||
 		!events[4].SharesAfter.Equal("6.001") {
 		t.Fatalf("settlement events = %#v err=%v", events, err)
+	}
+}
+
+// TestBuyFeeReservationPostgresIntegration 验证手续费上限被预占，且超上限 Fill 不会消费未预占资金。
+func TestBuyFeeReservationPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	repository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations, err := NewReservationManager(ReservationManagerParams{
+		DB: db, MaxBuyFeeRateBPS: "250",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := NewFillLedger(FillLedgerParams{DB: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor, err := fillprocessor.New(fillprocessor.Params{
+		Orders: repository, Source: noFillsSource{}, Ledger: ledger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	insertAccount(t, db, "account-buy-fee-cap", "0xbuyfeecap", "6.15", "6.15", "0")
+	atCap := integrationOrder("buy-fee-cap", "account-buy-fee-cap", "token-buy-fee-cap", domain.SideBuy, "10", "0.6")
+	atCap.Intent.Venue = "paper"
+	atCap = createAcknowledgedIntegrationOrder(t, ctx, repository, reservations, atCap, "0xbuy-fee-cap", now)
+	assertAccount(t, db, "account-buy-fee-cap", "6.15", "0", "6.15")
+	confirmedAt := now.Add(10 * time.Second)
+	application, err := processor.Process(ctx, atCap, domain.Fill{
+		VenueFillID: "trade-buy-fee-cap-partial", LiquidityRole: domain.LiquidityRoleMaker,
+		Status: domain.FillStatusConfirmed, Shares: "4", Price: "0.6",
+		GrossNotional: "2.4", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "250", BuilderFee: "0.06", TotalFee: "0.06",
+		FeeSource: "TEST_AUTHORITATIVE_SETTLEMENT", MatchedAt: confirmedAt, VenueUpdatedAt: confirmedAt,
+		ObservedAt: confirmedAt, ConfirmedAt: &confirmedAt,
+	})
+	if err != nil || !application.Applied || application.Order.Status != domain.OrderStatusPartiallyFilled ||
+		!application.Order.TotalFees.Equal("0.06") {
+		t.Fatalf("partial fee-capped fill application=%#v err=%v", application, err)
+	}
+	assertAccount(t, db, "account-buy-fee-cap", "3.69", "0", "3.69")
+
+	finalAt := confirmedAt.Add(time.Second)
+	application, err = processor.Process(ctx, application.Order, domain.Fill{
+		VenueFillID: "trade-buy-fee-cap-final", LiquidityRole: domain.LiquidityRoleMaker,
+		Status: domain.FillStatusConfirmed, Shares: "6", Price: "0.6",
+		GrossNotional: "3.6", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "250", BuilderFee: "0.09", TotalFee: "0.09",
+		FeeSource: "TEST_AUTHORITATIVE_SETTLEMENT", MatchedAt: finalAt, VenueUpdatedAt: finalAt,
+		ObservedAt: finalAt, ConfirmedAt: &finalAt,
+	})
+	if err != nil || !application.Applied || application.Order.Status != domain.OrderStatusFilled ||
+		!application.Order.TotalFees.Equal("0.15") {
+		t.Fatalf("final fee-capped fill application=%#v err=%v", application, err)
+	}
+	assertAccount(t, db, "account-buy-fee-cap", "0", "0", "0")
+
+	insertAccount(t, db, "account-buy-fee-over-cap", "0xbuyfeeovercap", "10", "10", "0")
+	overCap := integrationOrder("buy-fee-over-cap", "account-buy-fee-over-cap", "token-buy-fee-over-cap", domain.SideBuy, "10", "0.6")
+	overCap.Intent.Venue = "paper"
+	overCap = createAcknowledgedIntegrationOrder(t, ctx, repository, reservations, overCap, "0xbuy-fee-over-cap", now.Add(20*time.Second))
+	assertAccount(t, db, "account-buy-fee-over-cap", "10", "3.85", "6.15")
+	overCapAt := now.Add(30 * time.Second)
+	if _, err := processor.Process(ctx, overCap, domain.Fill{
+		VenueFillID: "trade-buy-fee-over-cap", LiquidityRole: domain.LiquidityRoleMaker,
+		Status: domain.FillStatusConfirmed, Shares: "10", Price: "0.6",
+		GrossNotional: "6", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "251", BuilderFee: "0.1506", TotalFee: "0.1506",
+		FeeSource: "TEST_AUTHORITATIVE_SETTLEMENT", MatchedAt: overCapAt, VenueUpdatedAt: overCapAt,
+		ObservedAt: overCapAt, ConfirmedAt: &overCapAt,
+	}); err == nil {
+		t.Fatal("over-cap fill error = nil, want reservation constraint rejection")
+	}
+	// The account mutation precedes the reservation update inside FillLedger,
+	// so this assertion proves the database constraint rolled back the whole
+	// transaction rather than consuming unrelated available cash.
+	assertAccount(t, db, "account-buy-fee-over-cap", "10", "3.85", "6.15")
+}
+
+// TestPolygonSettlementEvidencePostgresIntegration proves that the finalized
+// OrderFilled proof and V2 curve inputs survive a round trip, participate in
+// fill idempotency, and cannot be replayed under another local fill key.
+func TestPolygonSettlementEvidencePostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	insertAccount(t, db, "account-v2-evidence", "0x1111111111111111111111111111111111111111", "10", "10", "0")
+	repository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations, err := NewReservationManager(ReservationManagerParams{DB: db, MaxBuyFeeRateBPS: "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := NewFillLedger(FillLedgerParams{DB: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	orderHash := "0x" + strings.Repeat("22", 32)
+	transactionHash := "0x" + strings.Repeat("cd", 32)
+	order := integrationOrder("v2-evidence", "account-v2-evidence", "42", domain.SideBuy, "1", "0.5")
+	order = createAcknowledgedIntegrationOrder(t, ctx, repository, reservations, order, orderHash, now)
+	confirmedAt := now.Add(10 * time.Second)
+	fill := domain.Fill{
+		Key:   fillprocessor.FillKey("polymarket", "trade-v2-evidence", order.ID),
+		Venue: "polymarket", VenueFillID: "trade-v2-evidence", OrderID: order.ID,
+		VenueOrderID: orderHash, ExecutionAccountID: order.Intent.ExecutionAccountID,
+		MarketID: order.Intent.MarketID, ConditionID: order.Intent.ConditionID,
+		TokenID: order.Intent.TokenID, Side: domain.SideBuy,
+		LiquidityRole: domain.LiquidityRoleMaker, Status: domain.FillStatusConfirmed,
+		Shares: "1", Price: "0.5", GrossNotional: "0.5", FeeRateBPS: "0",
+		PlatformFeeRate: "0.25", FeeExponent: "2", PlatformFee: "0",
+		BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0", NetCashDelta: "-0.5",
+		TransactionHash: transactionHash, MatchedAt: confirmedAt,
+		VenueUpdatedAt: confirmedAt, ObservedAt: confirmedAt, ConfirmedAt: &confirmedAt,
+		FeeSource:        domain.FeeSourcePolygonV2OrderFilled,
+		RawPayloadSHA256: strings.Repeat("a", 64),
+		SettlementEvidence: &domain.SettlementEvidence{
+			SchemaVersion:   domain.SettlementEvidenceSchemaV1,
+			Source:          domain.FeeSourcePolygonV2OrderFilled,
+			ChainID:         domain.SettlementEvidencePolygonChainID,
+			ExchangeAddress: "0x" + strings.Repeat("ab", 20),
+			TransactionHash: transactionHash, BlockNumber: 123,
+			BlockHash: "0x" + strings.Repeat("ef", 32), LogIndex: 7, Confirmations: 64,
+			OrderHash: orderHash, MakerAddress: "0x" + strings.Repeat("11", 20),
+			TokenID: order.Intent.TokenID, Side: domain.SideBuy,
+			MakerAmountBaseUnits: "500000", TakerAmountBaseUnits: "1000000",
+			TotalFeeBaseUnits: "0", BuilderCode: "0x" + strings.Repeat("00", 32),
+			BuilderFeeKnown: true, BuilderFeeBaseUnits: "0",
+			BuilderFeeSource:   domain.SettlementEvidenceZeroBuilder,
+			CollateralDecimals: 6, OutcomeTokenDecimals: 6,
+		},
+	}
+	application, err := ledger.Record(ctx, order, fill)
+	if err != nil || !application.Applied {
+		t.Fatalf("record Polygon settlement: application=%#v err=%v", application, err)
+	}
+	stored, err := ledger.GetFill(ctx, fill.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.PlatformFeeRate.Equal("0.25") || !stored.FeeExponent.Equal("2") ||
+		stored.SettlementEvidence == nil || stored.SettlementEvidence.LogIndex != 7 {
+		t.Fatalf("stored V2 settlement = %#v", stored)
+	}
+	if err := verifyFillIdentity(stored, fill); err != nil {
+		t.Fatalf("round-trip identity mismatch: %v", err)
+	}
+
+	changedRate := cloneFillEvidence(fill)
+	changedRate.PlatformFeeRate = "0.3"
+	if _, err := ledger.Record(ctx, application.Order, changedRate); !errors.Is(err, port.ErrFillConflict) {
+		t.Fatalf("changed platform rate error = %v, want fill conflict", err)
+	}
+	growingConfirmations := cloneFillEvidence(fill)
+	growingConfirmations.SettlementEvidence.Confirmations++
+	replay, err := ledger.Record(ctx, application.Order, growingConfirmations)
+	if err != nil || replay.Applied {
+		t.Fatalf("confirmation-only replay application=%#v err=%v, want idempotent no-op", replay, err)
+	}
+	changedEvidence := cloneFillEvidence(fill)
+	changedEvidence.SettlementEvidence.BlockHash = "0x" + strings.Repeat("88", 32)
+	if _, err := ledger.Record(ctx, application.Order, changedEvidence); !errors.Is(err, port.ErrFillConflict) {
+		t.Fatalf("changed immutable evidence error = %v, want fill conflict", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO execution_fills (
+			fill_key, venue, venue_fill_id, order_id, venue_order_id, execution_account_id,
+			market_id, condition_id, token_id, side, liquidity_role, status, shares, price,
+			gross_notional, fee_rate_bps, platform_fee_rate, fee_exponent, platform_fee,
+			builder_fee_rate_bps, builder_fee, total_fee, net_cash_delta, settlement_evidence,
+			fee_source, transaction_hash, raw_payload_sha256, matched_at, venue_updated_at,
+			first_observed_at, last_observed_at, confirmed_at
+		)
+		SELECT 'replayed-' || fill_key, venue, 'replayed-' || venue_fill_id, order_id,
+			venue_order_id, execution_account_id, market_id, condition_id, token_id, side,
+			liquidity_role, status, shares, price, gross_notional, fee_rate_bps,
+			platform_fee_rate, fee_exponent, platform_fee, builder_fee_rate_bps,
+			builder_fee, total_fee, net_cash_delta, settlement_evidence, fee_source,
+			transaction_hash, raw_payload_sha256, matched_at, venue_updated_at,
+			first_observed_at, last_observed_at, confirmed_at
+		FROM execution_fills WHERE fill_key = $1`, fill.Key)
+	if err == nil {
+		t.Fatal("replayed on-chain event insert error = nil, want unique-index rejection")
 	}
 }
 
@@ -563,7 +1107,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 	db := stdlib.OpenDB(*testConfig)
 	db.SetMaxOpenConns(8)
 	t.Cleanup(func() { _ = db.Close() })
-	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql"} {
+	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", name, err)

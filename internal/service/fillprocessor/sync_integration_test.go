@@ -97,11 +97,17 @@ func TestSyncOrderEnrichesSortsAndBooksConfirmedFills(t *testing.T) {
 		{
 			VenueFillID: "fill-later", LiquidityRole: domain.LiquidityRoleMaker,
 			Status: domain.FillStatusConfirmed, Shares: "2", Price: "0.4",
+			GrossNotional: "0.8", FeeRateBPS: "10", PlatformFeeRate: "0.001", FeeExponent: "1", PlatformFee: "0",
+			BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
+			FeeSource: domain.FeeSourcePolygonV2OrderFilled,
 			MatchedAt: now.Add(-time.Minute), VenueUpdatedAt: updatedAt,
 		},
 		{
 			VenueFillID: "fill-earlier", LiquidityRole: domain.LiquidityRoleTaker,
 			Status: domain.FillStatusConfirmed, Shares: "10", Price: "0.5", FeeRateBPS: "10",
+			GrossNotional: "5", PlatformFeeRate: "0.001", FeeExponent: "1", PlatformFee: "0.0025",
+			BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0.0025",
+			FeeSource: domain.FeeSourcePolygonV2OrderFilled,
 			MatchedAt: now.Add(-2 * time.Minute), VenueUpdatedAt: updatedAt,
 		},
 	}}
@@ -138,7 +144,9 @@ func TestSyncOrderRetriesTransientRevisionConflict(t *testing.T) {
 	order := testFillOrder(t, repository, now)
 	source := &staticFillSource{fills: []domain.Fill{{
 		VenueFillID: "fill-retry", LiquidityRole: domain.LiquidityRoleMaker,
-		Status: domain.FillStatusConfirmed, Shares: "1", Price: "0.5", MatchedAt: now,
+		Status: domain.FillStatusConfirmed, Shares: "1", Price: "0.5", GrossNotional: "0.5",
+		FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0", PlatformFee: "0", BuilderFeeRateBPS: "0",
+		BuilderFee: "0", TotalFee: "0", FeeSource: domain.FeeSourcePolygonV2OrderFilled, MatchedAt: now,
 	}}}
 	ledger := newRecordingFillLedger()
 	ledger.revisionConflicts = 2

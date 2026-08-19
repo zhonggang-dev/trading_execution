@@ -163,8 +163,34 @@ func FillKey(venue, venueFillID, orderID string) string {
 	return "fill-" + hex.EncodeToString(digest[:])
 }
 
-// calculateMoney 精确计算 Money。
+// calculateMoney validates authoritative settlement amounts and derives only
+// the direction-dependent cash delta. It must never reconstruct a final fee
+// from CLOB rate metadata: even a zero fee requires settlement evidence.
 func calculateMoney(fill domain.Fill) (domain.Fill, error) {
+	for name, value := range map[string]domain.Decimal{
+		"gross_notional":       fill.GrossNotional,
+		"platform_fee_rate":    fill.PlatformFeeRate,
+		"fee_exponent":         fill.FeeExponent,
+		"platform_fee":         fill.PlatformFee,
+		"builder_fee_rate_bps": fill.BuilderFeeRateBPS,
+		"builder_fee":          fill.BuilderFee,
+		"total_fee":            fill.TotalFee,
+	} {
+		if value.IsEmpty() {
+			return domain.Fill{}, fmt.Errorf("authoritative fee evidence omitted %s", name)
+		}
+		if sign, err := value.Sign(); err != nil || sign < 0 {
+			return domain.Fill{}, fmt.Errorf("%s must be a non-negative decimal", name)
+		}
+	}
+	fill.FeeSource = strings.ToUpper(strings.TrimSpace(fill.FeeSource))
+	if fill.FeeSource == "" {
+		return domain.Fill{}, fmt.Errorf("authoritative fee_source is required even when total_fee is zero")
+	}
+	if strings.EqualFold(fill.Venue, "polymarket") && fill.FeeSource != domain.FeeSourcePolygonV2OrderFilled {
+		return domain.Fill{}, fmt.Errorf("Polymarket fill requires finalized V2 OrderFilled fee evidence")
+	}
+
 	shares, err := decimalRat(fill.Shares)
 	if err != nil {
 		return domain.Fill{}, err
@@ -173,68 +199,34 @@ func calculateMoney(fill domain.Fill) (domain.Fill, error) {
 	if err != nil {
 		return domain.Fill{}, err
 	}
-	gross := new(big.Rat).Mul(shares, price)
-	fill.GrossNotional, err = exactDecimal(gross, 18)
-	if err != nil {
-		return domain.Fill{}, fmt.Errorf("gross notional: %w", err)
-	}
-
-	builderFeeSource := "BUILDER_REPORTED"
-	if fill.BuilderFeeRateBPS.IsEmpty() {
-		fill.BuilderFeeRateBPS = "0"
-	}
-	if fill.BuilderFee.IsEmpty() {
-		builderRate, rateErr := decimalRat(fill.BuilderFeeRateBPS)
-		if rateErr != nil || builderRate.Sign() < 0 {
-			return domain.Fill{}, fmt.Errorf("builder_fee_rate_bps must be non-negative")
-		}
-		builderFee := new(big.Rat).Mul(gross, builderRate)
-		builderFee.Quo(builderFee, big.NewRat(10000, 1))
-		fill.BuilderFee = roundedDecimal(builderFee, 6)
-		builderFeeSource = "BUILDER_RATE"
-		if builderRate.Sign() == 0 {
-			builderFeeSource = "BUILDER_NONE"
-		}
-	}
-	if sign, err := fill.BuilderFee.Sign(); err != nil || sign < 0 {
-		return domain.Fill{}, fmt.Errorf("builder_fee must be non-negative")
-	}
-	platformFeeSource := "VENUE_REPORTED"
-	if fill.PlatformFee.IsEmpty() {
-		if fill.LiquidityRole == domain.LiquidityRoleMaker {
-			fill.PlatformFee = "0"
-			fill.FeeRateBPS = "0"
-			platformFeeSource = "PROTOCOL_MAKER_ZERO"
-		} else {
-			if fill.FeeRateBPS.IsEmpty() {
-				return domain.Fill{}, fmt.Errorf("taker fill requires fee_rate_bps or reported platform_fee")
-			}
-			rate, err := decimalRat(fill.FeeRateBPS)
-			if err != nil || rate.Sign() < 0 {
-				return domain.Fill{}, fmt.Errorf("fee_rate_bps must be non-negative")
-			}
-			fee := new(big.Rat).Mul(shares, price)
-			fee.Mul(fee, new(big.Rat).Sub(big.NewRat(1, 1), price))
-			fee.Mul(fee, rate)
-			fee.Quo(fee, big.NewRat(10000, 1))
-			fill.PlatformFee = roundedDecimal(fee, feeScale)
-			platformFeeSource = "CALCULATED_FROM_TRADE_FEE_RATE"
-		}
-	} else {
-		if sign, err := fill.PlatformFee.Sign(); err != nil || sign < 0 {
-			return domain.Fill{}, fmt.Errorf("platform_fee must be non-negative")
-		}
-		if fill.FeeRateBPS.IsEmpty() {
-			fill.FeeRateBPS = "0"
-		}
-	}
-	platformFee, _ := decimalRat(fill.PlatformFee)
-	builderFee, _ := decimalRat(fill.BuilderFee)
-	totalFee := new(big.Rat).Add(platformFee, builderFee)
-	fill.TotalFee, err = exactDecimal(totalFee, 18)
+	gross, err := decimalRat(fill.GrossNotional)
 	if err != nil {
 		return domain.Fill{}, err
 	}
+	if err := validateGrossEvidence(shares, price, gross, fill.FeeSource); err != nil {
+		return domain.Fill{}, err
+	}
+
+	platformFee, _ := decimalRat(fill.PlatformFee)
+	builderFee, _ := decimalRat(fill.BuilderFee)
+	totalFee, _ := decimalRat(fill.TotalFee)
+	if new(big.Rat).Add(platformFee, builderFee).Cmp(totalFee) != 0 {
+		return domain.Fill{}, fmt.Errorf("authoritative total_fee must equal platform_fee plus builder_fee")
+	}
+	if fill.LiquidityRole == domain.LiquidityRoleMaker {
+		if platformFee.Sign() != 0 {
+			return domain.Fill{}, fmt.Errorf("V2 maker fill cannot contain a platform fee")
+		}
+	} else if fill.FeeSource == domain.FeeSourcePolygonV2OrderFilled {
+		expected, err := expectedV2PlatformFee(shares, price, fill.PlatformFeeRate, fill.FeeExponent)
+		if err != nil {
+			return domain.Fill{}, err
+		}
+		if !fill.PlatformFee.Equal(expected) {
+			return domain.Fill{}, fmt.Errorf("authoritative platform_fee %s does not match V2 fee curve %s", fill.PlatformFee, expected)
+		}
+	}
+
 	change := new(big.Rat)
 	switch fill.Side {
 	case domain.SideBuy:
@@ -251,8 +243,49 @@ func calculateMoney(fill domain.Fill) (domain.Fill, error) {
 	if err != nil {
 		return domain.Fill{}, err
 	}
-	fill.FeeSource = platformFeeSource + "+" + builderFeeSource
 	return fill.Normalize(), nil
+}
+
+func validateGrossEvidence(shares, price, gross *big.Rat, source string) error {
+	calculated := new(big.Rat).Mul(shares, price)
+	difference := new(big.Rat).Sub(calculated, gross)
+	if difference.Sign() < 0 {
+		difference.Neg(difference)
+	}
+	if source == domain.FeeSourcePolygonV2OrderFilled {
+		if difference.Cmp(big.NewRat(1, 1_000_000)) >= 0 {
+			return fmt.Errorf("OrderFilled gross_notional differs from shares multiplied by price by at least one pUSD base unit")
+		}
+		return nil
+	}
+	if difference.Sign() != 0 {
+		return fmt.Errorf("gross_notional must equal shares multiplied by price")
+	}
+	return nil
+}
+
+func expectedV2PlatformFee(
+	shares *big.Rat,
+	price *big.Rat,
+	platformFeeRate domain.Decimal,
+	feeExponent domain.Decimal,
+) (domain.Decimal, error) {
+	rate, err := decimalRat(platformFeeRate)
+	if err != nil || rate.Sign() < 0 {
+		return "", fmt.Errorf("platform_fee_rate must be non-negative")
+	}
+	exponent, err := decimalRat(feeExponent)
+	if err != nil || exponent.Sign() < 0 || !exponent.IsInt() || exponent.Num().BitLen() > 16 {
+		return "", fmt.Errorf("fee_exponent must be a non-negative integer")
+	}
+	curve := new(big.Rat).Mul(price, new(big.Rat).Sub(big.NewRat(1, 1), price))
+	powered := big.NewRat(1, 1)
+	for value := uint64(0); value < exponent.Num().Uint64(); value++ {
+		powered.Mul(powered, curve)
+	}
+	fee := new(big.Rat).Mul(shares, rate)
+	fee.Mul(fee, powered)
+	return roundedDecimal(fee, feeScale), nil
 }
 
 // decimalRat 将十进制值转换为精确有理数。

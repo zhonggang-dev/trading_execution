@@ -6,8 +6,9 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 )
 
-// TestCalculateMoneyUsesExactTakerFeeAndSide 验证 Calculate Money Uses Exact Taker Fee And Side 场景下的行为。
-func TestCalculateMoneyUsesExactTakerFeeAndSide(t *testing.T) {
+// TestCalculateMoneyUsesAuthoritativeFeeAndSide verifies that the processor
+// derives cash movement without replacing finalized event amounts.
+func TestCalculateMoneyUsesAuthoritativeFeeAndSide(t *testing.T) {
 	tests := []struct {
 		name    string
 		side    domain.Side
@@ -18,10 +19,9 @@ func TestCalculateMoneyUsesExactTakerFeeAndSide(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fill, err := calculateMoney(domain.Fill{
-				Side: test.side, LiquidityRole: domain.LiquidityRoleTaker,
-				Shares: "10", Price: "0.5", FeeRateBPS: "10",
-			})
+			fill := authoritativeMoneyFill(test.side, domain.LiquidityRoleTaker)
+			var err error
+			fill, err = calculateMoney(fill)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -33,26 +33,39 @@ func TestCalculateMoneyUsesExactTakerFeeAndSide(t *testing.T) {
 	}
 }
 
-// TestCalculateMoneyMakerDoesNotInventTakerFee 验证 Calculate Money Maker Does Not Invent Taker Fee 场景下的行为。
+// TestCalculateMoneyMakerDoesNotTreatMakerRateAsBuilderFee protects the V2
+// distinction between maker fee_rate_bps and builder_fee.
 func TestCalculateMoneyMakerDoesNotInventTakerFee(t *testing.T) {
-	fill, err := calculateMoney(domain.Fill{
-		Side: domain.SideBuy, LiquidityRole: domain.LiquidityRoleMaker,
-		Shares: "3", Price: "0.4",
-	})
+	raw := authoritativeMoneyFill(domain.SideBuy, domain.LiquidityRoleMaker)
+	raw.FeeRateBPS = "750"
+	raw.PlatformFeeRate = "0.075"
+	raw.FeeExponent = "2"
+	raw.PlatformFee = "0"
+	raw.BuilderFeeRateBPS = "0"
+	raw.BuilderFee = "0"
+	raw.TotalFee = "0"
+	fill, err := calculateMoney(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fill.PlatformFee.Equal("0") || !fill.NetCashDelta.Equal("-1.2") || fill.FeeSource != "PROTOCOL_MAKER_ZERO+BUILDER_NONE" {
+	if !fill.PlatformFee.Equal("0") || !fill.BuilderFee.Equal("0") || !fill.NetCashDelta.Equal("-5") ||
+		fill.FeeSource != domain.FeeSourcePolygonV2OrderFilled {
 		t.Fatalf("calculated maker fill = %#v", fill)
 	}
 }
 
-// TestCalculateMoneyAddsBuilderFeeForMaker 验证 Calculate Money Adds Builder Fee For Maker 场景下的行为。
-func TestCalculateMoneyAddsBuilderFeeForMaker(t *testing.T) {
-	fill, err := calculateMoney(domain.Fill{
-		Side: domain.SideSell, LiquidityRole: domain.LiquidityRoleMaker,
-		Shares: "10", Price: "0.5", BuilderFeeRateBPS: "50",
-	})
+// TestCalculateMoneyUsesReportedBuilderFeeForMaker verifies that an actual
+// builder allocation is consumed but never reconstructed from its rate.
+func TestCalculateMoneyUsesReportedBuilderFeeForMaker(t *testing.T) {
+	raw := authoritativeMoneyFill(domain.SideSell, domain.LiquidityRoleMaker)
+	raw.FeeRateBPS = "750"
+	raw.PlatformFeeRate = "0.075"
+	raw.FeeExponent = "2"
+	raw.PlatformFee = "0"
+	raw.BuilderFeeRateBPS = "50"
+	raw.BuilderFee = "0.025"
+	raw.TotalFee = "0.025"
+	fill, err := calculateMoney(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,17 +75,82 @@ func TestCalculateMoneyAddsBuilderFeeForMaker(t *testing.T) {
 	}
 }
 
-// TestCalculateMoneyRoundsProtocolFeeHalfUpToFiveDecimals 验证 Calculate Money Rounds Protocol Fee Half Up To Five Decimals 场景下的行为。
-func TestCalculateMoneyRoundsProtocolFeeHalfUpToFiveDecimals(t *testing.T) {
-	fill, err := calculateMoney(domain.Fill{
-		Side: domain.SideBuy, LiquidityRole: domain.LiquidityRoleTaker,
-		Shares: "1", Price: "0.333333", FeeRateBPS: "17",
-	})
+// TestCalculateMoneyValidatesFeeExponent verifies the V2 exponent is included
+// in the curve cross-check rather than assuming the legacy exponent of one.
+func TestCalculateMoneyValidatesFeeExponent(t *testing.T) {
+	raw := authoritativeMoneyFill(domain.SideBuy, domain.LiquidityRoleTaker)
+	raw.Shares = "100"
+	raw.Price = "0.5"
+	raw.GrossNotional = "50"
+	raw.FeeRateBPS = "2500"
+	raw.PlatformFeeRate = "0.25"
+	raw.FeeExponent = "2"
+	raw.PlatformFee = "1.5625"
+	raw.TotalFee = "1.5625"
+	fill, err := calculateMoney(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fill.PlatformFee.Equal("0.00038") {
-		t.Fatalf("platform fee = %s, want 0.00038", fill.PlatformFee)
+	if !fill.PlatformFee.Equal("1.5625") {
+		t.Fatalf("platform fee = %s, want 1.5625", fill.PlatformFee)
+	}
+}
+
+func TestCalculateMoneyValidatesOfficialFiveDecimalFeePrecision(t *testing.T) {
+	raw := authoritativeMoneyFill(domain.SideBuy, domain.LiquidityRoleTaker)
+	raw.Shares = "1"
+	raw.Price = "0.333333"
+	raw.GrossNotional = "0.333333"
+	raw.FeeRateBPS = "17"
+	raw.PlatformFeeRate = "0.0017"
+	raw.FeeExponent = "1"
+	raw.PlatformFee = "0.00038"
+	raw.TotalFee = "0.00038"
+	if _, err := calculateMoney(raw); err != nil {
+		t.Fatalf("official five-decimal fee was rejected: %v", err)
+	}
+
+	raw.Shares = "0.000001"
+	raw.Price = "0.5"
+	raw.GrossNotional = "0.0000005"
+	raw.PlatformFee = "0"
+	raw.TotalFee = "0"
+	if _, err := calculateMoney(raw); err != nil {
+		t.Fatalf("verified sub-minimum zero fee was rejected: %v", err)
+	}
+}
+
+func TestCalculateMoneyFailsClosedWithoutEvidenceEvenForZeroFee(t *testing.T) {
+	raw := authoritativeMoneyFill(domain.SideBuy, domain.LiquidityRoleMaker)
+	raw.PlatformFee = "0"
+	raw.TotalFee = "0"
+	raw.FeeSource = ""
+	if _, err := calculateMoney(raw); err == nil {
+		t.Fatal("zero-fee fill without finalized evidence was accepted")
+	}
+	raw.FeeSource = domain.FeeSourcePolygonV2OrderFilled
+	raw.TotalFee = ""
+	if _, err := calculateMoney(raw); err == nil {
+		t.Fatal("fill without authoritative total fee was accepted")
+	}
+}
+
+func TestCalculateMoneyRejectsFeeCurveMismatch(t *testing.T) {
+	raw := authoritativeMoneyFill(domain.SideBuy, domain.LiquidityRoleTaker)
+	raw.PlatformFee = "0.01"
+	raw.TotalFee = "0.01"
+	if _, err := calculateMoney(raw); err == nil {
+		t.Fatal("event fee inconsistent with the V2 fee schedule was accepted")
+	}
+}
+
+func authoritativeMoneyFill(side domain.Side, role domain.LiquidityRole) domain.Fill {
+	return domain.Fill{
+		Venue: "polymarket", Side: side, LiquidityRole: role,
+		Shares: "10", Price: "0.5", GrossNotional: "5",
+		FeeRateBPS: "10", PlatformFeeRate: "0.001", FeeExponent: "1", PlatformFee: "0.0025",
+		BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0.0025",
+		FeeSource: domain.FeeSourcePolygonV2OrderFilled,
 	}
 }
 

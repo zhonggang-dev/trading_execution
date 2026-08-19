@@ -32,6 +32,8 @@ type Params struct {
 	MarketValidator         port.MarketValidator
 	Reservations            port.AssetReservationManager
 	Reconciliation          port.ReconciliationTriggerer
+	FillSynchronizer        port.FillSynchronizer
+	AuthoritativeFills      bool
 	CancelFillFinalityGrace time.Duration
 	ImmediateCancelFinality bool
 	MaxReconcileAttempts    int
@@ -47,6 +49,8 @@ type Service struct {
 	marketValidator         port.MarketValidator
 	reservations            port.AssetReservationManager
 	reconciliation          port.ReconciliationTriggerer
+	fillSynchronizer        port.FillSynchronizer
+	authoritativeFills      bool
 	cancelFillFinalityGrace time.Duration
 	immediateCancelFinality bool
 	maxReconcileAttempts    int
@@ -64,6 +68,12 @@ func New(params Params) (*Service, error) {
 	}
 	if strings.TrimSpace(params.Venue.Name()) == "" {
 		return nil, fmt.Errorf("execution venue name is required")
+	}
+	if params.AuthoritativeFills && params.FillSynchronizer == nil {
+		return nil, fmt.Errorf("authoritative fills require a fill synchronizer")
+	}
+	if params.AuthoritativeFills && params.ImmediateCancelFinality {
+		return nil, fmt.Errorf("authoritative fills cannot use immediate cancel finality")
 	}
 	if params.MaxReconcileAttempts == 0 {
 		params.MaxReconcileAttempts = 5
@@ -90,6 +100,8 @@ func New(params Params) (*Service, error) {
 		marketValidator:         params.MarketValidator,
 		reservations:            params.Reservations,
 		reconciliation:          params.Reconciliation,
+		fillSynchronizer:        params.FillSynchronizer,
+		authoritativeFills:      params.AuthoritativeFills,
 		cancelFillFinalityGrace: params.CancelFillFinalityGrace,
 		immediateCancelFinality: params.ImmediateCancelFinality,
 		maxReconcileAttempts:    params.MaxReconcileAttempts,
@@ -166,6 +178,20 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 func (service *Service) submitReserved(ctx context.Context, stored domain.Order, created bool) (SubmitResult, error) {
 	attempt, err := service.startAttempt(ctx, &stored, domain.OrderStatusSubmitting, domain.OrderAttemptSubmit, domain.TransitionTriggerSubmit)
 	if err != nil {
+		var localRejection *port.Rejection
+		if errors.As(err, &localRejection) {
+			rejectErr := service.reject(ctx, &stored, localRejection.Code, localRejection)
+			if rejectErr != nil {
+				uncertainErr := service.reservations.MarkUncertain(ctx, stored, "LOCAL_SUBMIT_REJECTION_PERSIST_FAILED: "+rejectErr.Error())
+				return SubmitResult{Order: stored, Created: created}, errors.Join(
+					fmt.Errorf("start submit attempt: %w", err), rejectErr, uncertainErr,
+				)
+			}
+			_, releaseErr := service.reservations.Reconcile(ctx, stored)
+			return SubmitResult{Order: stored, Created: created}, errors.Join(
+				fmt.Errorf("start submit attempt: %w", err), releaseErr,
+			)
+		}
 		uncertainErr := service.reservations.MarkUncertain(ctx, stored, "SUBMIT_ATTEMPT_PERSIST_FAILED: "+err.Error())
 		return SubmitResult{Order: stored, Created: created}, errors.Join(fmt.Errorf("start submit attempt: %w", err), uncertainErr)
 	}
@@ -209,6 +235,20 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 			return SubmitResult{Order: stored, Created: created}, errors.Join(err, unknownErr, uncertainErr)
 		}
 	}
+	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &stored, venueOrder)
+	if syncErr != nil {
+		if stored.Status == domain.OrderStatusCancelled {
+			return SubmitResult{Order: stored, Created: created}, errors.Join(syncErr, service.holdCancellationFinality(ctx, stored))
+		}
+		uncertainErr := service.reservations.MarkUncertain(ctx, stored, "AUTHORITATIVE_FILL_SYNC_FAILED: "+syncErr.Error())
+		service.triggerReconciliation(stored, domain.ReconciliationTriggerOrderUnknown)
+		return SubmitResult{Order: stored, Created: created}, errors.Join(syncErr, uncertainErr)
+	}
+	if pendingFillEvidence && stored.Status != domain.OrderStatusUnknown && stored.Status != domain.OrderStatusCancelled {
+		if err := service.markFillEvidencePending(ctx, stored, domain.ReconciliationTriggerOrderUnknown); err != nil {
+			return SubmitResult{Order: stored, Created: created}, err
+		}
+	}
 	if stored.Status == domain.OrderStatusUnknown {
 		_ = service.reservations.MarkUncertain(ctx, stored, "VENUE_RESPONSE_UNKNOWN")
 		service.triggerReconciliation(stored, domain.ReconciliationTriggerOrderUnknown)
@@ -216,7 +256,7 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 		if err := service.holdCancellationFinality(ctx, stored); err != nil {
 			return SubmitResult{Order: stored, Created: created}, err
 		}
-	} else if stored.Status != domain.OrderStatusAcknowledged {
+	} else if stored.Status != domain.OrderStatusAcknowledged && !service.authoritativeFills {
 		if _, err := service.reservations.Reconcile(ctx, stored); err != nil {
 			uncertainErr := service.reservations.MarkUncertain(ctx, stored, "INITIAL_RECONCILIATION_FAILED: "+err.Error())
 			return SubmitResult{Order: stored, Created: created}, errors.Join(fmt.Errorf("reconcile initial asset reservation: %w", err), uncertainErr)
@@ -357,7 +397,7 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 		}
 		return order, fmt.Errorf("get venue order: %w", getErr)
 	}
-	target, err := statusForVenue(venueOrder.State)
+	target, err := service.statusForVenueObservation(order, venueOrder.State)
 	if err != nil {
 		target = domain.OrderStatusUnknown
 	}
@@ -365,12 +405,29 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 		_ = service.reservations.MarkUncertain(ctx, order, "RECONCILE_PERSIST_FAILED: "+err.Error())
 		return order, err
 	}
-	if target == domain.OrderStatusUnknown || target == domain.OrderStatusAcknowledged {
+	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &order, venueOrder)
+	if syncErr != nil {
+		if order.Status == domain.OrderStatusCancelled {
+			return order, errors.Join(syncErr, service.holdCancellationFinality(ctx, order))
+		}
+		uncertainErr := service.reservations.MarkUncertain(ctx, order, "AUTHORITATIVE_FILL_SYNC_FAILED: "+syncErr.Error())
+		service.triggerReconciliation(order, domain.ReconciliationTriggerOrderUnknown)
+		return order, errors.Join(syncErr, uncertainErr)
+	}
+	if pendingFillEvidence && order.Status != domain.OrderStatusUnknown && order.Status != domain.OrderStatusCancelled {
+		if err := service.markFillEvidencePending(ctx, order, domain.ReconciliationTriggerOrderUnknown); err != nil {
+			return order, err
+		}
+	}
+	if order.Status == domain.OrderStatusUnknown || order.Status == domain.OrderStatusAcknowledged {
 		_ = service.reservations.MarkUncertain(ctx, order, "RECONCILIATION_NOT_FINAL")
 		return order, nil
 	}
-	if target == domain.OrderStatusCancelled {
+	if order.Status == domain.OrderStatusCancelled {
 		return order, service.holdCancellationFinality(ctx, order)
+	}
+	if service.authoritativeFills && order.Status != domain.OrderStatusRejected {
+		return order, nil
 	}
 	if _, err := service.reservations.Reconcile(ctx, order); err != nil {
 		uncertainErr := service.reservations.MarkUncertain(ctx, order, "REFRESH_RESERVATION_RECONCILIATION_FAILED: "+err.Error())
@@ -402,21 +459,38 @@ func (service *Service) Cancel(ctx context.Context, orderID string) (domain.Orde
 		service.triggerReconciliation(order, domain.ReconciliationTriggerCancelUnknown)
 		return order, errors.Join(fmt.Errorf("cancel venue order: %w", cancelErr), uncertainErr)
 	}
-	target, err := statusForVenue(venueOrder.State)
-	if err != nil || target == domain.OrderStatusAcknowledged || target == domain.OrderStatusRejected {
+	target, err := service.statusForVenueObservation(order, venueOrder.State)
+	if err != nil || venueOrder.State == port.VenueOrderAcknowledged || venueOrder.State == port.VenueOrderRejected {
 		target = domain.OrderStatusUnknown
 	}
 	if err := service.finishAttempt(ctx, &order, &attempt, target, domain.TransitionTriggerCancel, venueOrder, "", nil); err != nil {
 		_ = service.reservations.MarkUncertain(ctx, order, "CANCEL_RESULT_PERSIST_FAILED: "+err.Error())
 		return order, err
 	}
-	if target == domain.OrderStatusUnknown {
+	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &order, venueOrder)
+	if syncErr != nil {
+		if order.Status == domain.OrderStatusCancelled {
+			return order, errors.Join(syncErr, service.holdCancellationFinality(ctx, order))
+		}
+		uncertainErr := service.reservations.MarkUncertain(ctx, order, "AUTHORITATIVE_FILL_SYNC_FAILED: "+syncErr.Error())
+		service.triggerReconciliation(order, domain.ReconciliationTriggerCancelUnknown)
+		return order, errors.Join(syncErr, uncertainErr)
+	}
+	if pendingFillEvidence && order.Status != domain.OrderStatusUnknown && order.Status != domain.OrderStatusCancelled {
+		if err := service.markFillEvidencePending(ctx, order, domain.ReconciliationTriggerCancelUnknown); err != nil {
+			return order, err
+		}
+	}
+	if order.Status == domain.OrderStatusUnknown {
 		_ = service.reservations.MarkUncertain(ctx, order, "CANCEL_RESULT_UNKNOWN")
 		service.triggerReconciliation(order, domain.ReconciliationTriggerCancelUnknown)
 		return order, nil
 	}
-	if target == domain.OrderStatusCancelled {
+	if order.Status == domain.OrderStatusCancelled {
 		return order, service.holdCancellationFinality(ctx, order)
+	}
+	if service.authoritativeFills {
+		return order, nil
 	}
 	if _, err := service.reservations.Reconcile(ctx, order); err != nil {
 		uncertainErr := service.reservations.MarkUncertain(ctx, order, "CANCEL_RECONCILIATION_FAILED: "+err.Error())
@@ -467,6 +541,84 @@ func (service *Service) triggerReconciliation(order domain.Order, trigger domain
 		return
 	}
 	service.reconciliation.Trigger(order.Intent.ExecutionAccountID, trigger, order.ID)
+}
+
+// syncObservedFills routes any venue indication of a possible fill through the
+// confirmed-fill synchronizer, then reloads the order aggregate written by the
+// FillLedger. The CLOB order response is observation evidence only.
+func (service *Service) syncObservedFills(ctx context.Context, order *domain.Order, observed port.VenueOrder) (bool, error) {
+	if !service.authoritativeFills || !venueObservationNeedsFillSync(observed) {
+		return false, nil
+	}
+	_, syncErr := service.fillSynchronizer.SyncOrder(ctx, order.ID)
+	refreshed, reloadErr := service.repository.Get(ctx, order.ID)
+	if reloadErr == nil {
+		*order = refreshed
+	}
+	if syncErr != nil {
+		syncErr = fmt.Errorf("sync authoritative fills for order %s: %w", order.ID, syncErr)
+	}
+	if reloadErr != nil {
+		reloadErr = fmt.Errorf("reload order %s after authoritative fill sync: %w", order.ID, reloadErr)
+	}
+	return authoritativeFillEvidencePending(observed, *order), errors.Join(syncErr, reloadErr)
+}
+
+// markFillEvidencePending keeps collateral frozen until a later reconciliation
+// observes the corresponding confirmed trades.
+func (service *Service) markFillEvidencePending(ctx context.Context, order domain.Order, trigger domain.ReconciliationTrigger) error {
+	err := service.reservations.MarkUncertain(ctx, order, "VENUE_FILL_EVIDENCE_PENDING")
+	service.triggerReconciliation(order, trigger)
+	if err != nil {
+		return fmt.Errorf("retain reservation while confirmed fill evidence is pending: %w", err)
+	}
+	return nil
+}
+
+// venueObservationNeedsFillSync identifies observations that may race with the
+// venue's confirmed trade feed. A successful cancel always requires one final
+// pre-finality scan, even when size_matched is zero.
+func venueObservationNeedsFillSync(observed port.VenueOrder) bool {
+	switch observed.State {
+	case port.VenueOrderPartiallyFilled, port.VenueOrderFilled, port.VenueOrderCancelled:
+		return true
+	}
+	filled := observed.FilledSize
+	if filled.IsEmpty() {
+		return false
+	}
+	sign, err := filled.Sign()
+	return err != nil || sign > 0
+}
+
+// authoritativeFillEvidencePending reports whether the venue has observed more
+// execution than the confirmed-fill ledger has applied so far.
+func authoritativeFillEvidencePending(observed port.VenueOrder, order domain.Order) bool {
+	venueFilled := observed.FilledSize
+	if venueFilled.IsEmpty() {
+		venueFilled = "0"
+	}
+	confirmedFilled := order.FilledSize
+	if confirmedFilled.IsEmpty() {
+		confirmedFilled = "0"
+	}
+	comparison, err := venueFilled.Compare(confirmedFilled)
+	if err != nil || comparison > 0 {
+		return true
+	}
+	confirmedSign, err := confirmedFilled.Sign()
+	if err != nil {
+		return true
+	}
+	switch observed.State {
+	case port.VenueOrderFilled:
+		return order.Status != domain.OrderStatusFilled
+	case port.VenueOrderPartiallyFilled:
+		return confirmedSign <= 0 || (order.Status != domain.OrderStatusPartiallyFilled &&
+			order.Status != domain.OrderStatusFilled && order.Status != domain.OrderStatusCancelled)
+	default:
+		return false
+	}
 }
 
 // Events 查询指定订单的不可变状态事件。
@@ -597,8 +749,15 @@ func (service *Service) buildTransition(order domain.Order, target domain.OrderS
 		venueOrder := details.venueOrder
 		transition.VenueStatus = venueOrder.RawStatus
 		transition.VenueOrderID = venueOrder.ID
-		transition.FilledSize = venueOrder.FilledSize
-		transition.AverageFillPrice = venueOrder.AverageFillPrice
+		if service.authoritativeFills {
+			// In live composition only confirmed fills processed by FillLedger may
+			// change cumulative execution amounts.
+			transition.FilledSize = order.FilledSize
+			transition.AverageFillPrice = order.AverageFillPrice
+		} else {
+			transition.FilledSize = venueOrder.FilledSize
+			transition.AverageFillPrice = venueOrder.AverageFillPrice
+		}
 		if !venueOrder.ObservedAt.IsZero() {
 			observedAt := venueOrder.ObservedAt.UTC()
 			transition.VenueObservedAt = &observedAt
@@ -609,7 +768,7 @@ func (service *Service) buildTransition(order domain.Order, target domain.OrderS
 
 // applyVenueState 应用 Venue State 的领域变更。
 func (service *Service) applyVenueState(ctx context.Context, order *domain.Order, venueOrder port.VenueOrder, trigger domain.OrderTransitionTrigger, attemptID string) error {
-	target, err := statusForVenue(venueOrder.State)
+	target, err := service.statusForVenueObservation(*order, venueOrder.State)
 	if err != nil {
 		return err
 	}
@@ -618,6 +777,47 @@ func (service *Service) applyVenueState(ctx context.Context, order *domain.Order
 		venueOrder:       venueOrder,
 		includeVenueData: true,
 	})
+}
+
+// statusForVenueObservation maps order-state evidence without allowing an
+// unconfirmed CLOB size_matched value to create PARTIALLY_FILLED or FILLED.
+func (service *Service) statusForVenueObservation(order domain.Order, state port.VenueOrderState) (domain.OrderStatus, error) {
+	target, err := statusForVenue(state)
+	if err != nil || !service.authoritativeFills {
+		return target, err
+	}
+	filled := order.FilledSize
+	if filled.IsEmpty() {
+		filled = "0"
+	}
+	sign, err := filled.Sign()
+	if err != nil {
+		return "", fmt.Errorf("parse authoritative filled size: %w", err)
+	}
+	comparison, err := filled.Compare(order.Intent.Size)
+	if err != nil || comparison > 0 {
+		return "", fmt.Errorf("compare authoritative filled size with requested size")
+	}
+	if target == domain.OrderStatusRejected && sign > 0 {
+		// A post-ack rejection cannot release an order that already has a
+		// confirmed fill; require reconciliation instead.
+		return domain.OrderStatusUnknown, nil
+	}
+	switch target {
+	case domain.OrderStatusAcknowledged, domain.OrderStatusLive, domain.OrderStatusPartiallyFilled, domain.OrderStatusFilled:
+		if comparison == 0 {
+			return domain.OrderStatusFilled, nil
+		}
+		if sign > 0 {
+			return domain.OrderStatusPartiallyFilled, nil
+		}
+		if target == domain.OrderStatusAcknowledged {
+			return domain.OrderStatusAcknowledged, nil
+		}
+		return domain.OrderStatusLive, nil
+	default:
+		return target, nil
+	}
 }
 
 // reject 构建并返回 对应数据 的拒绝结果。

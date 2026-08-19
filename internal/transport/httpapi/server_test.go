@@ -239,15 +239,10 @@ func TestTradeHistoryEndpointAuthenticatesAndValidatesFilters(t *testing.T) {
 }
 
 // RunAccount 执行测试模拟流程。
-func (job *fakeReconciliationJob) RunAccount(
-	_ context.Context,
-	accountID string,
-	trigger domain.ReconciliationTrigger,
-	orderID string,
-) (reconciliation.Result, error) {
-	job.accountID, job.trigger, job.orderID = accountID, trigger, orderID
+func (job *fakeReconciliationJob) RunAccount(_ context.Context, params reconciliation.RunAccountParams) (reconciliation.Result, error) {
+	job.accountID, job.trigger, job.orderID = params.ExecutionAccountID, params.Trigger, params.FocusOrderID
 	return reconciliation.Result{Run: domain.ReconciliationRun{
-		RunID: "recon-1", ExecutionAccountID: accountID, Trigger: trigger,
+		RunID: "recon-1", ExecutionAccountID: params.ExecutionAccountID, Trigger: params.Trigger,
 		Status: domain.ReconciliationRunCompleted, Summary: map[string]int{},
 	}}, nil
 }

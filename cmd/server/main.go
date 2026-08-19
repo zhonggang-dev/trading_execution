@@ -20,6 +20,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/ordercoordinator"
+	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 	"github.com/UniPat-AI/trading_execution/internal/service/tradehistory"
 	"github.com/UniPat-AI/trading_execution/internal/transport/httpapi"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -50,30 +51,22 @@ func run() error {
 		defer database.Close()
 	}
 
-	var repository port.OrderRepository = memory.NewOrderRepository()
-	var reservations port.AssetReservationManager = paper.NewReservationManager()
-	var readiness *postgresadapter.HealthChecker
+	rootContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	var databaseReadiness *postgresadapter.HealthChecker
 	if database != nil {
-		repository, err = postgresadapter.NewOrderRepository(database)
-		if err != nil {
-			return err
-		}
-		reservations, err = postgresadapter.NewReservationManager(postgresadapter.ReservationManagerParams{DB: database})
-		if err != nil {
-			return err
-		}
-		readiness, err = postgresadapter.NewHealthChecker(database)
+		databaseReadiness, err = postgresadapter.NewHealthChecker(database)
 		if err != nil {
 			return err
 		}
 		readinessContext, cancel := context.WithTimeout(context.Background(), cfg.Database.ConnectTimeout)
-		readinessErr := readiness.Check(readinessContext)
+		readinessErr := databaseReadiness.Check(readinessContext)
 		cancel()
 		if readinessErr != nil {
 			return fmt.Errorf("database readiness check: %w", readinessErr)
 		}
 	}
-	venue := paper.NewVenue(cfg.Execution.Venue)
 	guard, err := risk.NewStaticGuard(risk.StaticGuardParams{
 		AllowMarketOrders: cfg.Execution.AllowMarketOrders,
 		MaxOrderSize:      cfg.Execution.MaxOrderSize,
@@ -82,18 +75,31 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	executionService, err := execution.New(execution.Params{
-		Repository:      repository,
-		Venue:           venue,
-		Guard:           guard,
-		MarketValidator: paper.NewMarketValidator(),
-		Reservations:    reservations,
-		// The paper venue is synchronous and cannot produce late external fills.
-		// Live venues must keep this false and wait for reconciliation finality.
-		ImmediateCancelFinality: cfg.Execution.Mode == "paper",
-	})
-	if err != nil {
-		return err
+
+	var (
+		repository            port.OrderRepository
+		executionService      *execution.Service
+		readiness             readinessChecker
+		reconciliationService *reconciliation.Service
+		live                  *liveRuntime
+	)
+	if cfg.Execution.Mode == "live" {
+		startupContext, cancel := context.WithTimeout(rootContext, cfg.Polymarket.StartupTimeout)
+		live, err = buildLiveRuntime(startupContext, cfg, database, databaseReadiness, guard, logger)
+		cancel()
+		if err != nil {
+			return err
+		}
+		repository = live.repository
+		executionService = live.execution
+		readiness = live.readiness
+		reconciliationService = live.reconciliation
+	} else {
+		repository, executionService, err = buildPaperRuntime(cfg, database, guard)
+		if err != nil {
+			return err
+		}
+		readiness = databaseReadiness
 	}
 	tradeHistoryService, err := buildTradeHistoryService(database)
 	if err != nil {
@@ -109,6 +115,9 @@ func run() error {
 	if readiness != nil {
 		httpParams.Readiness = readiness
 	}
+	if reconciliationService != nil {
+		httpParams.Reconciliation = reconciliationService
+	}
 	httpAPI, err := httpapi.New(httpParams)
 	if err != nil {
 		return err
@@ -122,8 +131,11 @@ func run() error {
 		IdleTimeout:       cfg.HTTP.IdleTimeout,
 	}
 
-	rootContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	if live != nil {
+		if err := live.startBackground(rootContext, logger); err != nil {
+			return err
+		}
+	}
 
 	if database != nil {
 		coordinator, err := ordercoordinator.New(ordercoordinator.Params{
@@ -167,6 +179,52 @@ func run() error {
 		}
 		return err
 	}
+}
+
+type readinessChecker interface {
+	Check(context.Context) error
+}
+
+// buildPaperRuntime preserves the deterministic paper composition. When a
+// database is configured, orders and reservations remain durable, but no live
+// wallet, CLOB, heartbeat, or reconciliation dependency is installed.
+func buildPaperRuntime(
+	cfg config.Config,
+	database *sql.DB,
+	guard port.Guard,
+) (port.OrderRepository, *execution.Service, error) {
+	var repository port.OrderRepository = memory.NewOrderRepository()
+	var reservations port.AssetReservationManager = paper.NewReservationManager()
+	if database != nil {
+		var err error
+		repository, err = postgresadapter.NewOrderRepository(database)
+		if err != nil {
+			return nil, nil, err
+		}
+		reservations, err = postgresadapter.NewReservationManager(postgresadapter.ReservationManagerParams{
+			DB: database,
+			// Paper fills have no venue fees; keep the pre-live reservation
+			// behavior instead of applying the production fee uncertainty cap.
+			MaxBuyFeeRateBPS: "0",
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	venue := paper.NewVenue(cfg.Execution.Venue)
+	service, err := execution.New(execution.Params{
+		Repository:      repository,
+		Venue:           venue,
+		Guard:           guard,
+		MarketValidator: paper.NewMarketValidator(),
+		Reservations:    reservations,
+		// The paper venue is synchronous and cannot produce late external fills.
+		ImmediateCancelFinality: true,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return repository, service, nil
 }
 
 // openDatabase opens and validates the single PostgreSQL pool shared by all

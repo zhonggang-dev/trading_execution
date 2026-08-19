@@ -128,6 +128,6 @@ Venue。`observed_at` 是这份市场元数据的观察时间，不应拿业务�
 默认时效阈值为：策略快照 2 分钟、Market Universe 元数据 5 分钟、最新盘口 10 秒、未来
 时钟偏差 2 秒。构造 `marketvalidation.Service` 时都可配置；实盘配置应结合服务 SLA 调整。
 
-当前 server 仍被配置层强制限制为 paper，并显式使用 `PAPER_BYPASS` validator。切换 live
-前必须把 `marketuniverse.Client`、Market Data/CLOB `OrderBookSource` 和
-`marketvalidation.Service` 注入 `execution.Service`；缺少 validator 时执行服务会拒绝启动。
+paper 使用显式 `PAPER_BYPASS` validator。live composition 会注入 Gamma Market Universe、
+CLOB OrderBookSource 和 `marketvalidation.Service`，并生成 `LIVE_CHECK` 证据；缺少、过期或冲突的
+Market 身份、状态、tick/盘口会 fail closed，且只有 `LIVE_CHECK` 才会进入数据库原子动态风控。

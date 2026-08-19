@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/UniPat-AI/trading_execution/internal/buildinfo"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
@@ -39,7 +40,7 @@ type positionExitJob interface {
 
 // reconciliationJob 表示后端使用的 reconciliationJob 类型。
 type reconciliationJob interface {
-	RunAccount(context.Context, string, domain.ReconciliationTrigger, string) (reconciliation.Result, error)
+	RunAccount(context.Context, reconciliation.RunAccountParams) (reconciliation.Result, error)
 }
 
 // tradeHistoryService 表示后端使用的 tradeHistoryService 类型。
@@ -142,7 +143,9 @@ func (server *Server) Handler() http.Handler {
 
 // liveness 返回进程存活检查结果。
 func (server *Server) liveness(writer http.ResponseWriter, _ *http.Request) {
-	writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(writer, http.StatusOK, map[string]string{
+		"status": "ok", "version": buildinfo.Version, "commit": buildinfo.Commit,
+	})
 }
 
 // readiness verifies serving dependencies without conflating them with process liveness.
@@ -152,11 +155,15 @@ func (server *Server) readiness(writer http.ResponseWriter, request *http.Reques
 		defer cancel()
 		if err := server.readinessChecker.Check(ctx); err != nil {
 			server.logger.Error("readiness dependency check failed", "error", err)
-			writeJSON(writer, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+			writeJSON(writer, http.StatusServiceUnavailable, map[string]string{
+				"status": "not_ready", "version": buildinfo.Version, "commit": buildinfo.Commit,
+			})
 			return
 		}
 	}
-	writeJSON(writer, http.StatusOK, map[string]string{"status": "ready"})
+	writeJSON(writer, http.StatusOK, map[string]string{
+		"status": "ready", "version": buildinfo.Version, "commit": buildinfo.Commit,
+	})
 }
 
 // submit 解码订单意图并调用执行服务返回幂等提交结果。
@@ -388,9 +395,8 @@ func (server *Server) runReconciliation(writer http.ResponseWriter, request *htt
 		writeError(writer, http.StatusBadRequest, "INVALID_RECONCILIATION_TRIGGER", "unsupported reconciliation trigger")
 		return
 	}
-	result, err := server.reconciliation.RunAccount(
-		request.Context(), input.ExecutionAccountID, input.Trigger, input.FocusOrderID,
-	)
+	params := reconciliation.RunAccountParams{ExecutionAccountID: input.ExecutionAccountID, Trigger: input.Trigger, FocusOrderID: input.FocusOrderID}
+	result, err := server.reconciliation.RunAccount(request.Context(), params)
 	if err != nil {
 		writeJSON(writer, http.StatusBadGateway, map[string]any{
 			"data": result,

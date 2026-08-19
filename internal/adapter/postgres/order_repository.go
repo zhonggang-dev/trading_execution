@@ -11,6 +11,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // OrderRepository 表示后端使用的 OrderRepository 类型。
@@ -156,6 +157,11 @@ func (repository *OrderRepository) writeTransition(ctx context.Context, order do
 		order.AverageFillPrice.String(), order.FailureCode, order.FailureReason,
 		order.VenueLastObservedAt, order.UpdatedAt, string(event.FromStatus))
 	if err != nil {
+		if order.Status == domain.OrderStatusSubmitting {
+			if rejection := liveSubmitRiskRejection(err); rejection != nil {
+				return rejection
+			}
+		}
 		return fmt.Errorf("update execution order: %w", err)
 	}
 	if !oneRow(result) {
@@ -175,6 +181,31 @@ func (repository *OrderRepository) writeTransition(ctx context.Context, order do
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit order transition: %w", err)
+	}
+	return nil
+}
+
+func liveSubmitRiskRejection(err error) error {
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) || postgresError.Code != "P0001" {
+		return nil
+	}
+	message := strings.TrimSpace(postgresError.Message)
+	for _, code := range []string{
+		"LIVE_RISK_AUTHORIZATION_MISSING",
+		"GLOBAL_KILL_SWITCH",
+		"RISK_POLICY_DISABLED_OR_CHANGED",
+		"EXECUTION_ACCOUNT_PAUSED",
+		"STRATEGY_ACCOUNT_BINDING_DENIED",
+		"STRATEGY_OR_MARKET_PAUSED",
+		"PRICE_STALE",
+		"SIGNAL_STALE",
+		"RISK_STATE_STALE",
+		"RISK_STATE_HAS_OPEN_ISSUES",
+	} {
+		if strings.HasPrefix(message, code+" ") || message == code {
+			return reject(code, message)
+		}
 	}
 	return nil
 }

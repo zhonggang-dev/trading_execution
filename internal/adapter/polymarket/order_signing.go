@@ -295,15 +295,20 @@ func keccak256(parts ...[]byte) []byte {
 	return hash.Sum(nil)
 }
 
-// randomUint256 从加密随机源生成无偏的 uint256 值。
+// randomUint256 returns a non-zero cryptographic salt that is also exactly
+// representable by JSON/JavaScript number parsers. The official V2 clients
+// serialize salt as a JSON number; using the full uint256 range can round the
+// wire value and make CLOB hash a different order than the one we signed.
 func randomUint256(reader io.Reader) (*big.Int, error) {
 	if reader == nil {
 		reader = rand.Reader
 	}
-	buffer := make([]byte, 32)
+	buffer := make([]byte, 7)
 	if _, err := io.ReadFull(reader, buffer); err != nil {
 		return nil, err
 	}
+	// IEEE-754 doubles exactly represent all integers through 2^53-1.
+	buffer[0] &= 0x1f
 	value := new(big.Int).SetBytes(buffer)
 	if value.Sign() == 0 {
 		value.SetInt64(1)

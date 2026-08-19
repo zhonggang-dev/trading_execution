@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 const maxWalletFileBytes = 4 << 20
@@ -40,11 +41,35 @@ func LoadTradingAccounts(ctx context.Context, params WalletLoadParams) ([]Tradin
 	if path == "" {
 		return nil, fmt.Errorf("Polymarket accounts file path is required")
 	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("lstat Polymarket accounts file: %w", err)
+	}
+	if !pathInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("Polymarket accounts file must be a non-symlink regular file")
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open Polymarket accounts file: %w", err)
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat Polymarket accounts file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("Polymarket accounts file must be a regular file")
+	}
+	if !os.SameFile(pathInfo, info) {
+		return nil, fmt.Errorf("Polymarket accounts file changed while opening")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("Polymarket accounts file must not be accessible to group or other users")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Geteuid() {
+		return nil, fmt.Errorf("Polymarket accounts file must be owned by the service user")
+	}
 
 	payload, err := io.ReadAll(io.LimitReader(file, maxWalletFileBytes+1))
 	if err != nil {

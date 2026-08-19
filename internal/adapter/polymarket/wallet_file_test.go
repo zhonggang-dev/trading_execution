@@ -102,6 +102,40 @@ func TestLoadTradingAccountsDoesNotBootstrapByDefault(t *testing.T) {
 	}
 }
 
+func TestLoadTradingAccountsRejectsWorldReadableSecret(t *testing.T) {
+	path := writeWalletFile(t, `{"wallet":{"private_key":"`+testPrivateKey+`"}}`)
+	if err := os.Chmod(path, 0o604); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadTradingAccounts(context.Background(), WalletLoadParams{Path: path})
+	if err == nil || !strings.Contains(err.Error(), "group or other users") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadTradingAccountsRejectsGroupReadableSecret(t *testing.T) {
+	path := writeWalletFile(t, `{"wallet":{"private_key":"`+testPrivateKey+`"}}`)
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadTradingAccounts(context.Background(), WalletLoadParams{Path: path})
+	if err == nil || !strings.Contains(err.Error(), "group or other users") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadTradingAccountsRejectsSymlink(t *testing.T) {
+	target := writeWalletFile(t, `{"wallet":{"private_key":"`+testPrivateKey+`"}}`)
+	link := filepath.Join(t.TempDir(), "wallets-link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadTradingAccounts(context.Background(), WalletLoadParams{Path: link})
+	if err == nil || !strings.Contains(err.Error(), "non-symlink") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 // writeWalletFile 实现当前测试场景所需的辅助行为。
 func writeWalletFile(t *testing.T, contents string) string {
 	t.Helper()

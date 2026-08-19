@@ -16,7 +16,7 @@ func TestMapTradeToOrderFillSeparatesTakerAndMakerComponents(t *testing.T) {
 		MatchTime: "2026-08-18T09:59:58Z", LastUpdate: "2026-08-18T09:59:59Z",
 		MakerOrders: []MakerOrder{{
 			OrderID: "0xvenue", TokenID: "token-1", Side: "SELL",
-			MatchedAmount: "4", Price: "0.4", FeeRateBPS: "0",
+			MatchedAmount: "4", Price: "0.4", FeeRateBPS: "75", BuilderFee: "999",
 		}},
 	}
 	order := adapterOrder()
@@ -26,7 +26,8 @@ func TestMapTradeToOrderFillSeparatesTakerAndMakerComponents(t *testing.T) {
 		t.Fatalf("map result matched=%v err=%v", matched, err)
 	}
 	if fill.LiquidityRole != domain.LiquidityRoleMaker || !fill.Shares.Equal("4") ||
-		!fill.Price.Equal("0.4") || fill.Status != domain.FillStatusConfirmed || fill.ConfirmedAt == nil {
+		!fill.Price.Equal("0.4") || !fill.FeeRateBPS.Equal("75") || !fill.BuilderFeeRateBPS.IsEmpty() ||
+		fill.Status != domain.FillStatusConfirmed || fill.ConfirmedAt == nil {
 		t.Fatalf("maker fill = %#v", fill)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/paper"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/domain/orderstate"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 )
@@ -75,6 +77,33 @@ func TestSubmitPersistsAmbiguousVenueFailureWithoutRetry(t *testing.T) {
 	reservation, ok := reservations.Get(first.Order.ID)
 	if !ok || reservation.Status != domain.ReservationStatusReconciliationRequired {
 		t.Fatalf("reservation = %#v, %v; want retained reconciliation-required collateral", reservation, ok)
+	}
+}
+
+func TestSubmitLocalRiskGateRejectionNeverMarksVenueOutcomeUncertain(t *testing.T) {
+	venue := &fakeVenue{}
+	repository := &localRejectStartRepository{OrderRepository: memory.NewOrderRepository()}
+	paperReservations := paper.NewReservationManager()
+	reservations := &trackingReservations{delegate: paperReservations}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		Now:   func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) },
+		NewID: func() string { return "ord-local-risk-reject" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, submitErr := service.Submit(context.Background(), validIntent("client-local-risk-reject"))
+	if submitErr == nil || result.Order.Status != domain.OrderStatusRejected || result.Order.FailureCode != "GLOBAL_KILL_SWITCH" {
+		t.Fatalf("Submit() = %#v, %v; want local REJECTED", result, submitErr)
+	}
+	if venue.placeCalls.Load() != 0 || reservations.uncertainCalls.Load() != 0 || reservations.reconcileCalls.Load() != 1 {
+		t.Fatalf("place/uncertain/reconcile = %d/%d/%d", venue.placeCalls.Load(), reservations.uncertainCalls.Load(), reservations.reconcileCalls.Load())
+	}
+	reservation, ok := paperReservations.Get(result.Order.ID)
+	if !ok || reservation.Status != domain.ReservationStatusReleased {
+		t.Fatalf("reservation = %#v, %v; want released", reservation, ok)
 	}
 }
 
@@ -322,6 +351,224 @@ func TestPaperCancellationCanReleaseImmediately(t *testing.T) {
 	}
 }
 
+// TestAuthoritativeFillsRequireSafeDependencies verifies that live fill
+// accounting cannot be enabled without its confirmed-fill pipeline.
+func TestAuthoritativeFillsRequireSafeDependencies(t *testing.T) {
+	params := execution.Params{
+		Repository:         memory.NewOrderRepository(),
+		Venue:              &fakeVenue{},
+		Guard:              allowGuard{},
+		MarketValidator:    allowMarketValidator{},
+		Reservations:       paper.NewReservationManager(),
+		AuthoritativeFills: true,
+	}
+	if _, err := execution.New(params); err == nil || !strings.Contains(err.Error(), "fill synchronizer") {
+		t.Fatalf("New() error = %v, want missing fill synchronizer", err)
+	}
+	params.FillSynchronizer = &fakeFillSynchronizer{}
+	params.ImmediateCancelFinality = true
+	if _, err := execution.New(params); err == nil || !strings.Contains(err.Error(), "immediate cancel finality") {
+		t.Fatalf("New() error = %v, want unsafe cancel finality rejection", err)
+	}
+}
+
+// TestPaperSubmitKeepsLegacyVenueFillAccounting protects the existing paper
+// behavior when authoritative fill accounting is not enabled.
+func TestPaperSubmitKeepsLegacyVenueFillAccounting(t *testing.T) {
+	venueOrder := port.VenueOrder{
+		ID: "venue-paper-partial", State: port.VenueOrderPartiallyFilled, RawStatus: "matched",
+		FilledSize: "4", AverageFillPrice: "0.5", ObservedAt: time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC),
+	}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service := newServiceWithReservations(t, &fakeVenue{placeOrder: &venueOrder}, allowGuard{}, reservations)
+	result, err := service.Submit(context.Background(), validIntent("client-paper-partial"))
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if result.Order.Status != domain.OrderStatusPartiallyFilled || !result.Order.FilledSize.Equal("4") ||
+		!result.Order.AverageFillPrice.Equal("0.5") {
+		t.Fatalf("Submit() order = %#v, want legacy paper partial fill", result.Order)
+	}
+	if reservations.reconcileCalls.Load() != 1 {
+		t.Fatalf("paper reconcile calls = %d, want 1", reservations.reconcileCalls.Load())
+	}
+}
+
+// TestSubmitDoesNotBookVenueSizeMatchedWithoutConfirmedFill verifies that a
+// synchronous CLOB match is only evidence until FillLedger applies a confirmed
+// trade.
+func TestSubmitDoesNotBookVenueSizeMatchedWithoutConfirmedFill(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venueOrder := port.VenueOrder{
+		ID: "venue-authoritative-pending", State: port.VenueOrderFilled, RawStatus: "matched",
+		FilledSize: "10", AverageFillPrice: "0.5", ObservedAt: now,
+	}
+	venue := &fakeVenue{placeOrder: &venueOrder}
+	synchronizer := &fakeFillSynchronizer{}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	trigger := &reconciliationTrigger{}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, Reconciliation: trigger, FillSynchronizer: synchronizer,
+		AuthoritativeFills: true, Now: func() time.Time { return now }, NewID: func() string { return "ord-authoritative-pending" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(context.Background(), validIntent("client-authoritative-pending"))
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if result.Order.Status != domain.OrderStatusLive || !result.Order.FilledSize.Equal("0") || !result.Order.AverageFillPrice.IsEmpty() {
+		t.Fatalf("Submit() order = %#v, want LIVE with no ledger-confirmed fill", result.Order)
+	}
+	if synchronizer.calls.Load() != 1 || reservations.reconcileCalls.Load() != 0 || reservations.uncertainCalls.Load() != 1 {
+		t.Fatalf("sync/reconcile/uncertain calls = %d/%d/%d, want 1/0/1",
+			synchronizer.calls.Load(), reservations.reconcileCalls.Load(), reservations.uncertainCalls.Load())
+	}
+	if len(trigger.calls) != 1 || trigger.calls[0].trigger != domain.ReconciliationTriggerOrderUnknown {
+		t.Fatalf("reconciliation triggers = %#v", trigger.calls)
+	}
+}
+
+// TestSubmitReloadsConfirmedFillLedgerOrder verifies that the order returned by
+// Submit is reloaded after the synchronizer commits its authoritative update.
+func TestSubmitReloadsConfirmedFillLedgerOrder(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venueOrder := port.VenueOrder{
+		ID: "venue-authoritative-confirmed", State: port.VenueOrderPartiallyFilled, RawStatus: "matched",
+		FilledSize: "4", AverageFillPrice: "0.5", ObservedAt: now,
+	}
+	synchronizer := &fakeFillSynchronizer{sync: func(ctx context.Context, orderID string) error {
+		return persistConfirmedFill(ctx, repository, orderID, domain.OrderStatusPartiallyFilled, "4", "0.5")
+	}}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: &fakeVenue{placeOrder: &venueOrder}, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations, FillSynchronizer: synchronizer,
+		AuthoritativeFills: true, Now: func() time.Time { return now }, NewID: func() string { return "ord-authoritative-confirmed" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(context.Background(), validIntent("client-authoritative-confirmed"))
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if result.Order.Status != domain.OrderStatusPartiallyFilled || !result.Order.FilledSize.Equal("4") ||
+		!result.Order.AverageFillPrice.Equal("0.5") {
+		t.Fatalf("Submit() order = %#v, want reloaded confirmed fill", result.Order)
+	}
+	if synchronizer.calls.Load() != 1 || reservations.reconcileCalls.Load() != 0 {
+		t.Fatalf("sync/reconcile calls = %d/%d, want 1/0", synchronizer.calls.Load(), reservations.reconcileCalls.Load())
+	}
+}
+
+// TestRefreshUsesConfirmedFillLedgerAsAuthority covers the GET-order path and
+// prevents its cumulative size_matched value from directly settling assets.
+func TestRefreshUsesConfirmedFillLedgerAsAuthority(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	synchronizer := &fakeFillSynchronizer{sync: func(ctx context.Context, orderID string) error {
+		return persistConfirmedFill(ctx, repository, orderID, domain.OrderStatusPartiallyFilled, "3", "0.5")
+	}}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		Now: func() time.Time { return now }, NewID: func() string { return "ord-authoritative-refresh" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(context.Background(), validIntent("client-authoritative-refresh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	getOrder := port.VenueOrder{
+		ID: result.Order.VenueOrderID, State: port.VenueOrderPartiallyFilled, RawStatus: "matched",
+		FilledSize: "3", AverageFillPrice: "0.5", ObservedAt: now,
+	}
+	venue.getOrder = &getOrder
+	refreshed, err := service.Refresh(context.Background(), result.Order.ID)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if refreshed.Status != domain.OrderStatusPartiallyFilled || !refreshed.FilledSize.Equal("3") {
+		t.Fatalf("Refresh() order = %#v, want ledger-confirmed partial fill", refreshed)
+	}
+	if synchronizer.calls.Load() != 1 || reservations.reconcileCalls.Load() != 0 {
+		t.Fatalf("sync/reconcile calls = %d/%d, want 1/0", synchronizer.calls.Load(), reservations.reconcileCalls.Load())
+	}
+}
+
+// TestCancelSyncsConfirmedFillsBeforeHoldingFinality covers fills racing a
+// successful cancellation and preserves the delayed-release contract.
+func TestCancelSyncsConfirmedFillsBeforeHoldingFinality(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	synchronizer := &fakeFillSynchronizer{sync: func(ctx context.Context, orderID string) error {
+		return persistConfirmedFill(ctx, repository, orderID, domain.OrderStatusCancelled, "3", "0.5")
+	}}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		Now: func() time.Time { return now }, NewID: func() string { return "ord-authoritative-cancel" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(context.Background(), validIntent("client-authoritative-cancel"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelOrder := port.VenueOrder{
+		ID: result.Order.VenueOrderID, State: port.VenueOrderCancelled, RawStatus: "cancelled",
+		FilledSize: "3", AverageFillPrice: "0.5", ObservedAt: now,
+	}
+	venue.cancelOrder = &cancelOrder
+	cancelled, err := service.Cancel(context.Background(), result.Order.ID)
+	if err != nil {
+		t.Fatalf("Cancel() error = %v", err)
+	}
+	if cancelled.Status != domain.OrderStatusCancelled || !cancelled.FilledSize.Equal("3") {
+		t.Fatalf("Cancel() order = %#v, want cancelled order with ledger-confirmed fill", cancelled)
+	}
+	if synchronizer.calls.Load() != 1 || reservations.reconcileCalls.Load() != 0 || reservations.uncertainCalls.Load() != 1 {
+		t.Fatalf("sync/reconcile/uncertain calls = %d/%d/%d, want 1/0/1",
+			synchronizer.calls.Load(), reservations.reconcileCalls.Load(), reservations.uncertainCalls.Load())
+	}
+}
+
+// TestAuthoritativeFillsStillReleaseDefinitiveRejection verifies that an order
+// rejected before acceptance has no fill race and may release its reservation.
+func TestAuthoritativeFillsStillReleaseDefinitiveRejection(t *testing.T) {
+	venue := &fakeVenue{placeErr: &port.VenueError{Kind: port.VenueErrorRejected, Code: "CLOB_REJECTED", Message: "rejected"}}
+	synchronizer := &fakeFillSynchronizer{}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: memory.NewOrderRepository(), Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		Now:   func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) },
+		NewID: func() string { return "ord-authoritative-rejected" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, submitErr := service.Submit(context.Background(), validIntent("client-authoritative-rejected"))
+	if submitErr == nil || result.Order.Status != domain.OrderStatusRejected {
+		t.Fatalf("Submit() = %#v, %v; want definitive rejection", result, submitErr)
+	}
+	if synchronizer.calls.Load() != 0 || reservations.reconcileCalls.Load() != 1 {
+		t.Fatalf("sync/reconcile calls = %d/%d, want 0/1", synchronizer.calls.Load(), reservations.reconcileCalls.Load())
+	}
+}
+
 // TestReservationRejectionNeverCallsVenue 验证 Reservation Rejection Never Calls Venue 场景下的行为。
 func TestReservationRejectionNeverCallsVenue(t *testing.T) {
 	venue := &fakeVenue{}
@@ -401,10 +648,91 @@ func newServiceWithReservations(t *testing.T, venue port.Venue, guard port.Guard
 // rejectingReservations 表示后端使用的 rejectingReservations 类型。
 type rejectingReservations struct{}
 
+// trackingReservations records whether execution bypassed the authoritative
+// fill ledger and attempted legacy aggregate reconciliation.
+type trackingReservations struct {
+	delegate       port.AssetReservationManager
+	reconcileCalls atomic.Int64
+	uncertainCalls atomic.Int64
+}
+
+// Reserve delegates the reservation operation.
+func (reservations *trackingReservations) Reserve(ctx context.Context, order domain.Order) (domain.AssetReservation, error) {
+	return reservations.delegate.Reserve(ctx, order)
+}
+
+// Reconcile records and delegates a legacy aggregate reconciliation.
+func (reservations *trackingReservations) Reconcile(ctx context.Context, order domain.Order) (domain.AssetReservation, error) {
+	reservations.reconcileCalls.Add(1)
+	return reservations.delegate.Reconcile(ctx, order)
+}
+
+// MarkUncertain records and delegates retention of an uncertain reservation.
+func (reservations *trackingReservations) MarkUncertain(ctx context.Context, order domain.Order, reason string) error {
+	reservations.uncertainCalls.Add(1)
+	return reservations.delegate.MarkUncertain(ctx, order, reason)
+}
+
+// fakeFillSynchronizer simulates a confirmed-fill ledger transaction and lets
+// tests independently mutate the repository before execution reloads it.
+type fakeFillSynchronizer struct {
+	calls atomic.Int64
+	sync  func(context.Context, string) error
+}
+
+// SyncOrder implements the production fill synchronization boundary.
+func (synchronizer *fakeFillSynchronizer) SyncOrder(ctx context.Context, orderID string) (port.FillSyncResult, error) {
+	synchronizer.calls.Add(1)
+	result := port.FillSyncResult{OrderID: orderID, Observed: 1}
+	if synchronizer.sync == nil {
+		return result, nil
+	}
+	if err := synchronizer.sync(ctx, orderID); err != nil {
+		return result, err
+	}
+	result.Applied = 1
+	return result, nil
+}
+
+// persistConfirmedFill models the order aggregate portion of an atomic
+// FillLedger commit; reservation and position effects remain behind that port.
+func persistConfirmedFill(ctx context.Context, repository port.OrderRepository, orderID string, target domain.OrderStatus, filledSize, averagePrice domain.Decimal) error {
+	order, err := repository.Get(ctx, orderID)
+	if err != nil {
+		return err
+	}
+	next, event, err := orderstate.Apply(order, orderstate.Transition{
+		EventID:          fmt.Sprintf("event:%s:%d", order.ID, order.Revision+1),
+		To:               target,
+		Trigger:          domain.TransitionTriggerFill,
+		FillKey:          fmt.Sprintf("fill:%s:%d", order.ID, order.Revision+1),
+		FilledSize:       filledSize,
+		AverageFillPrice: averagePrice,
+		At:               order.UpdatedAt.Add(time.Nanosecond),
+	})
+	if err != nil {
+		return err
+	}
+	return repository.Transition(ctx, next, event)
+}
+
 // failFirstStartRepository 表示后端使用的 failFirstStartRepository 类型。
 type failFirstStartRepository struct {
 	*memory.OrderRepository
 	failed atomic.Bool
+}
+
+type localRejectStartRepository struct {
+	*memory.OrderRepository
+}
+
+func (repository *localRejectStartRepository) StartAttempt(
+	context.Context,
+	domain.Order,
+	domain.OrderEvent,
+	domain.OrderAttempt,
+) error {
+	return &port.Rejection{Code: "GLOBAL_KILL_SWITCH", Reason: "test local database gate"}
 }
 
 // StartAttempt 模拟外部尝试开始。
@@ -507,6 +835,9 @@ type fakeVenue struct {
 	cancelCalls       atomic.Int64
 	placeErr          error
 	invalidFilledSize bool
+	placeOrder        *port.VenueOrder
+	cancelOrder       *port.VenueOrder
+	getOrder          *port.VenueOrder
 }
 
 // Name 返回模拟组件名称。
@@ -517,6 +848,9 @@ func (venue *fakeVenue) Place(_ context.Context, order domain.Order) (port.Venue
 	venue.placeCalls.Add(1)
 	if venue.placeErr != nil {
 		return port.VenueOrder{}, venue.placeErr
+	}
+	if venue.placeOrder != nil {
+		return *venue.placeOrder, nil
 	}
 	filledSize := domain.Decimal("0")
 	if venue.invalidFilledSize {
@@ -534,6 +868,9 @@ func (venue *fakeVenue) Place(_ context.Context, order domain.Order) (port.Venue
 // Cancel 记录模拟订单撤销。
 func (venue *fakeVenue) Cancel(_ context.Context, order domain.Order) (port.VenueOrder, error) {
 	venue.cancelCalls.Add(1)
+	if venue.cancelOrder != nil {
+		return *venue.cancelOrder, nil
+	}
 	return port.VenueOrder{
 		ID:         order.VenueOrderID,
 		State:      port.VenueOrderCancelled,
@@ -545,6 +882,9 @@ func (venue *fakeVenue) Cancel(_ context.Context, order domain.Order) (port.Venu
 
 // Get 返回模拟仓储中的测试记录。
 func (venue *fakeVenue) Get(_ context.Context, order domain.Order) (port.VenueOrder, error) {
+	if venue.getOrder != nil {
+		return *venue.getOrder, nil
+	}
 	state := port.VenueOrderLive
 	if order.Status == domain.OrderStatusPartiallyFilled {
 		state = port.VenueOrderPartiallyFilled

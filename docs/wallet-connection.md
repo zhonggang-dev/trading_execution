@@ -89,17 +89,18 @@ go run ./cmd/walletcheck
 与旧 Python `create_or_derive_api_key()` 一致。创建 API key 会改变 Polymarket 远端凭证状态，因此
 默认关闭；生产更推荐提前生成并由 secrets 系统注入。
 
-## 还不能等同于启用实盘
+## 从钱包连通到启用实盘
 
-钱包连通只证明 signer 和 CLOB credentials 可用。`cmd/server` 继续拒绝 live，是因为真实下单还
-必须同时满足以下条件：
+钱包连通只证明 signer 和 CLOB credentials 可用。`cmd/server` 已具备 live composition，但只有
+同时满足以下条件才会启动，并且数据库全局 Kill Switch 默认保持开启：
 
 1. PostgreSQL migrations 已在目标库执行并核对历史余额、成本和 lots；
-2. order repository 和资金/shares 预占已经持久化；还需把真实 Fill ledger 装入同一 live
-   composition，并验证 Fill 与订单/预占/仓位/outbox 的单事务边界；
-3. Market Universe、最新盘口、硬风控和 Kill Switch 都接入真实数据；
-4. submit timeout、Cancel Race 和 `/data/trades` 延迟由 reconciliation coordinator 接管；
-5. 使用小额专用钱包完成 signature type、allowance、BUY/SELL、部分成交和撤单验收。
+2. 数据库账户地址与 secret 的 funder 精确一致，pUSD 初始余额、历史仓位成本和 lots 已对齐；
+3. Market Universe、最新盘口、原子动态风控、strategy binding 和 Kill Switch 已配置；
+4. submit timeout、Cancel Race、`/data/trades` 延迟和 Polygon `OrderFilled` 最终性由 reconciliation
+   与链上证据读取器接管；
+5. 账户 `closed_only=false`，pUSD 和两个 V2 Exchange allowance 正确；
+6. 旧机器人已停止，并使用专用小额钱包完成明确批准的 BUY/SELL/Cancel canary。
 
-在这些条件完成以前，只连接钱包而继续使用 memory repository 或 paper reservation 会产生真实资金
-与内部账本不一致，不能开放下单入口。
+在这些条件完成以前不能解除全局 Kill Switch。进程即使以 live 配置启动，新 Place 也会 fail closed；
+Cancel/Get 和只读 reconciliation 则始终保留，便于降低风险。
