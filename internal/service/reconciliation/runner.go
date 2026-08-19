@@ -14,14 +14,16 @@ import (
 
 // AccountReconciler 表示后端使用的 AccountReconciler 类型。
 type AccountReconciler interface {
-	RunAccount(context.Context, string, domain.ReconciliationTrigger, string) (Result, error)
+	RunAccount(context.Context, RunAccountParams) (Result, error)
 }
 
 // RunnerParams 表示后端使用的 RunnerParams 类型。
 type RunnerParams struct {
-	Service  AccountReconciler
-	Accounts []string
-	Interval time.Duration
+	Service      AccountReconciler
+	Accounts     []string
+	Interval     time.Duration
+	Now          func() time.Time
+	MaxResultAge time.Duration
 }
 
 // Runner 表示后端使用的 Runner 类型。
@@ -29,10 +31,16 @@ type Runner struct {
 	service  AccountReconciler
 	accounts []string
 	interval time.Duration
+	now      func() time.Time
+	maxAge   time.Duration
 	requests chan request
 
-	mu          sync.Mutex
-	lastResults map[string]Result
+	mu               sync.Mutex
+	lastResults      map[string]Result
+	loopStarted      bool
+	loopRunning      bool
+	loopLastActivity time.Time
+	loopStoppedAt    time.Time
 }
 
 // request 表示后端使用的 request 类型。
@@ -51,16 +59,39 @@ type SweepResult struct {
 
 var _ port.ReconciliationTriggerer = (*Runner)(nil)
 
+const (
+	defaultRunnerInterval = 5 * time.Minute
+	maximumRunnerAge      = 24 * time.Hour
+)
+
 // NewRunner 校验账户和周期配置后创建对账运行器。
 func NewRunner(params RunnerParams) (*Runner, error) {
 	if params.Service == nil {
 		return nil, fmt.Errorf("reconciliation service is required")
 	}
 	if params.Interval == 0 {
-		params.Interval = 5 * time.Minute
+		params.Interval = defaultRunnerInterval
 	}
 	if params.Interval < time.Second {
 		return nil, fmt.Errorf("reconciliation interval must be at least one second")
+	}
+	if params.Interval >= maximumRunnerAge {
+		return nil, fmt.Errorf("reconciliation interval must be less than %s", maximumRunnerAge)
+	}
+	if params.Now == nil {
+		params.Now = time.Now
+	}
+	if params.MaxResultAge == 0 {
+		params.MaxResultAge = params.Interval * 3
+		if params.MaxResultAge > maximumRunnerAge {
+			params.MaxResultAge = maximumRunnerAge
+		}
+	}
+	if params.MaxResultAge <= params.Interval {
+		return nil, fmt.Errorf("reconciliation max result age must be greater than interval")
+	}
+	if params.MaxResultAge > maximumRunnerAge {
+		return nil, fmt.Errorf("reconciliation max result age must not exceed %s", maximumRunnerAge)
 	}
 	seen := make(map[string]struct{})
 	accounts := make([]string, 0, len(params.Accounts))
@@ -80,6 +111,7 @@ func NewRunner(params RunnerParams) (*Runner, error) {
 	}
 	return &Runner{
 		service: params.Service, accounts: accounts, interval: params.Interval,
+		now: params.Now, maxAge: params.MaxResultAge,
 		requests: make(chan request, 1024), lastResults: make(map[string]Result),
 	}, nil
 }
@@ -102,25 +134,133 @@ func (runner *Runner) Run(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return runner.runLoop(ctx, startup.Errors, nil)
+}
+
+// RunAfterStartup starts only the scheduled/immediate loop. Production uses
+// this after a synchronous startup Sweep has passed before opening HTTP.
+func (runner *Runner) RunAfterStartup(ctx context.Context) error {
+	return runner.runLoop(ctx, nil, nil)
+}
+
+// RunAfterStartupReady is the production startup handshake. It closes ready
+// only after the loop has acquired its single-runner state, allowing callers
+// to start crash-recovery coordinators without racing the placement gate.
+func (runner *Runner) RunAfterStartupReady(ctx context.Context, ready chan<- struct{}) error {
+	if ready == nil {
+		return fmt.Errorf("reconciliation loop readiness channel is required")
+	}
+	return runner.runLoop(ctx, nil, ready)
+}
+
+func (runner *Runner) runLoop(ctx context.Context, initialErrors []error, ready chan<- struct{}) error {
+	if err := runner.beginLoop(); err != nil {
+		return err
+	}
+	defer runner.endLoop()
+	if ready != nil {
+		close(ready)
+	}
+
 	ticker := time.NewTicker(runner.interval)
 	defer ticker.Stop()
 	var accumulated []error
-	accumulated = append(accumulated, startup.Errors...)
+	accumulated = append(accumulated, initialErrors...)
 	for {
 		select {
 		case <-ctx.Done():
 			return errors.Join(append(accumulated, ctx.Err())...)
 		case <-ticker.C:
+			runner.recordLoopActivity()
 			result := runner.Sweep(ctx, domain.ReconciliationTriggerScheduled)
 			accumulated = appendBounded(accumulated, result.Errors...)
+			runner.recordLoopActivity()
 		case requested := <-runner.requests:
-			result, err := runner.service.RunAccount(ctx, requested.accountID, requested.trigger, requested.orderID)
+			runner.recordLoopActivity()
+			params := RunAccountParams{ExecutionAccountID: requested.accountID, Trigger: requested.trigger, FocusOrderID: requested.orderID}
+			result, err := runner.service.RunAccount(ctx, params)
 			runner.remember(requested.accountID, result)
 			if err != nil {
 				accumulated = appendBounded(accumulated, err)
 			}
+			runner.recordLoopActivity()
 		}
 	}
+}
+
+// Check implements live readiness. Every configured account must have a fresh,
+// completed reconciliation and the background loop must be running and active.
+func (runner *Runner) Check(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := runner.now().UTC()
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	for _, accountID := range runner.accounts {
+		result, exists := runner.lastResults[accountID]
+		if !exists {
+			return fmt.Errorf("execution account %q has not completed reconciliation", accountID)
+		}
+		if result.Run.Status != domain.ReconciliationRunCompleted {
+			return fmt.Errorf("execution account %q reconciliation status is %s", accountID, result.Run.Status)
+		}
+		if result.Run.CompletedAt == nil || result.Run.CompletedAt.IsZero() {
+			return fmt.Errorf("execution account %q completed reconciliation has no completed_at", accountID)
+		}
+		completedAt := result.Run.CompletedAt.UTC()
+		if completedAt.After(now) {
+			return fmt.Errorf("execution account %q reconciliation completed_at is in the future", accountID)
+		}
+		if age := now.Sub(completedAt); age > runner.maxAge {
+			return fmt.Errorf("execution account %q reconciliation is stale (age %s, maximum %s)", accountID, age, runner.maxAge)
+		}
+	}
+	if !runner.loopStarted {
+		return fmt.Errorf("reconciliation background loop has not started")
+	}
+	if !runner.loopRunning {
+		return fmt.Errorf("reconciliation background loop stopped at %s", runner.loopStoppedAt.UTC().Format(time.RFC3339Nano))
+	}
+	if runner.loopLastActivity.IsZero() {
+		return fmt.Errorf("reconciliation background loop has no activity timestamp")
+	}
+	if runner.loopLastActivity.After(now) {
+		return fmt.Errorf("reconciliation background loop activity is in the future")
+	}
+	if age := now.Sub(runner.loopLastActivity); age > runner.maxAge {
+		return fmt.Errorf("reconciliation background loop is inactive (age %s, maximum %s)", age, runner.maxAge)
+	}
+	return nil
+}
+
+func (runner *Runner) beginLoop() error {
+	now := runner.now().UTC()
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if runner.loopRunning {
+		return fmt.Errorf("reconciliation background loop is already running")
+	}
+	runner.loopStarted = true
+	runner.loopRunning = true
+	runner.loopLastActivity = now
+	runner.loopStoppedAt = time.Time{}
+	return nil
+}
+
+func (runner *Runner) endLoop() {
+	now := runner.now().UTC()
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	runner.loopRunning = false
+	runner.loopStoppedAt = now
+}
+
+func (runner *Runner) recordLoopActivity() {
+	now := runner.now().UTC()
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	runner.loopLastActivity = now
 }
 
 // Sweep 执行一次有界扫描并处理选中的记录。
@@ -131,7 +271,8 @@ func (runner *Runner) Sweep(ctx context.Context, trigger domain.ReconciliationTr
 			result.Errors = append(result.Errors, err)
 			break
 		}
-		run, err := runner.service.RunAccount(ctx, accountID, trigger, "")
+		params := RunAccountParams{ExecutionAccountID: accountID, Trigger: trigger}
+		run, err := runner.service.RunAccount(ctx, params)
 		result.Runs = append(result.Runs, run)
 		runner.remember(accountID, run)
 		if err != nil {

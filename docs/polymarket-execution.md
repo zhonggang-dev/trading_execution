@@ -14,9 +14,12 @@
 
 `StaticCredentialProvider` 适用于由进程外 secrets 系统注入后的账户对象。代码不把私钥、API secret、签名或完整签名请求写入订单日志；attempt 只保存非敏感 SHA-256 fingerprint。
 
-设置非零 `BuilderCode` 时，还必须把 Builder Profile/Market Info 中当前的 maker/taker builder fee
-bps 注入 `TradingClientParams`。成交账本会把 maker order 的 `fee_rate_bps` 和配置费率归一为
-独立 builder fee；平台 fee 与 builder fee 分开保存后再计算真实净现金。
+确认成交的真实现金只认 Polygon V2 Exchange `OrderFilled` 日志中的整数
+`makerAmountFilled/takerAmountFilled/fee`，并把 chain、exchange、transaction、block、log index、
+order hash 和确认数作为不可变证据持久化。`/data/trades.fee_rate_bps` 只是上游费率元数据，
+`maker_orders[].fee_rate_bps` 也不是 builder fee，二者都不能冒充实际扣款。当前默认 zero builder
+可由事件直接证明；非零 `BuilderCode` 如果没有独立、权威且能与链上 total fee 对账的拆分证据，
+成交会 fail closed，而不是猜测 platform/builder 分摊。
 
 当前支持 V2 signature type `0/1/2`。`POLY_1271 (3)` 使用官方 V2 特有的 Solady/EIP-1271 包装签名，当前会 fail closed；在完成 deposit-wallet 合约一致性测试以前，不能把它误当普通 EIP-712 签名。
 
@@ -42,7 +45,8 @@ verifyingContract = standard V2 exchange 或 neg-risk V2 exchange
 - price 必须是最新 tick size 的整数倍；
 - shares 当前最多 2 位小数，与官方 V2 rounding table 一致；
 - `price × shares` 必须能按对应 tick 的 amount precision 精确表达；
-- raw maker/taker amount 使用 6 位 token decimals；
+- raw maker/taker amount 和 CLOB order/trade quantity 使用 6 位 token decimals；例如 wire
+  `100000000` 必须显式解码为 `100` shares；
 - size 必须不低于 `/book.min_order_size`；
 - BUY notional 默认不得低于 `1 pUSD`，可配置但不能为零；
 - FAK/FOK 使用更严格的 marketable-order amount precision；
@@ -71,8 +75,9 @@ POST 返回 `matched/delayed` 和 order 的累计 `size_matched` 都不能直接
 `FillSource` 只从 `/data/trades` 生成 taker 或 maker 分量；trade 明细尚未可见时继续保留预占并
 轮询，不用限价、`makingAmount/takingAmount` 或 placement status 伪造成交。
 
-CLOB 的 `MATCHED/size_matched` 只用于订单观察。资金、仓位和订单累计成交以真实 trade 为依据，
-并且当前权威账本只在 trade status 为 `CONFIRMED` 时入账。完整语义见
+CLOB 的 `MATCHED/size_matched` 只用于订单观察。资金、仓位和订单累计成交以真实 trade 与对应的
+已确认 Polygon `OrderFilled` 证据为依据；当前权威账本只在 trade status 为 `CONFIRMED` 且证据
+身份、数量和总费用全部吻合时入账。完整语义见
 [`fills-and-position-ledger.md`](fills-and-position-ledger.md)。
 
 官方对照：

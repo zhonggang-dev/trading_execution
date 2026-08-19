@@ -46,7 +46,7 @@ func TestRunAccountRepairsOnlyProvableFacts(t *testing.T) {
 		})},
 	})
 
-	result, err := service.RunAccount(context.Background(), "account-1", domain.ReconciliationTriggerStartup, "")
+	result, err := service.RunAccount(context.Background(), RunAccountParams{ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerStartup})
 	if err != nil {
 		t.Fatalf("RunAccount() error = %v", err)
 	}
@@ -97,7 +97,7 @@ func TestRunAccountLeavesUnattributableStateForManualReview(t *testing.T) {
 		})},
 	})
 
-	result, err := service.RunAccount(context.Background(), "account-1", domain.ReconciliationTriggerOrderUnknown, unknown.ID)
+	result, err := service.RunAccount(context.Background(), RunAccountParams{ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerOrderUnknown, FocusOrderID: unknown.ID})
 	if err != nil {
 		t.Fatalf("RunAccount() error = %v", err)
 	}
@@ -148,7 +148,7 @@ func TestRunAccountDisablesRepairWhenSourcesConflict(t *testing.T) {
 		BalanceSources:  []port.ExternalBalanceSource{balance("100"), balance("99")},
 	})
 
-	result, err := service.RunAccount(context.Background(), "account-1", domain.ReconciliationTriggerScheduled, "")
+	result, err := service.RunAccount(context.Background(), RunAccountParams{ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled})
 	if err != nil {
 		t.Fatalf("RunAccount() error = %v", err)
 	}
@@ -172,7 +172,7 @@ func TestRunAccountNeverTreatsUnavailableSourceAsEmpty(t *testing.T) {
 		})},
 	})
 
-	result, err := service.RunAccount(context.Background(), "account-1", domain.ReconciliationTriggerScheduled, "")
+	result, err := service.RunAccount(context.Background(), RunAccountParams{ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled})
 	if err == nil {
 		t.Fatal("RunAccount() error = nil, want upstream uncertainty")
 	}
@@ -200,7 +200,7 @@ func TestRunAccountDoesNotFinalizeCancelledReservationWithoutCompleteFillEvidenc
 		})},
 	})
 
-	if _, err := service.RunAccount(context.Background(), "account-1", domain.ReconciliationTriggerScheduled, ""); err == nil {
+	if _, err := service.RunAccount(context.Background(), RunAccountParams{ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled}); err == nil {
 		t.Fatal("RunAccount() error = nil, want incomplete trade evidence")
 	}
 	if refresher.finalizations != 0 {
@@ -223,7 +223,7 @@ func TestRunAccountFinalizesCancelledReservationAfterSuccessfulFillScan(t *testi
 		})},
 	})
 
-	if _, err := service.RunAccount(context.Background(), "account-1", domain.ReconciliationTriggerScheduled, ""); err != nil {
+	if _, err := service.RunAccount(context.Background(), RunAccountParams{ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled}); err != nil {
 		t.Fatalf("RunAccount() error = %v", err)
 	}
 	if refresher.finalizations != 1 {

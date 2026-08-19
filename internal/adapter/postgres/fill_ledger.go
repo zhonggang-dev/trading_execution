@@ -430,16 +430,63 @@ func positionOrNil(position domain.Position) *domain.Position {
 
 // verifyFillIdentity 验证 Fill Identity 的身份和一致性。
 func verifyFillIdentity(stored, incoming domain.Fill) error {
+	storedEvidence, err := canonicalSettlementEvidenceIdentity(stored.SettlementEvidence)
+	if err != nil {
+		return fmt.Errorf("canonicalize stored settlement evidence: %w", err)
+	}
+	incomingEvidence, err := canonicalSettlementEvidenceIdentity(incoming.SettlementEvidence)
+	if err != nil {
+		return fmt.Errorf("canonicalize incoming settlement evidence: %w", err)
+	}
 	if stored.Key != incoming.Key || stored.Venue != incoming.Venue || stored.VenueFillID != incoming.VenueFillID ||
 		stored.OrderID != incoming.OrderID || stored.VenueOrderID != incoming.VenueOrderID ||
 		stored.ExecutionAccountID != incoming.ExecutionAccountID || stored.MarketID != incoming.MarketID ||
-		stored.TokenID != incoming.TokenID || stored.Side != incoming.Side || stored.LiquidityRole != incoming.LiquidityRole ||
-		!stored.Shares.Equal(incoming.Shares) || !stored.Price.Equal(incoming.Price) ||
-		!stored.GrossNotional.Equal(incoming.GrossNotional) ||
-		!stored.BuilderFeeRateBPS.Equal(incoming.BuilderFeeRateBPS) || !stored.TotalFee.Equal(incoming.TotalFee) {
+		stored.ConditionID != incoming.ConditionID || stored.TokenID != incoming.TokenID ||
+		stored.Side != incoming.Side || stored.LiquidityRole != incoming.LiquidityRole ||
+		!persistedDecimalEqual(stored.Shares, incoming.Shares) ||
+		!persistedDecimalEqual(stored.Price, incoming.Price) ||
+		!persistedDecimalEqual(stored.GrossNotional, incoming.GrossNotional) ||
+		!persistedDecimalEqual(stored.FeeRateBPS, incoming.FeeRateBPS) ||
+		!persistedDecimalEqual(stored.PlatformFeeRate, incoming.PlatformFeeRate) ||
+		!persistedDecimalEqual(stored.FeeExponent, incoming.FeeExponent) ||
+		!persistedDecimalEqual(stored.PlatformFee, incoming.PlatformFee) ||
+		!persistedDecimalEqual(stored.BuilderFeeRateBPS, incoming.BuilderFeeRateBPS) ||
+		!persistedDecimalEqual(stored.BuilderFee, incoming.BuilderFee) ||
+		!persistedDecimalEqual(stored.TotalFee, incoming.TotalFee) ||
+		!persistedDecimalEqual(stored.NetCashDelta, incoming.NetCashDelta) ||
+		stored.FeeSource != incoming.FeeSource ||
+		!strings.EqualFold(stored.TransactionHash, incoming.TransactionHash) ||
+		stored.RawPayloadSHA256 != incoming.RawPayloadSHA256 ||
+		!stored.MatchedAt.Equal(incoming.MatchedAt) ||
+		string(storedEvidence) != string(incomingEvidence) {
 		return port.ErrFillConflict
 	}
 	return nil
+}
+
+// persistedDecimalEqual mirrors the ledger's empty-to-zero SQL encoding so
+// replaying an old non-fee observation is not rejected merely because numeric
+// zero scans back from PostgreSQL as "0".
+func persistedDecimalEqual(left, right domain.Decimal) bool {
+	return domain.Decimal(decimalOrZero(left)).Equal(domain.Decimal(decimalOrZero(right)))
+}
+
+// canonicalSettlementEvidence serializes the normalized struct rather than
+// comparing JSONB text, whose key ordering is controlled by PostgreSQL.
+func canonicalSettlementEvidence(evidence *domain.SettlementEvidence) ([]byte, error) {
+	if evidence == nil {
+		return []byte("{}"), nil
+	}
+	return evidence.CanonicalJSON()
+}
+
+// canonicalSettlementEvidenceIdentity excludes mutable observation metadata
+// such as confirmations while retaining every immutable event and money field.
+func canonicalSettlementEvidenceIdentity(evidence *domain.SettlementEvidence) ([]byte, error) {
+	if evidence == nil {
+		return []byte("{}"), nil
+	}
+	return evidence.CanonicalIdentityJSON()
 }
 
 // selectFillForUpdate 从 PostgreSQL 查询 Fill For Update。
@@ -453,21 +500,27 @@ func selectFillForUpdate(ctx context.Context, tx *sql.Tx, fillKey string) (domai
 
 // insertFill 在当前事务中插入 Fill。
 func insertFill(ctx context.Context, tx *sql.Tx, fill domain.Fill) error {
-	_, err := tx.ExecContext(ctx, `
+	evidence, err := canonicalSettlementEvidence(fill.SettlementEvidence)
+	if err != nil {
+		return fmt.Errorf("encode settlement evidence: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO execution_fills (
 			fill_key, venue, venue_fill_id, order_id, venue_order_id, execution_account_id,
 			market_id, condition_id, token_id, side, liquidity_role, status, shares, price,
-			gross_notional, fee_rate_bps, platform_fee, builder_fee_rate_bps, builder_fee, total_fee, net_cash_delta,
+			gross_notional, fee_rate_bps, platform_fee_rate, fee_exponent, platform_fee,
+			builder_fee_rate_bps, builder_fee, total_fee, net_cash_delta, settlement_evidence,
 			fee_source, transaction_hash, raw_payload_sha256, matched_at, venue_updated_at,
 			first_observed_at, last_observed_at, confirmed_at
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::numeric,$14::numeric,
 			$15::numeric,$16::numeric,$17::numeric,$18::numeric,$19::numeric,$20::numeric,$21::numeric,
-			$22,$23,$24,$25,$26,$27,$27,$28)`,
+			$22::numeric,$23::numeric,$24::jsonb,$25,$26,$27,$28,$29,$30,$30,$31)`,
 		fill.Key, fill.Venue, fill.VenueFillID, fill.OrderID, fill.VenueOrderID, fill.ExecutionAccountID,
 		fill.MarketID, fill.ConditionID, fill.TokenID, string(fill.Side), string(fill.LiquidityRole), string(fill.Status),
 		fill.Shares.String(), fill.Price.String(), fill.GrossNotional.String(), decimalOrZero(fill.FeeRateBPS),
-		decimalOrZero(fill.PlatformFee), decimalOrZero(fill.BuilderFeeRateBPS), decimalOrZero(fill.BuilderFee),
-		decimalOrZero(fill.TotalFee), fill.NetCashDelta.String(),
+		decimalOrZero(fill.PlatformFeeRate), decimalOrZero(fill.FeeExponent), decimalOrZero(fill.PlatformFee),
+		decimalOrZero(fill.BuilderFeeRateBPS), decimalOrZero(fill.BuilderFee), decimalOrZero(fill.TotalFee),
+		fill.NetCashDelta.String(), evidence,
 		fill.FeeSource, fill.TransactionHash, fill.RawPayloadSHA256, fill.MatchedAt, nullTime(fill.VenueUpdatedAt),
 		fill.ObservedAt, fill.ConfirmedAt)
 	return err
@@ -509,7 +562,9 @@ const fillSelect = `
 	SELECT fill_key, venue, venue_fill_id, order_id, venue_order_id, execution_account_id,
 	       market_id, condition_id, token_id, side, liquidity_role, status,
 	       shares::text, price::text, gross_notional::text, fee_rate_bps::text,
-	       platform_fee::text, builder_fee_rate_bps::text, builder_fee::text, total_fee::text, net_cash_delta::text,
+	       platform_fee_rate::text, fee_exponent::text, platform_fee::text,
+	       builder_fee_rate_bps::text, builder_fee::text, total_fee::text, net_cash_delta::text,
+	       settlement_evidence,
 	       fee_source, transaction_hash, raw_payload_sha256, matched_at, venue_updated_at,
 	       last_observed_at, confirmed_at, applied_at
 	FROM execution_fills`
@@ -519,11 +574,14 @@ func scanFill(row rowScanner) (domain.Fill, error) {
 	var fill domain.Fill
 	var side, role, status string
 	var venueUpdated, confirmed, applied sql.NullTime
+	var settlementEvidence []byte
 	err := row.Scan(
 		&fill.Key, &fill.Venue, &fill.VenueFillID, &fill.OrderID, &fill.VenueOrderID, &fill.ExecutionAccountID,
 		&fill.MarketID, &fill.ConditionID, &fill.TokenID, &side, &role, &status,
 		&fill.Shares, &fill.Price, &fill.GrossNotional, &fill.FeeRateBPS,
-		&fill.PlatformFee, &fill.BuilderFeeRateBPS, &fill.BuilderFee, &fill.TotalFee, &fill.NetCashDelta,
+		&fill.PlatformFeeRate, &fill.FeeExponent, &fill.PlatformFee,
+		&fill.BuilderFeeRateBPS, &fill.BuilderFee, &fill.TotalFee, &fill.NetCashDelta,
+		&settlementEvidence,
 		&fill.FeeSource, &fill.TransactionHash, &fill.RawPayloadSHA256, &fill.MatchedAt, &venueUpdated,
 		&fill.ObservedAt, &confirmed, &applied,
 	)
@@ -532,6 +590,13 @@ func scanFill(row rowScanner) (domain.Fill, error) {
 	}
 	if err != nil {
 		return domain.Fill{}, err
+	}
+	if payload := strings.TrimSpace(string(settlementEvidence)); payload != "" && payload != "{}" {
+		var evidence domain.SettlementEvidence
+		if err := json.Unmarshal(settlementEvidence, &evidence); err != nil {
+			return domain.Fill{}, fmt.Errorf("decode settlement evidence: %w", err)
+		}
+		fill.SettlementEvidence = &evidence
 	}
 	fill.Side = domain.Side(side)
 	fill.LiquidityRole = domain.LiquidityRole(role)

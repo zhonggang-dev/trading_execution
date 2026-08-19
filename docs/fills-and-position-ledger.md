@@ -64,21 +64,25 @@ average_fill_price = filled_notional / filled_size
 total_fees        = sum(platform_fee + builder_fee)
 ```
 
-全部金额使用 JSON decimal string、Go `big.Rat` 和 PostgreSQL `NUMERIC`。ledger 会再次校验
-`gross = shares × price`、`total_fee = platform_fee + builder_fee` 和 BUY/SELL 的净现金方向，
-即使绕过标准 processor 也不能写入一组自相矛盾的金额。
+全部金额使用 JSON decimal string、Go `big.Rat` 和 PostgreSQL `NUMERIC`。普通 Fill 要求
+`gross = shares × price`；Polygon V2 Fill 以链上 6-decimal integer gross 为权威，并要求它与
+`shares × API price` 的差小于一个 pUSD base unit。ledger 还会校验
+`total_fee = platform_fee + builder_fee`、BUY/SELL 净现金方向和完整结算证据，即使绕过标准
+processor 也不能写入一组自相矛盾的金额。
 
 ## 手续费与真实现金
 
 BUY 的 `net_cash_delta = -(gross_notional + total_fee)`；SELL 的
-`net_cash_delta = gross_notional - total_fee`。taker 平台费按 trade 的 `fee_rate_bps` 和
-Polymarket 公式计算并按 5 位小数舍入；maker 平台费记为零。builder fee 按
-`notional × builder_fee_rate_bps / 10000` 计算并与平台费相加；启用非零 builder code 时，
-配置的 maker/taker builder rate 必须与 Builder Profile/Market Info 一致。
+`net_cash_delta = gross_notional - total_fee`。最终 `gross_notional/total_fee` 来自已确认的 Polygon
+V2 `OrderFilled` 日志；CLOB fee schedule 只用于独立交叉检查和预占上限，不能替代实际扣款。
+zero builder 时 `builder_fee=0`、`platform_fee=total_fee`；非零 builder 只有在权威拆分来源能与
+链上 total 精确对账时才允许入账，否则进入人工处理。
 
-目前下单前 BUY 预占仍是 `worst_price × shares`。实盘配置必须额外保留 execution-owned 的
-最大手续费 buffer，否则一个刚好花光余额的最差价成交可能因手续费导致结算失败。这个 buffer
-不能由 Python 策略指定。
+下单前 BUY 预占是
+`worst_price × (1 + max_buy_fee_rate_bps/10000) × shares`。手续费上限由 execution 配置，
+覆盖平台费、builder fee 和逐 Fill 舍入余量，不能由 Python 策略指定。数据库同时约束
+`settled_notional + settled_fees + remaining_reserved_balance <= initial_reserved_balance`；超过
+配置上限的异常 Fill 会整体回滚而不会消耗未预占现金，调用方必须告警并转人工处理。
 
 ## 仓位快照、独立批次和盈亏
 
@@ -125,8 +129,8 @@ is_dust          = true/false（取决于配置和 mark）
 
 撤单成功不会立刻释放预占：`/data/trades` 可能仍有传播延迟。execution 先把 reservation 保持为
 `RECONCILIATION_REQUIRED`；对账服务再次同步真实 Fill，经过默认 30 秒（可配置）的 finality/grace
-窗口后才调用 `FinalizeCancellation` 释放剩余部分。当前 `cmd/server` 仍只装配 paper adapter；必须在
-live composition 中启用 reconciliation Runner，避免旧的累计 `Reconcile` 与新 Fill ledger 同时记账。
+窗口后才调用 `FinalizeCancellation` 释放剩余部分。live composition 已启用 reconciliation Runner
+与 authoritative Fill synchronizer，并明确禁止旧的累计 `Reconcile` 与新 Fill ledger 同时记账。
 
 ## 事件发布
 

@@ -1,7 +1,9 @@
 [Unit]
-Description=UniPat Trading Execution (paper mode)
+Description=UniPat Trading Execution
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=3
 
 [Service]
 Type=simple

@@ -1,6 +1,7 @@
 package polymarket
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"math/big"
@@ -8,6 +9,17 @@ import (
 
 	secp256k1ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
+
+func TestRandomOrderSaltFitsJSONSafeInteger(t *testing.T) {
+	salt, err := randomUint256(bytes.NewReader(bytes.Repeat([]byte{0xff}, 7)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxSafeInteger := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 53), big.NewInt(1))
+	if salt.Sign() <= 0 || salt.Cmp(maxSafeInteger) > 0 {
+		t.Fatalf("salt = %s, want 1..%s", salt, maxSafeInteger)
+	}
+}
 
 // TestEOASignatureRecoversConfiguredSigner 验证 EOA Signature Recovers Configured Signer 场景下的行为。
 func TestEOASignatureRecoversConfiguredSigner(t *testing.T) {

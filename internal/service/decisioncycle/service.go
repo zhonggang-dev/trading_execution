@@ -156,7 +156,10 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err != nil {
 		return RunResult{}, err
 	}
-	histories, err = alignMidPriceHistories(targets, histories, decisionAt, service.midPriceLookback, service.now().UTC())
+	histories, err = alignMidPriceHistories(alignMidPriceHistoriesParams{
+		targets: targets, histories: histories, decisionAt: decisionAt,
+		lookback: service.midPriceLookback, fetchedAt: service.now().UTC(),
+	})
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -190,7 +193,10 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
 			continue
 		}
-		run, runErr := service.runBinding(ctx, decisionAt, snapshot.SnapshotID, binding, predictions, positions, bindingBooks, bindingHistories)
+		run, runErr := service.runBinding(ctx, runBindingParams{
+			decisionAt: decisionAt, predictionSnapshotID: snapshot.SnapshotID, binding: binding,
+			predictions: predictions, positions: positions, books: bindingBooks, histories: bindingHistories,
+		})
 		run.Error = runErr
 		result.Runs = append(result.Runs, run)
 		if runErr != nil {
@@ -245,11 +251,7 @@ func flattenPositionLots(byAccount map[string][]domain.StrategyPositionLot) []do
 }
 
 // captureMarketData 采集 Market Data。
-func (service *Service) captureMarketData(
-	ctx context.Context,
-	decisionAt time.Time,
-	targets []domain.BookTarget,
-) ([]domain.OrderBookSnapshot, []domain.MidPriceHistory, error) {
+func (service *Service) captureMarketData(ctx context.Context, decisionAt time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, []domain.MidPriceHistory, error) {
 	type bookResult struct {
 		books []domain.OrderBookSnapshot
 		err   error
@@ -287,29 +289,31 @@ func wrapError(operation string, err error) error {
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
+// runBindingParams 收拢单个模型策略绑定执行一次决策所需的冻结输入。
+type runBindingParams struct {
+	decisionAt           time.Time
+	predictionSnapshotID string
+	binding              domain.StrategyExecutionContext
+	predictions          []domain.Prediction
+	positions            []domain.StrategyPositionLot
+	books                []domain.OrderBookSnapshot
+	histories            []domain.MidPriceHistory
+}
+
 // runBinding 为单个绑定冻结输入、调用策略、持久化输出并提交订单意图。
-func (service *Service) runBinding(
-	ctx context.Context,
-	decisionAt time.Time,
-	predictionSnapshotID string,
-	binding domain.StrategyExecutionContext,
-	predictions []domain.Prediction,
-	positions []domain.StrategyPositionLot,
-	books []domain.OrderBookSnapshot,
-	histories []domain.MidPriceHistory,
-) (BindingRunResult, error) {
+func (service *Service) runBinding(ctx context.Context, params runBindingParams) (BindingRunResult, error) {
 	request, err := (domain.StrategyDecisionRequestParams{
-		CycleID:              cycleID(binding, decisionAt),
-		Context:              binding,
-		DecisionAt:           decisionAt,
+		CycleID:              cycleID(params.binding, params.decisionAt),
+		Context:              params.binding,
+		DecisionAt:           params.decisionAt,
 		GeneratedAt:          service.now().UTC(),
-		PredictionSnapshotID: predictionSnapshotID,
-		Predictions:          predictions,
-		Positions:            positions,
-		OrderBooks:           books,
-		MidPriceHistories:    histories,
+		PredictionSnapshotID: params.predictionSnapshotID,
+		Predictions:          params.predictions,
+		Positions:            params.positions,
+		OrderBooks:           params.books,
+		MidPriceHistories:    params.histories,
 	}).Build()
-	run := BindingRunResult{Context: binding, Request: request}
+	run := BindingRunResult{Context: params.binding, Request: request}
 	if err != nil {
 		return run, err
 	}
@@ -319,7 +323,7 @@ func (service *Service) runBinding(
 	if err != nil {
 		return run, fmt.Errorf("record strategy input: %w", err)
 	}
-	if err := validateClaimedInput(request, proposedCycleID, binding, decisionAt); err != nil {
+	if err := validateClaimedInput(request, proposedCycleID, params.binding, params.decisionAt); err != nil {
 		return run, err
 	}
 	response, err := service.strategy.Decide(ctx, request)
@@ -433,10 +437,7 @@ func booksForTargets(targets []domain.BookTarget, books []domain.OrderBookSnapsh
 }
 
 // midPriceHistoriesForTargets 按目标顺序选取共享中间价历史快照。
-func midPriceHistoriesForTargets(
-	targets []domain.BookTarget,
-	histories []domain.MidPriceHistory,
-) ([]domain.MidPriceHistory, error) {
+func midPriceHistoriesForTargets(targets []domain.BookTarget, histories []domain.MidPriceHistory) ([]domain.MidPriceHistory, error) {
 	byToken := make(map[string]domain.MidPriceHistory, len(histories))
 	for _, history := range histories {
 		byToken[history.TokenID] = history
@@ -549,24 +550,27 @@ func alignBooks(targets []domain.BookTarget, books []domain.OrderBookSnapshot, o
 	return result, nil
 }
 
+// alignMidPriceHistoriesParams 收拢中间价历史对齐所需的目标和时间窗口。
+type alignMidPriceHistoriesParams struct {
+	targets    []domain.BookTarget
+	histories  []domain.MidPriceHistory
+	decisionAt time.Time
+	lookback   time.Duration
+	fetchedAt  time.Time
+}
+
 // alignMidPriceHistories 按目标身份对齐 Mid Price Histories。
-func alignMidPriceHistories(
-	targets []domain.BookTarget,
-	histories []domain.MidPriceHistory,
-	decisionAt time.Time,
-	lookback time.Duration,
-	fetchedAt time.Time,
-) ([]domain.MidPriceHistory, error) {
-	byToken := make(map[string]domain.MidPriceHistory, len(histories))
-	for _, history := range histories {
+func alignMidPriceHistories(params alignMidPriceHistoriesParams) ([]domain.MidPriceHistory, error) {
+	byToken := make(map[string]domain.MidPriceHistory, len(params.histories))
+	for _, history := range params.histories {
 		if _, exists := byToken[history.TokenID]; exists {
 			return nil, fmt.Errorf("mid-price source returned duplicate token %q", history.TokenID)
 		}
 		byToken[history.TokenID] = history
 	}
-	windowStart := decisionAt.Add(-lookback)
-	result := make([]domain.MidPriceHistory, 0, len(targets))
-	for _, target := range targets {
+	windowStart := params.decisionAt.Add(-params.lookback)
+	result := make([]domain.MidPriceHistory, 0, len(params.targets))
+	for _, target := range params.targets {
 		history, found := byToken[target.TokenID]
 		if !found {
 			history = domain.MidPriceHistory{
@@ -576,19 +580,19 @@ func alignMidPriceHistories(
 				TokenID:            target.TokenID,
 				Status:             domain.MidPriceHistoryStatusMissing,
 				WindowStart:        windowStart,
-				WindowEnd:          decisionAt,
+				WindowEnd:          params.decisionAt,
 				FidelitySeconds:    60,
 				Sampling:           domain.MidPriceSamplingUpstreamRaw,
 				MissingValues:      domain.MidPriceMissingValuePolicyNoFill,
 				TimestampSemantics: domain.MidPriceTimestampSemanticsIntervalEndUTC,
-				FetchedAt:          fetchedAt,
+				FetchedAt:          params.fetchedAt,
 				MidPrices:          []domain.MidPricePoint{},
 				ErrorCode:          "SOURCE_DID_NOT_RETURN_TOKEN",
 			}
 		} else if history.MarketID != target.MarketID || history.ConditionID != target.ConditionID || history.OutcomeIndex != target.OutcomeIndex {
 			return nil, fmt.Errorf("mid-price token %q has mismatched market identity", target.TokenID)
 		}
-		if !history.WindowStart.Equal(windowStart) || !history.WindowEnd.Equal(decisionAt) {
+		if !history.WindowStart.Equal(windowStart) || !history.WindowEnd.Equal(params.decisionAt) {
 			return nil, fmt.Errorf("mid-price token %q has mismatched requested window", target.TokenID)
 		}
 		if err := history.Validate(); err != nil {

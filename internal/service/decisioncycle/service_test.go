@@ -44,12 +44,7 @@ type fakeMidPriceHistorySource struct {
 }
 
 // Capture 返回模拟行情快照。
-func (source *fakeMidPriceHistorySource) Capture(
-	_ context.Context,
-	_ time.Time,
-	lookback time.Duration,
-	targets []domain.BookTarget,
-) ([]domain.MidPriceHistory, error) {
+func (source *fakeMidPriceHistorySource) Capture(_ context.Context, _ time.Time, lookback time.Duration, targets []domain.BookTarget) ([]domain.MidPriceHistory, error) {
 	source.targets = targets
 	source.lookback = lookback
 	return source.histories, nil

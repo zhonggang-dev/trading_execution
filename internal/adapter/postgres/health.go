@@ -21,9 +21,12 @@ func NewHealthChecker(db *sql.DB) (*HealthChecker, error) {
 	return &HealthChecker{db: db}, nil
 }
 
-// Check returns nil only when PostgreSQL is reachable and every table used by
-// the persistent execution, reservation, fill, outbox, reconciliation, exit,
-// and trade-history paths exists.
+// Check returns nil only when PostgreSQL is reachable and the complete schema
+// used by the persistent execution, reservation, fill, outbox,
+// reconciliation, exit, trade-history, fee-protection, and atomic live-risk
+// paths is installed.  Checking only relation names is insufficient: a
+// partially applied live migration could otherwise advertise readiness while
+// omitting the durable SUBMITTING gate.
 func (checker *HealthChecker) Check(ctx context.Context) error {
 	if err := checker.db.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping postgres: %w", err)
@@ -48,14 +51,129 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_outbox'),
 			('position_exit_runs'),
 			('reconciliation_runs'),
-			('reconciliation_issues')
+			('reconciliation_issues'),
+			('execution_risk_global_control'),
+			('execution_risk_policies'),
+			('execution_risk_controls'),
+			('execution_strategy_bindings')
 		) AS required(name)
-		WHERE to_regclass('public.' || required.name) IS NULL`).Scan(&missing)
+		WHERE to_regclass(required.name) IS NULL`).Scan(&missing)
 	if err != nil {
 		return fmt.Errorf("inspect postgres schema: %w", err)
 	}
 	if missing != 0 {
 		return fmt.Errorf("postgres schema is incomplete: %d required relations are missing", missing)
+	}
+
+	var missingColumns int
+	err = checker.db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM (VALUES
+			('asset_reservations', 'settled_fees'),
+			('asset_reservations', 'risk_policy_id'),
+			('asset_reservations', 'risk_policy_version'),
+			('asset_reservations', 'risk_day'),
+			('asset_reservations', 'daily_risk_notional'),
+			('execution_fills', 'platform_fee_rate'),
+			('execution_fills', 'fee_exponent'),
+			('execution_fills', 'settlement_evidence')
+		) AS required(table_name, column_name)
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM information_schema.columns actual
+			WHERE actual.table_schema = current_schema()
+			  AND actual.table_name = required.table_name
+			  AND actual.column_name = required.column_name
+		)`).Scan(&missingColumns)
+	if err != nil {
+		return fmt.Errorf("inspect postgres live schema columns: %w", err)
+	}
+	if missingColumns != 0 {
+		return fmt.Errorf("postgres live schema is incomplete: %d required columns are missing", missingColumns)
+	}
+
+	var missingConstraints int
+	err = checker.db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM (VALUES
+			('asset_reservations_target_lot_fk'),
+			('asset_reservations_target_lot_shape'),
+			('asset_reservations_buy_initial_reserve_identity'),
+			('asset_reservations_buy_spend_within_reserve'),
+			('asset_reservations_risk_metadata_shape'),
+			('execution_strategy_bindings_canonical_strategy'),
+			('execution_risk_controls_canonical_strategy'),
+			('execution_fills_platform_fee_rate_nonnegative'),
+			('execution_fills_fee_exponent_shape'),
+			('execution_fills_settlement_evidence_object'),
+			('execution_fills_polygon_settlement_evidence_shape')
+		) AS required(name)
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM pg_constraint constraint_definition
+			JOIN pg_namespace namespace_definition
+			  ON namespace_definition.oid = constraint_definition.connamespace
+			WHERE namespace_definition.nspname = current_schema()
+			  AND constraint_definition.conname = required.name
+			  AND constraint_definition.convalidated
+		)`).Scan(&missingConstraints)
+	if err != nil {
+		return fmt.Errorf("inspect postgres live schema constraints: %w", err)
+	}
+	if missingConstraints != 0 {
+		return fmt.Errorf("postgres live schema is incomplete: %d required constraints are missing or not validated", missingConstraints)
+	}
+
+	var missingIndexes int
+	err = checker.db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM (VALUES
+			('execution_fills_polygon_settlement_event_uidx')
+		) AS required(name)
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM pg_class index_definition
+			JOIN pg_namespace namespace_definition
+			  ON namespace_definition.oid = index_definition.relnamespace
+			JOIN pg_index index_state ON index_state.indexrelid = index_definition.oid
+			WHERE namespace_definition.nspname = current_schema()
+			  AND index_definition.relname = required.name
+			  AND index_state.indisunique
+			  AND index_state.indisvalid
+			  AND index_state.indisready
+		)`).Scan(&missingIndexes)
+	if err != nil {
+		return fmt.Errorf("inspect postgres live schema indexes: %w", err)
+	}
+	if missingIndexes != 0 {
+		return fmt.Errorf("postgres live schema is incomplete: %d required indexes are missing or invalid", missingIndexes)
+	}
+
+	var missingTriggers int
+	err = checker.db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM (VALUES
+			('execution_orders_live_submit_risk_trigger'),
+			('execution_risk_global_control_version_trigger'),
+			('execution_risk_policies_version_trigger'),
+			('execution_risk_controls_version_trigger'),
+			('execution_strategy_bindings_version_trigger')
+		) AS required(name)
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM pg_trigger trigger_definition
+			JOIN pg_class relation_definition ON relation_definition.oid = trigger_definition.tgrelid
+			JOIN pg_namespace namespace_definition ON namespace_definition.oid = relation_definition.relnamespace
+			WHERE namespace_definition.nspname = current_schema()
+			  AND trigger_definition.tgname = required.name
+			  AND NOT trigger_definition.tgisinternal
+			  AND trigger_definition.tgenabled <> 'D'
+		)`).Scan(&missingTriggers)
+	if err != nil {
+		return fmt.Errorf("inspect postgres live schema triggers: %w", err)
+	}
+	if missingTriggers != 0 {
+		return fmt.Errorf("postgres live schema is incomplete: %d required triggers are missing or disabled", missingTriggers)
 	}
 	return nil
 }

@@ -1,11 +1,31 @@
 package postgres
 
 import (
+	"database/sql"
 	"errors"
 	"testing"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 )
+
+// TestNewReservationManagerRequiresExplicitBuyFeeBound 验证 PostgreSQL 权威预占不会在未配置手续费上限时静默退化。
+func TestNewReservationManagerRequiresExplicitBuyFeeBound(t *testing.T) {
+	database := &sql.DB{}
+	if _, err := NewReservationManager(ReservationManagerParams{DB: database}); err == nil {
+		t.Fatal("NewReservationManager() error = nil, want missing maximum BUY fee rate rejection")
+	}
+	if _, err := NewReservationManager(ReservationManagerParams{
+		DB: database, MaxBuyFeeRateBPS: "-0.01",
+	}); err == nil {
+		t.Fatal("NewReservationManager() error = nil, want negative maximum BUY fee rate rejection")
+	}
+	manager, err := NewReservationManager(ReservationManagerParams{
+		DB: database, MaxBuyFeeRateBPS: "0",
+	})
+	if err != nil || !manager.maxBuyFeeRateBPS.Equal("0") {
+		t.Fatalf("NewReservationManager() manager=%#v err=%v", manager, err)
+	}
+}
 
 // TestValidateReservationOrderRequiresWorstPriceForBuy 验证 Validate Reservation Order Requires Worst Price For Buy 场景下的行为。
 func TestValidateReservationOrderRequiresWorstPriceForBuy(t *testing.T) {

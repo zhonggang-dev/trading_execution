@@ -123,7 +123,7 @@ PostgreSQL 事务关闭 shares、记录实际 payout 和 realized PnL。没有 r
 
 ## 生产装配
 
-当前 `cmd/server` 仍是明确的 paper composition root，防止半装配实盘。生产 composition 需要把：
+`cmd/server` 的 live composition 已把以下组件连接到同一个 shutdown context：
 
 ```text
 Postgres OrderRepository + ReservationManager + FillLedger + ReconciliationRecorder
@@ -133,9 +133,9 @@ EVM RPC ERC20BalanceClient（token/asset/decimals 必须使用当前实盘 colla
 fillprocessor.Service + execution.Service + reconciliation.Service + reconciliation.Runner
 ```
 
-连接起来，并让 Runner 与 HTTP server 共用 shutdown context。`execution.Params.Reconciliation` 指向
-Runner，HTTP 的 `Reconciliation` 指向同步 service。只有这些依赖全部启用后，启动扫描和 UNKNOWN
-即时触发才会在实盘进程中生效。
+`execution.Params.Reconciliation` 通过 trigger bridge 指向 Runner，HTTP 的 `Reconciliation` 指向
+同步 service。启动 reconciliation 必须全部成功，heartbeat 和后台 loop 才会启动；任何账户结果
+不新鲜、loop 停止或 heartbeat 失效都会只阻止新 Place，不阻止 Cancel/Get。
 
 上线前还要为实际 Polygon RPC/Data API 做故障注入：超时、429、分页重复、API 相互矛盾、
 `/trades` 延迟、Cancel Race、进程在网络调用后/数据库提交前崩溃。PostgreSQL migration 集成测试

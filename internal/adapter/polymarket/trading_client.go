@@ -27,35 +27,37 @@ const maxTradingResponseBytes = 4 << 20
 
 // TradingClientParams 表示后端使用的 TradingClientParams 类型。
 type TradingClientParams struct {
-	BaseURL            string
-	HTTPClient         *http.Client
-	Credentials        CredentialProvider
-	RequestTimeout     time.Duration
-	RequestsPerSecond  float64
-	Burst              int
-	BuilderCode        string
-	BuilderMakerFeeBPS domain.Decimal
-	BuilderTakerFeeBPS domain.Decimal
-	Metadata           string
-	MinBuyNotional     domain.Decimal
-	Now                func() time.Time
-	Random             io.Reader
+	BaseURL           string
+	HTTPClient        *http.Client
+	Credentials       CredentialProvider
+	FeeEvidence       FillFeeEvidenceSource
+	RequestTimeout    time.Duration
+	RequestsPerSecond float64
+	Burst             int
+	BuilderCode       string
+	Metadata          string
+	MinBuyNotional    domain.Decimal
+	Now               func() time.Time
+	Random            io.Reader
 }
 
 // TradingClient 表示后端使用的 TradingClient 类型。
 type TradingClient struct {
-	baseURL            *url.URL
-	httpClient         *http.Client
-	credentials        CredentialProvider
-	timeout            time.Duration
-	limiter            *tokenBucket
-	builder            orderBuilder
-	builderMakerFeeBPS domain.Decimal
-	builderTakerFeeBPS domain.Decimal
-	now                func() time.Time
+	baseURL     *url.URL
+	httpClient  *http.Client
+	credentials CredentialProvider
+	timeout     time.Duration
+	limiter     *tokenBucket
+	builder     orderBuilder
+	feeEvidence FillFeeEvidenceSource
+	now         func() time.Time
 
 	versionMu      sync.Mutex
 	versionChecked bool
+	clockMu        sync.RWMutex
+	clockOffset    time.Duration
+	feeScheduleMu  sync.RWMutex
+	feeSchedules   map[string]marketFeeSchedule
 }
 
 var (
@@ -123,6 +125,88 @@ type MakerOrder struct {
 	Price         domain.Decimal `json:"price"`
 	MatchedAmount domain.Decimal `json:"matched_amount"`
 	FeeRateBPS    domain.Decimal `json:"fee_rate_bps"`
+	BuilderFee    string         `json:"builder_fee"`
+	BuilderCode   string         `json:"builder_code"`
+}
+
+type marketFeeSchedule struct {
+	Rate      domain.Decimal
+	Exponent  domain.Decimal
+	TakerOnly bool
+}
+
+// UnmarshalJSON converts V2 response quantities from canonical six-decimal
+// uint256 base units. Prices and fee-rate metadata remain decimal strings.
+func (raw *rawOrder) UnmarshalJSON(data []byte) error {
+	type rawOrderAlias rawOrder
+	var decoded rawOrderAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var quantities struct {
+		OriginalSize json.RawMessage `json:"original_size"`
+		SizeMatched  json.RawMessage `json:"size_matched"`
+	}
+	if err := json.Unmarshal(data, &quantities); err != nil {
+		return err
+	}
+	var err error
+	if len(quantities.OriginalSize) > 0 && string(quantities.OriginalSize) != "null" {
+		decoded.OriginalSize, err = decimalFromWireBaseUnits(quantities.OriginalSize, "original_size")
+		if err != nil {
+			return err
+		}
+	}
+	if len(quantities.SizeMatched) > 0 && string(quantities.SizeMatched) != "null" {
+		decoded.SizeMatched, err = decimalFromWireBaseUnits(quantities.SizeMatched, "size_matched")
+		if err != nil {
+			return err
+		}
+	}
+	*raw = rawOrder(decoded)
+	return nil
+}
+
+func (trade *Trade) UnmarshalJSON(data []byte) error {
+	type tradeAlias Trade
+	var decoded tradeAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var quantity struct {
+		Size json.RawMessage `json:"size"`
+	}
+	if err := json.Unmarshal(data, &quantity); err != nil {
+		return err
+	}
+	size, err := decimalFromWireBaseUnits(quantity.Size, "size")
+	if err != nil {
+		return err
+	}
+	decoded.Size = size
+	*trade = Trade(decoded)
+	return nil
+}
+
+func (maker *MakerOrder) UnmarshalJSON(data []byte) error {
+	type makerOrderAlias MakerOrder
+	var decoded makerOrderAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var quantity struct {
+		MatchedAmount json.RawMessage `json:"matched_amount"`
+	}
+	if err := json.Unmarshal(data, &quantity); err != nil {
+		return err
+	}
+	matched, err := decimalFromWireBaseUnits(quantity.MatchedAmount, "matched_amount")
+	if err != nil {
+		return err
+	}
+	decoded.MatchedAmount = matched
+	*maker = MakerOrder(decoded)
+	return nil
 }
 
 // OpenOrderFilter 表示后端使用的 OpenOrderFilter 类型。
@@ -138,6 +222,24 @@ type AccountProbe struct {
 	FunderAddress      string
 	SignatureType      SignatureType
 	OpenOrderCount     int
+}
+
+// FundingProbe is a non-secret startup result. It deliberately exposes only
+// booleans and counts, not wallet balances or allowance quantities.
+type FundingProbe struct {
+	ExecutionAccountID         string
+	CollateralBalancePositive  bool
+	AllowanceContractCount     int
+	AllAllowancesPositive      bool
+	RequiredAllowancesPositive bool
+}
+
+// ProtocolProbe is the public, non-secret CLOB V2 startup result. ClockSkew is
+// measured before applying the server offset to subsequent signatures.
+type ProtocolProbe struct {
+	Version    int
+	ServerTime time.Time
+	ClockSkew  time.Duration
 }
 
 // TradeFilter 表示后端使用的 TradeFilter 类型。
@@ -165,9 +267,18 @@ func NewTradingClient(params TradingClientParams) (*TradingClient, error) {
 	if params.RequestTimeout < 500*time.Millisecond || params.RequestTimeout > 30*time.Second {
 		return nil, fmt.Errorf("Polymarket request timeout must be between 500ms and 30s")
 	}
-	if params.HTTPClient == nil {
-		params.HTTPClient = &http.Client{Timeout: params.RequestTimeout}
+	baseHTTPClient := params.HTTPClient
+	if baseHTTPClient == nil {
+		baseHTTPClient = &http.Client{Timeout: params.RequestTimeout}
 	}
+	// Clone caller-owned clients so enforcing the CLOB no-redirect policy
+	// cannot mutate shared state. Authenticated POLY_* headers must never be
+	// replayed to a redirect target, including a target on the same host.
+	httpClient := *baseHTTPClient
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	params.HTTPClient = &httpClient
 	if params.RequestsPerSecond == 0 {
 		params.RequestsPerSecond = 8
 	}
@@ -184,41 +295,28 @@ func NewTradingClient(params TradingClientParams) (*TradingClient, error) {
 	if sign, err := params.MinBuyNotional.Sign(); err != nil || sign <= 0 {
 		return nil, fmt.Errorf("Polymarket minimum BUY notional must be positive")
 	}
-	for name, value := range map[string]*domain.Decimal{
-		"builder maker fee": &params.BuilderMakerFeeBPS,
-		"builder taker fee": &params.BuilderTakerFeeBPS,
-	} {
-		if value.IsEmpty() {
-			*value = "0"
-		}
-		if sign, err := value.Sign(); err != nil || sign < 0 {
-			return nil, fmt.Errorf("%s bps must be non-negative", name)
-		}
-		if comparison, err := value.Compare("10000"); err != nil || comparison > 0 {
-			return nil, fmt.Errorf("%s bps must not exceed 10000", name)
-		}
-	}
 	if params.Now == nil {
 		params.Now = time.Now
 	}
-	return &TradingClient{
-		baseURL:            baseURL,
-		httpClient:         params.HTTPClient,
-		credentials:        params.Credentials,
-		timeout:            params.RequestTimeout,
-		limiter:            limiter,
-		now:                params.Now,
-		builderMakerFeeBPS: params.BuilderMakerFeeBPS,
-		builderTakerFeeBPS: params.BuilderTakerFeeBPS,
+	client := &TradingClient{
+		baseURL:      baseURL,
+		httpClient:   params.HTTPClient,
+		credentials:  params.Credentials,
+		timeout:      params.RequestTimeout,
+		limiter:      limiter,
+		feeEvidence:  params.FeeEvidence,
+		now:          params.Now,
+		feeSchedules: make(map[string]marketFeeSchedule),
 		builder: orderBuilder{
 			chainID:        polygonChainID,
 			builderCode:    params.BuilderCode,
 			metadata:       params.Metadata,
 			minBuyNotional: params.MinBuyNotional,
-			now:            params.Now,
 			random:         params.Random,
 		},
-	}, nil
+	}
+	client.builder.now = client.protocolNow
+	return client, nil
 }
 
 // Name 返回当前交易场所适配器名称。
@@ -303,6 +401,16 @@ func (client *TradingClient) Place(ctx context.Context, order domain.Order) (por
 			fmt.Errorf("CLOB accepted order but omitted order id"),
 		)
 	}
+	if !strings.EqualFold(orderID, expectedOrderID) {
+		return port.VenueOrder{}, ambiguousVenueError(
+			"CLOB_ORDER_ID_MISMATCH", expectedOrderID,
+			fmt.Errorf("CLOB accepted order but returned an id that differs from the signed EIP-712 order hash"),
+		)
+	}
+	// Persist the locally derived canonical hash even if the response used a
+	// different hexadecimal case. It is the identity later matched against the
+	// Polygon OrderFilled log and the only safe key for ambiguous reconciliation.
+	orderID = expectedOrderID
 	state := placementState(response.Status)
 	tradeIDs := append(append([]string(nil), response.TradeIDs...), response.TradeIDsAlt...)
 	// A placement status of matched can represent a full or partial immediate
@@ -582,6 +690,172 @@ func (client *TradingClient) ProbeAccount(ctx context.Context, executionAccountI
 	}, nil
 }
 
+// ProbeProtocol verifies the three public V2 startup endpoints, rejects an
+// unsafe local clock, and synchronizes future L2/order timestamps to CLOB time.
+func (client *TradingClient) ProbeProtocol(ctx context.Context, maxClockSkew time.Duration) (ProtocolProbe, error) {
+	if maxClockSkew <= 0 || maxClockSkew > time.Minute {
+		return ProtocolProbe{}, fmt.Errorf("maximum CLOB clock skew must be between 1ns and 1m")
+	}
+	if _, _, err := client.do(ctx, TradingAccount{}, http.MethodGet, "/ok", nil, nil, false, false); err != nil {
+		return ProtocolProbe{}, fmt.Errorf("CLOB /ok probe: %w", err)
+	}
+	if err := client.ensureV2(ctx); err != nil {
+		return ProtocolProbe{}, err
+	}
+	body, _, err := client.do(ctx, TradingAccount{}, http.MethodGet, "/time", nil, nil, false, false)
+	if err != nil {
+		return ProtocolProbe{}, fmt.Errorf("CLOB /time probe: %w", err)
+	}
+	serverTime, err := parseProtocolTime(body)
+	if err != nil {
+		return ProtocolProbe{}, err
+	}
+	localTime := client.now().UTC()
+	skew := serverTime.Sub(localTime)
+	if skew < -maxClockSkew || skew > maxClockSkew {
+		return ProtocolProbe{}, fmt.Errorf("CLOB clock skew %s exceeds maximum %s", skew, maxClockSkew)
+	}
+	client.clockMu.Lock()
+	client.clockOffset = skew
+	client.clockMu.Unlock()
+	return ProtocolProbe{Version: 2, ServerTime: serverTime, ClockSkew: skew}, nil
+}
+
+// ClosedOnly implements the authenticated account-level placement gate used by
+// CLOB V2. It is separate from the public website geoblock response.
+func (client *TradingClient) ClosedOnly(ctx context.Context, executionAccountID string) (bool, error) {
+	account, err := client.account(ctx, executionAccountID)
+	if err != nil {
+		return false, err
+	}
+	body, _, err := client.doAuthenticated(ctx, account, http.MethodGet, "/auth/ban-status/closed-only", nil, nil, false)
+	if err != nil {
+		return false, err
+	}
+	var response struct {
+		ClosedOnly *bool `json:"closed_only"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil || response.ClosedOnly == nil {
+		return false, fmt.Errorf("decode CLOB closed-only status")
+	}
+	return *response.ClosedOnly, nil
+}
+
+// Heartbeat maintains the CLOB V2 dead-man switch session for one account.
+// The first call uses an empty id and every subsequent call must reuse the id
+// returned by the server.
+func (client *TradingClient) Heartbeat(
+	ctx context.Context,
+	executionAccountID string,
+	heartbeatID string,
+) (string, error) {
+	account, err := client.account(ctx, executionAccountID)
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(struct {
+		HeartbeatID string `json:"heartbeat_id"`
+	}{HeartbeatID: strings.TrimSpace(heartbeatID)})
+	if err != nil {
+		return "", fmt.Errorf("encode CLOB heartbeat: %w", err)
+	}
+	responseBody, _, err := client.doAuthenticated(ctx, account, http.MethodPost, "/v1/heartbeats", nil, body, false)
+	if err != nil {
+		return "", err
+	}
+	var response struct {
+		HeartbeatID string `json:"heartbeat_id"`
+		ErrorMsg    string `json:"error_msg"`
+	}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		return "", fmt.Errorf("decode CLOB heartbeat response: %w", err)
+	}
+	response.HeartbeatID = strings.TrimSpace(response.HeartbeatID)
+	if response.HeartbeatID == "" {
+		return "", fmt.Errorf("CLOB heartbeat response omitted heartbeat_id: %s", strings.TrimSpace(response.ErrorMsg))
+	}
+	return response.HeartbeatID, nil
+}
+
+// GetBalanceAllowance reads the CLOB ledger cache for one wallet and asset.
+// The returned quantities remain integer base units.
+func (client *TradingClient) GetBalanceAllowance(
+	ctx context.Context,
+	executionAccountID string,
+	assetType BalanceAssetType,
+	tokenID string,
+) (BalanceAllowance, error) {
+	account, err := client.account(ctx, executionAccountID)
+	if err != nil {
+		return BalanceAllowance{}, err
+	}
+	if assetType != BalanceAssetCollateral && assetType != BalanceAssetConditional {
+		return BalanceAllowance{}, newInvalidError("CLOB_ASSET_TYPE_INVALID", "asset type must be COLLATERAL or CONDITIONAL")
+	}
+	tokenID = strings.TrimSpace(tokenID)
+	if assetType == BalanceAssetConditional && tokenID == "" {
+		return BalanceAllowance{}, newInvalidError("CLOB_TOKEN_ID_REQUIRED", "conditional balance allowance requires token id")
+	}
+	query := url.Values{
+		"asset_type":     []string{string(assetType)},
+		"signature_type": []string{strconv.Itoa(int(account.SignatureType))},
+	}
+	if tokenID != "" {
+		query.Set("token_id", tokenID)
+	}
+	body, _, err := client.doAuthenticated(ctx, account, http.MethodGet, "/balance-allowance", query, nil, false)
+	if err != nil {
+		return BalanceAllowance{}, err
+	}
+	var response struct {
+		Balance    json.RawMessage            `json:"balance"`
+		Allowances map[string]json.RawMessage `json:"allowances"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return BalanceAllowance{}, fmt.Errorf("decode CLOB balance allowance: %w", err)
+	}
+	balance, err := nonNegativeIntegerFromJSON(response.Balance)
+	if err != nil {
+		return BalanceAllowance{}, fmt.Errorf("decode CLOB collateral balance: %w", err)
+	}
+	allowances := make(map[string]string, len(response.Allowances))
+	for contract, raw := range response.Allowances {
+		contract = strings.ToLower(strings.TrimSpace(contract))
+		if _, ok := decodeAddress(contract); !ok {
+			return BalanceAllowance{}, fmt.Errorf("decode CLOB allowance: invalid contract address")
+		}
+		amount, err := nonNegativeIntegerFromJSON(raw)
+		if err != nil {
+			return BalanceAllowance{}, fmt.Errorf("decode CLOB allowance for %s: %w", contract, err)
+		}
+		allowances[contract] = amount
+	}
+	return BalanceAllowance{
+		AssetType:  assetType,
+		TokenID:    tokenID,
+		Balance:    balance,
+		Allowances: allowances,
+	}, nil
+}
+
+// ProbeFunding checks the collateral prerequisite without logging quantities.
+func (client *TradingClient) ProbeFunding(ctx context.Context, executionAccountID string) (FundingProbe, error) {
+	allowance, err := client.GetBalanceAllowance(ctx, executionAccountID, BalanceAssetCollateral, "")
+	if err != nil {
+		return FundingProbe{}, err
+	}
+	return FundingProbe{
+		ExecutionAccountID:        executionAccountID,
+		CollateralBalancePositive: allowance.Positive(),
+		AllowanceContractCount:    len(allowance.Allowances),
+		AllAllowancesPositive:     allowance.AllAllowancesPositive(),
+		RequiredAllowancesPositive: allowance.RequiredAllowancesPositive(
+			StandardExchangeV2Address,
+			NegRiskExchangeV2Address,
+		),
+	}, nil
+}
+
 // ListTrades 分页查询指定执行账户的交易所成交。
 func (client *TradingClient) ListTrades(ctx context.Context, executionAccountID string, filter TradeFilter) ([]Trade, error) {
 	account, err := client.account(ctx, executionAccountID)
@@ -705,12 +979,10 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 		if !matched {
 			continue
 		}
-		if fill.BuilderFeeRateBPS.IsEmpty() || fill.BuilderFeeRateBPS.Equal("0") {
-			if fill.LiquidityRole == domain.LiquidityRoleMaker {
-				fill.BuilderFeeRateBPS = client.builderMakerFeeBPS
-			} else {
-				fill.BuilderFeeRateBPS = client.builderTakerFeeBPS
-			}
+		// CLOB's matched/mined observations do not yet carry finalized receipt
+		// evidence. They must not enter the money ledger with provisional fees.
+		if fill.Status != domain.FillStatusConfirmed {
+			continue
 		}
 		identity := fill.VenueFillID + "\x00" + fill.OrderID
 		if existingIndex, exists := seen[identity]; exists {
@@ -723,6 +995,23 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 		}
 		seen[identity] = len(fills)
 		fills = append(fills, fill)
+	}
+	if len(fills) == 0 {
+		return fills, nil
+	}
+	account, err := client.account(ctx, order.Intent.ExecutionAccountID)
+	if err != nil {
+		return nil, err
+	}
+	schedule, err := client.getMarketFeeSchedule(ctx, order.Intent.ConditionID, order.Intent.TokenID)
+	if err != nil {
+		return nil, err
+	}
+	for index := range fills {
+		fills[index], err = client.attachFillFeeEvidence(ctx, account, order, fills[index], schedule)
+		if err != nil {
+			return nil, fmt.Errorf("CLOB trade %s fee evidence: %w", fills[index].VenueFillID, err)
+		}
 	}
 	return fills, nil
 }
@@ -771,7 +1060,6 @@ func mapTradeToOrderFill(trade Trade, order domain.Order, observedAt time.Time) 
 	shares := trade.Size
 	price := trade.Price
 	feeRate := trade.FeeRateBPS
-	builderFeeRate := domain.Decimal("0")
 	matched := strings.EqualFold(strings.TrimSpace(trade.TakerOrderID), strings.TrimSpace(order.VenueOrderID))
 	if !matched {
 		role = domain.LiquidityRoleMaker
@@ -784,8 +1072,7 @@ func mapTradeToOrderFill(trade Trade, order domain.Order, observedAt time.Time) 
 			if price.IsEmpty() {
 				price = trade.Price
 			}
-			feeRate = "0"
-			builderFeeRate = maker.FeeRateBPS
+			feeRate = maker.FeeRateBPS
 			matched = true
 			break
 		}
@@ -810,7 +1097,6 @@ func mapTradeToOrderFill(trade Trade, order domain.Order, observedAt time.Time) 
 		Shares:             shares,
 		Price:              price,
 		FeeRateBPS:         feeRate,
-		BuilderFeeRateBPS:  builderFeeRate,
 		TransactionHash:    trade.TransactionHash,
 		MatchedAt:          matchedAt,
 		VenueUpdatedAt:     updatedAt,
@@ -822,6 +1108,456 @@ func mapTradeToOrderFill(trade Trade, order domain.Order, observedAt time.Time) 
 		fill.ConfirmedAt = &confirmedAt
 	}
 	return fill, true, nil
+}
+
+const v2OrderFilledFeeSource = domain.FeeSourcePolygonV2OrderFilled
+
+// getMarketFeeSchedule reads the V2 fee curve rather than treating the
+// fee_rate_bps field on an order component as a complete fee formula.
+func (client *TradingClient) getMarketFeeSchedule(
+	ctx context.Context,
+	conditionID string,
+	tokenID string,
+) (marketFeeSchedule, error) {
+	conditionID = strings.TrimSpace(conditionID)
+	tokenID = strings.TrimSpace(tokenID)
+	if conditionID == "" || tokenID == "" {
+		return marketFeeSchedule{}, fmt.Errorf("condition id and token id are required for fee evidence")
+	}
+	cacheKey := conditionID + "\x00" + tokenID
+	client.feeScheduleMu.RLock()
+	cached, exists := client.feeSchedules[cacheKey]
+	client.feeScheduleMu.RUnlock()
+	if exists {
+		return cached, nil
+	}
+	body, _, err := client.do(
+		ctx, TradingAccount{}, http.MethodGet, "/clob-markets/"+url.PathEscape(conditionID), nil, nil, false, false,
+	)
+	if err != nil {
+		return marketFeeSchedule{}, fmt.Errorf("read CLOB V2 market fee schedule: %w", err)
+	}
+	var response struct {
+		ConditionID string `json:"c"`
+		Tokens      []struct {
+			TokenID string `json:"t"`
+		} `json:"t"`
+		FeeDetails *struct {
+			Rate      json.RawMessage `json:"r"`
+			Exponent  json.RawMessage `json:"e"`
+			TakerOnly *bool           `json:"to"`
+		} `json:"fd"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return marketFeeSchedule{}, fmt.Errorf("decode CLOB V2 market fee schedule: %w", err)
+	}
+	if response.ConditionID != "" && !strings.EqualFold(strings.TrimSpace(response.ConditionID), conditionID) {
+		return marketFeeSchedule{}, fmt.Errorf("CLOB V2 market fee schedule condition id mismatch")
+	}
+	tokenFound := false
+	for _, token := range response.Tokens {
+		if strings.TrimSpace(token.TokenID) == tokenID {
+			tokenFound = true
+			break
+		}
+	}
+	if !tokenFound {
+		return marketFeeSchedule{}, fmt.Errorf("CLOB V2 market fee schedule omitted requested token")
+	}
+	schedule := marketFeeSchedule{Rate: "0", Exponent: "0", TakerOnly: true}
+	if response.FeeDetails != nil {
+		rate, err := decimalFromJSON(response.FeeDetails.Rate)
+		if err != nil {
+			return marketFeeSchedule{}, fmt.Errorf("decode CLOB V2 fee rate: %w", err)
+		}
+		exponent, err := decimalFromJSON(response.FeeDetails.Exponent)
+		if err != nil {
+			return marketFeeSchedule{}, fmt.Errorf("decode CLOB V2 fee exponent: %w", err)
+		}
+		if sign, err := rate.Sign(); err != nil || sign < 0 {
+			return marketFeeSchedule{}, fmt.Errorf("CLOB V2 fee rate must be non-negative")
+		}
+		if err := validateFeeExponent(exponent); err != nil {
+			return marketFeeSchedule{}, err
+		}
+		takerOnly := response.FeeDetails.TakerOnly != nil && *response.FeeDetails.TakerOnly
+		if sign, _ := rate.Sign(); sign > 0 && !takerOnly {
+			return marketFeeSchedule{}, fmt.Errorf("CLOB V2 non-taker-only fee schedule is unsupported")
+		}
+		schedule = marketFeeSchedule{Rate: rate, Exponent: exponent, TakerOnly: takerOnly}
+	}
+	client.feeScheduleMu.Lock()
+	client.feeSchedules[cacheKey] = schedule
+	client.feeScheduleMu.Unlock()
+	return schedule, nil
+}
+
+func (client *TradingClient) attachFillFeeEvidence(
+	ctx context.Context,
+	account TradingAccount,
+	order domain.Order,
+	fill domain.Fill,
+	schedule marketFeeSchedule,
+) (domain.Fill, error) {
+	if client.feeEvidence == nil {
+		return domain.Fill{}, fmt.Errorf("authoritative Polygon OrderFilled fee evidence source is not configured")
+	}
+	if order.MarketValidation == nil {
+		return domain.Fill{}, fmt.Errorf("persisted market validation is required for settlement evidence")
+	}
+	transactionHash := strings.TrimSpace(fill.TransactionHash)
+	if transactionHash == "" {
+		return domain.Fill{}, fmt.Errorf("confirmed CLOB trade omitted transaction hash")
+	}
+	exchange := polygonExchangeV2
+	if order.MarketValidation.NegRisk {
+		exchange = polygonNegRiskExchangeV2
+	}
+	builderCode := normalizeBytes32(client.builder.builderCode)
+	if builderCode == "" {
+		return domain.Fill{}, fmt.Errorf("configured builder code is invalid")
+	}
+	evidence, err := client.feeEvidence.ResolveFillFeeEvidence(ctx, FillFeeEvidenceRequest{
+		TransactionHash:         transactionHash,
+		VenueOrderID:            order.VenueOrderID,
+		ExecutionAccountID:      order.Intent.ExecutionAccountID,
+		ExpectedExchangeAddress: exchange,
+		ExpectedMakerAddress:    account.FunderAddress,
+		ExpectedBuilderCode:     builderCode,
+		Side:                    fill.Side,
+		TokenID:                 fill.TokenID,
+		Shares:                  fill.Shares,
+		Price:                   fill.Price,
+	})
+	if err != nil {
+		return domain.Fill{}, err
+	}
+	return applyFillFeeEvidence(fill, schedule, evidence, exchange, account.FunderAddress, builderCode)
+}
+
+func applyFillFeeEvidence(
+	fill domain.Fill,
+	schedule marketFeeSchedule,
+	evidence FillFeeEvidence,
+	expectedExchange string,
+	expectedMaker string,
+	expectedBuilder string,
+) (domain.Fill, error) {
+	if fill.FeeRateBPS.IsEmpty() {
+		return domain.Fill{}, fmt.Errorf("CLOB trade omitted fee_rate_bps metadata")
+	}
+	if sign, err := fill.FeeRateBPS.Sign(); err != nil || sign < 0 {
+		return domain.Fill{}, fmt.Errorf("CLOB trade fee_rate_bps metadata must be non-negative")
+	}
+	if strings.ToUpper(strings.TrimSpace(evidence.Source)) != v2OrderFilledFeeSource {
+		return domain.Fill{}, fmt.Errorf("unsupported fee evidence source %q", evidence.Source)
+	}
+	if !strings.EqualFold(strings.TrimSpace(evidence.ExchangeAddress), expectedExchange) ||
+		!strings.EqualFold(strings.TrimSpace(evidence.TransactionHash), strings.TrimSpace(fill.TransactionHash)) ||
+		!strings.EqualFold(strings.TrimSpace(evidence.OrderHash), strings.TrimSpace(fill.VenueOrderID)) ||
+		!strings.EqualFold(strings.TrimSpace(evidence.MakerAddress), strings.TrimSpace(expectedMaker)) ||
+		strings.TrimSpace(evidence.TokenID) != strings.TrimSpace(fill.TokenID) ||
+		evidence.Side != fill.Side ||
+		!strings.EqualFold(strings.TrimSpace(evidence.BuilderCode), expectedBuilder) {
+		return domain.Fill{}, fmt.Errorf("OrderFilled evidence identity does not match the CLOB fill")
+	}
+	if evidence.CollateralDecimals != 6 || evidence.OutcomeTokenDecimals != 6 {
+		return domain.Fill{}, fmt.Errorf("OrderFilled evidence must use 6-decimal pUSD and outcome-token units")
+	}
+	if evidence.BlockNumber == 0 || strings.TrimSpace(evidence.BlockHash) == "" || evidence.Confirmations == 0 {
+		return domain.Fill{}, fmt.Errorf("OrderFilled evidence is not finalized")
+	}
+	makerAmount, err := decimalFromBaseUnits(evidence.MakerAmountBaseUnits, evidence.CollateralDecimals)
+	if err != nil {
+		return domain.Fill{}, fmt.Errorf("OrderFilled maker amount: %w", err)
+	}
+	takerAmount, err := decimalFromBaseUnits(evidence.TakerAmountBaseUnits, evidence.OutcomeTokenDecimals)
+	if err != nil {
+		return domain.Fill{}, fmt.Errorf("OrderFilled taker amount: %w", err)
+	}
+	var eventShares, eventGross domain.Decimal
+	switch fill.Side {
+	case domain.SideBuy:
+		eventGross, eventShares = makerAmount, takerAmount
+	case domain.SideSell:
+		eventShares, eventGross = makerAmount, takerAmount
+	default:
+		return domain.Fill{}, fmt.Errorf("unsupported OrderFilled side %q", fill.Side)
+	}
+	if !eventShares.Equal(fill.Shares) {
+		return domain.Fill{}, fmt.Errorf("CLOB shares do not match OrderFilled base-unit amounts")
+	}
+	if err := validateEventGross(fill.Shares, fill.Price, eventGross, evidence.CollateralDecimals); err != nil {
+		return domain.Fill{}, err
+	}
+	totalFee, err := decimalFromBaseUnits(evidence.TotalFeeBaseUnits, evidence.CollateralDecimals)
+	if err != nil {
+		return domain.Fill{}, fmt.Errorf("OrderFilled total fee: %w", err)
+	}
+	if !evidence.BuilderFeeKnown {
+		return domain.Fill{}, fmt.Errorf("OrderFilled total fee lacks authoritative builder-fee allocation")
+	}
+	builderFee, err := decimalFromBaseUnits(evidence.BuilderFeeBaseUnits, evidence.CollateralDecimals)
+	if err != nil {
+		return domain.Fill{}, fmt.Errorf("OrderFilled builder fee: %w", err)
+	}
+	if comparison, err := builderFee.Compare(totalFee); err != nil || comparison > 0 {
+		return domain.Fill{}, fmt.Errorf("builder fee exceeds OrderFilled total fee")
+	}
+	if strings.EqualFold(expectedBuilder, zeroBytes32) && !builderFee.Equal("0") {
+		return domain.Fill{}, fmt.Errorf("zero builder code cannot have a builder fee")
+	}
+	platformFee, err := subtractDecimal(totalFee, builderFee)
+	if err != nil {
+		return domain.Fill{}, err
+	}
+	if fill.LiquidityRole == domain.LiquidityRoleMaker {
+		if !platformFee.Equal("0") {
+			return domain.Fill{}, fmt.Errorf("V2 maker fill contains a platform fee")
+		}
+	} else {
+		expectedFee, err := calculateV2PlatformFee(fill.Shares, fill.Price, schedule.Rate, schedule.Exponent)
+		if err != nil {
+			return domain.Fill{}, err
+		}
+		if !platformFee.Equal(expectedFee) {
+			return domain.Fill{}, fmt.Errorf("OrderFilled platform fee %s does not match V2 fee curve %s", platformFee, expectedFee)
+		}
+	}
+	builderRate := evidence.BuilderFeeRateBPS
+	if builderRate.IsEmpty() {
+		if !builderFee.Equal("0") {
+			return domain.Fill{}, fmt.Errorf("positive builder fee lacks an authoritative builder fee rate")
+		}
+		builderRate = "0"
+	}
+	if sign, err := builderRate.Sign(); err != nil || sign < 0 {
+		return domain.Fill{}, fmt.Errorf("builder fee rate bps must be non-negative")
+	}
+	fill.GrossNotional = eventGross
+	fill.PlatformFeeRate = schedule.Rate
+	fill.FeeExponent = schedule.Exponent
+	fill.PlatformFee = platformFee
+	fill.BuilderFeeRateBPS = builderRate
+	fill.BuilderFee = builderFee
+	fill.TotalFee = totalFee
+	fill.FeeSource = v2OrderFilledFeeSource
+	fill.SettlementEvidence = &domain.SettlementEvidence{
+		SchemaVersion:        domain.SettlementEvidenceSchemaV1,
+		Source:               domain.FeeSourcePolygonV2OrderFilled,
+		ChainID:              domain.SettlementEvidencePolygonChainID,
+		ExchangeAddress:      evidence.ExchangeAddress,
+		TransactionHash:      evidence.TransactionHash,
+		BlockNumber:          evidence.BlockNumber,
+		BlockHash:            evidence.BlockHash,
+		LogIndex:             evidence.LogIndex,
+		Confirmations:        evidence.Confirmations,
+		OrderHash:            evidence.OrderHash,
+		MakerAddress:         evidence.MakerAddress,
+		TokenID:              evidence.TokenID,
+		Side:                 evidence.Side,
+		MakerAmountBaseUnits: evidence.MakerAmountBaseUnits,
+		TakerAmountBaseUnits: evidence.TakerAmountBaseUnits,
+		TotalFeeBaseUnits:    evidence.TotalFeeBaseUnits,
+		BuilderCode:          evidence.BuilderCode,
+		BuilderFeeKnown:      evidence.BuilderFeeKnown,
+		BuilderFeeBaseUnits:  evidence.BuilderFeeBaseUnits,
+		CollateralDecimals:   evidence.CollateralDecimals,
+		OutcomeTokenDecimals: evidence.OutcomeTokenDecimals,
+	}
+	if strings.EqualFold(expectedBuilder, zeroBytes32) {
+		fill.SettlementEvidence.BuilderFeeSource = domain.SettlementEvidenceZeroBuilder
+	}
+	fill.RawPayloadSHA256 = settlementEvidenceDigest(fill.RawPayloadSHA256, evidence)
+	return fill, nil
+}
+
+func decimalFromBaseUnits(raw string, decimals uint8) (domain.Decimal, error) {
+	if raw == "" || raw != strings.TrimSpace(raw) || (len(raw) > 1 && raw[0] == '0') {
+		return "", fmt.Errorf("amount must be a canonical uint256 base-unit string")
+	}
+	for _, character := range raw {
+		if character < '0' || character > '9' {
+			return "", fmt.Errorf("amount must be a canonical uint256 base-unit string")
+		}
+	}
+	value, ok := new(big.Int).SetString(raw, 10)
+	if !ok || value.Sign() < 0 || value.BitLen() > 256 {
+		return "", fmt.Errorf("amount must be a canonical uint256 base-unit string")
+	}
+	digits := value.String()
+	scale := int(decimals)
+	for len(digits) <= scale {
+		digits = "0" + digits
+	}
+	if scale > 0 {
+		digits = digits[:len(digits)-scale] + "." + digits[len(digits)-scale:]
+	}
+	parsed, err := domain.ParseDecimal(canonicalDecimalText(digits))
+	if err != nil {
+		return "", err
+	}
+	return parsed, nil
+}
+
+func decimalFromWireBaseUnits(raw json.RawMessage, field string) (domain.Decimal, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", fmt.Errorf("CLOB V2 %s is required", field)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("CLOB V2 %s must be a string-encoded uint256", field)
+	}
+	parsed, err := decimalFromBaseUnits(value, 6)
+	if err != nil {
+		return "", fmt.Errorf("CLOB V2 %s: %w", field, err)
+	}
+	return parsed, nil
+}
+
+func validateEventGross(shares domain.Decimal, price domain.Decimal, eventGross domain.Decimal, decimals uint8) error {
+	sharesRat, err := decimalRat(shares)
+	if err != nil {
+		return err
+	}
+	priceRat, err := decimalRat(price)
+	if err != nil {
+		return err
+	}
+	eventRat, err := decimalRat(eventGross)
+	if err != nil {
+		return err
+	}
+	difference := new(big.Rat).Sub(new(big.Rat).Mul(sharesRat, priceRat), eventRat)
+	if difference.Sign() < 0 {
+		difference.Neg(difference)
+	}
+	oneBaseUnit := new(big.Rat).SetFrac(big.NewInt(1), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
+	// V2 CalculatorHelper floors takingAmount integer division, so the only
+	// permitted API-price discrepancy is strictly less than one base unit.
+	if difference.Cmp(oneBaseUnit) >= 0 {
+		return fmt.Errorf("CLOB shares/price do not match OrderFilled base-unit amounts")
+	}
+	return nil
+}
+
+func subtractDecimal(left domain.Decimal, right domain.Decimal) (domain.Decimal, error) {
+	leftRat, err := decimalRat(left)
+	if err != nil {
+		return "", err
+	}
+	rightRat, err := decimalRat(right)
+	if err != nil {
+		return "", err
+	}
+	return exactRatDecimal(new(big.Rat).Sub(leftRat, rightRat), 18)
+}
+
+func validateFeeExponent(exponent domain.Decimal) error {
+	value, err := decimalRat(exponent)
+	if err != nil || value.Sign() < 0 || !value.IsInt() || value.Num().BitLen() > 16 {
+		return fmt.Errorf("CLOB V2 fee exponent must be a non-negative integer")
+	}
+	return nil
+}
+
+func calculateV2PlatformFee(
+	shares domain.Decimal,
+	price domain.Decimal,
+	feeRate domain.Decimal,
+	exponent domain.Decimal,
+) (domain.Decimal, error) {
+	if err := validateFeeExponent(exponent); err != nil {
+		return "", err
+	}
+	sharesRat, err := decimalRat(shares)
+	if err != nil {
+		return "", err
+	}
+	priceRat, err := decimalRat(price)
+	if err != nil {
+		return "", err
+	}
+	rateRat, err := decimalRat(feeRate)
+	if err != nil || rateRat.Sign() < 0 {
+		return "", fmt.Errorf("CLOB V2 fee rate must be non-negative")
+	}
+	curve := new(big.Rat).Mul(priceRat, new(big.Rat).Sub(big.NewRat(1, 1), priceRat))
+	exponentValue := exponentInt(exponent)
+	powered := big.NewRat(1, 1)
+	for value := uint64(0); value < exponentValue; value++ {
+		powered.Mul(powered, curve)
+	}
+	fee := new(big.Rat).Mul(sharesRat, rateRat)
+	fee.Mul(fee, powered)
+	return roundedRatDecimal(fee, 5), nil
+}
+
+func exactRatDecimal(value *big.Rat, maxScale int) (domain.Decimal, error) {
+	if value == nil || maxScale < 0 {
+		return "", fmt.Errorf("invalid exact decimal conversion")
+	}
+	for scale := 0; scale <= maxScale; scale++ {
+		text := value.FloatString(scale)
+		parsed, err := domain.ParseDecimal(canonicalDecimalText(text))
+		if err != nil {
+			return "", err
+		}
+		parsedRat, err := decimalRat(parsed)
+		if err == nil && parsedRat.Cmp(value) == 0 {
+			return parsed, nil
+		}
+	}
+	return "", fmt.Errorf("decimal requires more than %d fractional digits", maxScale)
+}
+
+// roundedRatDecimal uses half-away-from-zero rounding, matching the V2 fee
+// clients' documented five-decimal settlement precision.
+func roundedRatDecimal(value *big.Rat, scale int) domain.Decimal {
+	factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+	scaled := new(big.Rat).Mul(value, new(big.Rat).SetInt(factor))
+	quotient, remainder := new(big.Int).QuoRem(scaled.Num(), scaled.Denom(), new(big.Int))
+	doubleRemainder := new(big.Int).Abs(remainder)
+	doubleRemainder.Mul(doubleRemainder, big.NewInt(2))
+	if doubleRemainder.Cmp(scaled.Denom()) >= 0 {
+		if scaled.Sign() >= 0 {
+			quotient.Add(quotient, big.NewInt(1))
+		} else {
+			quotient.Sub(quotient, big.NewInt(1))
+		}
+	}
+	text := new(big.Rat).SetFrac(quotient, factor).FloatString(scale)
+	parsed, _ := domain.ParseDecimal(canonicalDecimalText(text))
+	return parsed
+}
+
+func canonicalDecimalText(value string) string {
+	if strings.Contains(value, ".") {
+		value = strings.TrimRight(value, "0")
+		value = strings.TrimRight(value, ".")
+	}
+	if value == "" || value == "-0" {
+		return "0"
+	}
+	return value
+}
+
+func exponentInt(value domain.Decimal) uint64 {
+	parsed, _ := decimalRat(value)
+	return parsed.Num().Uint64()
+}
+
+func settlementEvidenceDigest(clobDigest string, evidence FillFeeEvidence) string {
+	// Confirmations are derived from the current chain head and increase on
+	// every later reconciliation. They prove the configured threshold at read
+	// time, but are not part of the immutable OrderFilled event identity.
+	evidence.Confirmations = 0
+	payload, _ := json.Marshal(struct {
+		CLOBDigest string          `json:"clob_digest"`
+		Evidence   FillFeeEvidence `json:"evidence"`
+	}{CLOBDigest: strings.TrimSpace(clobDigest), Evidence: evidence})
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
 }
 
 // GetTickSize 查询指定 token 当前允许的价格步长。
@@ -948,7 +1684,7 @@ func (client *TradingClient) do(ctx context.Context, account TradingAccount, met
 		request.Header.Set("Content-Type", "application/json")
 	}
 	if authenticated {
-		timestamp := client.now().UTC().Unix()
+		timestamp := client.protocolNow().Unix()
 		signature, err := hmacSignature(account.API.Secret, timestamp, method, path, body)
 		if err != nil {
 			return nil, nil, newInvalidError("CLOB_CREDENTIALS_INVALID", err.Error())
@@ -984,6 +1720,25 @@ func (client *TradingClient) do(ctx context.Context, account TradingAccount, met
 		return nil, response.Header, mapHTTPError(method, response.StatusCode, response.Header, responseBody)
 	}
 	return responseBody, response.Header, nil
+}
+
+// protocolNow applies the offset established by ProbeProtocol. Before startup
+// probing it is identical to the injected/local clock.
+func (client *TradingClient) protocolNow() time.Time {
+	client.clockMu.RLock()
+	offset := client.clockOffset
+	client.clockMu.RUnlock()
+	return client.now().UTC().Add(offset)
+}
+
+func parseProtocolTime(payload []byte) (time.Time, error) {
+	raw := strings.TrimSpace(string(payload))
+	raw = strings.Trim(raw, "\"")
+	seconds, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || seconds <= 0 {
+		return time.Time{}, fmt.Errorf("decode CLOB server time")
+	}
+	return time.Unix(seconds, 0).UTC(), nil
 }
 
 // hmacSignature 构建订单签名或鉴权所需的规范化字节数据。
@@ -1082,6 +1837,26 @@ func decimalFromJSON(raw json.RawMessage) (domain.Decimal, error) {
 		text = string(raw)
 	}
 	return domain.ParseDecimal(text)
+}
+
+// nonNegativeIntegerFromJSON accepts the string or number representation used
+// by CLOB while preserving arbitrarily large base-unit values.
+func nonNegativeIntegerFromJSON(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 {
+		return "", fmt.Errorf("integer field is missing")
+	}
+	value := strings.TrimSpace(string(raw))
+	if raw[0] == '"' {
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return "", err
+		}
+		value = strings.TrimSpace(value)
+	}
+	integer, ok := new(big.Int).SetString(value, 10)
+	if !ok || integer.Sign() < 0 {
+		return "", fmt.Errorf("value must be a non-negative base-10 integer")
+	}
+	return integer.String(), nil
 }
 
 // containsOrderID 判断集合是否包含 Order 标识。

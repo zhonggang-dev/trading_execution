@@ -50,9 +50,9 @@ httpapi.New(httpapi.Params{
 })
 ```
 
-The current repository's `cmd/server` is still deliberately paper-only, so
-this live assembly belongs in the existing pending production bootstrap; it
-must not be wired to the paper reservation ledger.
+The current `cmd/server` has a fail-closed live execution composition, but it
+does not yet construct or register this Position Exit job. Add this assembly
+only to the live runtime and never wire it to the paper reservation ledger.
 
 ## Python endpoint
 

@@ -24,6 +24,10 @@ type LiquidityRole string
 const (
 	LiquidityRoleMaker LiquidityRole = "MAKER"
 	LiquidityRoleTaker LiquidityRole = "TAKER"
+
+	// FeeSourcePolygonV2OrderFilled means final money fields were verified
+	// against a finalized Polygon CLOB V2 OrderFilled event.
+	FeeSourcePolygonV2OrderFilled = "POLYGON_V2_ORDER_FILLED"
 )
 
 // Fill 表示一个订单在 Polymarket 交易中的成交分量，唯一身份由 venue、venue_fill_id 和 order_id 共同确定。
@@ -43,20 +47,28 @@ type Fill struct {
 	Shares             Decimal       `json:"shares"`
 	Price              Decimal       `json:"price"`
 	GrossNotional      Decimal       `json:"gross_notional"`
-	FeeRateBPS         Decimal       `json:"fee_rate_bps"`
-	PlatformFee        Decimal       `json:"platform_fee"`
-	BuilderFeeRateBPS  Decimal       `json:"builder_fee_rate_bps"`
-	BuilderFee         Decimal       `json:"builder_fee"`
-	TotalFee           Decimal       `json:"total_fee"`
-	NetCashDelta       Decimal       `json:"net_cash_delta"`
-	TransactionHash    string        `json:"transaction_hash,omitempty"`
-	MatchedAt          time.Time     `json:"matched_at"`
-	VenueUpdatedAt     time.Time     `json:"venue_updated_at,omitempty"`
-	ObservedAt         time.Time     `json:"observed_at"`
-	ConfirmedAt        *time.Time    `json:"confirmed_at,omitempty"`
-	AppliedAt          *time.Time    `json:"applied_at,omitempty"`
-	FeeSource          string        `json:"fee_source"`
-	RawPayloadSHA256   string        `json:"raw_payload_sha256,omitempty"`
+	// FeeRateBPS is the CLOB trade response metadata. V2 final fee accounting
+	// uses PlatformFeeRate and FeeExponent from /clob-markets instead.
+	FeeRateBPS        Decimal    `json:"fee_rate_bps"`
+	PlatformFeeRate   Decimal    `json:"platform_fee_rate"`
+	FeeExponent       Decimal    `json:"fee_exponent"`
+	PlatformFee       Decimal    `json:"platform_fee"`
+	BuilderFeeRateBPS Decimal    `json:"builder_fee_rate_bps"`
+	BuilderFee        Decimal    `json:"builder_fee"`
+	TotalFee          Decimal    `json:"total_fee"`
+	NetCashDelta      Decimal    `json:"net_cash_delta"`
+	TransactionHash   string     `json:"transaction_hash,omitempty"`
+	MatchedAt         time.Time  `json:"matched_at"`
+	VenueUpdatedAt    time.Time  `json:"venue_updated_at,omitempty"`
+	ObservedAt        time.Time  `json:"observed_at"`
+	ConfirmedAt       *time.Time `json:"confirmed_at,omitempty"`
+	AppliedAt         *time.Time `json:"applied_at,omitempty"`
+	FeeSource         string     `json:"fee_source"`
+	RawPayloadSHA256  string     `json:"raw_payload_sha256,omitempty"`
+	// SettlementEvidence is intentionally excluded from public JSON. The
+	// PostgreSQL fill ledger persists it as the immutable on-chain proof for
+	// authoritative Polygon settlements.
+	SettlementEvidence *SettlementEvidence `json:"-"`
 }
 
 // Normalize 规范化当前模型的文本、时间和可变字段。
@@ -76,6 +88,10 @@ func (fill Fill) Normalize() Fill {
 	fill.TransactionHash = strings.TrimSpace(fill.TransactionHash)
 	fill.FeeSource = strings.ToUpper(strings.TrimSpace(fill.FeeSource))
 	fill.RawPayloadSHA256 = strings.ToLower(strings.TrimSpace(fill.RawPayloadSHA256))
+	if fill.SettlementEvidence != nil {
+		value := fill.SettlementEvidence.Normalize()
+		fill.SettlementEvidence = &value
+	}
 	fill.MatchedAt = fill.MatchedAt.UTC()
 	fill.VenueUpdatedAt = fill.VenueUpdatedAt.UTC()
 	fill.ObservedAt = fill.ObservedAt.UTC()
@@ -134,9 +150,13 @@ func (fill Fill) ValidateAccounting() error {
 	if strings.TrimSpace(fill.Key) == "" {
 		return fmt.Errorf("fill_key is required at the ledger boundary")
 	}
+	if strings.TrimSpace(fill.FeeSource) == "" {
+		return fmt.Errorf("fee_source is required even when total_fee is zero")
+	}
 	for name, value := range map[string]Decimal{
 		"gross_notional":       fill.GrossNotional,
-		"fee_rate_bps":         fill.FeeRateBPS,
+		"platform_fee_rate":    fill.PlatformFeeRate,
+		"fee_exponent":         fill.FeeExponent,
 		"platform_fee":         fill.PlatformFee,
 		"builder_fee_rate_bps": fill.BuilderFeeRateBPS,
 		"builder_fee":          fill.BuilderFee,
@@ -149,12 +169,37 @@ func (fill Fill) ValidateAccounting() error {
 	if _, err := fill.NetCashDelta.Sign(); err != nil {
 		return fmt.Errorf("net_cash_delta must be a decimal")
 	}
+	exponent, _ := fill.FeeExponent.rat()
+	if !exponent.IsInt() {
+		return fmt.Errorf("fee_exponent must be an integer")
+	}
 	shares, _ := fill.Shares.rat()
 	price, _ := fill.Price.rat()
 	gross, _ := fill.GrossNotional.rat()
 	calculatedGross := new(big.Rat).Mul(shares, price)
-	if calculatedGross.Cmp(gross) != 0 {
+	difference := new(big.Rat).Sub(calculatedGross, gross)
+	if difference.Sign() < 0 {
+		difference.Neg(difference)
+	}
+	if fill.FeeSource == FeeSourcePolygonV2OrderFilled {
+		// V2 CalculatorHelper floors integer takingAmount arithmetic. The CLOB
+		// display price may therefore differ from the event cash amount, but by
+		// strictly less than one six-decimal pUSD base unit.
+		if difference.Cmp(big.NewRat(1, 1_000_000)) >= 0 {
+			return fmt.Errorf("gross_notional differs from shares multiplied by price by at least one pUSD base unit")
+		}
+	} else if difference.Sign() != 0 {
 		return fmt.Errorf("gross_notional must equal shares multiplied by price")
+	}
+	if fill.FeeSource == FeeSourcePolygonV2OrderFilled {
+		if fill.SettlementEvidence == nil {
+			return fmt.Errorf("Polygon V2 fill requires durable settlement evidence")
+		}
+		if err := fill.SettlementEvidence.ValidateAgainst(fill); err != nil {
+			return fmt.Errorf("settlement evidence: %w", err)
+		}
+	} else if fill.SettlementEvidence != nil {
+		return fmt.Errorf("settlement evidence is only supported for authoritative Polygon V2 fills")
 	}
 	platformFee, _ := fill.PlatformFee.rat()
 	builderFee, _ := fill.BuilderFee.rat()

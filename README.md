@@ -68,8 +68,8 @@ Prediction / Strategy service
        -> atomic client_order_id claim
        -> PostgreSQL cash/share reservation
        -> Venue port
-            -> paper adapter（当前）
-            -> Polymarket CLOB V2 adapter（已实现，live 尚未装配）
+            -> paper adapter（默认）
+            -> Polymarket CLOB V2 adapter（仅显式启用 live 时装配）
        -> OrderRepository port
             -> memory adapter（仅 local 且未配置数据库）
             -> PostgreSQL order/event/attempt adapter（非 local 当前实现）
@@ -82,25 +82,31 @@ Venue adapter 使用 execution account 选择对应钱包和签名器，Python �
 
 ## 当前安全状态
 
-服务当前只支持 `EXECUTION_MODE=paper`，paper adapter 不发起任何网络请求。非 local 环境强制
+默认仍是 `EXECUTION_MODE=paper`，paper adapter 不发起任何交易网络请求。非 local 环境强制
 配置 PostgreSQL，并把订单、事件、外部操作尝试、幂等键和资金预占持久化；服务启动时会恢复
-未完成订单，`/health/ready` 会实际检查数据库连接和必需 schema。paper venue 的标识可从持久化
-订单确定性恢复，因此重启后仍可查询和撤单；paper 撤单同步释放预占，live 则必须等待成交终局
-对账，不能复用这个快速路径。
+未完成订单，`/health/ready` 会实际检查数据库连接和必需 schema。paper 撤单可同步释放预占；
+live 必须等待真实成交终局和对账，不能复用这个快速路径。
 
-多钱包 secret
-加载、EOA signer、L1 create/derive、L2 HMAC 和只读 `cmd/walletcheck` 已经实现；它可以验证真实
-钱包凭证但不能下单。Polymarket CLOB V2 adapter、PostgreSQL 订单/Fill/资金/仓位账本和 outbox
-也已经实现，但尚未在 `cmd/server` 中整体装配，因此 `EXECUTION_MODE=live` 仍会拒绝启动。
-启用实盘前还需要：
+`cmd/server` 已有 fail-closed 的 Polymarket CLOB V2 live composition：多钱包 secret、EOA/legacy
+proxy/safe 签名、L2 认证、账户级 closed-only、pUSD 余额和 allowance、Gamma Market 校验、
+PostgreSQL 订单/预占/Fill/仓位账本、启动与持续 reconciliation、heartbeat、Polygon
+`OrderFilled` 结算证据和 placement-only readiness gate。live 必须同时显式设置
+`EXECUTION_MODE=live`、`EXECUTION_VENUE=polymarket` 和 `POLYMARKET_LIVE_TRADING_ENABLED=true`；
+缺少任何依赖都会拒绝启动或拒绝新下单，Cancel/Get 仍保持可用。
 
-1. 接入生产 secrets/HSM，并为实际钱包类型完成签名验收；`POLY_1271` 当前 fail closed；
-2. 在 live composition 中装配 Polymarket Venue、FillLedger、outbox dispatcher、启动/持续
-   reconciliation 和 Position Exit；PostgreSQL order/reservation 与启动恢复 coordinator 已装配；
-3. 将已实现的 `riskcontrol.Service` 接到真实余额、仓位和订单数据源，并补齐同事务敞口检查、
-   pending 对账、kill switch 控制面和可观测性；
-4. 在 live composition 中启用已实现的 cancel Fill finality/grace worker，并增加 BUY 最大手续费
-   预占 buffer；禁止旧累计 Reconcile 与新 Fill ledger 同时消费同一成交。
+这不代表拿任意旧钱包即可直接开实盘。正式解除数据库全局 Kill Switch 前仍必须：
+
+1. 用进程外 secret 文件/HSM 安全配置钱包，并确认旧机器人已停机；同一账户不能由两个 heartbeat
+   owner 并行控制。`POLY_1271`/Deposit Wallet 当前仍 fail closed；
+2. 执行并审计 migrations `0001..0010`，把钱包、账面 pUSD、已有仓位 cost basis/lots、
+   risk policy、strategy binding 和 reconciliation 基线对齐；
+3. 确认 CLOB V2 私有认证成功、`closed_only=false`、Polygon pUSD 及两个 V2 Exchange allowance
+   正确，并让每个确认 Fill 都取得足够确认数的链上 `OrderFilled` 证据；
+4. 使用专用小额空钱包完成一次人工批准的 BUY/SELL/Cancel canary 后再逐步放量。
+
+transactional outbox 会与账本同事务写入，但生产消息 publisher 仍需按部署环境注入；Position Exit、
+策略周期和链上 redeem 也尚未在 `cmd/server` 装配。这些不影响人工 API canary，但在完成前不能
+声称已经具备全自动策略生命周期。
 
 内存 Repository 只用于 local 且未配置数据库的开发模式；重启会丢失订单和幂等记录，不能用于
 共享测试或实盘。非 local 环境缺少 `TRADING_EXECUTION_DATABASE_URL` 时会直接拒绝启动。
@@ -142,7 +148,7 @@ GET  /api/v1/orders/{order_id}/events
 GET  /api/v1/orders/{order_id}/attempts
 GET  /api/v1/trades                              # 已确认且已入账的真实 Fill
 POST /internal/jobs/position-exit-evaluation/run  # 仅在注入 PositionExitJob 后注册，当前 cmd/server 未装配
-POST /internal/jobs/reconciliation/run             # 仅在注入 Reconciliation 后注册，当前 cmd/server 未装配
+POST /internal/jobs/reconciliation/run             # live 模式注册；paper 模式不注册
 ```
 
 查询交易记录：
@@ -157,7 +163,7 @@ curl 'http://127.0.0.1:8090/api/v1/trades?from=2026-08-01T00:00:00Z&side=SELL&mo
 字符串小数；不返回钱包地址、CLOB 凭证、签名或原始响应。配置
 `TRADING_EXECUTION_DATABASE_URL` 后读取 PostgreSQL；未配置时 paper 模式返回空列表，
 不会把 paper 订单状态伪装成真实成交。生产库需按顺序执行至
-`migrations/0007_trade_history_read_model.sql`。
+`migrations/0010_v2_settlement_evidence.sql`。
 
 创建限价单：
 

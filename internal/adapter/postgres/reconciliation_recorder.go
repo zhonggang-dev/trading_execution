@@ -67,6 +67,38 @@ func (recorder *ReconciliationRecorder) Start(ctx context.Context, run domain.Re
 
 // RecordIssue 幂等持久化一次对账问题。
 func (recorder *ReconciliationRecorder) RecordIssue(ctx context.Context, issue domain.ReconciliationIssue) error {
+	if issue.Status == domain.ReconciliationIssueResolved {
+		result, err := recorder.db.ExecContext(ctx, `
+			UPDATE reconciliation_issues
+			SET status='RESOLVED', resolution=$3, details=$4, source=$5,
+			    resolved_at=$6, observed_at=GREATEST(observed_at, $7)
+			WHERE execution_account_id=$1 AND fingerprint=$2 AND status='OPEN'`,
+			issue.ExecutionAccountID, issue.Fingerprint, string(issue.Resolution),
+			issue.Details, issue.Source, issue.ResolvedAt, issue.ObservedAt.UTC())
+		if err != nil {
+			return fmt.Errorf("resolve reconciliation issue: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return fmt.Errorf("resolve reconciliation issue rows: %w", err)
+		} else if affected > 0 {
+			return nil
+		}
+	}
+	conflictClause := "ON CONFLICT DO NOTHING"
+	if issue.Status == domain.ReconciliationIssueOpen {
+		// Re-observing the same open fingerprint moves its evidence to this
+		// run. Complete can then distinguish an actively reproduced transient
+		// issue from one that disappeared after a healthy sweep.
+		conflictClause = `ON CONFLICT (execution_account_id, fingerprint)
+			WHERE status = 'OPEN' DO UPDATE SET
+				run_id = EXCLUDED.run_id,
+				resolution = EXCLUDED.resolution,
+				details = EXCLUDED.details,
+				source = EXCLUDED.source,
+				local_value = EXCLUDED.local_value,
+				remote_value = EXCLUDED.remote_value,
+				observed_at = EXCLUDED.observed_at`
+	}
 	_, err := recorder.db.ExecContext(ctx, `
 		INSERT INTO reconciliation_issues (
 			issue_id, run_id, fingerprint, execution_account_id, issue_type,
@@ -77,7 +109,7 @@ func (recorder *ReconciliationRecorder) RecordIssue(ctx context.Context, issue d
 			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
 			NULLIF($14,'')::numeric,NULLIF($15,'')::numeric,$16,$17,$18,$19
 		)
-		ON CONFLICT DO NOTHING`,
+		`+conflictClause,
 		issue.IssueID, issue.RunID, issue.Fingerprint, issue.ExecutionAccountID,
 		string(issue.Type), string(issue.Resolution), string(issue.Status),
 		issue.OrderID, issue.VenueOrderID, issue.VenueTradeID, issue.MarketID,
@@ -98,7 +130,12 @@ func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain
 	if err != nil {
 		return fmt.Errorf("encode reconciliation summary: %w", err)
 	}
-	result, err := recorder.db.ExecContext(ctx, `
+	tx, err := recorder.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin reconciliation run completion: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE reconciliation_runs
 		SET status=$2, summary=$3::jsonb, error=$4, completed_at=$5
 		WHERE run_id=$1 AND status='RUNNING'`, run.RunID, string(run.Status),
@@ -108,6 +145,23 @@ func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain
 	}
 	if !oneRow(result) {
 		return fmt.Errorf("reconciliation run is missing or already completed")
+	}
+	if run.Status == domain.ReconciliationRunCompleted {
+		// RETRY_LATER means infrastructure uncertainty, not a permanent manual
+		// discrepancy. If a fully completed later sweep did not reproduce the
+		// fingerprint, close it; manual-review issues remain fail-closed until an
+		// operator or attributable repair explicitly resolves them.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE reconciliation_issues
+			SET status='RESOLVED', resolved_at=$3
+			WHERE execution_account_id=$1 AND status='OPEN'
+			  AND resolution='RETRY_LATER' AND run_id <> $2`,
+			run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC()); err != nil {
+			return fmt.Errorf("resolve recovered reconciliation infrastructure issues: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit reconciliation run completion: %w", err)
 	}
 	return nil
 }

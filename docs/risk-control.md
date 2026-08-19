@@ -89,7 +89,8 @@ Go 不会为了让订单满足限额而缩小 size、调整 price、把 BUY 改�
 触发对账和告警。只做无锁的“读快照再检查”会让两个并发 BUY 或 SELL 同时通过，因此禁止用于
 live。表结构、锁顺序、部分成交和失败处理见 [`asset-reservations.md`](asset-reservations.md)。
 
-当前 server 仍是 paper 模式，使用静态 guard；`riskcontrol.Service` 已实现并满足 `port.Guard`
-接口。非 local composition 已经使用真实 PostgreSQL OrderRepository 和资金/仓位预占 adapter，
-不会再因重启丢失订单或幂等键；但 live 所需的余额/仓位同步、hard-risk PostgreSQL 数据源、
-Polymarket Venue、Fill ledger 和持续对账尚未整体装配。接入完成前配置层继续拒绝 live 启动。
+paper 继续使用静态 guard。live 在静态单笔上限之外，把账户、Market、strategy、wallet、daily
+notional、pause/Kill Switch、binding 和 reconciliation freshness 放进 ReservationManager 的同一个
+账户行锁事务内检查并预占，避免“先查再扣”的 TOCTOU；数据库 trigger 还会在进入 SUBMITTING 前
+二次阻断 crash-resume 绕过。全局 Kill Switch 在 migration 中默认开启，必须完成账户、policy、
+binding 和新鲜对账审计后才能显式解除。

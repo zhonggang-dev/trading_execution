@@ -75,14 +75,27 @@ SELL 使用同一个账户锁并额外锁 token position，因此两笔 SELL 也
 
 ## 预占金额
 
-- BUY：`worst_price * size`，不是策略快照价，也不是下单时 best ask；
+- BUY：`worst_price * (1 + max_buy_fee_rate_bps / 10000) * size`，不是策略快照价，也不是下单时 best ask；
 - SELL：`size` shares；
 - BUY 缺少正数 `worst_price` 时 fail closed；
 - 全部使用 PostgreSQL `NUMERIC` 和 Go decimal string，不经过 `float64`。
 
-`worst_price` 是 Python 允许的最差成交价，但其合法性仍由 Go Market 校验。迁移 0003 已增加
-累计 `settled_fees`，真实 Fill ledger 按 `gross + fee` 扣除 BUY 现金；尚需在 live 装配前增加
-execution-owned 的最大手续费预占 buffer。不能把 Python 传入的 fee 当作可信预占依据。
+`worst_price` 是 Python 允许的最差成交价，但其合法性仍由 Go Market 校验。`MaxBuyFeeRateBPS`
+由 Go execution 配置所有平台费、builder fee 和逐 Fill 舍入余量的合计上界，不能采用 Python
+策略传入的 fee。该配置必须显式提供；即使已确认零费，也要显式配置 `0`，防止 live 因漏配而
+静默回到无手续费保护。
+
+`reserve_unit_price` 保存的是最差价格加每 share 手续费 buffer 后的单位现金上限。迁移 0008
+强制以下不变量（已有历史行先 `NOT VALID`，新写入和更新仍立即受约束）：
+
+```text
+initial_reserved_balance = requested_shares * reserve_unit_price
+settled_notional + settled_fees + remaining_reserved_balance
+  <= initial_reserved_balance
+```
+
+因此 Fill ledger 即使收到超过配置上限的 reported fee，也会在同一个数据库事务中 fail closed；
+账户扣款、Fill、仓位和 reservation 会整体回滚，不会使用该订单之外的 available balance。
 
 ## 部分成交和释放
 
@@ -90,18 +103,18 @@ execution-owned 的最大手续费预占 buffer。不能把 Python 传入的 fee
 数据库保存累计 `settled_shares + settled_notional + settled_fees`。`fill_key` 去重保证重复轮询
 不会重复扣款或增加仓位。两个路径不能同时启用。
 
-BUY 示例：余额 100，按 `worst_price=0.80, size=100` 预占 80；随后成交 30 shares，累计均价
-0.70：
+BUY 示例：余额 100，按 `worst_price=0.80, size=100, max_buy_fee_rate_bps=250` 预占 82；
+随后成交 30 shares，累计均价 0.70、累计手续费 0.525：
 
 ```text
-成交消耗             21
-剩余订单继续预占     0.80 * 70 = 56
-total_balance         100 - 21 = 79
-reserved_balance      56
-available_balance     23
+成交消耗             21 + 0.525 = 21.525
+剩余订单继续预占     0.82 * 70 = 57.4
+total_balance         100 - 21.525 = 78.475
+reserved_balance      57.4
+available_balance     21.075
 ```
 
-如果之后取消，只释放未成交的 56；已成交的 21 不会退回。BUY 成交 shares 会在同一事务增加
+如果之后取消，只释放未成交的 57.4；已成交的 `gross + fee` 不会退回。BUY 成交 shares 会在同一事务增加
 对应 position。SELL 则从 `total_shares/reserved_shares` 消耗成交 delta，并把成交现金增加到
 `total_balance/available_balance`。
 
@@ -143,10 +156,11 @@ Venue 不会在 Reserve 失败后被调用。Place 返回不确定错误时，�
 3. 为历史仓位回填 cost basis 和 position lots；
 4. 将单 Market/策略/钱包敞口与每日额度的最终判断合并到同一 check-and-reserve 事务，避免
    这些上限仍受只读快照竞态影响；
-5. 增加最大手续费预占 buffer，并完成链上 settlement 延迟、negative-risk conversion 和 allowance 的账务口径。
+5. 完成链上 settlement 延迟、negative-risk conversion 和 allowance 的账务口径。
 
 迁移文件：[`migrations/0001_asset_reservations.sql`](../migrations/0001_asset_reservations.sql) 和
-[`migrations/0003_fills_positions_ledger.sql`](../migrations/0003_fills_positions_ledger.sql)。
+[`migrations/0003_fills_positions_ledger.sql`](../migrations/0003_fills_positions_ledger.sql)、
+[`migrations/0008_buy_fee_reservation_guard.sql`](../migrations/0008_buy_fee_reservation_guard.sql)。
 PostgreSQL 实现：[`internal/adapter/postgres/reservation.go`](../internal/adapter/postgres/reservation.go)。
 
 真实 PostgreSQL 并发测试：
