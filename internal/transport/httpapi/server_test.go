@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/adapter/risk"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
+	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/positionexit"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 )
@@ -25,6 +26,78 @@ import (
 type fakeReadiness struct{ err error }
 
 func (checker fakeReadiness) Check(context.Context) error { return checker.err }
+
+// fakeLiveOperationsService 返回预设的只读实盘快照。
+type fakeLiveOperationsService struct {
+	snapshot domain.LiveOperationsSnapshot
+	err      error
+}
+
+// Snapshot 返回预设快照或错误。
+func (service *fakeLiveOperationsService) Snapshot(context.Context) (domain.LiveOperationsSnapshot, error) {
+	return service.snapshot, service.err
+}
+
+// TestLiveOperationsEndpointUsesDedicatedReadOnlyPermission 验证只读接口的独立权限和 JSON 数字契约。
+func TestLiveOperationsEndpointUsesDedicatedReadOnlyPermission(t *testing.T) {
+	operations := &fakeLiveOperationsService{snapshot: testLiveOperationsSnapshot()}
+	server, err := New(Params{
+		Service: baseExecutionService(t), LiveOperations: operations,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		APIToken: "execution-secret", ReadOnlyToken: "readonly-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized := performRequest(t, server, http.MethodGet, "/api/v1/live-operations", "", "")
+	if unauthorized.Code != http.StatusUnauthorized || !strings.Contains(unauthorized.Body.String(), `"requestId"`) {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	forbidden := performRequest(t, server, http.MethodGet, "/api/v1/live-operations", "", "execution-secret")
+	if forbidden.Code != http.StatusForbidden || !strings.Contains(forbidden.Body.String(), `"code":"READ_PERMISSION_REQUIRED"`) {
+		t.Fatalf("forbidden status=%d body=%s", forbidden.Code, forbidden.Body.String())
+	}
+	response := performRequest(t, server, http.MethodGet, "/api/v1/live-operations", "", "readonly-secret")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"equity":1.25`) || !strings.Contains(response.Body.String(), `"positions":[]`) {
+		t.Fatalf("response status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// TestLiveOperationsEndpointReturnsTopLevelUnavailableError 验证可信快照缺失时返回需求约定的 503 结构。
+func TestLiveOperationsEndpointReturnsTopLevelUnavailableError(t *testing.T) {
+	operations := &fakeLiveOperationsService{err: liveoperations.ErrSnapshotUnavailable}
+	server, err := New(Params{
+		Service: baseExecutionService(t), LiveOperations: operations,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), ReadOnlyToken: "readonly-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/live-operations", nil)
+	request.Header.Set("Authorization", "Bearer readonly-secret")
+	request.Header.Set("X-Request-ID", "req-test")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	want := `{"code":"LIVE_SNAPSHOT_UNAVAILABLE","message":"无法获取完整实盘快照","requestId":"req-test"}`
+	if response.Code != http.StatusServiceUnavailable || strings.TrimSpace(response.Body.String()) != want {
+		t.Fatalf("response status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// testLiveOperationsSnapshot 创建字段可完整 JSON 编码的最小只读快照。
+func testLiveOperationsSnapshot() domain.LiveOperationsSnapshot {
+	now := time.Date(2026, 8, 19, 8, 0, 0, 0, time.UTC)
+	return domain.LiveOperationsSnapshot{
+		ObservedAt: now, Engine: domain.LiveEngine{Health: domain.LiveHealthHealthy},
+		Capital: domain.LiveCapital{
+			Equity: "1.25", AvailableCash: "1.25", GrossExposure: "0", ExposureLimit: "10",
+			RealizedPnLToday: "0", UnrealizedPnL: "0", FeeToday: "0",
+		},
+		Workers: []domain.LiveWorker{}, Funnel: []domain.LiveFunnelStage{}, Risks: []domain.LiveRisk{},
+		Orders: []domain.LiveOrder{}, Positions: []domain.LivePosition{}, Events: []domain.LiveEvent{},
+		DataQuality: []domain.LiveDataQuality{},
+	}
+}
 
 // TestHTTPOrderLifecycleAndAuthentication 验证 HTTP Order Lifecycle And Authentication 场景下的行为。
 func TestHTTPOrderLifecycleAndAuthentication(t *testing.T) {

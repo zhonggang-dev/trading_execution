@@ -78,6 +78,16 @@ func TestLoadRejectsShortLiveWriteTimeout(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsSharedLiveOperationsToken 验证实盘只读令牌不能复用交易执行权限。
+func TestLoadRejectsSharedLiveOperationsToken(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	t.Setenv("LIVE_OPERATIONS_READ_ONLY_TOKEN", strings.Repeat("x", 32))
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be different") {
+		t.Fatalf("Load() error = %v, want token separation rejection", err)
+	}
+}
+
 func TestLoadRequiresExplicitLiveRiskLimits(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -114,8 +124,10 @@ func clearConfigEnvironment(t *testing.T) {
 	for _, key := range []string{
 		"APP_NAME", "APP_ENV", "LOG_LEVEL", "HTTP_ADDRESS", "HTTP_READ_HEADER_TIMEOUT",
 		"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT", "HTTP_SHUTDOWN_TIMEOUT",
+		"LIVE_OPERATIONS_READ_ONLY_TOKEN", "LIVE_OPERATIONS_INTERVAL", "LIVE_OPERATIONS_REFRESH_TIMEOUT",
+		"LIVE_OPERATIONS_MAX_SNAPSHOT_AGE", "LIVE_OPERATIONS_EVENT_LIMIT",
 		"DATABASE_CONNECT_TIMEOUT", "TRADING_EXECUTION_DATABASE_URL",
-		"EXECUTION_API_TOKEN", "EXECUTION_MODE", "EXECUTION_VENUE", "EXECUTION_ALLOW_MARKET_ORDERS",
+		"EXECUTION_API_TOKEN", "POSITION_EXIT_JOB_TOKEN", "EXECUTION_MODE", "EXECUTION_VENUE", "EXECUTION_ALLOW_MARKET_ORDERS",
 		"EXECUTION_MAX_ORDER_SIZE", "EXECUTION_MAX_ORDER_NOTIONAL",
 		"ORDER_COORDINATOR_INTERVAL", "ORDER_COORDINATOR_BATCH_SIZE",
 		"POLYMARKET_LIVE_TRADING_ENABLED", "POLYMARKET_ACCOUNTS_FILE", "POLYMARKET_CLOB_URL",
@@ -137,6 +149,7 @@ func setCompleteLiveEnvironment(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("HTTP_ADDRESS", "127.0.0.1:14000")
 	t.Setenv("EXECUTION_API_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("LIVE_OPERATIONS_READ_ONLY_TOKEN", strings.Repeat("r", 32))
 	t.Setenv("TRADING_EXECUTION_DATABASE_URL", "postgres://example.invalid/trading")
 	t.Setenv("EXECUTION_MODE", "live")
 	t.Setenv("EXECUTION_VENUE", "polymarket")

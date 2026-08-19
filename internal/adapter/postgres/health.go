@@ -6,14 +6,12 @@ import (
 	"fmt"
 )
 
-// HealthChecker verifies both database connectivity and the schema required by
-// the HTTP execution path. A successful Ping alone is not enough: serving with
-// a partially migrated database would fail after accepting traffic.
+// HealthChecker 同时校验数据库连通性和 HTTP 执行链路所需的完整 schema。
 type HealthChecker struct {
 	db *sql.DB
 }
 
-// NewHealthChecker creates a read-only PostgreSQL readiness checker.
+// NewHealthChecker 创建只读 PostgreSQL 就绪检查器。
 func NewHealthChecker(db *sql.DB) (*HealthChecker, error) {
 	if db == nil {
 		return nil, fmt.Errorf("postgres database is required")
@@ -21,12 +19,7 @@ func NewHealthChecker(db *sql.DB) (*HealthChecker, error) {
 	return &HealthChecker{db: db}, nil
 }
 
-// Check returns nil only when PostgreSQL is reachable and the complete schema
-// used by the persistent execution, reservation, fill, outbox,
-// reconciliation, exit, trade-history, fee-protection, and atomic live-risk
-// paths is installed.  Checking only relation names is insufficient: a
-// partially applied live migration could otherwise advertise readiness while
-// omitting the durable SUBMITTING gate.
+// Check 仅在 PostgreSQL 可访问且执行、预占、成交、对账、风控与监控 schema 完整时返回成功。
 func (checker *HealthChecker) Check(ctx context.Context) error {
 	if err := checker.db.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping postgres: %w", err)
@@ -55,7 +48,9 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_risk_global_control'),
 			('execution_risk_policies'),
 			('execution_risk_controls'),
-			('execution_strategy_bindings')
+			('execution_strategy_bindings'),
+			('live_runtime_status'),
+			('live_cycle_funnel')
 		) AS required(name)
 		WHERE to_regclass(required.name) IS NULL`).Scan(&missing)
 	if err != nil {

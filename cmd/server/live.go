@@ -20,6 +20,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/clobheartbeat"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
+	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/marketvalidation"
 	"github.com/UniPat-AI/trading_execution/internal/service/readiness"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
@@ -28,9 +29,7 @@ import (
 
 const polymarketCollateralAsset = "pUSD"
 
-// liveRuntime contains only the already-preflighted production graph. It is
-// returned after startup reconciliation and the first heartbeat have both
-// succeeded, so the caller cannot accidentally open HTTP earlier.
+// liveRuntime 保存已经通过预检的实盘依赖图和后台服务。
 type liveRuntime struct {
 	repository     *postgresadapter.OrderRepository
 	execution      *execution.Service
@@ -38,20 +37,25 @@ type liveRuntime struct {
 	readiness      *readiness.All
 	heartbeat      *clobheartbeat.Service
 	runner         *reconciliation.Runner
+	operations     *liveoperations.Service
 }
 
-// buildLiveRuntime assembles the Polymarket V2 production path without ever
-// bootstrapping credentials or placing an order. Every network operation in
-// this function is public or authenticated read-only except the heartbeat
-// handshake, which is installed only after reconciliation has passed.
-func buildLiveRuntime(
-	ctx context.Context,
-	cfg config.Config,
-	database *sql.DB,
-	databaseReadiness *postgresadapter.HealthChecker,
-	guard port.Guard,
-	logger *slog.Logger,
-) (*liveRuntime, error) {
+// buildLiveRuntimeParams 收拢实盘依赖装配参数，避免长参数列表破坏函数声明可读性。
+type buildLiveRuntimeParams struct {
+	ctx               context.Context
+	cfg               config.Config
+	database          *sql.DB
+	databaseReadiness *postgresadapter.HealthChecker
+	guard             port.Guard
+	logger            *slog.Logger
+}
+
+// buildLiveRuntime 装配 Polymarket V2 实盘链路，并在开放 HTTP 前完成启动对账和首次只读快照。
+func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
+	ctx, cfg := params.ctx, params.cfg
+	database, databaseReadiness := params.database, params.databaseReadiness
+	guard, logger := params.guard, params.logger
+	startedAt := time.Now().UTC()
 	if database == nil || databaseReadiness == nil {
 		return nil, fmt.Errorf("live execution requires a ready PostgreSQL database")
 	}
@@ -336,6 +340,25 @@ func buildLiveRuntime(
 	if err := heartbeat.Check(ctx); err != nil {
 		return nil, fmt.Errorf("verify initial Polymarket CLOB heartbeat freshness: %w", err)
 	}
+	liveOperationsRepository, err := postgresadapter.NewLiveOperationsRepository(database)
+	if err != nil {
+		return nil, err
+	}
+	operations, err := liveoperations.New(liveoperations.Params{
+		Repository: liveOperationsRepository, Venue: tradingClient,
+		PositionSource: positionSource, BalanceSource: balanceSource, OrderBooks: orderBooks,
+		Accounts: accountIDs, VenueName: "Polymarket CLOB", StartedAt: startedAt,
+		RunID:    "live-" + startedAt.Format("20060102T150405.000000000Z"),
+		Interval: cfg.LiveOperations.Interval, RefreshTimeout: cfg.LiveOperations.RefreshTimeout,
+		MaxSnapshotAge: cfg.LiveOperations.MaxSnapshotAge, EventLimit: cfg.LiveOperations.EventLimit,
+		Logger: logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := operations.Refresh(ctx); err != nil {
+		return nil, fmt.Errorf("build initial live operations snapshot: %w", err)
+	}
 
 	combinedReadiness, err := readiness.NewAll(
 		readiness.NamedChecker{Name: "postgres", Checker: databaseReadiness},
@@ -349,14 +372,11 @@ func buildLiveRuntime(
 	return &liveRuntime{
 		repository: repository, execution: executionService,
 		reconciliation: reconciliationService, readiness: combinedReadiness,
-		heartbeat: heartbeat, runner: runner,
+		heartbeat: heartbeat, runner: runner, operations: operations,
 	}, nil
 }
 
-// noRedirectHTTPClient prevents credentials embedded in headers or provider
-// URLs from being replayed to a redirect target. Every live endpoint is
-// configured as an explicit canonical origin and redirects are therefore a
-// configuration or upstream-integrity failure, never a recovery mechanism.
+// noRedirectHTTPClient 禁止把请求头或供应商 URL 中的凭证重放到重定向目标。
 func noRedirectHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
@@ -366,6 +386,7 @@ func noRedirectHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// validateStartupReconciliation 确认所有配置账户均成功完成启动对账。
 func validateStartupReconciliation(result reconciliation.SweepResult, expectedAccounts int) error {
 	if len(result.Runs) != expectedAccounts {
 		return fmt.Errorf("live startup reconciliation returned %d account run(s), want %d", len(result.Runs), expectedAccounts)
@@ -384,9 +405,7 @@ func validateStartupReconciliation(result reconciliation.SweepResult, expectedAc
 	return nil
 }
 
-// startBackground starts the two loops whose health gates only new placement.
-// The venue decorators deliberately allow Cancel and Get to reach CLOB even
-// when heartbeat or geolocation checks are unhealthy.
+// startBackground 启动 heartbeat、对账和只读快照三个后台循环。
 func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Logger) error {
 	runnerReady := make(chan struct{})
 	runnerErrors := make(chan error, 1)
@@ -408,6 +427,11 @@ func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Lo
 	go func() {
 		if err := <-runnerErrors; err != nil && ctx.Err() == nil {
 			logger.Error("Polymarket reconciliation loop stopped", "error", err)
+		}
+	}()
+	go func() {
+		if err := runtime.operations.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("live operations snapshot loop stopped", "error", err)
 		}
 	}()
 	return nil

@@ -15,11 +15,12 @@ import (
 
 // Config 表示后端使用的 Config 类型。
 type Config struct {
-	App        App
-	HTTP       HTTP
-	Database   Database
-	Execution  Execution
-	Polymarket Polymarket
+	App            App
+	HTTP           HTTP
+	Database       Database
+	Execution      Execution
+	Polymarket     Polymarket
+	LiveOperations LiveOperations
 }
 
 // App 表示后端使用的 App 类型。
@@ -39,6 +40,15 @@ type HTTP struct {
 	ShutdownTimeout   time.Duration
 	APIToken          string
 	JobToken          string
+	ReadOnlyToken     string
+}
+
+// LiveOperations 表示实盘只读快照后台刷新与过期策略。
+type LiveOperations struct {
+	Interval       time.Duration
+	RefreshTimeout time.Duration
+	MaxSnapshotAge time.Duration
+	EventLimit     int
 }
 
 // Database 表示后端使用的 Database 类型。
@@ -58,8 +68,7 @@ type Execution struct {
 	CoordinatorBatchSize int
 }
 
-// Polymarket contains the fail-closed production composition settings. Wallet
-// secrets remain in the referenced root-only file and never enter this value.
+// Polymarket 保存 fail-closed 实盘装配配置，钱包秘密只留在受限文件中。
 type Polymarket struct {
 	LiveTradingEnabled       bool
 	AccountsFile             string
@@ -211,6 +220,22 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	liveOperationsInterval, err := duration("LIVE_OPERATIONS_INTERVAL", 10*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	liveOperationsRefreshTimeout, err := duration("LIVE_OPERATIONS_REFRESH_TIMEOUT", 8*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	liveOperationsMaxAge, err := duration("LIVE_OPERATIONS_MAX_SNAPSHOT_AGE", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	liveOperationsEventLimit, err := integer("LIVE_OPERATIONS_EVENT_LIMIT", 50, 1, 200)
+	if err != nil {
+		return Config{}, err
+	}
 	config := Config{
 		App: App{
 			Name:     env("APP_NAME", "trading_execution"),
@@ -226,6 +251,7 @@ func Load() (Config, error) {
 			ShutdownTimeout:   shutdownTimeout,
 			APIToken:          strings.TrimSpace(os.Getenv("EXECUTION_API_TOKEN")),
 			JobToken:          strings.TrimSpace(os.Getenv("POSITION_EXIT_JOB_TOKEN")),
+			ReadOnlyToken:     strings.TrimSpace(os.Getenv("LIVE_OPERATIONS_READ_ONLY_TOKEN")),
 		},
 		Database: Database{
 			URL:            strings.TrimSpace(os.Getenv("TRADING_EXECUTION_DATABASE_URL")),
@@ -266,6 +292,10 @@ func Load() (Config, error) {
 			MaxReconcileAttempts:     maxReconcileAttempts,
 			MaxBuyFeeRateBPS:         maxBuyFeeRateBPS,
 			OrderFilledConfirmations: orderFilledConfirmations,
+		},
+		LiveOperations: LiveOperations{
+			Interval: liveOperationsInterval, RefreshTimeout: liveOperationsRefreshTimeout,
+			MaxSnapshotAge: liveOperationsMaxAge, EventLimit: liveOperationsEventLimit,
 		},
 	}
 	if err := config.Validate(); err != nil {
@@ -310,6 +340,12 @@ func (config Config) Validate() error {
 		if strings.TrimSpace(config.Polymarket.PolygonRPCURL) == "" {
 			return fmt.Errorf("POLYGON_RPC_URL is required in live mode")
 		}
+		if len(config.HTTP.ReadOnlyToken) < 32 {
+			return fmt.Errorf("LIVE_OPERATIONS_READ_ONLY_TOKEN must contain at least 32 bytes in live mode")
+		}
+		if config.HTTP.ReadOnlyToken == config.HTTP.APIToken || (config.HTTP.JobToken != "" && config.HTTP.ReadOnlyToken == config.HTTP.JobToken) {
+			return fmt.Errorf("LIVE_OPERATIONS_READ_ONLY_TOKEN must be different from execution and job tokens")
+		}
 		for name, value := range map[string]string{
 			"POLYMARKET_CLOB_URL":     config.Polymarket.CLOBURL,
 			"POLYMARKET_GEOBLOCK_URL": config.Polymarket.GeoblockURL,
@@ -332,6 +368,15 @@ func (config Config) Validate() error {
 		}
 		if comparison, err := config.Polymarket.MaxBuyFeeRateBPS.Compare("10000"); err != nil || comparison > 0 {
 			return fmt.Errorf("POLYMARKET_MAX_BUY_FEE_RATE_BPS must not exceed 10000")
+		}
+		if config.LiveOperations.Interval < 5*time.Second || config.LiveOperations.Interval > 15*time.Second {
+			return fmt.Errorf("LIVE_OPERATIONS_INTERVAL must be between 5s and 15s in live mode")
+		}
+		if config.LiveOperations.RefreshTimeout >= config.LiveOperations.Interval {
+			return fmt.Errorf("LIVE_OPERATIONS_REFRESH_TIMEOUT must be less than LIVE_OPERATIONS_INTERVAL")
+		}
+		if config.LiveOperations.MaxSnapshotAge <= config.LiveOperations.Interval {
+			return fmt.Errorf("LIVE_OPERATIONS_MAX_SNAPSHOT_AGE must be greater than LIVE_OPERATIONS_INTERVAL")
 		}
 	}
 	return nil
@@ -394,7 +439,7 @@ func boolean(key string, fallback bool) (bool, error) {
 	return parsed, nil
 }
 
-// integer reads a bounded integer configuration value.
+// integer 读取并校验有上下界的整数配置。
 func integer(key string, fallback, minimum, maximum int) (int, error) {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
