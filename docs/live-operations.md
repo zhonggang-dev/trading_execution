@@ -118,7 +118,7 @@ LIVE_OPERATIONS_EVENT_LIMIT=50
 
 ```dotenv
 TRADING_EXECUTION_BASE_URL=http://127.0.0.1:8090
-TRADING_EXECUTION_API_TOKEN=<与后端只读令牌相同>
+TRADING_EXECUTION_LIVE_READ_ONLY_TOKEN=<与后端只读令牌相同>
 ```
 
-令牌只能放在前端服务端环境变量中，不能打包进浏览器静态资源。
+`TRADING_EXECUTION_API_TOKEN` 继续用于成交账本接口，不能与上述只读令牌共用。两个令牌都只能放在前端服务端环境变量中，不能打包进浏览器静态资源。
