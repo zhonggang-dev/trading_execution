@@ -311,10 +311,10 @@ func (repository *fakeOrders) ListForReconciliation(context.Context, string, tim
 
 // fakeVenue 表示后端使用的 fakeVenue 类型。
 type fakeVenue struct {
-	openOrders []domain.VenueOrderSnapshot
-	trades     []domain.VenueTradeSnapshot
-	openErr    error
-	tradesErr  error
+	openOrders  []domain.VenueOrderSnapshot
+	trades      []domain.VenueTradeSnapshot
+	openErr     error
+	tradesErr   error
 	tradesAfter time.Time
 }
 
