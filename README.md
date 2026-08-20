@@ -35,10 +35,10 @@ prediction_infra PIT 概率快照 + PostgreSQL OPEN lots + Polymarket top-15 订
 盘口和历史 midpoint 由 Trading Execution 自己采集；每个执行上下文的冻结输入必须在调用策略前持久化，策略输出
 也必须在下单前持久化。完整协议见
 [`docs/decision-cycle.md`](docs/decision-cycle.md)。
-策略团队需要同时实现的入场与逐笔持仓退出 HTTP 接口、完整请求/响应类型见
+外部策略团队需要实现的入场与逐笔持仓退出 HTTP 接口、完整请求/响应类型和业务校验见
 [`docs/python-algorithm-http-api.md`](docs/python-algorithm-http-api.md)。
-入场接口的详细业务口径见 [`docs/strategy-http-api.md`](docs/strategy-http-api.md)，独立十分钟
-持仓退出任务的运行和持久化说明见 [`docs/position-exit-job.md`](docs/position-exit-job.md)。
+独立十分钟持仓退出任务的运行和持久化说明见
+[`docs/position-exit-job.md`](docs/position-exit-job.md)。
 执行前的市场身份、状态、tick 与最新价格校验见
 [`docs/market-validation.md`](docs/market-validation.md)。
 Python/Go 风控边界、硬风控规则和实盘原子预占要求见
