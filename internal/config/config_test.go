@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestLoadSafeDefaults 验证 Load Safe Defaults 场景下的行为。
@@ -17,6 +18,78 @@ func TestLoadSafeDefaults(t *testing.T) {
 	}
 	if config.Execution.AllowMarketOrders {
 		t.Fatal("market orders must be disabled by default")
+	}
+	if config.DecisionCycle.Enabled || config.DecisionCycle.OrderSubmissionEnabled {
+		t.Fatalf("decision cycle safe defaults = %#v", config.DecisionCycle)
+	}
+}
+
+func TestLoadAcceptsDecisionCycleWithSubmissionDisabled(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !config.DecisionCycle.Enabled || config.DecisionCycle.OrderSubmissionEnabled ||
+		len(config.DecisionCycle.Bindings) != 1 || config.DecisionCycle.Interval != 10*time.Minute {
+		t.Fatalf("decision cycle config = %#v", config.DecisionCycle)
+	}
+}
+
+func TestLoadAcceptsExplicitLiveDecisionSubmission(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !config.DecisionCycle.OrderSubmissionEnabled {
+		t.Fatal("decision-cycle order submission was not enabled")
+	}
+}
+
+func TestLoadRejectsDecisionCycleOnInsecureRemoteHTTP(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_PREDICTION_INFRA_URL", "http://prediction.example.invalid")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "HTTPS or loopback") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadRejectsDecisionCycleStartWindowAtCadence(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_MAX_START_LATENESS", "10m")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "MAX_START_LATENESS") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadRejectsDecisionSubmissionWithoutCycle(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECISION_CYCLE_ENABLED") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadRejectsDuplicateDecisionBinding(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"model_id":"model-a","strategy_id":"multfactor_v1","execution_account_id":"account-a"},
+		{"model_id":"model-b","strategy_id":"multfactor_v2","execution_account_id":"account-a"}
+	]`)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "duplicate execution account") {
+		t.Fatalf("Load() error = %v", err)
 	}
 }
 
@@ -139,9 +212,32 @@ func clearConfigEnvironment(t *testing.T) {
 		"RECONCILIATION_POSITION_EPSILON", "RECONCILIATION_BALANCE_EPSILON",
 		"CANCEL_FILL_FINALITY_GRACE", "MAX_ORDER_RECONCILE_ATTEMPTS",
 		"POLYMARKET_MAX_BUY_FEE_RATE_BPS", "POLYGON_ORDER_FILLED_CONFIRMATIONS",
+		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED",
+		"DECISION_CYCLE_PREDICTION_INFRA_URL", "DECISION_CYCLE_PREDICTION_INFRA_TOKEN",
+		"DECISION_CYCLE_STRATEGY_URL", "DECISION_CYCLE_STRATEGY_TOKEN",
+		"DECISION_CYCLE_INTERVAL", "DECISION_CYCLE_STARTUP_DELAY", "DECISION_CYCLE_MAX_START_LATENESS", "DECISION_CYCLE_TIMEOUT",
+		"DECISION_CYCLE_PREDICTION_LOOKBACK", "DECISION_CYCLE_MID_PRICE_LOOKBACK",
+		"DECISION_CYCLE_BINDINGS_JSON",
 	} {
 		t.Setenv(key, "")
 	}
+}
+
+func setCompleteDecisionCycleEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("DECISION_CYCLE_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "false")
+	t.Setenv("DECISION_CYCLE_PREDICTION_INFRA_URL", "http://127.0.0.1:11000")
+	t.Setenv("DECISION_CYCLE_PREDICTION_INFRA_TOKEN", strings.Repeat("p", 32))
+	t.Setenv("DECISION_CYCLE_STRATEGY_URL", "http://127.0.0.1:8787")
+	t.Setenv("DECISION_CYCLE_STRATEGY_TOKEN", strings.Repeat("s", 32))
+	t.Setenv("DECISION_CYCLE_INTERVAL", "10m")
+	t.Setenv("DECISION_CYCLE_STARTUP_DELAY", "15s")
+	t.Setenv("DECISION_CYCLE_MAX_START_LATENESS", "30s")
+	t.Setenv("DECISION_CYCLE_TIMEOUT", "8m")
+	t.Setenv("DECISION_CYCLE_PREDICTION_LOOKBACK", "3h")
+	t.Setenv("DECISION_CYCLE_MID_PRICE_LOOKBACK", "48h")
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[{"model_id":"model-a","strategy_id":"multfactor_v1","execution_account_id":"account-a"}]`)
 }
 
 func setCompleteLiveEnvironment(t *testing.T) {

@@ -219,9 +219,16 @@ func (venue *EligibilityVenue) Name() string { return venue.venue.Name() }
 
 // Place checks the actual server egress immediately before any venue mutation.
 func (venue *EligibilityVenue) Place(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
+	if err := venue.checkPlace(ctx, order); err != nil {
+		return port.VenueOrder{}, err
+	}
+	return venue.venue.Place(ctx, order)
+}
+
+func (venue *EligibilityVenue) checkPlace(ctx context.Context, order domain.Order) error {
 	eligibility, err := venue.checker.Check(ctx, order.Intent.ExecutionAccountID)
 	if err != nil {
-		return port.VenueOrder{}, &port.VenueError{
+		return &port.VenueError{
 			Kind:    port.VenueErrorRejected,
 			Code:    "POLYMARKET_GEO_CHECK_UNAVAILABLE",
 			Message: "new order rejected locally because geographic eligibility could not be proven",
@@ -233,13 +240,49 @@ func (venue *EligibilityVenue) Place(ctx context.Context, order domain.Order) (p
 		if eligibility.Region != "" {
 			location += "-" + eligibility.Region
 		}
-		return port.VenueOrder{}, &port.VenueError{
+		return &port.VenueError{
 			Kind:    port.VenueErrorRejected,
 			Code:    "POLYMARKET_GEO_BLOCKED",
 			Message: fmt.Sprintf("new order rejected locally because Polymarket reports the server egress as blocked in %s", location),
 		}
 	}
-	return venue.venue.Place(ctx, order)
+	return nil
+}
+
+type eligibilityPrepared struct{ inner port.PreparedPlacement }
+
+func (prepared eligibilityPrepared) ExpectedVenueOrderID() string {
+	if prepared.inner == nil {
+		return ""
+	}
+	return prepared.inner.ExpectedVenueOrderID()
+}
+
+func (venue *EligibilityVenue) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {
+	if err := venue.checkPlace(ctx, order); err != nil {
+		return nil, err
+	}
+	underlying, ok := venue.venue.(port.PreparedVenue)
+	if !ok {
+		return nil, &port.VenueError{Kind: port.VenueErrorInvalid, Code: "CLOB_PREPARED_PLACEMENT_UNSUPPORTED", Message: "underlying live venue does not support prepared placement"}
+	}
+	prepared, err := underlying.PreparePlace(ctx, order)
+	if err != nil {
+		return nil, err
+	}
+	return eligibilityPrepared{inner: prepared}, nil
+}
+
+func (venue *EligibilityVenue) PlacePrepared(ctx context.Context, order domain.Order, placement port.PreparedPlacement) (port.VenueOrder, error) {
+	prepared, ok := placement.(eligibilityPrepared)
+	underlying, supported := venue.venue.(port.PreparedVenue)
+	if !ok || !supported || prepared.inner == nil {
+		return port.VenueOrder{}, &port.VenueError{Kind: port.VenueErrorInvalid, Code: "CLOB_PREPARED_PLACEMENT_INVALID", Message: "geographic eligibility prepared placement is invalid"}
+	}
+	if err := venue.checkPlace(ctx, order); err != nil {
+		return port.VenueOrder{}, err
+	}
+	return underlying.PlacePrepared(ctx, order, prepared.inner)
 }
 
 // Cancel deliberately bypasses the placement gate.
@@ -256,3 +299,4 @@ var _ GeographicEligibilityChecker = (*GeoblockClient)(nil)
 var _ GeographicEligibilityChecker = (*CLOBEligibilityChecker)(nil)
 var _ ClosedOnlyChecker = (*TradingClient)(nil)
 var _ port.Venue = (*EligibilityVenue)(nil)
+var _ port.PreparedVenue = (*EligibilityVenue)(nil)

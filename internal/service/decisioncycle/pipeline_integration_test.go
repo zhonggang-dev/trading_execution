@@ -17,15 +17,17 @@ import (
 
 // replayDecisionRecorder 表示后端使用的 replayDecisionRecorder 类型。
 type replayDecisionRecorder struct {
-	inputs  map[string]domain.StrategyDecisionRequest
-	outputs map[string]domain.StrategyDecisionResponse
+	inputs     map[string]domain.StrategyDecisionRequest
+	outputs    map[string]domain.StrategyDecisionResponse
+	deliveries map[string][]domain.DecisionIntentDelivery
 }
 
 // newReplayDecisionRecorder 创建可验证冻结输入输出重放语义的内存记录器。
 func newReplayDecisionRecorder() *replayDecisionRecorder {
 	return &replayDecisionRecorder{
-		inputs:  make(map[string]domain.StrategyDecisionRequest),
-		outputs: make(map[string]domain.StrategyDecisionResponse),
+		inputs:     make(map[string]domain.StrategyDecisionRequest),
+		outputs:    make(map[string]domain.StrategyDecisionResponse),
+		deliveries: make(map[string][]domain.DecisionIntentDelivery),
 	}
 }
 
@@ -42,7 +44,7 @@ func (recorder *replayDecisionRecorder) ClaimInput(_ context.Context, request do
 }
 
 // ClaimOutput 幂等保存同一决策周期首次通过校验的算法输出。
-func (recorder *replayDecisionRecorder) ClaimOutput(_ context.Context, response domain.StrategyDecisionResponse) (domain.StrategyDecisionResponse, bool, error) {
+func (recorder *replayDecisionRecorder) ClaimOutput(_ context.Context, response domain.StrategyDecisionResponse, intents []domain.OrderIntent, submissionEnabled bool) (domain.StrategyDecisionResponse, bool, error) {
 	if stored, ok := recorder.outputs[response.CycleID]; ok {
 		if stored.InputID != response.InputID {
 			return domain.StrategyDecisionResponse{}, false, fmt.Errorf("decision output conflict")
@@ -50,7 +52,60 @@ func (recorder *replayDecisionRecorder) ClaimOutput(_ context.Context, response 
 		return stored, false, nil
 	}
 	recorder.outputs[response.CycleID] = response
+	if submissionEnabled {
+		deliveries := make([]domain.DecisionIntentDelivery, len(intents))
+		for index, intent := range intents {
+			deliveries[index] = domain.DecisionIntentDelivery{
+				CycleID: response.CycleID, ClientOrderID: intent.ClientOrderID,
+				Sequence: index, Intent: intent, Status: domain.DecisionIntentPending,
+			}
+		}
+		recorder.deliveries[response.CycleID] = deliveries
+	}
 	return response, true, nil
+}
+
+func (recorder *replayDecisionRecorder) ClaimPendingIntents(_ context.Context, cycleID string, limit int) ([]domain.DecisionIntentDelivery, error) {
+	result := make([]domain.DecisionIntentDelivery, 0)
+	for key, deliveries := range recorder.deliveries {
+		if cycleID != "" && key != cycleID {
+			continue
+		}
+		for index := range deliveries {
+			if deliveries[index].Status != domain.DecisionIntentPending || len(result) >= limit {
+				continue
+			}
+			deliveries[index].Status = domain.DecisionIntentSubmitting
+			deliveries[index].Attempt++
+			result = append(result, deliveries[index])
+		}
+		recorder.deliveries[key] = deliveries
+	}
+	return result, nil
+}
+
+func (recorder *replayDecisionRecorder) RequeueStaleSubmitting(_ context.Context, _ time.Time, _ int) (int, error) {
+	return 0, nil
+}
+
+func (recorder *replayDecisionRecorder) CompleteIntent(_ context.Context, clientOrderID string, attempt int, completion domain.DecisionIntentCompletion) error {
+	for key, deliveries := range recorder.deliveries {
+		for index := range deliveries {
+			if deliveries[index].ClientOrderID == clientOrderID && deliveries[index].Attempt == attempt {
+				deliveries[index].Status = completion.Status
+				deliveries[index].OrderID = completion.OrderID
+				deliveries[index].OrderStatus = completion.OrderStatus
+				deliveries[index].LastError = completion.LastError
+				recorder.deliveries[key] = deliveries
+				return nil
+			}
+		}
+	}
+	return port.ErrDecisionIntentConflict
+}
+
+func (recorder *replayDecisionRecorder) ListIntents(_ context.Context, cycleID string) ([]domain.DecisionIntentDelivery, error) {
+	return append([]domain.DecisionIntentDelivery(nil), recorder.deliveries[cycleID]...), nil
 }
 
 // replayStrategy 表示后端使用的 replayStrategy 类型。
@@ -109,7 +164,7 @@ type pipelineFixture struct {
 }
 
 // newPipelineFixture 组装算法决策到真实执行服务的完整纸交易测试链路。
-func newPipelineFixture(t *testing.T, maxNotional domain.Decimal) *pipelineFixture {
+func newPipelineFixture(t *testing.T, maxNotional domain.Decimal, submitEnabled ...bool) *pipelineFixture {
 	t.Helper()
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
@@ -133,6 +188,10 @@ func newPipelineFixture(t *testing.T, maxNotional domain.Decimal) *pipelineFixtu
 	if err != nil {
 		t.Fatal(err)
 	}
+	enabled := true
+	if len(submitEnabled) != 0 {
+		enabled = submitEnabled[0]
+	}
 	service, err := New(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-pipeline-1",
@@ -152,7 +211,7 @@ func newPipelineFixture(t *testing.T, maxNotional domain.Decimal) *pipelineFixtu
 		MidPriceSource: &fakeMidPriceHistorySource{histories: []domain.MidPriceHistory{
 			validMidPriceHistory(prediction, 0, decisionAt),
 		}},
-		Strategy: strategy, Recorder: recorder, Executor: executor,
+		Strategy: strategy, Recorder: recorder, Executor: executor, SubmitEnabled: enabled,
 		Bindings: []domain.StrategyExecutionContext{testBinding()}, Venue: "polymarket-paper",
 		Now: func() time.Time { return decisionAt.Add(5 * time.Second) },
 	})
@@ -282,5 +341,29 @@ func TestAlgorithmOrderRejectedByHardRiskBeforeVenue(t *testing.T) {
 	}
 	if _, ok := fixture.reservations.Get(order.ID); ok {
 		t.Fatal("hard-risk rejection unexpectedly created a reservation")
+	}
+}
+
+// TestDecisionCycleSubmissionGateRecordsOutputWithoutCreatingAnOrder proves
+// that the independent production gate still exercises the complete upstream
+// decision path while preventing any call into execution.Submit.
+func TestDecisionCycleSubmissionGateRecordsOutputWithoutCreatingAnOrder(t *testing.T) {
+	fixture := newPipelineFixture(t, "100", false)
+	result, err := fixture.service.Run(context.Background(), fixture.decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(result.Runs) != 1 || len(result.Runs[0].Intents) != 1 ||
+		!result.Runs[0].Intents[0].SubmissionDisabled {
+		t.Fatalf("submission-disabled result = %#v", result)
+	}
+	if fixture.strategy.calls != 1 || len(fixture.recorder.inputs) != 1 || len(fixture.recorder.outputs) != 1 {
+		t.Fatalf("strategy/recorder calls = %d/%d/%d", fixture.strategy.calls, len(fixture.recorder.inputs), len(fixture.recorder.outputs))
+	}
+	if fixture.venue.placeCalls != 0 {
+		t.Fatalf("submission-disabled cycle reached venue %d times", fixture.venue.placeCalls)
+	}
+	if _, err := fixture.repository.GetByClientOrderID(context.Background(), result.Runs[0].Intents[0].Intent.ClientOrderID); !errors.Is(err, port.ErrOrderNotFound) {
+		t.Fatalf("submission-disabled cycle created an order: %v", err)
 	}
 }

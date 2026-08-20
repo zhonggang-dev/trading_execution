@@ -64,6 +64,58 @@ func TestTradingClientSignsAndPostsExactV2Order(t *testing.T) {
 	}
 }
 
+func TestPreparePlaceDoesNotPostAndPlacePreparedRequiresPersistedExpectedHash(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	postCalls := 0
+	var posted postOrderPayload
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/version":
+			writeTestJSON(writer, map[string]any{"version": 2})
+		case "/tick-size":
+			writeTestJSON(writer, map[string]any{"minimum_tick_size": "0.01"})
+		case "/neg-risk":
+			writeTestJSON(writer, map[string]any{"neg_risk": false})
+		case "/order":
+			postCalls++
+			if err := json.NewDecoder(request.Body).Decode(&posted); err != nil {
+				t.Fatal(err)
+			}
+			writeTestJSON(writer, map[string]any{
+				"success": true, "orderID": signedOrderIDForTest(t, posted.Order, false), "status": "live",
+			})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestTradingClient(t, server.URL, now)
+	order := adapterOrder()
+	prepared, err := client.PreparePlace(context.Background(), order)
+	if err != nil {
+		t.Fatalf("PreparePlace() error = %v", err)
+	}
+	if postCalls != 0 || prepared.ExpectedVenueOrderID() == "" {
+		t.Fatalf("prepare post calls/hash = %d/%q", postCalls, prepared.ExpectedVenueOrderID())
+	}
+	if _, err := client.PlacePrepared(context.Background(), order, prepared); err == nil {
+		t.Fatal("PlacePrepared() without persisted expected hash error = nil")
+	}
+	if postCalls != 0 {
+		t.Fatalf("invalid prepared placement emitted %d POST(s)", postCalls)
+	}
+	order.VenueOrderID = prepared.ExpectedVenueOrderID()
+	venueOrder, err := client.PlacePrepared(context.Background(), order, prepared)
+	if err != nil {
+		t.Fatalf("PlacePrepared() error = %v", err)
+	}
+	if postCalls != 1 || venueOrder.ID != prepared.ExpectedVenueOrderID() ||
+		venueOrder.ID != signedOrderIDForTest(t, posted.Order, false) {
+		t.Fatalf("post calls/order = %d/%#v", postCalls, venueOrder)
+	}
+}
+
 // TestCancelRaceReturnsFillObservedAfterCancel 验证 Cancel Race Returns Fill Observed After Cancel 场景下的行为。
 func TestCancelRaceReturnsFillObservedAfterCancel(t *testing.T) {
 	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)

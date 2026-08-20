@@ -218,13 +218,56 @@ func NewVenue(venue port.Venue, status *Service) (*Venue, error) {
 func (venue *Venue) Name() string { return venue.venue.Name() }
 
 func (venue *Venue) Place(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
+	if err := venue.checkPlace(ctx, order); err != nil {
+		return port.VenueOrder{}, err
+	}
+	return venue.venue.Place(ctx, order)
+}
+
+func (venue *Venue) checkPlace(ctx context.Context, order domain.Order) error {
 	if err := venue.status.CheckAccount(ctx, order.Intent.ExecutionAccountID); err != nil {
-		return port.VenueOrder{}, &port.VenueError{
+		return &port.VenueError{
 			Kind: port.VenueErrorRejected, Code: "CLOB_HEARTBEAT_UNHEALTHY",
 			Message: "new order rejected locally because the CLOB heartbeat is not healthy", Cause: err,
 		}
 	}
-	return venue.venue.Place(ctx, order)
+	return nil
+}
+
+type heartbeatPrepared struct{ inner port.PreparedPlacement }
+
+func (prepared heartbeatPrepared) ExpectedVenueOrderID() string {
+	if prepared.inner == nil {
+		return ""
+	}
+	return prepared.inner.ExpectedVenueOrderID()
+}
+
+func (venue *Venue) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {
+	if err := venue.checkPlace(ctx, order); err != nil {
+		return nil, err
+	}
+	underlying, ok := venue.venue.(port.PreparedVenue)
+	if !ok {
+		return nil, &port.VenueError{Kind: port.VenueErrorInvalid, Code: "CLOB_PREPARED_PLACEMENT_UNSUPPORTED", Message: "underlying live venue does not support prepared placement"}
+	}
+	prepared, err := underlying.PreparePlace(ctx, order)
+	if err != nil {
+		return nil, err
+	}
+	return heartbeatPrepared{inner: prepared}, nil
+}
+
+func (venue *Venue) PlacePrepared(ctx context.Context, order domain.Order, placement port.PreparedPlacement) (port.VenueOrder, error) {
+	prepared, ok := placement.(heartbeatPrepared)
+	underlying, supported := venue.venue.(port.PreparedVenue)
+	if !ok || !supported || prepared.inner == nil {
+		return port.VenueOrder{}, &port.VenueError{Kind: port.VenueErrorInvalid, Code: "CLOB_PREPARED_PLACEMENT_INVALID", Message: "heartbeat prepared placement is invalid"}
+	}
+	if err := venue.checkPlace(ctx, order); err != nil {
+		return port.VenueOrder{}, err
+	}
+	return underlying.PlacePrepared(ctx, order, prepared.inner)
 }
 
 func (venue *Venue) Cancel(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
@@ -236,3 +279,4 @@ func (venue *Venue) Get(ctx context.Context, order domain.Order) (port.VenueOrde
 }
 
 var _ port.Venue = (*Venue)(nil)
+var _ port.PreparedVenue = (*Venue)(nil)

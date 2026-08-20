@@ -20,6 +20,10 @@ var (
 	ErrAccountNotFound         = errors.New("execution account not found")
 	ErrPositionExitRunNotFound = errors.New("position exit run not found")
 	ErrPositionExitConflict    = errors.New("position exit idempotency conflict")
+	ErrDecisionRunNotFound     = errors.New("strategy decision run not found")
+	ErrDecisionConflict        = errors.New("strategy decision idempotency conflict")
+	ErrDecisionIntentNotFound  = errors.New("strategy decision intent not found")
+	ErrDecisionIntentConflict  = errors.New("strategy decision intent claim conflict")
 	ErrCancelFinalityPending   = errors.New("cancel fill finality window has not elapsed")
 )
 
@@ -79,6 +83,22 @@ type Venue interface {
 	Place(ctx context.Context, order domain.Order) (VenueOrder, error)
 	Cancel(ctx context.Context, order domain.Order) (VenueOrder, error)
 	Get(ctx context.Context, order domain.Order) (VenueOrder, error)
+}
+
+// PreparedPlacement is an opaque, in-memory-only signed placement. Only its
+// expected venue order identity is exposed to the execution service; signed
+// bytes and credentials must never be persisted in the order ledger.
+type PreparedPlacement interface {
+	ExpectedVenueOrderID() string
+}
+
+// PreparedVenue separates signing from the state-changing POST. Live venues
+// implement this contract so execution can durably persist SUBMITTING and the
+// expected signed-order hash before any placement POST bytes leave the process.
+type PreparedVenue interface {
+	Venue
+	PreparePlace(ctx context.Context, order domain.Order) (PreparedPlacement, error)
+	PlacePrepared(ctx context.Context, order domain.Order, placement PreparedPlacement) (VenueOrder, error)
 }
 
 // FillSource 读取真实成交记录；订单提交状态不属于此接口，也不能据此构造成交记录。
@@ -338,8 +358,21 @@ type PositionExitRecorder interface {
 type DecisionRecorder interface {
 	// ClaimInput 原子创建周期输入或返回已保存的相同输入；同一周期出现不同输入时返回幂等冲突。
 	ClaimInput(ctx context.Context, request domain.StrategyDecisionRequest) (stored domain.StrategyDecisionRequest, created bool, err error)
-	// ClaimOutput 在 SUBMIT 动作转换成 OrderIntent 前提供相同的幂等保证。
-	ClaimOutput(ctx context.Context, response domain.StrategyDecisionResponse) (stored domain.StrategyDecisionResponse, created bool, err error)
+	// ClaimOutput atomically freezes the validated output and, only when
+	// submissionEnabled was true for this first claim, its complete SUBMIT
+	// intent set. Replays must use the same mode and exact intent set.
+	ClaimOutput(ctx context.Context, response domain.StrategyDecisionResponse, intents []domain.OrderIntent, submissionEnabled bool) (stored domain.StrategyDecisionResponse, created bool, err error)
+	// ClaimPendingIntents exclusively moves PENDING rows to SUBMITTING. An empty
+	// cycleID claims across cycles for crash recovery.
+	ClaimPendingIntents(ctx context.Context, cycleID string, limit int) ([]domain.DecisionIntentDelivery, error)
+	// RequeueStaleSubmitting makes abandoned claims retryable. The stable
+	// client_order_id and execution service's durable lookup make this safe;
+	// an execution result already recorded as UNKNOWN is never requeued.
+	RequeueStaleSubmitting(ctx context.Context, before time.Time, limit int) (int, error)
+	// CompleteIntent uses Attempt as a fencing token and accepts only terminal
+	// SUBMITTED, FAILED, or UNKNOWN states.
+	CompleteIntent(ctx context.Context, clientOrderID string, attempt int, completion domain.DecisionIntentCompletion) error
+	ListIntents(ctx context.Context, cycleID string) ([]domain.DecisionIntentDelivery, error)
 }
 
 // Rejection 表示后端使用的 Rejection 类型。

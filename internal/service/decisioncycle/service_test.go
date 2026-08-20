@@ -3,10 +3,12 @@ package decisioncycle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 )
 
@@ -41,13 +43,16 @@ type fakeMidPriceHistorySource struct {
 	targets   []domain.BookTarget
 	lookback  time.Duration
 	histories []domain.MidPriceHistory
+	err       error
+	calls     int
 }
 
 // Capture 返回模拟行情快照。
 func (source *fakeMidPriceHistorySource) Capture(_ context.Context, _ time.Time, lookback time.Duration, targets []domain.BookTarget) ([]domain.MidPriceHistory, error) {
+	source.calls++
 	source.targets = targets
 	source.lookback = lookback
-	return source.histories, nil
+	return source.histories, source.err
 }
 
 // Capture 返回模拟行情快照。
@@ -130,6 +135,8 @@ type fakeRecorder struct {
 	inputRecorded  bool
 	outputRecorded bool
 	inputError     error
+	deliveries     []domain.DecisionIntentDelivery
+	requeueCalls   int
 }
 
 // ClaimInput 模拟幂等认领并保存测试数据。
@@ -139,9 +146,74 @@ func (recorder *fakeRecorder) ClaimInput(_ context.Context, request domain.Strat
 }
 
 // ClaimOutput 模拟幂等认领并保存测试数据。
-func (recorder *fakeRecorder) ClaimOutput(_ context.Context, response domain.StrategyDecisionResponse) (domain.StrategyDecisionResponse, bool, error) {
+func (recorder *fakeRecorder) ClaimOutput(_ context.Context, response domain.StrategyDecisionResponse, intents []domain.OrderIntent, submissionEnabled bool) (domain.StrategyDecisionResponse, bool, error) {
 	recorder.outputRecorded = true
+	if submissionEnabled && recorder.deliveries == nil {
+		recorder.deliveries = make([]domain.DecisionIntentDelivery, len(intents))
+		for index, intent := range intents {
+			recorder.deliveries[index] = domain.DecisionIntentDelivery{
+				CycleID: response.CycleID, ClientOrderID: intent.ClientOrderID,
+				Sequence: index, Intent: intent, Status: domain.DecisionIntentPending,
+			}
+		}
+	}
 	return response, true, nil
+}
+
+func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, cycleID string, limit int) ([]domain.DecisionIntentDelivery, error) {
+	result := make([]domain.DecisionIntentDelivery, 0)
+	for index := range recorder.deliveries {
+		delivery := &recorder.deliveries[index]
+		if delivery.Status != domain.DecisionIntentPending || (cycleID != "" && delivery.CycleID != cycleID) || len(result) >= limit {
+			continue
+		}
+		delivery.Status = domain.DecisionIntentSubmitting
+		delivery.Attempt++
+		result = append(result, *delivery)
+	}
+	return result, nil
+}
+
+func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, _ time.Time, limit int) (int, error) {
+	recorder.requeueCalls++
+	requeued := 0
+	for index := range recorder.deliveries {
+		if requeued >= limit {
+			break
+		}
+		delivery := &recorder.deliveries[index]
+		if delivery.Status != domain.DecisionIntentSubmitting {
+			continue
+		}
+		delivery.Status = domain.DecisionIntentPending
+		delivery.ClaimedAt = nil
+		requeued++
+	}
+	return requeued, nil
+}
+
+func (recorder *fakeRecorder) CompleteIntent(_ context.Context, clientOrderID string, attempt int, completion domain.DecisionIntentCompletion) error {
+	for index := range recorder.deliveries {
+		delivery := &recorder.deliveries[index]
+		if delivery.ClientOrderID == clientOrderID && delivery.Attempt == attempt {
+			delivery.Status = completion.Status
+			delivery.OrderID = completion.OrderID
+			delivery.OrderStatus = completion.OrderStatus
+			delivery.LastError = completion.LastError
+			return nil
+		}
+	}
+	return port.ErrDecisionIntentConflict
+}
+
+func (recorder *fakeRecorder) ListIntents(_ context.Context, cycleID string) ([]domain.DecisionIntentDelivery, error) {
+	result := make([]domain.DecisionIntentDelivery, 0)
+	for _, delivery := range recorder.deliveries {
+		if delivery.CycleID == cycleID {
+			result = append(result, delivery)
+		}
+	}
+	return result, nil
 }
 
 // fakeExecutor 表示后端使用的 fakeExecutor 类型。
@@ -152,7 +224,16 @@ type fakeExecutor struct {
 // Submit 记录模拟订单提交。
 func (executor *fakeExecutor) Submit(_ context.Context, intent domain.OrderIntent) (execution.SubmitResult, error) {
 	executor.intents = append(executor.intents, intent)
-	return execution.SubmitResult{Order: domain.Order{ID: "order-1", Intent: intent}, Created: true}, nil
+	return execution.SubmitResult{Order: domain.Order{ID: "order-1", Intent: intent, Status: domain.OrderStatusAcknowledged}, Created: true}, nil
+}
+
+type fixedResultExecutor struct {
+	result port.OrderSubmitResult
+	err    error
+}
+
+func (executor fixedResultExecutor) Submit(context.Context, domain.OrderIntent) (port.OrderSubmitResult, error) {
+	return executor.result, executor.err
 }
 
 // TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput 验证 Run Builds Frozen Input And Executes Recorded Strategy Output 场景下的行为。
@@ -230,6 +311,7 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		Strategy:        strategy,
 		Recorder:        recorder,
 		Executor:        executor,
+		SubmitEnabled:   true,
 		Bindings:        []domain.StrategyExecutionContext{testBinding()},
 		Venue:           "polymarket-paper",
 		Now:             func() time.Time { return decisionAt.Add(5 * time.Second) },
@@ -258,6 +340,9 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 	}
 	if !recorder.inputRecorded || !recorder.outputRecorded || len(executor.intents) != 1 {
 		t.Fatalf("recorded input/output = %v/%v, executed = %d", recorder.inputRecorded, recorder.outputRecorded, len(executor.intents))
+	}
+	if len(run.Intents) != 1 || run.Intents[0].DeliveryStatus != domain.DecisionIntentSubmitted || run.Intents[0].DeliveryAttempt != 1 {
+		t.Fatalf("durable intent deliveries = %#v", run.Intents)
 	}
 	intent := executor.intents[0]
 	if intent.ModelID != "test" || intent.StrategyID != domain.StrategyIDMultfactorV2 || intent.ExecutionAccountID != "account-test-v2" ||
@@ -304,6 +389,7 @@ func TestRunExpandsThreeModelsAndTwoStrategiesIntoSixAccounts(t *testing.T) {
 		Strategy:        strategy,
 		Recorder:        &fakeRecorder{},
 		Executor:        &fakeExecutor{},
+		SubmitEnabled:   true,
 		Bindings:        bindings,
 		Venue:           "polymarket-paper",
 		Now:             func() time.Time { return decisionAt.Add(2 * time.Second) },
@@ -359,6 +445,7 @@ func TestRunFailsClosedWhenInputCannotBeRecorded(t *testing.T) {
 		Strategy:        strategy,
 		Recorder:        recorder,
 		Executor:        executor,
+		SubmitEnabled:   true,
 		Bindings:        []domain.StrategyExecutionContext{testBinding()},
 		Venue:           "polymarket-paper",
 	})
@@ -407,6 +494,7 @@ func TestRunRejectsStrategyResponseThatOmitsAnOutcome(t *testing.T) {
 		Strategy:        strategy,
 		Recorder:        recorder,
 		Executor:        executor,
+		SubmitEnabled:   true,
 		Bindings:        []domain.StrategyExecutionContext{testBinding()},
 		Venue:           "polymarket-paper",
 	})
@@ -437,6 +525,7 @@ func TestRunRejectsStrategyResponseThatChangesExecutionAccount(t *testing.T) {
 		Strategy:        contextHijackStrategy{},
 		Recorder:        &fakeRecorder{},
 		Executor:        &fakeExecutor{},
+		SubmitEnabled:   true,
 		Bindings:        []domain.StrategyExecutionContext{testBinding()},
 		Venue:           "polymarket-paper",
 	})
@@ -445,6 +534,44 @@ func TestRunRejectsStrategyResponseThatChangesExecutionAccount(t *testing.T) {
 	}
 	if _, err := service.Run(context.Background(), decisionAt); !errors.Is(err, ErrInvalidStrategy) {
 		t.Fatalf("Run() error = %v, want ErrInvalidStrategy", err)
+	}
+}
+
+func TestRunRejectsFutureStrategyDecisionTime(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	strategy := &fakeStrategy{response: domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion,
+		DecidedAt:     decisionAt.Add(time.Hour),
+		Evaluations:   []domain.StrategyEvaluation{},
+		Exits:         []domain.StrategyExit{},
+	}}
+	recorder := &fakeRecorder{}
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
+			SnapshotID:    "predsnap-empty",
+			DecisionAt:    decisionAt,
+			Predictions:   []domain.Prediction{},
+		}},
+		PositionSource:  fakePositionSource{},
+		OrderBookSource: &fakeOrderBookSource{},
+		MidPriceSource:  &fakeMidPriceHistorySource{},
+		Strategy:        strategy,
+		Recorder:        recorder,
+		Executor:        &fakeExecutor{},
+		SubmitEnabled:   true,
+		Bindings:        []domain.StrategyExecutionContext{testBinding()},
+		Venue:           "polymarket-paper",
+		Now:             func() time.Time { return decisionAt.Add(2 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := service.Run(context.Background(), decisionAt); !errors.Is(err, ErrInvalidStrategy) {
+		t.Fatalf("Run() error = %v, want ErrInvalidStrategy", err)
+	}
+	if recorder.outputRecorded {
+		t.Fatal("future strategy response was recorded")
 	}
 }
 
@@ -461,6 +588,7 @@ func TestNewRejectsDuplicateAccountBinding(t *testing.T) {
 		Strategy:         &fakeStrategy{},
 		Recorder:         &fakeRecorder{},
 		Executor:         &fakeExecutor{},
+		SubmitEnabled:    true,
 		Bindings:         []domain.StrategyExecutionContext{first, second},
 		Venue:            "polymarket-paper",
 	})
@@ -479,6 +607,7 @@ func TestRunRejectsNonBoundaryTime(t *testing.T) {
 		Strategy:         &fakeStrategy{},
 		Recorder:         &fakeRecorder{},
 		Executor:         &fakeExecutor{},
+		SubmitEnabled:    true,
 		Bindings:         []domain.StrategyExecutionContext{testBinding()},
 		Venue:            "polymarket-paper",
 	})
@@ -520,6 +649,251 @@ func TestBuildEntryIntentRequiresUsableMidPriceHistory(t *testing.T) {
 	}
 	if _, err := buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket"); err == nil {
 		t.Fatal("buildEntryIntent() error = nil, want unusable mid-price history rejection")
+	}
+}
+
+func TestMultfactorV1EntryDoesNotRequireMidPriceHistory(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	request := domain.StrategyDecisionRequest{
+		Context: domain.StrategyExecutionContext{
+			ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-v1",
+		},
+		DecisionAt: decisionAt, Predictions: []domain.Prediction{prediction},
+		ExecutionConstraints: domain.DefaultStrategyExecutionConstraints(),
+		OrderBooks: []domain.OrderBookSnapshot{{
+			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: 0,
+			TokenID: prediction.Outcomes[0].TokenID, Status: domain.OrderBookStatusOK,
+			SourceAt: decisionAt, ObservedAt: decisionAt, DepthLimit: domain.StrategyOrderBookDepth,
+			Bids: []domain.PriceLevel{{Price: "0.48", Size: "10"}},
+			Asks: []domain.PriceLevel{{Price: "0.50", Size: "10"}},
+		}},
+		MidPriceHistories: []domain.MidPriceHistory{{
+			TokenID: prediction.Outcomes[0].TokenID, Status: domain.MidPriceHistoryStatusPartial,
+		}},
+	}
+	evaluation := domain.StrategyEvaluation{
+		DecisionID: "decision-v1", PredictionID: prediction.PredictionID,
+		MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+		OutcomeIndex: 0, TokenID: prediction.Outcomes[0].TokenID,
+		Order: &domain.StrategyOrderParams{
+			Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.50", Size: "10", TimeInForce: domain.TimeInForceFOK,
+		},
+	}
+	if _, err := buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket"); err != nil {
+		t.Fatalf("buildEntryIntent() error = %v, want v1 to ignore hourly history", err)
+	}
+	if reason := inputFailureReason(request, prediction.Outcomes[0].TokenID); reason != "" {
+		t.Fatalf("inputFailureReason() = %q, want no v1 history failure", reason)
+	}
+}
+
+func TestV1OnlyCycleDoesNotCallMidPriceSource(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	historySource := &fakeMidPriceHistorySource{err: errors.New("history source must not be called")}
+	strategy := &matrixStrategy{}
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
+			SnapshotID:    "predsnap-v1", DecisionAt: decisionAt,
+			Predictions: []domain.Prediction{prediction},
+		}},
+		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
+		MidPriceSource: historySource, Strategy: strategy, Recorder: &fakeRecorder{},
+		Bindings: []domain.StrategyExecutionContext{{
+			ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-v1",
+		}},
+		Venue: "polymarket", Now: func() time.Time { return decisionAt.Add(time.Second) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if historySource.calls != 0 || len(strategy.requests) != 1 || len(result.Runs) != 1 {
+		t.Fatalf("history calls=%d strategy requests=%d runs=%d", historySource.calls, len(strategy.requests), len(result.Runs))
+	}
+	histories := strategy.requests[0].MidPriceHistories
+	if len(histories) != 2 || histories[0].Status != domain.MidPriceHistoryStatusMissing ||
+		histories[0].ErrorCode != "NOT_REQUIRED_FOR_MULTFACTOR_V1" {
+		t.Fatalf("v1 history placeholders = %#v", histories)
+	}
+}
+
+func TestMixedCycleHistoryFailureDoesNotBlockV1Binding(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	historySource := &fakeMidPriceHistorySource{err: errors.New("history unavailable")}
+	strategy := &matrixStrategy{}
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
+			SnapshotID:    "predsnap-mixed", DecisionAt: decisionAt,
+			Predictions: []domain.Prediction{prediction},
+		}},
+		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
+		MidPriceSource: historySource, Strategy: strategy, Recorder: &fakeRecorder{},
+		Bindings: []domain.StrategyExecutionContext{
+			{ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-v1"},
+			{ModelID: "test", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "account-v2"},
+		},
+		Venue: "polymarket", Now: func() time.Time { return decisionAt.Add(time.Second) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, runErr := service.Run(context.Background(), decisionAt)
+	if runErr == nil {
+		t.Fatal("Run() error = nil, want v2 history failure")
+	}
+	if historySource.calls != 1 || len(strategy.requests) != 1 ||
+		strategy.requests[0].Context.StrategyID != domain.StrategyIDMultfactorV1 || len(result.Runs) != 2 ||
+		result.Runs[0].Error != nil || result.Runs[1].Error == nil {
+		t.Fatalf("mixed result=%#v history calls=%d strategy requests=%#v", result, historySource.calls, strategy.requests)
+	}
+}
+
+func TestUnknownStrategyFailsClosedBeforeStrategyOutputCanCreateAnIntent(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	request := domain.StrategyDecisionRequest{
+		SchemaVersion: domain.StrategyInputSchemaVersion,
+		CycleID:       "cycle-unknown",
+		InputID:       "input-unknown",
+		Context: domain.StrategyExecutionContext{
+			ModelID: "test", StrategyID: "multfactor_v3", ExecutionAccountID: "account-1",
+		},
+		DecisionAt: decisionAt,
+	}
+	response := domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion,
+		CycleID:       request.CycleID,
+		InputID:       request.InputID,
+		Context:       request.Context,
+		DecidedAt:     decisionAt.Add(time.Second),
+		Evaluations:   []domain.StrategyEvaluation{},
+		Exits:         []domain.StrategyExit{},
+	}
+	if _, err := validateResponse(request, response, "polymarket"); err == nil || !errors.Is(err, ErrInvalidStrategy) {
+		t.Fatalf("validateResponse() error = %v, want unsupported strategy rejection", err)
+	}
+}
+
+func TestStrategySpecificEvidenceMetricsAndUniverseReason(t *testing.T) {
+	request := domain.StrategyDecisionRequest{Context: domain.StrategyExecutionContext{
+		ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-v1",
+	}, OrderBooks: []domain.OrderBookSnapshot{{
+		TokenID: "token", Status: domain.OrderBookStatusOK,
+		Asks: []domain.PriceLevel{{Price: "0.50", Size: "10"}},
+	}}}
+	evidence := domain.StrategyEvidence{Metrics: map[string]string{
+		"best_ask": "0.50", "near_logdiff_usd": "2.40", "rel_spread": "0.05",
+	}}
+	if err := validateEvidenceMetrics(evidence, request, "token", true); err != nil {
+		t.Fatalf("v1 evidence error = %v", err)
+	}
+	evidence.Metrics["MOM"] = "-0.01"
+	if err := validateEvidenceMetrics(evidence, request, "token", true); err != nil {
+		t.Fatalf("optional v1 hourly evidence error = %v", err)
+	}
+	if !validSkipReason(domain.StrategyReasonOutsideUniverse) {
+		t.Fatal("OUTSIDE_STRATEGY_UNIVERSE is not accepted as an auditable SKIP reason")
+	}
+}
+
+func TestDecisionIntentCompletionRequiresDurableExecutionOwnership(t *testing.T) {
+	if _, complete := decisionIntentCompletion(port.OrderSubmitResult{}, errors.New("database unavailable")); complete {
+		t.Fatal("delivery without a durable execution order was marked terminal")
+	}
+	cases := []struct {
+		status domain.OrderStatus
+		want   domain.DecisionIntentDeliveryStatus
+	}{
+		{status: domain.OrderStatusRejected, want: domain.DecisionIntentFailed},
+		{status: domain.OrderStatusUnknown, want: domain.DecisionIntentUnknown},
+		{status: domain.OrderStatusManualReview, want: domain.DecisionIntentUnknown},
+		{status: domain.OrderStatusAcknowledged, want: domain.DecisionIntentSubmitted},
+		{status: domain.OrderStatusFilled, want: domain.DecisionIntentSubmitted},
+	}
+	for _, testCase := range cases {
+		completion, complete := decisionIntentCompletion(port.OrderSubmitResult{Order: domain.Order{
+			ID: "order-1", Status: testCase.status,
+		}}, errors.New("execution returned an audited result"))
+		if !complete || completion.Status != testCase.want || completion.OrderID != "order-1" || completion.LastError == "" {
+			t.Fatalf("status %s completion = %#v, complete=%v", testCase.status, completion, complete)
+		}
+	}
+}
+
+func TestDeliverPendingSurfacesReplayedRejectedAndUnknownOrders(t *testing.T) {
+	for _, status := range []domain.OrderStatus{domain.OrderStatusRejected, domain.OrderStatusUnknown} {
+		t.Run(string(status), func(t *testing.T) {
+			intent := domain.OrderIntent{ClientOrderID: "client-1"}
+			recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{{
+				CycleID: "cycle-1", ClientOrderID: intent.ClientOrderID,
+				Intent: intent, Status: domain.DecisionIntentPending,
+			}}}
+			service := &Service{recorder: recorder, executor: fixedResultExecutor{result: port.OrderSubmitResult{
+				Order: domain.Order{ID: "order-1", Status: status},
+			}}}
+			results, err := service.deliverPending(context.Background(), "cycle-1")
+			if err == nil || len(results) != 1 || results[0].Error == nil {
+				t.Fatalf("deliverPending() results=%#v error=%v", results, err)
+			}
+			want := domain.DecisionIntentFailed
+			if status == domain.OrderStatusUnknown {
+				want = domain.DecisionIntentUnknown
+			}
+			if results[0].DeliveryStatus != want || recorder.deliveries[0].Status != want {
+				t.Fatalf("delivery status=%s stored=%s want=%s", results[0].DeliveryStatus, recorder.deliveries[0].Status, want)
+			}
+		})
+	}
+}
+
+func TestDeliverPendingLeavesMissingOrderOwnershipLeasedAndUnhealthy(t *testing.T) {
+	intent := domain.OrderIntent{ClientOrderID: "client-1"}
+	recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{{
+		CycleID: "cycle-1", ClientOrderID: intent.ClientOrderID,
+		Intent: intent, Status: domain.DecisionIntentPending,
+	}}}
+	service := &Service{recorder: recorder, executor: fixedResultExecutor{}}
+	results, err := service.deliverPending(context.Background(), "cycle-1")
+	if err == nil || len(results) != 1 || results[0].Error == nil ||
+		recorder.deliveries[0].Status != domain.DecisionIntentSubmitting {
+		t.Fatalf("deliverPending() results=%#v stored=%#v error=%v", results, recorder.deliveries, err)
+	}
+}
+
+func TestRecoverStartupDrainsMoreThanOneClaimBatchBeforeNewSchedule(t *testing.T) {
+	deliveries := make([]domain.DecisionIntentDelivery, 201)
+	for index := range deliveries {
+		deliveries[index] = domain.DecisionIntentDelivery{
+			CycleID:       "old-cycle",
+			ClientOrderID: fmt.Sprintf("client-%03d", index),
+			Intent:        domain.OrderIntent{ClientOrderID: fmt.Sprintf("client-%03d", index)},
+			Status:        domain.DecisionIntentSubmitting,
+			Attempt:       1,
+		}
+	}
+	recorder := &fakeRecorder{deliveries: deliveries}
+	executor := &fakeExecutor{}
+	service := &Service{
+		recorder: recorder, executor: executor, submitEnabled: true,
+		now: func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
+	}
+	if err := service.RecoverStartup(context.Background()); err != nil {
+		t.Fatalf("RecoverStartup() error = %v", err)
+	}
+	if recorder.requeueCalls != 3 || len(executor.intents) != 201 {
+		t.Fatalf("requeue calls=%d submitted=%d", recorder.requeueCalls, len(executor.intents))
+	}
+	for _, delivery := range recorder.deliveries {
+		if delivery.Status != domain.DecisionIntentSubmitted {
+			t.Fatalf("delivery %q status = %s", delivery.ClientOrderID, delivery.Status)
+		}
 	}
 }
 

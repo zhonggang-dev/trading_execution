@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/clobheartbeat"
+	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
@@ -38,6 +39,7 @@ type liveRuntime struct {
 	heartbeat      *clobheartbeat.Service
 	runner         *reconciliation.Runner
 	operations     *liveoperations.Service
+	decisionRunner *decisionrunner.Runner
 }
 
 // buildLiveRuntimeParams 收拢实盘依赖装配参数，避免长参数列表破坏函数声明可读性。
@@ -256,17 +258,18 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	}
 
 	executionService, err := execution.New(execution.Params{
-		Repository:              repository,
-		Venue:                   reconciliationVenue,
-		Guard:                   guard,
-		MarketValidator:         marketValidator,
-		Reservations:            reservations,
-		Reconciliation:          triggerBridge,
-		FillSynchronizer:        fillProcessor,
-		AuthoritativeFills:      true,
-		CancelFillFinalityGrace: cfg.Polymarket.CancelFillFinalityGrace,
-		ImmediateCancelFinality: false,
-		MaxReconcileAttempts:    cfg.Polymarket.MaxReconcileAttempts,
+		Repository:               repository,
+		Venue:                    reconciliationVenue,
+		Guard:                    guard,
+		MarketValidator:          marketValidator,
+		Reservations:             reservations,
+		Reconciliation:           triggerBridge,
+		FillSynchronizer:         fillProcessor,
+		AuthoritativeFills:       true,
+		CancelFillFinalityGrace:  cfg.Polymarket.CancelFillFinalityGrace,
+		ImmediateCancelFinality:  false,
+		MaxReconcileAttempts:     cfg.Polymarket.MaxReconcileAttempts,
+		RequirePreparedPlacement: true,
 	})
 	if err != nil {
 		return nil, err
@@ -331,15 +334,6 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if triggerBridge.Dropped() != 0 {
 		return nil, fmt.Errorf("live startup dropped %d reconciliation trigger(s)", triggerBridge.Dropped())
 	}
-	// Activating the dead-man switch earlier could cancel pre-existing orders
-	// if another startup check failed. Start it only after all read-only checks
-	// and startup reconciliation have succeeded.
-	if err := heartbeat.Start(ctx); err != nil {
-		return nil, fmt.Errorf("start Polymarket CLOB heartbeat: %w", err)
-	}
-	if err := heartbeat.Check(ctx); err != nil {
-		return nil, fmt.Errorf("verify initial Polymarket CLOB heartbeat freshness: %w", err)
-	}
 	liveOperationsRepository, err := postgresadapter.NewLiveOperationsRepository(database)
 	if err != nil {
 		return nil, err
@@ -359,20 +353,40 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err := operations.Refresh(ctx); err != nil {
 		return nil, fmt.Errorf("build initial live operations snapshot: %w", err)
 	}
+	decisionRunner, err := buildDecisionRunner(buildDecisionRunnerParams{
+		cfg: cfg, database: database, positionSource: fillLedger, orderBooks: orderBooks,
+		executor: executionService, accountIDs: accountIDs, logger: logger,
+	})
+	if err != nil {
+		return nil, err
+	}
 
-	combinedReadiness, err := readiness.NewAll(
+	readinessChecks := []readiness.NamedChecker{
 		readiness.NamedChecker{Name: "postgres", Checker: databaseReadiness},
 		readiness.NamedChecker{Name: "reconciliation", Checker: runner},
 		readiness.NamedChecker{Name: "clob_heartbeat", Checker: heartbeat},
-	)
+	}
+	if decisionRunner != nil {
+		readinessChecks = append(readinessChecks, readiness.NamedChecker{Name: "decision_cycle", Checker: decisionRunner})
+	}
+	combinedReadiness, err := readiness.NewAll(readinessChecks...)
 	if err != nil {
 		return nil, err
+	}
+	// Activating the dead-man switch can cancel pre-existing orders, so it is
+	// intentionally the final fallible startup action after reconciliation,
+	// the initial operations snapshot, and decision-cycle composition.
+	if err := heartbeat.Start(ctx); err != nil {
+		return nil, fmt.Errorf("start Polymarket CLOB heartbeat: %w", err)
+	}
+	if err := heartbeat.Check(ctx); err != nil {
+		return nil, fmt.Errorf("verify initial Polymarket CLOB heartbeat freshness: %w", err)
 	}
 	logger.Info("Polymarket live startup reconciliation passed", "accounts", len(accountIDs))
 	return &liveRuntime{
 		repository: repository, execution: executionService,
 		reconciliation: reconciliationService, readiness: combinedReadiness,
-		heartbeat: heartbeat, runner: runner, operations: operations,
+		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
 	}, nil
 }
 
@@ -405,7 +419,7 @@ func validateStartupReconciliation(result reconciliation.SweepResult, expectedAc
 	return nil
 }
 
-// startBackground 启动 heartbeat、对账和只读快照三个后台循环。
+// startBackground 启动 heartbeat、对账、只读快照和可选决策周期后台循环。
 func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Logger) error {
 	runnerReady := make(chan struct{})
 	runnerErrors := make(chan error, 1)
@@ -419,11 +433,30 @@ func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Lo
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// Heartbeat has already completed its synchronous first beat during live
+	// composition. Keep the dead-man loop alive before any optional decision
+	// recovery can spend time reconciling durable intent deliveries.
 	go func() {
 		if err := runtime.heartbeat.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("Polymarket CLOB heartbeat loop stopped", "error", err)
 		}
 	}()
+	var decisionErrors <-chan error
+	if runtime.decisionRunner != nil {
+		decisionReady := make(chan struct{})
+		errorsChannel := make(chan error, 1)
+		decisionErrors = errorsChannel
+		go func() {
+			errorsChannel <- runtime.decisionRunner.RunReady(ctx, decisionReady)
+		}()
+		select {
+		case <-decisionReady:
+		case err := <-errorsChannel:
+			return fmt.Errorf("start decision cycle loop: %w", err)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	go func() {
 		if err := <-runnerErrors; err != nil && ctx.Err() == nil {
 			logger.Error("Polymarket reconciliation loop stopped", "error", err)
@@ -434,5 +467,12 @@ func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Lo
 			logger.Error("live operations snapshot loop stopped", "error", err)
 		}
 	}()
+	if decisionErrors != nil {
+		go func() {
+			if err := <-decisionErrors; err != nil && ctx.Err() == nil {
+				logger.Error("decision cycle loop stopped", "error", err)
+			}
+		}()
+	}
 	return nil
 }

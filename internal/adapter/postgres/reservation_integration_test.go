@@ -1107,7 +1107,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 	db := stdlib.OpenDB(*testConfig)
 	db.SetMaxOpenConns(8)
 	t.Cleanup(func() { _ = db.Close() })
-	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql"} {
+	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", name, err)

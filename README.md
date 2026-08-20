@@ -23,7 +23,7 @@
 新框架通过独立的 `decisioncycle` 应用服务编排 10 分钟周期，但不包含策略规则：
 
 ```text
-prediction_infra PIT 概率快照 + PostgreSQL OPEN lots + Polymarket top-15 订单簿 + 48 小时 mid price history
+prediction_infra PIT 概率快照 + PostgreSQL OPEN lots + Polymarket top-15 订单簿 + v2 所需的 48 小时 mid price history
   -> 按 (model_id, strategy_id, execution_account_id) 展开
   -> trading.strategy_input.v4
   -> 外部策略服务
@@ -98,15 +98,19 @@ PostgreSQL 订单/预占/Fill/仓位账本、启动与持续 reconciliation、he
 
 1. 用进程外 secret 文件/HSM 安全配置钱包，并确认旧机器人已停机；同一账户不能由两个 heartbeat
    owner 并行控制。`POLY_1271`/Deposit Wallet 当前仍 fail closed；
-2. 执行并审计 migrations `0001..0010`，把钱包、账面 pUSD、已有仓位 cost basis/lots、
+2. 执行并审计 migrations `0001..0013`，把钱包、账面 pUSD、已有仓位 cost basis/lots、
    risk policy、strategy binding 和 reconciliation 基线对齐；
 3. 确认 CLOB V2 私有认证成功、`closed_only=false`、Polygon pUSD 及两个 V2 Exchange allowance
    正确，并让每个确认 Fill 都取得足够确认数的链上 `OrderFilled` 证据；
 4. 使用专用小额空钱包完成一次人工批准的 BUY/SELL/Cancel canary 后再逐步放量。
 
-transactional outbox 会与账本同事务写入，但生产消息 publisher 仍需按部署环境注入；Position Exit、
-策略周期和链上 redeem 也尚未在 `cmd/server` 装配。这些不影响人工 API canary，但在完成前不能
-声称已经具备全自动策略生命周期。
+transactional outbox 会与账本同事务写入，但生产消息 publisher 仍需按部署环境注入；Position Exit
+和链上 redeem 仍未在 `cmd/server` 装配。策略周期已经使用 prediction_infra HTTP snapshot、
+Python `/api/v4/decisions`、PostgreSQL 输入/输出审计和精确 UTC Runner 完成 live 装配，但默认
+`DECISION_CYCLE_ENABLED=false`，且独立的订单提交开关也默认关闭。两个开关未同时明确开启时，
+不会由周期创建订单。提交开关打开时，经过校验的 OrderIntent 会先与策略输出在同一事务中写入
+PostgreSQL 投递表，再由带租约和 fencing attempt 的 worker 调用幂等执行服务；进程崩溃后只会按
+稳定 `client_order_id` 恢复，不会把一次算法响应直接当成一次不可靠的内存下单。
 
 内存 Repository 只用于 local 且未配置数据库的开发模式；重启会丢失订单和幂等记录，不能用于
 共享测试或实盘。非 local 环境缺少 `TRADING_EXECUTION_DATABASE_URL` 时会直接拒绝启动。
@@ -165,7 +169,7 @@ curl 'http://127.0.0.1:8090/api/v1/trades?from=2026-08-01T00:00:00Z&side=SELL&mo
 字符串小数；不返回钱包地址、CLOB 凭证、签名或原始响应。配置
 `TRADING_EXECUTION_DATABASE_URL` 后读取 PostgreSQL；未配置时 paper 模式返回空列表，
 不会把 paper 订单状态伪装成真实成交。生产库需按顺序执行至
-`migrations/0010_v2_settlement_evidence.sql`。
+`migrations/0013_strategy_intent_deliveries.sql`。
 
 创建限价单：
 

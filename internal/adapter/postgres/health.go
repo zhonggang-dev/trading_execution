@@ -43,6 +43,8 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_account_events'),
 			('execution_outbox'),
 			('position_exit_runs'),
+			('strategy_decision_runs'),
+			('strategy_order_intent_deliveries'),
 			('reconciliation_runs'),
 			('reconciliation_issues'),
 			('execution_risk_global_control'),
@@ -71,7 +73,11 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('asset_reservations', 'daily_risk_notional'),
 			('execution_fills', 'platform_fee_rate'),
 			('execution_fills', 'fee_exponent'),
-			('execution_fills', 'settlement_evidence')
+			('execution_fills', 'settlement_evidence'),
+			('strategy_decision_runs', 'order_submission_enabled'),
+			('strategy_order_intent_deliveries', 'intent_payload'),
+			('strategy_order_intent_deliveries', 'status'),
+			('strategy_order_intent_deliveries', 'attempt_count')
 		) AS required(table_name, column_name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -101,7 +107,15 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_fills_platform_fee_rate_nonnegative'),
 			('execution_fills_fee_exponent_shape'),
 			('execution_fills_settlement_evidence_object'),
-			('execution_fills_polygon_settlement_evidence_shape')
+			('execution_fills_polygon_settlement_evidence_shape'),
+			('strategy_decision_runs_submission_mode_shape'),
+			('strategy_order_intent_deliveries_cycle_sequence_unique'),
+			('strategy_order_intent_deliveries_identity_nonempty'),
+			('strategy_order_intent_deliveries_payload_object'),
+			('strategy_order_intent_deliveries_status'),
+			('strategy_order_intent_deliveries_attempt_nonnegative'),
+			('strategy_order_intent_deliveries_state_shape'),
+			('strategy_order_intent_deliveries_result_shape')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -123,7 +137,9 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 	err = checker.db.QueryRowContext(ctx, `
 		SELECT count(*)
 		FROM (VALUES
-			('execution_fills_polygon_settlement_event_uidx')
+			('execution_fills_polygon_settlement_event_uidx'),
+			('strategy_decision_runs_account_time_idx'),
+			('strategy_order_intent_deliveries_cycle_sequence_unique')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -142,6 +158,31 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 	}
 	if missingIndexes != 0 {
 		return fmt.Errorf("postgres live schema is incomplete: %d required indexes are missing or invalid", missingIndexes)
+	}
+
+	var missingDeliveryIndexes int
+	err = checker.db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM (VALUES
+			('strategy_order_intent_deliveries_pending_idx'),
+			('strategy_order_intent_deliveries_stale_idx')
+		) AS required(name)
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM pg_class index_definition
+			JOIN pg_namespace namespace_definition
+			  ON namespace_definition.oid = index_definition.relnamespace
+			JOIN pg_index index_state ON index_state.indexrelid = index_definition.oid
+			WHERE namespace_definition.nspname = current_schema()
+			  AND index_definition.relname = required.name
+			  AND index_state.indisvalid
+			  AND index_state.indisready
+		)`).Scan(&missingDeliveryIndexes)
+	if err != nil {
+		return fmt.Errorf("inspect postgres decision delivery indexes: %w", err)
+	}
+	if missingDeliveryIndexes != 0 {
+		return fmt.Errorf("postgres live schema is incomplete: %d decision delivery indexes are missing or invalid", missingDeliveryIndexes)
 	}
 
 	var missingTriggers int

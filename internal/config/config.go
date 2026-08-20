@@ -1,7 +1,9 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -21,6 +23,7 @@ type Config struct {
 	Execution      Execution
 	Polymarket     Polymarket
 	LiveOperations LiveOperations
+	DecisionCycle  DecisionCycle
 }
 
 // App 表示后端使用的 App 类型。
@@ -49,6 +52,25 @@ type LiveOperations struct {
 	RefreshTimeout time.Duration
 	MaxSnapshotAge time.Duration
 	EventLimit     int
+}
+
+// DecisionCycle configures the pull-based prediction -> algorithm -> execution
+// workflow. OrderSubmissionEnabled is deliberately independent from Enabled so
+// production can run the complete decision path without creating orders.
+type DecisionCycle struct {
+	Enabled                bool
+	OrderSubmissionEnabled bool
+	PredictionInfraBaseURL string
+	PredictionInfraToken   string
+	StrategyBaseURL        string
+	StrategyToken          string
+	Interval               time.Duration
+	StartupDelay           time.Duration
+	MaxStartLateness       time.Duration
+	Timeout                time.Duration
+	PredictionLookback     time.Duration
+	MidPriceLookback       time.Duration
+	Bindings               []domain.StrategyExecutionContext
 }
 
 // Database 表示后端使用的 Database 类型。
@@ -236,6 +258,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	decisionCycle, err := loadDecisionCycle()
+	if err != nil {
+		return Config{}, err
+	}
 	config := Config{
 		App: App{
 			Name:     env("APP_NAME", "trading_execution"),
@@ -297,6 +323,7 @@ func Load() (Config, error) {
 			Interval: liveOperationsInterval, RefreshTimeout: liveOperationsRefreshTimeout,
 			MaxSnapshotAge: liveOperationsMaxAge, EventLimit: liveOperationsEventLimit,
 		},
+		DecisionCycle: decisionCycle,
 	}
 	if err := config.Validate(); err != nil {
 		return Config{}, err
@@ -379,7 +406,167 @@ func (config Config) Validate() error {
 			return fmt.Errorf("LIVE_OPERATIONS_MAX_SNAPSHOT_AGE must be greater than LIVE_OPERATIONS_INTERVAL")
 		}
 	}
+	if config.DecisionCycle.OrderSubmissionEnabled && !config.DecisionCycle.Enabled {
+		return fmt.Errorf("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED requires DECISION_CYCLE_ENABLED=true")
+	}
+	if config.DecisionCycle.Enabled {
+		if config.Execution.Mode != "live" {
+			return fmt.Errorf("DECISION_CYCLE_ENABLED requires EXECUTION_MODE=live")
+		}
+		if config.DecisionCycle.Interval != 10*time.Minute {
+			return fmt.Errorf("DECISION_CYCLE_INTERVAL must be exactly 10m")
+		}
+		if config.DecisionCycle.StartupDelay < 0 || config.DecisionCycle.StartupDelay >= config.DecisionCycle.Interval {
+			return fmt.Errorf("DECISION_CYCLE_STARTUP_DELAY must be non-negative and less than the interval")
+		}
+		if config.DecisionCycle.MaxStartLateness <= 0 || config.DecisionCycle.MaxStartLateness >= config.DecisionCycle.Interval {
+			return fmt.Errorf("DECISION_CYCLE_MAX_START_LATENESS must be positive and less than the interval")
+		}
+		if config.DecisionCycle.Timeout <= 0 || config.DecisionCycle.Timeout >= config.DecisionCycle.Interval {
+			return fmt.Errorf("DECISION_CYCLE_TIMEOUT must be positive and less than DECISION_CYCLE_INTERVAL")
+		}
+		if config.DecisionCycle.PredictionLookback < 10*time.Minute || config.DecisionCycle.PredictionLookback > 24*time.Hour {
+			return fmt.Errorf("DECISION_CYCLE_PREDICTION_LOOKBACK must be between 10m and 24h")
+		}
+		if config.DecisionCycle.MidPriceLookback < 2*time.Hour || config.DecisionCycle.MidPriceLookback > 7*24*time.Hour {
+			return fmt.Errorf("DECISION_CYCLE_MID_PRICE_LOOKBACK must be between 2h and 168h")
+		}
+		for name, value := range map[string]string{
+			"DECISION_CYCLE_PREDICTION_INFRA_URL": config.DecisionCycle.PredictionInfraBaseURL,
+			"DECISION_CYCLE_STRATEGY_URL":         config.DecisionCycle.StrategyBaseURL,
+		} {
+			if !secureServiceURL(value) {
+				return fmt.Errorf("%s must be HTTPS or loopback HTTP without credentials", name)
+			}
+		}
+		if len(config.DecisionCycle.PredictionInfraToken) < 32 || len(config.DecisionCycle.StrategyToken) < 32 {
+			return fmt.Errorf("decision-cycle prediction and strategy tokens must each contain at least 32 bytes")
+		}
+		if config.DecisionCycle.PredictionInfraToken == config.DecisionCycle.StrategyToken ||
+			config.DecisionCycle.PredictionInfraToken == config.HTTP.APIToken ||
+			config.DecisionCycle.StrategyToken == config.HTTP.APIToken ||
+			config.DecisionCycle.PredictionInfraToken == config.HTTP.ReadOnlyToken ||
+			config.DecisionCycle.StrategyToken == config.HTTP.ReadOnlyToken ||
+			(config.HTTP.JobToken != "" && (config.DecisionCycle.PredictionInfraToken == config.HTTP.JobToken ||
+				config.DecisionCycle.StrategyToken == config.HTTP.JobToken)) {
+			return fmt.Errorf("decision-cycle tokens must be distinct from each other and existing service tokens")
+		}
+		if err := validateDecisionBindings(config.DecisionCycle.Bindings); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func loadDecisionCycle() (DecisionCycle, error) {
+	enabled, err := boolean("DECISION_CYCLE_ENABLED", false)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	submitEnabled, err := boolean("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", false)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	interval, err := duration("DECISION_CYCLE_INTERVAL", 10*time.Minute)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	startupDelay, err := nonNegativeDuration("DECISION_CYCLE_STARTUP_DELAY", 15*time.Second)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	maxStartLateness, err := duration("DECISION_CYCLE_MAX_START_LATENESS", 30*time.Second)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	timeout, err := duration("DECISION_CYCLE_TIMEOUT", 8*time.Minute)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	predictionLookback, err := duration("DECISION_CYCLE_PREDICTION_LOOKBACK", 3*time.Hour)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	midPriceLookback, err := duration("DECISION_CYCLE_MID_PRICE_LOOKBACK", 48*time.Hour)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	bindings, err := decodeDecisionBindings(os.Getenv("DECISION_CYCLE_BINDINGS_JSON"))
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	return DecisionCycle{
+		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
+		PredictionInfraBaseURL: strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_URL")),
+		PredictionInfraToken:   strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_TOKEN")),
+		StrategyBaseURL:        strings.TrimSpace(os.Getenv("DECISION_CYCLE_STRATEGY_URL")),
+		StrategyToken:          strings.TrimSpace(os.Getenv("DECISION_CYCLE_STRATEGY_TOKEN")),
+		Interval:               interval, StartupDelay: startupDelay,
+		MaxStartLateness: maxStartLateness, Timeout: timeout,
+		PredictionLookback: predictionLookback, MidPriceLookback: midPriceLookback,
+		Bindings: bindings,
+	}, nil
+}
+
+func decodeDecisionBindings(value string) ([]domain.StrategyExecutionContext, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+	var bindings []domain.StrategyExecutionContext
+	if err := decoder.Decode(&bindings); err != nil {
+		return nil, fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON must contain exactly one JSON array")
+	}
+	return bindings, nil
+}
+
+func validateDecisionBindings(bindings []domain.StrategyExecutionContext) error {
+	if len(bindings) == 0 {
+		return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON must contain at least one binding")
+	}
+	modelStrategies := make(map[string]struct{}, len(bindings))
+	accounts := make(map[string]struct{}, len(bindings))
+	for index, binding := range bindings {
+		binding = binding.Normalize()
+		if err := binding.Validate(); err != nil {
+			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON binding %d: %w", index, err)
+		}
+		pair := binding.ModelID + "\x00" + binding.StrategyID
+		if _, exists := modelStrategies[pair]; exists {
+			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON contains duplicate model/strategy binding")
+		}
+		if _, exists := accounts[binding.ExecutionAccountID]; exists {
+			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON contains duplicate execution account")
+		}
+		modelStrategies[pair] = struct{}{}
+		accounts[binding.ExecutionAccountID] = struct{}{}
+		bindings[index] = binding
+	}
+	return nil
+}
+
+func secureServiceURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		(parsed.Path != "" && parsed.Path != "/") {
+		return false
+	}
+	if parsed.Scheme == "https" {
+		return true
+	}
+	if parsed.Scheme != "http" {
+		return false
+	}
+	if strings.EqualFold(parsed.Hostname(), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(parsed.Hostname())
+	return ip != nil && ip.IsLoopback()
 }
 
 func secureExternalURL(value string) bool {
@@ -422,6 +609,18 @@ func duration(key string, fallback time.Duration) (time.Duration, error) {
 	parsed, err := time.ParseDuration(value)
 	if err != nil || parsed <= 0 {
 		return 0, fmt.Errorf("%s must be a positive duration", key)
+	}
+	return parsed, nil
+}
+
+func nonNegativeDuration(key string, fallback time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative duration", key)
 	}
 	return parsed, nil
 }

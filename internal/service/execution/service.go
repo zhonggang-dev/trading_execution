@@ -37,25 +37,29 @@ type Params struct {
 	CancelFillFinalityGrace time.Duration
 	ImmediateCancelFinality bool
 	MaxReconcileAttempts    int
-	Now                     func() time.Time
-	NewID                   func() string
+	// RequirePreparedPlacement is mandatory for live composition. Paper and
+	// legacy in-memory tests may keep the one-step Venue contract.
+	RequirePreparedPlacement bool
+	Now                      func() time.Time
+	NewID                    func() string
 }
 
 // Service 表示后端使用的 Service 类型。
 type Service struct {
-	repository              port.OrderRepository
-	venue                   port.Venue
-	guard                   port.Guard
-	marketValidator         port.MarketValidator
-	reservations            port.AssetReservationManager
-	reconciliation          port.ReconciliationTriggerer
-	fillSynchronizer        port.FillSynchronizer
-	authoritativeFills      bool
-	cancelFillFinalityGrace time.Duration
-	immediateCancelFinality bool
-	maxReconcileAttempts    int
-	now                     func() time.Time
-	newID                   func() string
+	repository               port.OrderRepository
+	venue                    port.Venue
+	guard                    port.Guard
+	marketValidator          port.MarketValidator
+	reservations             port.AssetReservationManager
+	reconciliation           port.ReconciliationTriggerer
+	fillSynchronizer         port.FillSynchronizer
+	authoritativeFills       bool
+	cancelFillFinalityGrace  time.Duration
+	immediateCancelFinality  bool
+	maxReconcileAttempts     int
+	requirePreparedPlacement bool
+	now                      func() time.Time
+	newID                    func() string
 }
 
 // SubmitResult 表示后端使用的 SubmitResult 类型。
@@ -68,6 +72,11 @@ func New(params Params) (*Service, error) {
 	}
 	if strings.TrimSpace(params.Venue.Name()) == "" {
 		return nil, fmt.Errorf("execution venue name is required")
+	}
+	if params.RequirePreparedPlacement {
+		if _, ok := params.Venue.(port.PreparedVenue); !ok {
+			return nil, fmt.Errorf("live execution venue must support prepared placement")
+		}
 	}
 	if params.AuthoritativeFills && params.FillSynchronizer == nil {
 		return nil, fmt.Errorf("authoritative fills require a fill synchronizer")
@@ -94,19 +103,20 @@ func New(params Params) (*Service, error) {
 		params.NewID = newOrderID
 	}
 	return &Service{
-		repository:              params.Repository,
-		venue:                   params.Venue,
-		guard:                   params.Guard,
-		marketValidator:         params.MarketValidator,
-		reservations:            params.Reservations,
-		reconciliation:          params.Reconciliation,
-		fillSynchronizer:        params.FillSynchronizer,
-		authoritativeFills:      params.AuthoritativeFills,
-		cancelFillFinalityGrace: params.CancelFillFinalityGrace,
-		immediateCancelFinality: params.ImmediateCancelFinality,
-		maxReconcileAttempts:    params.MaxReconcileAttempts,
-		now:                     params.Now,
-		newID:                   params.NewID,
+		repository:               params.Repository,
+		venue:                    params.Venue,
+		guard:                    params.Guard,
+		marketValidator:          params.MarketValidator,
+		reservations:             params.Reservations,
+		reconciliation:           params.Reconciliation,
+		fillSynchronizer:         params.FillSynchronizer,
+		authoritativeFills:       params.AuthoritativeFills,
+		cancelFillFinalityGrace:  params.CancelFillFinalityGrace,
+		immediateCancelFinality:  params.ImmediateCancelFinality,
+		maxReconcileAttempts:     params.MaxReconcileAttempts,
+		requirePreparedPlacement: params.RequirePreparedPlacement,
+		now:                      params.Now,
+		newID:                    params.NewID,
 	}, nil
 }
 
@@ -176,6 +186,33 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 
 // submitReserved 为已预占订单记录提交尝试并处理交易所结果。
 func (service *Service) submitReserved(ctx context.Context, stored domain.Order, created bool) (SubmitResult, error) {
+	var prepared port.PreparedPlacement
+	preparedVenue, supportsPrepared := service.venue.(port.PreparedVenue)
+	if service.requirePreparedPlacement && !supportsPrepared {
+		// New rejects this configuration, but keep the runtime check as a
+		// fail-closed guard against an incorrectly assembled Service value.
+		return SubmitResult{Order: stored, Created: created}, fmt.Errorf("live execution venue does not support prepared placement")
+	}
+	if supportsPrepared {
+		var prepareErr error
+		prepared, prepareErr = preparedVenue.PreparePlace(ctx, stored)
+		if prepareErr != nil {
+			return service.finishPrepareError(ctx, stored, prepareErr, created)
+		}
+		expectedVenueOrderID := ""
+		if prepared != nil {
+			expectedVenueOrderID = strings.TrimSpace(prepared.ExpectedVenueOrderID())
+		}
+		if expectedVenueOrderID == "" {
+			return service.finishPrepareError(ctx, stored, errors.New("prepared placement omitted expected venue order id"), created)
+		}
+		if stored.VenueOrderID != "" && stored.VenueOrderID != expectedVenueOrderID {
+			return service.finishPrepareError(ctx, stored, fmt.Errorf("prepared venue order id changed from %q to %q", stored.VenueOrderID, expectedVenueOrderID), created)
+		}
+		// StartAttempt atomically writes this hash to both execution_orders and
+		// execution_order_attempts before PlacePrepared can issue the POST.
+		stored.VenueOrderID = expectedVenueOrderID
+	}
 	attempt, err := service.startAttempt(ctx, &stored, domain.OrderStatusSubmitting, domain.OrderAttemptSubmit, domain.TransitionTriggerSubmit)
 	if err != nil {
 		var localRejection *port.Rejection
@@ -195,7 +232,13 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 		uncertainErr := service.reservations.MarkUncertain(ctx, stored, "SUBMIT_ATTEMPT_PERSIST_FAILED: "+err.Error())
 		return SubmitResult{Order: stored, Created: created}, errors.Join(fmt.Errorf("start submit attempt: %w", err), uncertainErr)
 	}
-	venueOrder, placeErr := service.venue.Place(ctx, stored)
+	var venueOrder port.VenueOrder
+	var placeErr error
+	if supportsPrepared {
+		venueOrder, placeErr = preparedVenue.PlacePrepared(ctx, stored, prepared)
+	} else {
+		venueOrder, placeErr = service.venue.Place(ctx, stored)
+	}
 	if placeErr != nil {
 		return service.finishSubmitError(ctx, stored, attempt, placeErr, created)
 	}
@@ -263,6 +306,19 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 		}
 	}
 	return SubmitResult{Order: stored, Created: created}, nil
+}
+
+// finishPrepareError handles only failures that occur before a venue POST is
+// possible. They are definitive for this order attempt, so no STARTED attempt
+// is created and the reservation can be released safely.
+func (service *Service) finishPrepareError(ctx context.Context, order domain.Order, cause error, created bool) (SubmitResult, error) {
+	code := errorCode(cause, "VENUE_PREPARE_FAILED")
+	if err := service.reject(ctx, &order, code, cause); err != nil {
+		uncertainErr := service.reservations.MarkUncertain(ctx, order, "PREPARE_REJECTION_PERSIST_FAILED: "+err.Error())
+		return SubmitResult{Order: order, Created: created}, errors.Join(fmt.Errorf("prepare venue order: %w", cause), err, uncertainErr)
+	}
+	_, releaseErr := service.reservations.Reconcile(ctx, order)
+	return SubmitResult{Order: order, Created: created}, errors.Join(fmt.Errorf("prepare venue order: %w", cause), releaseErr)
 }
 
 // finishSubmitError 完成并持久化 Submit Error。

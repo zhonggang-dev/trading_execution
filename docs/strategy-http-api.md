@@ -237,9 +237,7 @@ X-Execution-Account-ID: account-model-a-v1
           "metrics": {
             "best_ask": "0.50",
             "near_logdiff_usd": "0.418",
-            "rel_spread": "0.0198",
-            "MOM": "0.031",
-            "MACD_SIGNAL": "0.008"
+            "rel_spread": "0.0198"
           }
         },
         "order": {
@@ -296,7 +294,8 @@ X-Execution-Account-ID: account-model-a-v1
 - Go 不静默改方向、价格或 size。不满足 tick、最小金额或精度时整笔拒绝；
 - SUBMIT evidence metrics 的封闭 key 是
   `best_ask / near_logdiff_usd / rel_spread / MOM / MACD_SIGNAL`；
-- entry SUBMIT 必须提供全部五个 metrics，`best_ask` 必须与输入盘口相等；SKIP 可只提供能计算的子集；
+- `multfactor_v1` entry SUBMIT 必须提供前三个盘口 metrics，MOM/MACD 可选；
+  `multfactor_v2` 必须提供全部五个 metrics；`best_ask` 必须与输入盘口相等；SKIP 可只提供能计算的子集；
 - exits 不依赖当前 prediction，也不要求 48 小时价格因子，只依赖 lot 持有时间和当前盘口；
 - 任何漏评、重复评估、未知 lot、上下文变化或非法枚举会拒绝整个响应，响应不会部分执行。
 
@@ -314,6 +313,7 @@ HOURLY_VETO
 FACTOR_WARMUP
 STALE_DATA
 INVALID_BOOK
+OUTSIDE_STRATEGY_UNIVERSE
 HOLD_48H
 ```
 
@@ -323,11 +323,16 @@ HOLD_48H
 | --- | --- | --- |
 | orderbook | `OK` | 可以计算；仍需自行通过策略门槛 |
 | orderbook | `EMPTY` / `MISSING` / `ERROR` | `SKIP + INVALID_BOOK` |
-| mid-price history | `OK` | 可以计算 |
-| mid-price history | `PARTIAL` / `EMPTY` / `MISSING` / `ERROR` | `SKIP + STALE_DATA` |
+| mid-price history (`multfactor_v1`) | 任意合法 status | v1 不依赖小时因子，不强制跳过 |
+| mid-price history (`multfactor_v2`) | `OK` | 可以计算 |
+| mid-price history (`multfactor_v2`) | `PARTIAL` / `EMPTY` / `MISSING` / `ERROR` | `SKIP + STALE_DATA` |
 
 若 book 和 history 同时失败，优先返回 `INVALID_BOOK`。Go 会再次执行这张映射；错误状态下的
 SUBMIT 会被整批拒绝。
+
+对于只由 `multfactor_v1` 使用的 Token，Go 不调用历史行情源，而是发送合法的
+`MISSING` 占位记录（`error_code=NOT_REQUIRED_FOR_MULTFACTOR_V1`）。算法必须把它视为
+“v1 不需要该数据”，不得把它转换成 `STALE_DATA`；v2 仍只接受 `OK` 历史。
 
 ## Strategy ID mapping
 

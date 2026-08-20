@@ -32,11 +32,18 @@ func NewConditionalFundingVenue(venue port.Venue, source BalanceAllowanceSource)
 func (venue *ConditionalFundingVenue) Name() string { return venue.venue.Name() }
 
 func (venue *ConditionalFundingVenue) Place(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
+	if err := venue.checkPlace(ctx, order); err != nil {
+		return port.VenueOrder{}, err
+	}
+	return venue.venue.Place(ctx, order)
+}
+
+func (venue *ConditionalFundingVenue) checkPlace(ctx context.Context, order domain.Order) error {
 	if order.Intent.Side != domain.SideSell {
-		return venue.venue.Place(ctx, order)
+		return nil
 	}
 	if order.MarketValidation == nil || strings.TrimSpace(order.Intent.TokenID) == "" {
-		return port.VenueOrder{}, preSubmitFundingRejection(
+		return preSubmitFundingRejection(
 			"CLOB_CONDITIONAL_FUNDING_IDENTITY_MISSING",
 			"SELL requires validated market identity before checking outcome-token funding",
 			nil,
@@ -46,7 +53,7 @@ func (venue *ConditionalFundingVenue) Place(ctx context.Context, order domain.Or
 		ctx, order.Intent.ExecutionAccountID, BalanceAssetConditional, order.Intent.TokenID,
 	)
 	if err != nil {
-		return port.VenueOrder{}, preSubmitFundingRejection(
+		return preSubmitFundingRejection(
 			"CLOB_CONDITIONAL_FUNDING_CHECK_FAILED",
 			"SELL outcome-token funding could not be verified before submission",
 			err,
@@ -57,7 +64,7 @@ func (venue *ConditionalFundingVenue) Place(ctx context.Context, order domain.Or
 		requiredExchange = NegRiskExchangeV2Address
 	}
 	if !allowance.RequiredAllowancesPositive(requiredExchange) {
-		return port.VenueOrder{}, preSubmitFundingRejection(
+		return preSubmitFundingRejection(
 			"CLOB_CONDITIONAL_ALLOWANCE_INSUFFICIENT",
 			"SELL outcome token is not approved for the validated CLOB V2 exchange",
 			nil,
@@ -65,7 +72,7 @@ func (venue *ConditionalFundingVenue) Place(ctx context.Context, order domain.Or
 	}
 	balance, err := decimalFromBaseUnits(allowance.Balance, 6)
 	if err != nil {
-		return port.VenueOrder{}, preSubmitFundingRejection(
+		return preSubmitFundingRejection(
 			"CLOB_CONDITIONAL_BALANCE_INVALID",
 			"SELL outcome-token balance response is malformed",
 			err,
@@ -73,13 +80,51 @@ func (venue *ConditionalFundingVenue) Place(ctx context.Context, order domain.Or
 	}
 	comparison, err := balance.Compare(order.Intent.Size)
 	if err != nil || comparison < 0 {
-		return port.VenueOrder{}, preSubmitFundingRejection(
+		return preSubmitFundingRejection(
 			"CLOB_CONDITIONAL_BALANCE_INSUFFICIENT",
 			"SELL outcome-token balance is below the requested size",
 			err,
 		)
 	}
-	return venue.venue.Place(ctx, order)
+	return nil
+}
+
+type conditionalFundingPrepared struct{ inner port.PreparedPlacement }
+
+func (prepared conditionalFundingPrepared) ExpectedVenueOrderID() string {
+	if prepared.inner == nil {
+		return ""
+	}
+	return prepared.inner.ExpectedVenueOrderID()
+}
+
+func (venue *ConditionalFundingVenue) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {
+	if err := venue.checkPlace(ctx, order); err != nil {
+		return nil, err
+	}
+	underlying, ok := venue.venue.(port.PreparedVenue)
+	if !ok {
+		return nil, preSubmitFundingRejection("CLOB_PREPARED_PLACEMENT_UNSUPPORTED", "underlying live venue does not support prepared placement", nil)
+	}
+	prepared, err := underlying.PreparePlace(ctx, order)
+	if err != nil {
+		return nil, err
+	}
+	return conditionalFundingPrepared{inner: prepared}, nil
+}
+
+func (venue *ConditionalFundingVenue) PlacePrepared(ctx context.Context, order domain.Order, placement port.PreparedPlacement) (port.VenueOrder, error) {
+	prepared, ok := placement.(conditionalFundingPrepared)
+	underlying, supported := venue.venue.(port.PreparedVenue)
+	if !ok || !supported || prepared.inner == nil {
+		return port.VenueOrder{}, preSubmitFundingRejection("CLOB_PREPARED_PLACEMENT_INVALID", "conditional funding prepared placement is invalid", nil)
+	}
+	// Recheck immediately before delegation because signing and the durable
+	// StartAttempt happen between the prepare check and the placement POST.
+	if err := venue.checkPlace(ctx, order); err != nil {
+		return port.VenueOrder{}, err
+	}
+	return underlying.PlacePrepared(ctx, order, prepared.inner)
 }
 
 func (venue *ConditionalFundingVenue) Cancel(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
@@ -100,3 +145,4 @@ func preSubmitFundingRejection(code, message string, cause error) error {
 }
 
 var _ port.Venue = (*ConditionalFundingVenue)(nil)
+var _ port.PreparedVenue = (*ConditionalFundingVenue)(nil)

@@ -322,38 +322,90 @@ func NewTradingClient(params TradingClientParams) (*TradingClient, error) {
 // Name 返回当前交易场所适配器名称。
 func (client *TradingClient) Name() string { return "polymarket" }
 
-// Place 将已校验订单提交到当前交易场所。
-func (client *TradingClient) Place(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
+// preparedCLOBPlacement is an in-memory-only signed request. Credentials and
+// signed bytes are deliberately opaque; only the expected EIP-712 hash may be
+// copied into the durable execution ledger.
+type preparedCLOBPlacement struct {
+	localOrderID       string
+	clientOrderID      string
+	executionAccountID string
+	expectedOrderID    string
+	body               []byte
+}
+
+func (placement *preparedCLOBPlacement) ExpectedVenueOrderID() string {
+	if placement == nil {
+		return ""
+	}
+	return placement.expectedOrderID
+}
+
+// PreparePlace validates and signs an order but cannot send POST /order.
+func (client *TradingClient) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {
 	account, err := client.account(ctx, order.Intent.ExecutionAccountID)
 	if err != nil {
-		return port.VenueOrder{}, err
+		return nil, err
 	}
 	if err := client.ensureV2(ctx); err != nil {
-		return port.VenueOrder{}, err
+		return nil, err
 	}
 	currentTick, err := client.GetTickSize(ctx, order.Intent.TokenID)
 	if err != nil {
-		return port.VenueOrder{}, err
+		return nil, err
 	}
 	if order.MarketValidation == nil || !currentTick.Equal(order.MarketValidation.TickSize) {
-		return port.VenueOrder{}, newInvalidError("TICK_SIZE_CHANGED", "CLOB tick_size changed after market validation")
+		return nil, newInvalidError("TICK_SIZE_CHANGED", "CLOB tick_size changed after market validation")
 	}
 	currentNegRisk, err := client.GetNegRisk(ctx, order.Intent.TokenID)
 	if err != nil {
-		return port.VenueOrder{}, err
+		return nil, err
 	}
 	if currentNegRisk != order.MarketValidation.NegRisk {
-		return port.VenueOrder{}, newInvalidError("NEG_RISK_CHANGED", "CLOB neg_risk changed after market validation")
+		return nil, newInvalidError("NEG_RISK_CHANGED", "CLOB neg_risk changed after market validation")
 	}
 	payload, expectedOrderID, err := client.builder.build(ctx, order, account)
 	if err != nil {
-		return port.VenueOrder{}, err
+		return nil, err
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return port.VenueOrder{}, fmt.Errorf("marshal signed CLOB order: %w", err)
+		return nil, fmt.Errorf("marshal signed CLOB order: %w", err)
 	}
-	responseBody, _, err := client.doAuthenticated(ctx, account, http.MethodPost, "/order", nil, body, true)
+	return &preparedCLOBPlacement{
+		localOrderID: order.ID, clientOrderID: order.Intent.ClientOrderID,
+		executionAccountID: order.Intent.ExecutionAccountID,
+		expectedOrderID:    expectedOrderID, body: append([]byte(nil), body...),
+	}, nil
+}
+
+// Place preserves compatibility for direct adapter callers. Production
+// execution invokes the two phases separately around its durable attempt.
+func (client *TradingClient) Place(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
+	prepared, err := client.PreparePlace(ctx, order)
+	if err != nil {
+		return port.VenueOrder{}, err
+	}
+	order.VenueOrderID = prepared.ExpectedVenueOrderID()
+	return client.PlacePrepared(ctx, order, prepared)
+}
+
+// PlacePrepared is the only order-placement method that emits POST bytes.
+func (client *TradingClient) PlacePrepared(ctx context.Context, order domain.Order, prepared port.PreparedPlacement) (port.VenueOrder, error) {
+	placement, ok := prepared.(*preparedCLOBPlacement)
+	if !ok || placement == nil {
+		return port.VenueOrder{}, newInvalidError("CLOB_PREPARED_ORDER_INVALID", "prepared placement was not created by this CLOB client")
+	}
+	expectedOrderID := strings.TrimSpace(placement.expectedOrderID)
+	if placement.localOrderID != order.ID || placement.clientOrderID != order.Intent.ClientOrderID ||
+		placement.executionAccountID != order.Intent.ExecutionAccountID || expectedOrderID == "" ||
+		strings.TrimSpace(order.VenueOrderID) != expectedOrderID {
+		return port.VenueOrder{}, newInvalidError("CLOB_PREPARED_ORDER_MISMATCH", "prepared placement does not match the durably identified order")
+	}
+	account, err := client.account(ctx, placement.executionAccountID)
+	if err != nil {
+		return port.VenueOrder{}, err
+	}
+	responseBody, _, err := client.doAuthenticated(ctx, account, http.MethodPost, "/order", nil, placement.body, true)
 	if err != nil {
 		var venueError *port.VenueError
 		if errors.As(err, &venueError) && venueError.Kind == port.VenueErrorAmbiguous {
@@ -1985,3 +2037,5 @@ func (bucket *tokenBucket) Wait(ctx context.Context, now time.Time) error {
 		}
 	}
 }
+
+var _ port.PreparedVenue = (*TradingClient)(nil)

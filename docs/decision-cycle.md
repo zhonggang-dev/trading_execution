@@ -103,12 +103,36 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
 - 某个盘口失败：在输入中明确标记，由策略拒绝该 token；
 - 周期输入通过 `ClaimInput` 原子持久化；重试只能复用原快照；
 - 策略输出通过 `ClaimOutput` 原子持久化；未成功持久化时不执行订单；
+- 进程启动时会在发布下一周期前接管并清空旧进程留下的全部 intent lease；任一恢复失败都会阻止调度器就绪，
+  不会把旧信号与新周期静默叠加；
+- 提交开关打开时，策略输出和全部 OrderIntent 在同一事务中写入
+  `strategy_order_intent_deliveries`；worker 使用 `PENDING -> SUBMITTING -> terminal` 状态、
+  有界租约和 attempt fencing 投递，进程崩溃后仍以稳定 `client_order_id` 恢复；
+- 执行层已经返回 `UNKNOWN/MANUAL_REVIEW` 的 intent 不会自动重投，必须由订单对账继续处理；
 - 单个订单失败：继续处理其余独立 intent，并返回组合错误；
 - 周期重试：账户级 `cycle_id`、策略幂等键和 `client_order_id` 共同避免重复交易；
+- 生产 Runner 只在精确的十分钟 UTC 边界运行，并可在边界后等待配置的启动延迟；进程
+  启动过晚、线程暂停超过 `DECISION_CYCLE_MAX_START_LATENESS` 或上一轮运行过长时直接跳过
+  已经错过的边界，不补跑陈旧交易；
+- Runner 串行执行且有单轮 timeout；单轮失败写日志并使 readiness 降级，但循环继续等待
+  下一边界，后续成功会自动恢复；
+- readiness 在首个完整周期成功前保持失败；调度器错过允许启动窗口也会降级，而不会保持假绿；
+- `DECISION_CYCLE_ENABLED=true` 只打开快照、行情、算法调用及 PostgreSQL 输入/输出审计。
+  `DECISION_CYCLE_ORDER_SUBMISSION_ENABLED` 默认 `false`，关闭时仍构建并记录合法 OrderIntent，
+  但明确标记 `submission_disabled` 且绝不调用 `execution.Submit`；
 - Go 绑定表保证一个 `(model_id, strategy_id)` 只对应一个唯一 `execution_account_id`，同一
   execution account 不能重复绑定。
 
-真实启用前仍需为 `DecisionRecorder` 接入 PostgreSQL，并为 live venue adapter 实现认证
-签名。最新 BBO 和价格保护由独立 Market Validation 层负责，详见
+生产装配使用 migrations `0012_strategy_decision_cycles.sql`、
+`0013_strategy_intent_deliveries.sql` 和 PostgreSQL `DecisionRecorder` 持久化完整输入、输出与
+订单意图投递状态。配置通过 `DECISION_CYCLE_BINDINGS_JSON` 注入，并要求绑定账户存在于
+受限钱包文件。只有 live 模式且两个显式开关都打开，OrderIntent 才会进入执行层；之后仍受
+数据库 Kill Switch、账户/策略暂停、binding、余额和 reconciliation freshness 等硬风控阻断。
+最新 BBO 和价格保护由独立 Market Validation 层负责，详见
 [`market-validation.md`](market-validation.md)；余额、仓位、敞口与暂停检查由 Go Hard Risk
 负责，详见 [`risk-control.md`](risk-control.md)。
+
+`multfactor_v1` 不依赖小时因子，因此调度器不会为仅由 v1 使用的 Token 请求
+48 小时历史数据；冻结输入仍保留一条 `MISSING` 占位记录，并使用
+`error_code=NOT_REQUIRED_FOR_MULTFACTOR_V1` 明确表示“未请求”而不是上游故障。
+混合 v1/v2 周期中，历史源故障只会让 v2 绑定失败关闭，v1 仍可基于同一冻结盘口完成审计决策。
