@@ -21,12 +21,14 @@ type Client interface {
 
 // Params configures the official five-second heartbeat cadence.
 type Params struct {
-	Client      Client
-	Accounts    []string
-	Interval    time.Duration
-	StaleAfter  time.Duration
-	CallTimeout time.Duration
-	Now         func() time.Time
+	Client               Client
+	Accounts             []string
+	Interval             time.Duration
+	StaleAfter           time.Duration
+	CallTimeout          time.Duration
+	StartupRetryDelay    time.Duration
+	StartupRetryAttempts int
+	Now                  func() time.Time
 }
 
 type accountState struct {
@@ -37,12 +39,14 @@ type accountState struct {
 
 // Service serializes heartbeat ids per account and supplies live readiness.
 type Service struct {
-	client      Client
-	accounts    []string
-	interval    time.Duration
-	staleAfter  time.Duration
-	callTimeout time.Duration
-	now         func() time.Time
+	client               Client
+	accounts             []string
+	interval             time.Duration
+	staleAfter           time.Duration
+	callTimeout          time.Duration
+	startupRetryDelay    time.Duration
+	startupRetryAttempts int
+	now                  func() time.Time
 
 	mu     sync.RWMutex
 	states map[string]accountState
@@ -62,9 +66,17 @@ func New(params Params) (*Service, error) {
 	if params.CallTimeout == 0 {
 		params.CallTimeout = 3 * time.Second
 	}
+	if params.StartupRetryDelay == 0 {
+		params.StartupRetryDelay = params.Interval
+	}
+	if params.StartupRetryAttempts == 0 {
+		params.StartupRetryAttempts = 5
+	}
 	if params.Interval < time.Second || params.Interval > 5*time.Second ||
 		params.StaleAfter <= params.Interval || params.StaleAfter >= 10*time.Second ||
-		params.CallTimeout <= 0 || params.CallTimeout >= params.StaleAfter {
+		params.CallTimeout <= 0 || params.CallTimeout >= params.StaleAfter ||
+		params.StartupRetryDelay <= 0 || params.StartupRetryDelay > 5*time.Second ||
+		params.StartupRetryAttempts < 1 || params.StartupRetryAttempts > 6 {
 		return nil, fmt.Errorf("invalid CLOB heartbeat timing")
 	}
 	if params.Now == nil {
@@ -90,7 +102,9 @@ func New(params Params) (*Service, error) {
 	}
 	return &Service{
 		client: params.Client, accounts: accounts, interval: params.Interval,
-		staleAfter: params.StaleAfter, callTimeout: params.CallTimeout, now: params.Now,
+		staleAfter: params.StaleAfter, callTimeout: params.CallTimeout,
+		startupRetryDelay:    params.StartupRetryDelay,
+		startupRetryAttempts: params.StartupRetryAttempts, now: params.Now,
 		states: states,
 	}, nil
 }
@@ -98,7 +112,52 @@ func New(params Params) (*Service, error) {
 // Start performs the mandatory initial heartbeat synchronously. The HTTP
 // listener must not start if this call fails.
 func (service *Service) Start(ctx context.Context) error {
-	return service.beatAll(ctx)
+	var lastError error
+	for attempt := 1; attempt <= service.startupRetryAttempts; attempt++ {
+		lastError = service.beatAll(ctx)
+		if lastError == nil {
+			return nil
+		}
+		if !onlyInvalidHeartbeatID(lastError) || attempt == service.startupRetryAttempts {
+			return lastError
+		}
+		timer := time.NewTimer(service.startupRetryDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastError
+}
+
+// onlyInvalidHeartbeatID recognizes the short server-side overlap window in
+// which a stopped process's heartbeat session is still alive. Authentication,
+// transport, and all other CLOB errors continue to fail startup immediately.
+func onlyInvalidHeartbeatID(err error) bool {
+	if err == nil {
+		return false
+	}
+	type multiUnwrapper interface{ Unwrap() []error }
+	if joined, ok := err.(multiUnwrapper); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyInvalidHeartbeatID(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if child := errors.Unwrap(err); child != nil {
+		return onlyInvalidHeartbeatID(child)
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "invalid heartbeat id")
 }
 
 // Run maintains the session until shutdown. A failure immediately closes the

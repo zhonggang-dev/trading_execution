@@ -58,6 +58,48 @@ func TestStartHeartbeatsAccountsConcurrently(t *testing.T) {
 	}
 }
 
+func TestStartRetriesOnlyInvalidHeartbeatIDOverlap(t *testing.T) {
+	now := time.Date(2026, 8, 20, 8, 30, 0, 0, time.UTC)
+	client := &fakeClient{errors: []error{
+		errors.New(`CLOB_REJECTED: {"error_msg":"Invalid Heartbeat ID"}`),
+		errors.New(`CLOB_REJECTED: {"error_msg":"Invalid Heartbeat ID"}`),
+		nil,
+	}}
+	service, err := New(Params{
+		Client: client, Accounts: []string{"account-1"}, Now: func() time.Time { return now },
+		StartupRetryDelay: time.Millisecond, StartupRetryAttempts: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if len(client.ids) != 3 || client.ids[0] != "" || client.ids[1] != "" || client.ids[2] != "" {
+		t.Fatalf("heartbeat ids = %#v, want three fresh-session attempts", client.ids)
+	}
+	if err := service.CheckAccount(context.Background(), "account-1"); err != nil {
+		t.Fatalf("CheckAccount() error = %v", err)
+	}
+}
+
+func TestStartDoesNotRetryOtherHeartbeatFailures(t *testing.T) {
+	client := &fakeClient{err: errors.New("authentication failed")}
+	service, err := New(Params{
+		Client: client, Accounts: []string{"account-1"},
+		StartupRetryDelay: time.Millisecond, StartupRetryAttempts: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Start(context.Background()); err == nil {
+		t.Fatal("Start() error = nil, want authentication failure")
+	}
+	if len(client.ids) != 1 {
+		t.Fatalf("heartbeat calls = %d, want one", len(client.ids))
+	}
+}
+
 func TestHeartbeatVenueBlocksOnlyPlaceWhenUnhealthy(t *testing.T) {
 	service, err := New(Params{Client: &fakeClient{err: errors.New("offline")}, Accounts: []string{"account-1"}})
 	if err != nil {
@@ -86,6 +128,7 @@ type fakeClient struct {
 	mu      sync.Mutex
 	ids     []string
 	err     error
+	errors  []error
 	started chan<- string
 	release <-chan struct{}
 }
@@ -104,6 +147,10 @@ func (client *fakeClient) Heartbeat(ctx context.Context, account, id string) (st
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	client.ids = append(client.ids, id)
+	call := len(client.ids) - 1
+	if call < len(client.errors) && client.errors[call] != nil {
+		return "", client.errors[call]
+	}
 	if client.err != nil {
 		return "", client.err
 	}
