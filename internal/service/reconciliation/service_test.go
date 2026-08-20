@@ -95,6 +95,63 @@ func TestStartupUsesExplicitAccountReconciliationBaselineForVenueTrades(t *testi
 	}
 }
 
+func TestScheduledReconciliationNeverScansBeforeAccountOwnershipBaseline(t *testing.T) {
+	baseline := testNow.Add(-2 * time.Minute)
+	balance := testBalance("100")
+	balance.ReconciledAt = &baseline
+	venue := &fakeVenue{}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{}, Venue: venue, Ledger: &fakeLedger{balance: balance},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{},
+		TradeLookback: 30 * time.Minute,
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil || result.Run.Status != domain.ReconciliationRunCompleted {
+		t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+	}
+	if !venue.tradesAfter.Equal(baseline) {
+		t.Fatalf("venue trades after = %s, want ownership baseline %s", venue.tradesAfter, baseline)
+	}
+}
+
+func TestScheduledReconciliationKeepsNewerLookbackThanAccountBaseline(t *testing.T) {
+	baseline := testNow.Add(-30 * time.Minute)
+	balance := testBalance("100")
+	balance.ReconciledAt = &baseline
+	venue := &fakeVenue{}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{}, Venue: venue, Ledger: &fakeLedger{balance: balance},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{},
+		TradeLookback: 5 * time.Minute,
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+
+	_, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := testNow.Add(-5 * time.Minute)
+	if !venue.tradesAfter.Equal(want) {
+		t.Fatalf("venue trades after = %s, want lookback %s", venue.tradesAfter, want)
+	}
+}
+
 func TestStartupWithoutAccountBaselineStillScansFullVenueHistory(t *testing.T) {
 	venue := &fakeVenue{}
 	service := newTestService(t, Params{
