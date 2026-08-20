@@ -130,7 +130,7 @@ func TestCancelRaceReturnsFillObservedAfterCancel(t *testing.T) {
 			})
 		case request.Method == http.MethodGet && request.URL.Path == "/data/trades":
 			writeTestJSON(writer, []map[string]any{{
-				"id": "trade-filled", "taker_order_id": "0xvenue", "size": "10000000", "price": "0.5",
+				"id": "trade-filled", "taker_order_id": "0xvenue", "size": "10", "price": "0.5",
 				"status": "CONFIRMED",
 			}})
 		default:
@@ -184,7 +184,7 @@ func TestMatchedPlacementReadsAuthoritativePartialFill(t *testing.T) {
 			}
 			writeTestJSON(writer, map[string]any{
 				"data": []map[string]any{{
-					"id": tradeID, "taker_order_id": placedOrderID, "size": "2000000", "price": price,
+					"id": tradeID, "taker_order_id": placedOrderID, "size": "2", "price": price,
 					"status": "CONFIRMED",
 				}},
 				"next_cursor": "LTE=",
@@ -276,9 +276,9 @@ func TestListTradesAcceptsBareWireArray(t *testing.T) {
 		}
 		writeTestJSON(writer, []map[string]any{{
 			"id": "trade-1", "taker_order_id": "0xvenue", "market": "condition-1",
-			"asset_id": "token-1", "side": "BUY", "size": "100000000", "price": "0.5",
+			"asset_id": "token-1", "side": "BUY", "size": "100", "price": "0.5",
 			"status": "MATCHED", "transaction_hash": "0xtx",
-			"maker_orders": []map[string]any{{"order_id": "0xmaker", "matched_amount": "2500000", "price": "0.5"}},
+			"maker_orders": []map[string]any{{"order_id": "0xmaker", "matched_amount": "2.5", "price": "0.5"}},
 		}})
 	}))
 	defer server.Close()
@@ -295,11 +295,26 @@ func TestListTradesAcceptsBareWireArray(t *testing.T) {
 	}
 }
 
-func TestTradeWireQuantityRejectsNonCanonicalOrHumanDecimal(t *testing.T) {
-	for _, size := range []string{`"01"`, `"1.5"`, `1000000`} {
+func TestTradeWireDefaultsEmptyDeprecatedFeeRateMetadataToZero(t *testing.T) {
+	var trade Trade
+	err := json.Unmarshal([]byte(`{
+		"id":"trade-1","size":"1.25","price":"0.5","fee_rate_bps":"",
+		"maker_orders":[{"order_id":"order-1","matched_amount":"0.75","price":"0.5","fee_rate_bps":""}]
+	}`), &trade)
+	if err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if !trade.Size.Equal("1.25") || !trade.FeeRateBPS.Equal("0") || len(trade.MakerOrders) != 1 ||
+		!trade.MakerOrders[0].MatchedAmount.Equal("0.75") || !trade.MakerOrders[0].FeeRateBPS.Equal("0") {
+		t.Fatalf("trade = %#v", trade)
+	}
+}
+
+func TestTradeWireQuantityRequiresDecimalString(t *testing.T) {
+	for _, size := range []string{`1000000`, `null`, `""`} {
 		var trade Trade
 		if err := json.Unmarshal([]byte(`{"size":`+size+`}`), &trade); err == nil {
-			t.Fatalf("non-canonical V2 size %s was accepted", size)
+			t.Fatalf("invalid trade size %s was accepted", size)
 		}
 	}
 }
@@ -315,7 +330,7 @@ func TestListOrderFillsFailsClosedWithoutFinalizedFeeEvidence(t *testing.T) {
 		case "/data/trades":
 			writeTestJSON(writer, map[string]any{"data": []map[string]any{{
 				"id": "trade-1", "taker_order_id": "0xvenue", "market": "condition-1",
-				"asset_id": tokenID, "side": "BUY", "size": "10000000", "price": "0.5",
+				"asset_id": tokenID, "side": "BUY", "size": "10", "price": "0.5",
 				"status": "CONFIRMED", "fee_rate_bps": "0", "transaction_hash": "0xtx",
 				"match_time": "2026-08-18T07:59:58Z", "last_update": "2026-08-18T07:59:59Z",
 			}}, "next_cursor": "LTE="})
