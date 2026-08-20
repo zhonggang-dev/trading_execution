@@ -80,6 +80,139 @@ func TestSubmitPersistsAmbiguousVenueFailureWithoutRetry(t *testing.T) {
 	}
 }
 
+func TestPreparedPlacementPersistsExpectedHashBeforeNetworkCall(t *testing.T) {
+	repository := memory.NewOrderRepository()
+	expectedHash := "0x" + strings.Repeat("ab", 32)
+	venue := &preparedTestVenue{expectedHash: expectedHash, repository: repository}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		RequirePreparedPlacement: true,
+		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) },
+		NewID:                    func() string { return "ord-prepared-crash-window" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(context.Background(), validIntent("client-prepared-crash-window"))
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if !venue.observedDurableStart.Load() {
+		t.Fatal("PlacePrepared was called before repository contained SUBMITTING plus expected hash")
+	}
+	if venue.legacyPlaceCalls.Load() != 0 || venue.preparedPlaceCalls.Load() != 1 {
+		t.Fatalf("legacy/prepared place calls = %d/%d", venue.legacyPlaceCalls.Load(), venue.preparedPlaceCalls.Load())
+	}
+	if result.Order.VenueOrderID != expectedHash || result.Order.Status != domain.OrderStatusLive {
+		t.Fatalf("submitted order = %#v", result.Order)
+	}
+}
+
+func TestPreparedPlacementIDMismatchKeepsExpectedHashAndBecomesUnknown(t *testing.T) {
+	repository := memory.NewOrderRepository()
+	expectedHash := "0x" + strings.Repeat("cd", 32)
+	venue := &preparedTestVenue{
+		expectedHash: expectedHash, repository: repository,
+		placeErr: &port.VenueError{
+			Kind: port.VenueErrorAmbiguous, Code: "CLOB_ORDER_ID_MISMATCH",
+			Message: "response id differs from signed hash", VenueOrderID: expectedHash,
+		},
+	}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		RequirePreparedPlacement: true,
+		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) },
+		NewID:                    func() string { return "ord-prepared-mismatch" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, submitErr := service.Submit(context.Background(), validIntent("client-prepared-mismatch"))
+	if submitErr == nil || result.Order.Status != domain.OrderStatusUnknown || result.Order.VenueOrderID != expectedHash {
+		t.Fatalf("Submit() = %#v, %v; want UNKNOWN retaining expected hash", result, submitErr)
+	}
+	attempts, err := repository.Attempts(context.Background(), result.Order.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Outcome != domain.AttemptOutcomeUnknown || attempts[0].VenueOrderID != expectedHash {
+		t.Fatalf("attempts = %#v, %v", attempts, err)
+	}
+	second, err := service.Submit(context.Background(), validIntent("client-prepared-mismatch"))
+	if err != nil || second.Created || venue.preparedPlaceCalls.Load() != 1 {
+		t.Fatalf("replay = %#v, %v, calls=%d; want no second POST", second, err, venue.preparedPlaceCalls.Load())
+	}
+}
+
+func TestPreparedPlacementPersistenceFailureNeverCallsNetwork(t *testing.T) {
+	repository := &failFirstStartRepository{OrderRepository: memory.NewOrderRepository()}
+	venue := &preparedTestVenue{
+		expectedHash: "0x" + strings.Repeat("ef", 32),
+		repository:   repository,
+	}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		RequirePreparedPlacement: true,
+		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) },
+		NewID:                    func() string { return "ord-prepared-persist-failure" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, submitErr := service.Submit(context.Background(), validIntent("client-prepared-persist-failure"))
+	if submitErr == nil || result.Order.Status != domain.OrderStatusReserved {
+		t.Fatalf("Submit() = %#v, %v; want persistence failure before POST", result, submitErr)
+	}
+	if venue.preparedPlaceCalls.Load() != 0 || venue.legacyPlaceCalls.Load() != 0 {
+		t.Fatalf("persistence failure reached venue: prepared=%d legacy=%d", venue.preparedPlaceCalls.Load(), venue.legacyPlaceCalls.Load())
+	}
+}
+
+func TestCrashAfterPreparedPostReconcilesByPersistedExpectedHash(t *testing.T) {
+	repository := &failFirstFinishRepository{OrderRepository: memory.NewOrderRepository()}
+	expectedHash := "0x" + strings.Repeat("12", 32)
+	venue := &preparedTestVenue{
+		expectedHash: expectedHash, repository: repository,
+		getOrder: &port.VenueOrder{
+			ID: expectedHash, State: port.VenueOrderLive, RawStatus: "live",
+			FilledSize: "0", ObservedAt: time.Date(2026, 8, 18, 8, 0, 1, 0, time.UTC),
+		},
+	}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		RequirePreparedPlacement: true,
+		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 1, 0, time.UTC) },
+		NewID:                    func() string { return "ord-prepared-crash-after-post" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, submitErr := service.Submit(context.Background(), validIntent("client-prepared-crash-after-post"))
+	if submitErr == nil {
+		t.Fatal("Submit() error = nil, want injected acknowledgement persistence failure")
+	}
+	stored, err := repository.Get(context.Background(), result.Order.ID)
+	if err != nil || stored.Status != domain.OrderStatusSubmitting || stored.VenueOrderID != expectedHash {
+		t.Fatalf("crash state = %#v, %v", stored, err)
+	}
+	refreshed, err := service.Refresh(context.Background(), stored.ID)
+	if err != nil || refreshed.Status != domain.OrderStatusLive || refreshed.VenueOrderID != expectedHash || venue.getCalls.Load() != 1 {
+		t.Fatalf("Refresh() = %#v, %v, get calls=%d", refreshed, err, venue.getCalls.Load())
+	}
+}
+
+func TestLiveExecutionRejectsVenueWithoutPreparedPlacement(t *testing.T) {
+	_, err := execution.New(execution.Params{
+		Repository: memory.NewOrderRepository(), Venue: &fakeVenue{}, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		RequirePreparedPlacement: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "must support prepared placement") {
+		t.Fatalf("New() error = %v, want fail-closed live venue rejection", err)
+	}
+}
+
 func TestSubmitLocalRiskGateRejectionNeverMarksVenueOutcomeUncertain(t *testing.T) {
 	venue := &fakeVenue{}
 	repository := &localRejectStartRepository{OrderRepository: memory.NewOrderRepository()}
@@ -722,6 +855,18 @@ type failFirstStartRepository struct {
 	failed atomic.Bool
 }
 
+type failFirstFinishRepository struct {
+	*memory.OrderRepository
+	failed atomic.Bool
+}
+
+func (repository *failFirstFinishRepository) FinishAttempt(ctx context.Context, order domain.Order, event domain.OrderEvent, attempt domain.OrderAttempt) error {
+	if repository.failed.CompareAndSwap(false, true) {
+		return errors.New("simulated crash after venue POST before acknowledgement commit")
+	}
+	return repository.OrderRepository.FinishAttempt(ctx, order, event, attempt)
+}
+
 type localRejectStartRepository struct {
 	*memory.OrderRepository
 }
@@ -838,6 +983,70 @@ type fakeVenue struct {
 	placeOrder        *port.VenueOrder
 	cancelOrder       *port.VenueOrder
 	getOrder          *port.VenueOrder
+}
+
+type preparedTestPlacement struct{ expectedHash string }
+
+func (placement preparedTestPlacement) ExpectedVenueOrderID() string { return placement.expectedHash }
+
+type preparedTestVenue struct {
+	expectedHash         string
+	repository           port.OrderRepository
+	placeErr             error
+	getOrder             *port.VenueOrder
+	legacyPlaceCalls     atomic.Int64
+	preparedPlaceCalls   atomic.Int64
+	observedDurableStart atomic.Bool
+	getCalls             atomic.Int64
+}
+
+func (*preparedTestVenue) Name() string { return "polymarket-paper" }
+
+func (venue *preparedTestVenue) PreparePlace(context.Context, domain.Order) (port.PreparedPlacement, error) {
+	return preparedTestPlacement{expectedHash: venue.expectedHash}, nil
+}
+
+func (venue *preparedTestVenue) PlacePrepared(ctx context.Context, order domain.Order, placement port.PreparedPlacement) (port.VenueOrder, error) {
+	venue.preparedPlaceCalls.Add(1)
+	if placement == nil || placement.ExpectedVenueOrderID() != venue.expectedHash || order.VenueOrderID != venue.expectedHash {
+		return port.VenueOrder{}, errors.New("prepared placement identity mismatch")
+	}
+	stored, err := venue.repository.Get(ctx, order.ID)
+	if err != nil || stored.Status != domain.OrderStatusSubmitting || stored.VenueOrderID != venue.expectedHash {
+		return port.VenueOrder{}, fmt.Errorf("order was not durably prepared before POST: %#v, %w", stored, err)
+	}
+	attempts, err := venue.repository.Attempts(ctx, order.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Outcome != domain.AttemptOutcomeStarted || attempts[0].VenueOrderID != venue.expectedHash {
+		return port.VenueOrder{}, fmt.Errorf("attempt was not durably prepared before POST: %#v, %w", attempts, err)
+	}
+	venue.observedDurableStart.Store(true)
+	if venue.placeErr != nil {
+		return port.VenueOrder{}, venue.placeErr
+	}
+	return port.VenueOrder{
+		ID: venue.expectedHash, State: port.VenueOrderLive, RawStatus: "live",
+		FilledSize: "0", ObservedAt: order.UpdatedAt,
+	}, nil
+}
+
+func (venue *preparedTestVenue) Place(context.Context, domain.Order) (port.VenueOrder, error) {
+	venue.legacyPlaceCalls.Add(1)
+	return port.VenueOrder{}, errors.New("legacy Place must not be used")
+}
+
+func (*preparedTestVenue) Cancel(context.Context, domain.Order) (port.VenueOrder, error) {
+	return port.VenueOrder{}, nil
+}
+
+func (venue *preparedTestVenue) Get(_ context.Context, order domain.Order) (port.VenueOrder, error) {
+	venue.getCalls.Add(1)
+	if order.VenueOrderID != venue.expectedHash {
+		return port.VenueOrder{}, fmt.Errorf("reconciliation used venue id %q, want expected hash %q", order.VenueOrderID, venue.expectedHash)
+	}
+	if venue.getOrder != nil {
+		return *venue.getOrder, nil
+	}
+	return port.VenueOrder{}, nil
 }
 
 // Name 返回模拟组件名称。

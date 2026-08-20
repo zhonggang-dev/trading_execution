@@ -263,7 +263,8 @@ type EntryReasonCode =
   | "HOURLY_VETO"
   | "FACTOR_WARMUP"
   | "STALE_DATA"
-  | "INVALID_BOOK";
+  | "INVALID_BOOK"
+  | "OUTSIDE_STRATEGY_UNIVERSE";
 
 type StrategyEvidence = {
   probability: number;
@@ -318,10 +319,11 @@ type StrategyDecisionSuccess = {
 - `SUBMIT` 必须是 `BUY + LIMIT + FOK`，`reason_code` 必须为 `ENTRY_SIGNAL`；
 - BUY `worst_price` 必须严格等于输入订单簿的 `best_ask`，不允许加价格垫；
 - `size` 单位为shares，最多2位小数；`worst_price * size` 最多2位小数且不少于1美元；
-- SUBMIT 的 `evidence.metrics` 必须完整包含
-  `best_ask/near_logdiff_usd/rel_spread/MOM/MACD_SIGNAL`；
+- `multfactor_v1` SUBMIT 的 `evidence.metrics` 必须包含
+  `best_ask/near_logdiff_usd/rel_spread`，MOM/MACD 可选；`multfactor_v2` 必须完整包含五项；
 - `metrics.best_ask` 必须等于输入 `best_ask`，metrics value 全部为十进制字符串；
-- 订单簿不可用必须 `SKIP + INVALID_BOOK`；mid price不可用必须 `SKIP + STALE_DATA`；
+- 订单簿不可用必须 `SKIP + INVALID_BOOK`；只有 `multfactor_v2` 在 mid price 不可用时必须
+  `SKIP + STALE_DATA`；策略范围外预测使用 `SKIP + OUTSIDE_STRATEGY_UNIVERSE`；
 - 任何漏评、重复评价、非法字段都会导致整个响应被拒绝，不会部分执行。
 
 ### 3.5 最小示例

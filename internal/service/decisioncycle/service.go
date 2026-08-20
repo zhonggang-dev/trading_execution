@@ -20,6 +20,8 @@ import (
 const (
 	decisionInterval        = 10 * time.Minute
 	defaultMidPriceLookback = 48 * time.Hour
+	defaultDeliveryBatch    = 100
+	defaultDeliveryStaleAge = 9 * time.Minute
 )
 
 var (
@@ -29,17 +31,21 @@ var (
 
 // Params 表示后端使用的 Params 类型。
 type Params struct {
-	PredictionSource   port.PredictionSource
-	PositionSource     port.StrategyPositionSource
-	OrderBookSource    port.OrderBookSource
-	MidPriceSource     port.MidPriceHistorySource
-	Strategy           port.StrategyClient
-	Recorder           port.DecisionRecorder
-	Executor           port.OrderExecutor
+	PredictionSource port.PredictionSource
+	PositionSource   port.StrategyPositionSource
+	OrderBookSource  port.OrderBookSource
+	MidPriceSource   port.MidPriceHistorySource
+	Strategy         port.StrategyClient
+	Recorder         port.DecisionRecorder
+	Executor         port.OrderExecutor
+	// SubmitEnabled is an independent, fail-closed gate. A disabled cycle still
+	// records the validated strategy output but never invokes execution.Submit.
+	SubmitEnabled      bool
 	Bindings           []domain.StrategyExecutionContext
 	Venue              string
 	PredictionLookback time.Duration
 	MidPriceLookback   time.Duration
+	DeliveryStaleAge   time.Duration
 	Now                func() time.Time
 }
 
@@ -52,18 +58,23 @@ type Service struct {
 	strategy           port.StrategyClient
 	recorder           port.DecisionRecorder
 	executor           port.OrderExecutor
+	submitEnabled      bool
 	bindings           []domain.StrategyExecutionContext
 	venue              string
 	predictionLookback time.Duration
 	midPriceLookback   time.Duration
+	deliveryStaleAge   time.Duration
 	now                func() time.Time
 }
 
 // IntentResult 表示后端使用的 IntentResult 类型。
 type IntentResult struct {
-	Intent domain.OrderIntent
-	Result port.OrderSubmitResult
-	Error  error
+	Intent             domain.OrderIntent
+	Result             port.OrderSubmitResult
+	DeliveryStatus     domain.DecisionIntentDeliveryStatus
+	DeliveryAttempt    int
+	SubmissionDisabled bool
+	Error              error
 }
 
 // BindingRunResult 表示后端使用的 BindingRunResult 类型。
@@ -85,8 +96,11 @@ type RunResult struct {
 // New 校验依赖和配置后创建当前服务实例。
 func New(params Params) (*Service, error) {
 	if params.PredictionSource == nil || params.PositionSource == nil || params.OrderBookSource == nil || params.MidPriceSource == nil || params.Strategy == nil ||
-		params.Recorder == nil || params.Executor == nil {
-		return nil, fmt.Errorf("prediction, position, orderbook, mid-price history, strategy, recorder, and executor dependencies are required")
+		params.Recorder == nil {
+		return nil, fmt.Errorf("prediction, position, orderbook, mid-price history, strategy, and recorder dependencies are required")
+	}
+	if params.SubmitEnabled && params.Executor == nil {
+		return nil, fmt.Errorf("order executor is required when decision-cycle submission is enabled")
 	}
 	params.Venue = strings.ToLower(strings.TrimSpace(params.Venue))
 	bindings, err := normalizeBindings(params.Bindings)
@@ -108,6 +122,12 @@ func New(params Params) (*Service, error) {
 	if params.MidPriceLookback < decisionInterval {
 		return nil, fmt.Errorf("mid-price lookback must be at least %s", decisionInterval)
 	}
+	if params.DeliveryStaleAge == 0 {
+		params.DeliveryStaleAge = defaultDeliveryStaleAge
+	}
+	if params.DeliveryStaleAge <= 0 || params.DeliveryStaleAge > 24*time.Hour {
+		return nil, fmt.Errorf("decision intent delivery stale age must be positive and at most 24h")
+	}
 	if params.Now == nil {
 		params.Now = time.Now
 	}
@@ -119,10 +139,12 @@ func New(params Params) (*Service, error) {
 		strategy:           params.Strategy,
 		recorder:           params.Recorder,
 		executor:           params.Executor,
+		submitEnabled:      params.SubmitEnabled,
 		bindings:           bindings,
 		venue:              params.Venue,
 		predictionLookback: params.PredictionLookback,
 		midPriceLookback:   params.MidPriceLookback,
+		deliveryStaleAge:   params.DeliveryStaleAge,
 		now:                params.Now,
 	}, nil
 }
@@ -132,6 +154,9 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	decisionAt = decisionAt.UTC()
 	if decisionAt.IsZero() || decisionAt.Unix()%int64(decisionInterval/time.Second) != 0 {
 		return RunResult{}, ErrInvalidBoundary
+	}
+	if err := service.RecoverPending(ctx); err != nil {
+		return RunResult{}, fmt.Errorf("recover pending strategy intents: %w", err)
 	}
 	snapshot, err := service.predictionSource.Snapshot(ctx, decisionAt, service.predictionLookback)
 	if err != nil {
@@ -149,7 +174,11 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err != nil {
 		return RunResult{}, err
 	}
-	books, histories, err := service.captureMarketData(ctx, decisionAt, targets)
+	historyTargets, err := buildHistoryTargets(selectedPredictions, positionLots, service.bindings)
+	if err != nil {
+		return RunResult{}, err
+	}
+	books, histories, historyCaptureErr, err := service.captureMarketData(ctx, decisionAt, targets, historyTargets)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -157,12 +186,14 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err != nil {
 		return RunResult{}, err
 	}
-	histories, err = alignMidPriceHistories(alignMidPriceHistoriesParams{
-		targets: targets, histories: histories, decisionAt: decisionAt,
-		lookback: service.midPriceLookback, fetchedAt: service.now().UTC(),
-	})
-	if err != nil {
-		return RunResult{}, err
+	if historyCaptureErr == nil {
+		histories, err = alignMidPriceHistories(alignMidPriceHistoriesParams{
+			targets: historyTargets, histories: histories, decisionAt: decisionAt,
+			lookback: service.midPriceLookback, fetchedAt: service.now().UTC(),
+		})
+		if err != nil {
+			historyCaptureErr = err
+		}
 	}
 	result := RunResult{
 		DecisionAt:           decisionAt,
@@ -187,12 +218,29 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
 			continue
 		}
-		bindingHistories, selectErr := midPriceHistoriesForTargets(bindingTargets, histories)
-		if selectErr != nil {
-			run := BindingRunResult{Context: binding, Error: selectErr}
-			result.Runs = append(result.Runs, run)
-			runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
-			continue
+		var bindingHistories []domain.MidPriceHistory
+		if binding.StrategyID == domain.StrategyIDMultfactorV2 {
+			if historyCaptureErr != nil {
+				selectErr = fmt.Errorf("capture mid-price histories: %w", historyCaptureErr)
+				run := BindingRunResult{Context: binding, Error: selectErr}
+				result.Runs = append(result.Runs, run)
+				runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
+				continue
+			}
+			bindingHistories, selectErr = midPriceHistoriesForTargets(bindingTargets, histories)
+			if selectErr != nil {
+				run := BindingRunResult{Context: binding, Error: selectErr}
+				result.Runs = append(result.Runs, run)
+				runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
+				continue
+			}
+		} else {
+			bindingHistories, selectErr = v1MidPricePlaceholders(
+				bindingTargets, decisionAt, service.midPriceLookback, service.now().UTC(),
+			)
+			if selectErr != nil {
+				return result, selectErr
+			}
 		}
 		run, runErr := service.runBinding(ctx, runBindingParams{
 			decisionAt: decisionAt, predictionSnapshotID: snapshot.SnapshotID, binding: binding,
@@ -252,7 +300,12 @@ func flattenPositionLots(byAccount map[string][]domain.StrategyPositionLot) []do
 }
 
 // captureMarketData 采集 Market Data。
-func (service *Service) captureMarketData(ctx context.Context, decisionAt time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, []domain.MidPriceHistory, error) {
+func (service *Service) captureMarketData(
+	ctx context.Context,
+	decisionAt time.Time,
+	bookTargets []domain.BookTarget,
+	historyTargets []domain.BookTarget,
+) ([]domain.OrderBookSnapshot, []domain.MidPriceHistory, error, error) {
 	type bookResult struct {
 		books []domain.OrderBookSnapshot
 		err   error
@@ -264,22 +317,62 @@ func (service *Service) captureMarketData(ctx context.Context, decisionAt time.T
 	booksChannel := make(chan bookResult, 1)
 	historiesChannel := make(chan historyResult, 1)
 	go func() {
-		books, err := service.orderBookSource.Capture(ctx, decisionAt, targets)
+		books, err := service.orderBookSource.Capture(ctx, decisionAt, bookTargets)
 		booksChannel <- bookResult{books: books, err: err}
 	}()
-	go func() {
-		histories, err := service.midPriceSource.Capture(ctx, decisionAt, service.midPriceLookback, targets)
-		historiesChannel <- historyResult{histories: histories, err: err}
-	}()
+	if len(historyTargets) == 0 {
+		historiesChannel <- historyResult{histories: []domain.MidPriceHistory{}}
+	} else {
+		go func() {
+			histories, err := service.midPriceSource.Capture(ctx, decisionAt, service.midPriceLookback, historyTargets)
+			historiesChannel <- historyResult{histories: histories, err: err}
+		}()
+	}
 	books := <-booksChannel
 	histories := <-historiesChannel
-	if books.err != nil || histories.err != nil {
-		return nil, nil, errors.Join(
-			wrapError("capture orderbooks", books.err),
-			wrapError("capture mid-price histories", histories.err),
-		)
+	if books.err != nil {
+		return nil, nil, histories.err, wrapError("capture orderbooks", books.err)
 	}
-	return books.books, histories.histories, nil
+	return books.books, histories.histories, histories.err, nil
+}
+
+// buildHistoryTargets limits expensive 48-hour CLOB history reads to v2
+// bindings. V1 receives explicit NOT_REQUIRED placeholders in its frozen input
+// so the wire contract remains complete without making v1 availability depend
+// on an unrelated hourly-data source.
+func buildHistoryTargets(
+	predictions []domain.Prediction,
+	positions map[string][]domain.StrategyPositionLot,
+	bindings []domain.StrategyExecutionContext,
+) ([]domain.BookTarget, error) {
+	var selectedPredictions []domain.Prediction
+	var selectedPositions []domain.StrategyPositionLot
+	for _, binding := range bindings {
+		if binding.StrategyID != domain.StrategyIDMultfactorV2 {
+			continue
+		}
+		selectedPredictions = append(selectedPredictions, predictionsForModel(predictions, binding.ModelID)...)
+		selectedPositions = append(selectedPositions, positions[binding.ExecutionAccountID]...)
+	}
+	return buildInputTargets(selectedPredictions, selectedPositions)
+}
+
+func v1MidPricePlaceholders(
+	targets []domain.BookTarget,
+	decisionAt time.Time,
+	lookback time.Duration,
+	fetchedAt time.Time,
+) ([]domain.MidPriceHistory, error) {
+	histories, err := alignMidPriceHistories(alignMidPriceHistoriesParams{
+		targets: targets, decisionAt: decisionAt, lookback: lookback, fetchedAt: fetchedAt,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for index := range histories {
+		histories[index].ErrorCode = "NOT_REQUIRED_FOR_MULTFACTOR_V1"
+	}
+	return histories, nil
 }
 
 // wrapError 为 Error 包装操作上下文。
@@ -332,11 +425,14 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, fmt.Errorf("request strategy decision: %w", err)
 	}
+	if response.DecidedAt.After(service.now().UTC()) {
+		return run, fmt.Errorf("%w: decided_at must not be in the future", ErrInvalidStrategy)
+	}
 	intents, err := validateResponse(request, response, service.venue)
 	if err != nil {
 		return run, err
 	}
-	response, _, err = service.recorder.ClaimOutput(ctx, response)
+	response, _, err = service.recorder.ClaimOutput(ctx, response, intents, service.submitEnabled)
 	run.Response = response
 	if err != nil {
 		return run, fmt.Errorf("record strategy output: %w", err)
@@ -345,17 +441,138 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, fmt.Errorf("validate recorded strategy output: %w", err)
 	}
-	run.Intents = make([]IntentResult, 0, len(intents))
-	executionErrors := make([]error, 0)
-	for _, intent := range intents {
-		intentResult := IntentResult{Intent: intent}
-		intentResult.Result, intentResult.Error = service.executor.Submit(ctx, intent)
-		if intentResult.Error != nil {
-			executionErrors = append(executionErrors, fmt.Errorf("submit %s: %w", intent.ClientOrderID, intentResult.Error))
+	if !service.submitEnabled {
+		run.Intents = make([]IntentResult, 0, len(intents))
+		for _, intent := range intents {
+			run.Intents = append(run.Intents, IntentResult{Intent: intent, SubmissionDisabled: true})
 		}
-		run.Intents = append(run.Intents, intentResult)
+		return run, nil
 	}
-	return run, errors.Join(executionErrors...)
+	delivered, deliveryErr := service.deliverPending(ctx, response.CycleID)
+	deliveryByID := make(map[string]IntentResult, len(delivered))
+	for _, result := range delivered {
+		deliveryByID[result.Intent.ClientOrderID] = result
+	}
+	storedDeliveries, listErr := service.recorder.ListIntents(ctx, response.CycleID)
+	if listErr != nil {
+		return run, errors.Join(deliveryErr, fmt.Errorf("list strategy intent deliveries: %w", listErr))
+	}
+	run.Intents = make([]IntentResult, 0, len(storedDeliveries))
+	for _, delivery := range storedDeliveries {
+		if result, exists := deliveryByID[delivery.ClientOrderID]; exists {
+			run.Intents = append(run.Intents, result)
+			continue
+		}
+		run.Intents = append(run.Intents, IntentResult{
+			Intent: delivery.Intent, DeliveryStatus: delivery.Status, DeliveryAttempt: delivery.Attempt,
+			Result: port.OrderSubmitResult{Order: domain.Order{ID: delivery.OrderID, Status: delivery.OrderStatus}},
+		})
+	}
+	return run, deliveryErr
+}
+
+// RecoverPending safely resumes durable strategy intents from an earlier
+// process. It is a no-op while the independent submission gate is disabled.
+// SUBMITTING claims are retried only after a bounded lease and always through
+// execution.Submit's stable client_order_id lookup.
+func (service *Service) RecoverPending(ctx context.Context) error {
+	if !service.submitEnabled {
+		return nil
+	}
+	return service.recoverDeliveries(ctx, service.now().UTC().Add(-service.deliveryStaleAge))
+}
+
+// RecoverStartup takes ownership of every durable claim left by the previous
+// process before a new schedule is published. A single systemd instance is the
+// supported deployment model; future active-active operation must add an
+// explicit database owner lease before using this eager startup takeover.
+func (service *Service) RecoverStartup(ctx context.Context) error {
+	if !service.submitEnabled {
+		return nil
+	}
+	return service.recoverDeliveries(ctx, service.now().UTC())
+}
+
+func (service *Service) recoverDeliveries(ctx context.Context, cutoff time.Time) error {
+	for {
+		requeued, err := service.recorder.RequeueStaleSubmitting(ctx, cutoff, defaultDeliveryBatch)
+		if err != nil {
+			return fmt.Errorf("requeue stale strategy intents: %w", err)
+		}
+		if requeued < defaultDeliveryBatch {
+			break
+		}
+	}
+	_, err := service.deliverPending(ctx, "")
+	return err
+}
+
+func (service *Service) deliverPending(ctx context.Context, cycleID string) ([]IntentResult, error) {
+	results := make([]IntentResult, 0)
+	deliveryErrors := make([]error, 0)
+	for {
+		deliveries, err := service.recorder.ClaimPendingIntents(ctx, cycleID, defaultDeliveryBatch)
+		if err != nil {
+			return results, errors.Join(errors.Join(deliveryErrors...), fmt.Errorf("claim strategy intents: %w", err))
+		}
+		if len(deliveries) == 0 {
+			break
+		}
+		for _, delivery := range deliveries {
+			result := IntentResult{
+				Intent: delivery.Intent, DeliveryStatus: delivery.Status, DeliveryAttempt: delivery.Attempt,
+			}
+			result.Result, result.Error = service.executor.Submit(ctx, delivery.Intent)
+			completion, complete := decisionIntentCompletion(result.Result, result.Error)
+			if complete {
+				if completeErr := service.recorder.CompleteIntent(ctx, delivery.ClientOrderID, delivery.Attempt, completion); completeErr != nil {
+					result.Error = errors.Join(result.Error, fmt.Errorf("complete durable strategy intent: %w", completeErr))
+				} else {
+					result.DeliveryStatus = completion.Status
+					if completion.Status == domain.DecisionIntentFailed || completion.Status == domain.DecisionIntentUnknown {
+						result.Error = errors.Join(result.Error, fmt.Errorf(
+							"execution order %s completed durable delivery as %s (%s)",
+							completion.OrderID, completion.Status, completion.OrderStatus,
+						))
+					}
+				}
+			} else if result.Error == nil {
+				result.Error = fmt.Errorf("execution did not return a durable order id; delivery remains leased for recovery")
+			}
+			if result.Error != nil {
+				deliveryErrors = append(deliveryErrors, fmt.Errorf("submit %s: %w", delivery.ClientOrderID, result.Error))
+			}
+			results = append(results, result)
+		}
+		if len(deliveries) < defaultDeliveryBatch {
+			break
+		}
+	}
+	return results, errors.Join(deliveryErrors...)
+}
+
+// decisionIntentCompletion marks a delivery terminal only after execution has
+// durably claimed an order_id. An infrastructure failure before that point is
+// left SUBMITTING so its lease can expire and be retried without data loss.
+func decisionIntentCompletion(result port.OrderSubmitResult, submitErr error) (domain.DecisionIntentCompletion, bool) {
+	if strings.TrimSpace(result.Order.ID) == "" {
+		return domain.DecisionIntentCompletion{}, false
+	}
+	completion := domain.DecisionIntentCompletion{
+		OrderID: result.Order.ID, OrderStatus: result.Order.Status,
+	}
+	if submitErr != nil {
+		completion.LastError = submitErr.Error()
+	}
+	switch result.Order.Status {
+	case domain.OrderStatusRejected:
+		completion.Status = domain.DecisionIntentFailed
+	case domain.OrderStatusUnknown, domain.OrderStatusManualReview:
+		completion.Status = domain.DecisionIntentUnknown
+	default:
+		completion.Status = domain.DecisionIntentSubmitted
+	}
+	return completion, true
 }
 
 // normalizeBindings 规范化 Bindings 的字段和表示。
@@ -718,6 +935,9 @@ type expectedEvaluation struct {
 
 // validateResponse 校验 Response 的字段和业务约束。
 func validateResponse(request domain.StrategyDecisionRequest, response domain.StrategyDecisionResponse, venue string) ([]domain.OrderIntent, error) {
+	if err := request.Context.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: request execution context: %v", ErrInvalidStrategy, err)
+	}
 	if response.SchemaVersion != domain.StrategyOutputSchemaVersion || response.CycleID != request.CycleID ||
 		response.InputID != request.InputID || !response.Context.Equal(request.Context) {
 		return nil, fmt.Errorf("%w: schema, cycle, input, or execution context mismatch", ErrInvalidStrategy)
@@ -823,13 +1043,19 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 	if evaluation.Order == nil {
 		return domain.OrderIntent{}, fmt.Errorf("SUBMIT requires order parameters")
 	}
+	strategyID := request.Context.Normalize().StrategyID
+	if strategyID != domain.StrategyIDMultfactorV1 && strategyID != domain.StrategyIDMultfactorV2 {
+		return domain.OrderIntent{}, fmt.Errorf("unsupported strategy_id %q", strategyID)
+	}
 	book, found := strategyBook(request.OrderBooks, evaluation.TokenID)
 	if !found || book.Status != domain.OrderBookStatusOK {
 		return domain.OrderIntent{}, fmt.Errorf("SUBMIT requires an OK orderbook")
 	}
-	history, found := strategyMidPriceHistory(request.MidPriceHistories, evaluation.TokenID)
-	if !found || history.Status != domain.MidPriceHistoryStatusOK {
-		return domain.OrderIntent{}, fmt.Errorf("SUBMIT requires at least two current hours of raw mid-price history")
+	if strategyID == domain.StrategyIDMultfactorV2 {
+		history, found := strategyMidPriceHistory(request.MidPriceHistories, evaluation.TokenID)
+		if !found || history.Status != domain.MidPriceHistoryStatusOK {
+			return domain.OrderIntent{}, fmt.Errorf("multfactor_v2 SUBMIT requires usable raw mid-price history")
+		}
 	}
 	if err := validateStrategyOrder(*evaluation.Order, domain.SideBuy, book.Asks[0].Price, book, request.ExecutionConstraints); err != nil {
 		return domain.OrderIntent{}, err
@@ -1016,6 +1242,7 @@ func rationalDecimalPlaces(value *big.Rat) int {
 
 // validateEvidenceMetrics 校验 Evidence Metrics 的字段和业务约束。
 func validateEvidenceMetrics(evidence domain.StrategyEvidence, request domain.StrategyDecisionRequest, tokenID string, requireAll bool) error {
+	strategyID := request.Context.Normalize().StrategyID
 	allowed := map[string]struct{}{
 		"best_ask": {}, "near_logdiff_usd": {}, "rel_spread": {}, "MOM": {}, "MACD_SIGNAL": {},
 	}
@@ -1030,7 +1257,11 @@ func validateEvidenceMetrics(evidence domain.StrategyEvidence, request domain.St
 	if !requireAll {
 		return nil
 	}
-	for key := range allowed {
+	required := []string{"best_ask", "near_logdiff_usd", "rel_spread"}
+	if strategyID == domain.StrategyIDMultfactorV2 {
+		required = append(required, "MOM", "MACD_SIGNAL")
+	}
+	for _, key := range required {
 		if _, exists := evidence.Metrics[key]; !exists {
 			return fmt.Errorf("SUBMIT requires evidence.metrics.%s", key)
 		}
@@ -1049,9 +1280,11 @@ func inputFailureReason(request domain.StrategyDecisionRequest, tokenID string) 
 	if !found || book.Status != domain.OrderBookStatusOK {
 		return domain.StrategyReasonInvalidBook
 	}
-	history, found := strategyMidPriceHistory(request.MidPriceHistories, tokenID)
-	if !found || history.Status != domain.MidPriceHistoryStatusOK {
-		return domain.StrategyReasonStaleData
+	if request.Context.Normalize().StrategyID == domain.StrategyIDMultfactorV2 {
+		history, found := strategyMidPriceHistory(request.MidPriceHistories, tokenID)
+		if !found || history.Status != domain.MidPriceHistoryStatusOK {
+			return domain.StrategyReasonStaleData
+		}
 	}
 	return ""
 }
@@ -1062,7 +1295,8 @@ func validSkipReason(reason domain.StrategyReasonCode) bool {
 	case domain.StrategyReasonEdgeTooLow, domain.StrategyReasonSpreadTooWide,
 		domain.StrategyReasonLiquidityTooLow, domain.StrategyReasonPriceOutOfRange,
 		domain.StrategyReasonHourlyVeto, domain.StrategyReasonFactorWarmup,
-		domain.StrategyReasonStaleData, domain.StrategyReasonInvalidBook:
+		domain.StrategyReasonStaleData, domain.StrategyReasonInvalidBook,
+		domain.StrategyReasonOutsideUniverse:
 		return true
 	default:
 		return false

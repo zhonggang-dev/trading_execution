@@ -43,16 +43,59 @@ func (venue *placementReadinessVenue) Bind(checker readinessChecker) error {
 func (venue *placementReadinessVenue) Name() string { return venue.venue.Name() }
 
 func (venue *placementReadinessVenue) Place(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
+	if err := venue.checkPlace(ctx); err != nil {
+		return port.VenueOrder{}, err
+	}
+	return venue.venue.Place(ctx, order)
+}
+
+func (venue *placementReadinessVenue) checkPlace(ctx context.Context) error {
 	venue.mu.RLock()
 	checker := venue.checker
 	venue.mu.RUnlock()
 	if checker == nil {
-		return port.VenueOrder{}, reconciliationNotReadyError(fmt.Errorf("reconciliation readiness is not bound"))
+		return reconciliationNotReadyError(fmt.Errorf("reconciliation readiness is not bound"))
 	}
 	if err := checker.Check(ctx); err != nil {
-		return port.VenueOrder{}, reconciliationNotReadyError(err)
+		return reconciliationNotReadyError(err)
 	}
-	return venue.venue.Place(ctx, order)
+	return nil
+}
+
+type placementReadinessPrepared struct{ inner port.PreparedPlacement }
+
+func (prepared placementReadinessPrepared) ExpectedVenueOrderID() string {
+	if prepared.inner == nil {
+		return ""
+	}
+	return prepared.inner.ExpectedVenueOrderID()
+}
+
+func (venue *placementReadinessVenue) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {
+	if err := venue.checkPlace(ctx); err != nil {
+		return nil, err
+	}
+	underlying, ok := venue.venue.(port.PreparedVenue)
+	if !ok {
+		return nil, reconciliationNotReadyError(fmt.Errorf("underlying live venue does not support prepared placement"))
+	}
+	prepared, err := underlying.PreparePlace(ctx, order)
+	if err != nil {
+		return nil, err
+	}
+	return placementReadinessPrepared{inner: prepared}, nil
+}
+
+func (venue *placementReadinessVenue) PlacePrepared(ctx context.Context, order domain.Order, placement port.PreparedPlacement) (port.VenueOrder, error) {
+	prepared, ok := placement.(placementReadinessPrepared)
+	underlying, supported := venue.venue.(port.PreparedVenue)
+	if !ok || !supported || prepared.inner == nil {
+		return port.VenueOrder{}, reconciliationNotReadyError(fmt.Errorf("placement readiness prepared placement is invalid"))
+	}
+	if err := venue.checkPlace(ctx); err != nil {
+		return port.VenueOrder{}, err
+	}
+	return underlying.PlacePrepared(ctx, order, prepared.inner)
 }
 
 func (venue *placementReadinessVenue) Cancel(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
@@ -73,3 +116,4 @@ func reconciliationNotReadyError(cause error) error {
 }
 
 var _ port.Venue = (*placementReadinessVenue)(nil)
+var _ port.PreparedVenue = (*placementReadinessVenue)(nil)

@@ -7,6 +7,20 @@ import (
 	"time"
 )
 
+func TestStrategyExecutionContextRejectsUnknownStrategy(t *testing.T) {
+	valid := StrategyExecutionContext{
+		ModelID: "model-1", StrategyID: "strategy-v1", ExecutionAccountID: "account-1",
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("Validate() historical alias error = %v", err)
+	}
+	unknown := valid
+	unknown.StrategyID = "multfactor_v3"
+	if err := unknown.Validate(); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("Validate() error = %v, want unsupported strategy rejection", err)
+	}
+}
+
 // TestMidPricePointWireFormatIsUnambiguousRawP 验证 Mid Price Point Wire Format Is Unambiguous Raw P 场景下的行为。
 func TestMidPricePointWireFormatIsUnambiguousRawP(t *testing.T) {
 	point := MidPricePoint{IntervalEndAt: time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC), P: "0.41"}

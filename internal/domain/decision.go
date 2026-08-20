@@ -451,7 +451,12 @@ func (executionContext StrategyExecutionContext) Validate() error {
 	if executionContext.ModelID == "" || executionContext.StrategyID == "" || executionContext.ExecutionAccountID == "" {
 		return fmt.Errorf("model_id, strategy_id, and execution_account_id are required")
 	}
-	return nil
+	switch executionContext.StrategyID {
+	case StrategyIDMultfactorV1, StrategyIDMultfactorV2:
+		return nil
+	default:
+		return fmt.Errorf("strategy_id %q is not supported", executionContext.StrategyID)
+	}
 }
 
 // Equal 判断两个值在规范化后是否相等。
@@ -532,6 +537,7 @@ const (
 	StrategyReasonFactorWarmup    StrategyReasonCode = "FACTOR_WARMUP"
 	StrategyReasonStaleData       StrategyReasonCode = "STALE_DATA"
 	StrategyReasonInvalidBook     StrategyReasonCode = "INVALID_BOOK"
+	StrategyReasonOutsideUniverse StrategyReasonCode = "OUTSIDE_STRATEGY_UNIVERSE"
 	StrategyReasonHold48H         StrategyReasonCode = "HOLD_48H"
 )
 
