@@ -91,8 +91,8 @@ prediction 和 position 的 token 并固定请求 top 15，每侧返回实际存
 
 策略必须原样回显可信 `context`，并为每个 `(prediction_id, token_id)` 返回一条买入 `SKIP` 或 `SUBMIT`
 evaluation；按手卖出通过 `exits[].lot_id` 返回。entry 和 exit 都只能使用 `LIMIT + FOK`。
-完整 HTTP 请求、响应字段和错误码见
-[`strategy-http-api.md`](strategy-http-api.md)。Trading Execution 根据 `SUBMIT` 的订单
+完整 HTTP 请求、响应字段、业务校验和错误码见
+[`python-algorithm-http-api.md`](python-algorithm-http-api.md)。Trading Execution 根据 `SUBMIT` 的订单
 参数生成内部 `OrderIntent`；venue 和 `client_order_id` 不由策略服务指定。
 Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风控执行信号时效检查。
 
