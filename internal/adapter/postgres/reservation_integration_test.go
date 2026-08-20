@@ -374,6 +374,174 @@ func TestReconciliationRecorderClosesPreviouslyOpenFingerprint(t *testing.T) {
 	}
 }
 
+func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	const accountID = "account-fill-lag-resolution"
+	insertAccount(t, db, accountID, "0xfilllag", "10", "10", "0")
+	recorder, err := NewReconciliationRecorder(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	firstRun, err := (domain.ReconciliationRunParams{
+		RunID: "run-fill-lag-open", ExecutionAccountID: accountID,
+		Trigger: domain.ReconciliationTriggerScheduled, StartedAt: now,
+	}).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.Start(context.Background(), firstRun); err != nil {
+		t.Fatal(err)
+	}
+	issues := []domain.ReconciliationIssue{
+		{
+			IssueID: "issue-fill-lag-balance", RunID: firstRun.RunID, Fingerprint: "fill-lag-balance",
+			ExecutionAccountID: accountID, Type: domain.ReconciliationIssueBalanceDrift,
+			Resolution: domain.ReconciliationResolutionManual, Status: domain.ReconciliationIssueOpen,
+			LocalValue: "10", RemoteValue: "8.5", Source: "EVM_ERC20_ETH_CALL",
+			Details: "fill reached chain before the local ledger", ObservedAt: now,
+		},
+		{
+			IssueID: "issue-fill-lag-position", RunID: firstRun.RunID, Fingerprint: "fill-lag-position",
+			ExecutionAccountID: accountID, Type: domain.ReconciliationIssuePhantomPosition,
+			Resolution: domain.ReconciliationResolutionManual, Status: domain.ReconciliationIssueOpen,
+			TokenID: "token-fill-lag", RemoteValue: "5", Source: "POLYMARKET_DATA_API",
+			Details: "fill reached the position source before the local ledger", ObservedAt: now,
+		},
+		{
+			IssueID: "issue-unrelated-external-trade", RunID: firstRun.RunID, Fingerprint: "unrelated-external-trade",
+			ExecutionAccountID: accountID, Type: domain.ReconciliationIssueExternalTrade,
+			Resolution: domain.ReconciliationResolutionManual, Status: domain.ReconciliationIssueOpen,
+			VenueTradeID: "external-trade", Source: "POLYMARKET_CLOB",
+			Details: "unrelated manual issue must remain open", ObservedAt: now,
+		},
+	}
+	for _, issue := range issues {
+		if err := recorder.RecordIssue(context.Background(), issue); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstCompleted := now.Add(time.Second)
+	firstRun.Status, firstRun.CompletedAt = domain.ReconciliationRunAttentionRequired, &firstCompleted
+	if err := recorder.Complete(context.Background(), firstRun); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`
+		UPDATE execution_accounts
+		SET total_balance=8.5,available_balance=8.5,reserved_balance=0
+		WHERE execution_account_id=$1`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_positions (
+			execution_account_id,market_id,condition_id,outcome_index,outcome_name,
+			token_id,total_shares,available_shares,reserved_shares,cost_basis
+		) VALUES ($1,'market-fill-lag','condition-fill-lag',0,'Yes',$2,5,5,0,1.5)`,
+		accountID, "token-fill-lag"); err != nil {
+		t.Fatal(err)
+	}
+	fillAppliedAt := now.Add(2500 * time.Millisecond)
+	if _, err := db.Exec(`
+		INSERT INTO execution_orders (
+			order_id,client_order_id,execution_account_id,venue,market_id,token_id,
+			intent,venue_order_id,status,filled_size,filled_notional,total_fees,
+			average_fill_price,revision,created_at,updated_at
+		) VALUES (
+			'order-fill-lag','client-fill-lag',$1,'polymarket','market-fill-lag',$2,
+			'{}'::jsonb,'venue-order-fill-lag','FILLED',5,1.5,0,0.3,1,$3,$4
+		)`, accountID, "token-fill-lag", now, fillAppliedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_fills (
+			fill_key,venue,venue_fill_id,order_id,venue_order_id,execution_account_id,
+			market_id,token_id,side,liquidity_role,status,shares,price,gross_notional,
+			fee_rate_bps,platform_fee,builder_fee_rate_bps,builder_fee,total_fee,
+			net_cash_delta,fee_source,matched_at,first_observed_at,last_observed_at,
+			confirmed_at,applied_at
+		) VALUES (
+			'fill-fill-lag','polymarket','venue-fill-lag','order-fill-lag',
+			'venue-order-fill-lag',$1,'market-fill-lag',$2,'BUY','TAKER','CONFIRMED',
+			5,0.3,1.5,0,0,0,0,0,-1.5,'TEST_FINALIZED_FILL',$3,$3,$3,$3,$3
+		)`, accountID, "token-fill-lag", fillAppliedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_account_events (
+			account_event_id,execution_account_id,event_type,order_id,fill_key,
+			total_balance_delta,available_balance_delta,reserved_balance_delta,
+			total_balance_after,available_balance_after,reserved_balance_after,occurred_at
+		) VALUES (
+			'account-event-fill-lag',$1,'BUY_FILL','order-fill-lag','fill-fill-lag',
+			-1.5,-1.5,0,8.5,8.5,0,$2
+		)`, accountID, fillAppliedAt); err != nil {
+		t.Fatal(err)
+	}
+	secondRun, err := (domain.ReconciliationRunParams{
+		RunID: "run-fill-lag-resolved", ExecutionAccountID: accountID,
+		Trigger: domain.ReconciliationTriggerScheduled, StartedAt: now.Add(2 * time.Second),
+	}).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.Start(context.Background(), secondRun); err != nil {
+		t.Fatal(err)
+	}
+	secondCompleted := now.Add(3 * time.Second)
+	secondRun.Status, secondRun.CompletedAt = domain.ReconciliationRunCompleted, &secondCompleted
+	secondRun.Summary["fills_applied"] = 1
+	if err := recorder.Complete(context.Background(), secondRun); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Query(`
+		SELECT issue_type,status,resolution
+		FROM reconciliation_issues
+		WHERE execution_account_id=$1 ORDER BY issue_type`, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	statuses := map[domain.ReconciliationIssueType][2]string{}
+	for rows.Next() {
+		var issueType domain.ReconciliationIssueType
+		var status, resolution string
+		if err := rows.Scan(&issueType, &status, &resolution); err != nil {
+			t.Fatal(err)
+		}
+		statuses[issueType] = [2]string{status, resolution}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, issueType := range []domain.ReconciliationIssueType{
+		domain.ReconciliationIssueBalanceDrift, domain.ReconciliationIssuePhantomPosition,
+	} {
+		if got := statuses[issueType]; got != [2]string{"RESOLVED", "AUTOMATIC"} {
+			t.Fatalf("%s status = %v, want RESOLVED/AUTOMATIC", issueType, got)
+		}
+	}
+	if got := statuses[domain.ReconciliationIssueExternalTrade]; got != [2]string{"OPEN", "MANUAL_REVIEW"} {
+		t.Fatalf("unrelated issue status = %v, want OPEN/MANUAL_REVIEW", got)
+	}
+	var summaryJSON []byte
+	if err := db.QueryRow(`SELECT summary FROM reconciliation_runs WHERE run_id=$1`, secondRun.RunID).Scan(&summaryJSON); err != nil {
+		t.Fatal(err)
+	}
+	var summary map[string]int
+	if err := json.Unmarshal(summaryJSON, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["issues_resolved"] != 2 || summary["issues_automatic"] != 2 || summary["issues_total"] != 2 {
+		t.Fatalf("resolution summary = %#v, want two automatic resolutions", summary)
+	}
+}
+
 // TestAtomicLiveRiskPostgresIntegration verifies that LIVE_CHECK orders are
 // fail-closed and that account-scoped limits are checked inside the same row
 // lock transaction as the balance reservation.

@@ -126,15 +126,26 @@ func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain
 	if run.CompletedAt == nil {
 		return fmt.Errorf("completed reconciliation run requires completed_at")
 	}
-	summary, err := json.Marshal(run.Summary)
-	if err != nil {
-		return fmt.Errorf("encode reconciliation summary: %w", err)
-	}
 	tx, err := recorder.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return fmt.Errorf("begin reconciliation run completion: %w", err)
 	}
 	defer tx.Rollback()
+	if run.Status == domain.ReconciliationRunCompleted && run.Summary["fills_applied"] > 0 {
+		resolved, resolveErr := resolveFillLagDriftIssues(ctx, tx, run)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if resolved > 0 {
+			run.Summary["issues_total"] += resolved
+			run.Summary["issues_resolved"] += resolved
+			run.Summary["issues_automatic"] += resolved
+		}
+	}
+	summary, err := json.Marshal(run.Summary)
+	if err != nil {
+		return fmt.Errorf("encode reconciliation summary: %w", err)
+	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE reconciliation_runs
 		SET status=$2, summary=$3::jsonb, error=$4, completed_at=$5
@@ -164,4 +175,83 @@ func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain
 		return fmt.Errorf("commit reconciliation run completion: %w", err)
 	}
 	return nil
+}
+
+// resolveFillLagDriftIssues closes only stale drift observations whose exact
+// remote value is now represented by the authoritative ledger after at least
+// one finalized fill was applied in this completed run. Unrelated manual
+// issues and discrepancies reproduced by the current run remain fail-closed.
+func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
+	const resolvedDetails = "; automatically resolved after finalized fill evidence made the local ledger match the previously observed remote value"
+	resolved := 0
+	result, err := tx.ExecContext(ctx, `
+		UPDATE reconciliation_issues issue
+		SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+		    details=issue.details || $4
+		FROM execution_accounts account
+		WHERE issue.execution_account_id=$1 AND issue.status='OPEN'
+		  AND issue.resolution='MANUAL_REVIEW' AND issue.issue_type='BALANCE_DRIFT'
+		  AND issue.run_id<>$2
+		  AND account.execution_account_id=issue.execution_account_id
+		  AND issue.remote_value IS NOT NULL
+		  AND account.total_balance=issue.remote_value
+		  AND EXISTS (
+		    SELECT 1
+		    FROM execution_account_events event
+		    JOIN execution_fills fill ON fill.fill_key=event.fill_key
+		    WHERE event.execution_account_id=issue.execution_account_id
+		      AND event.total_balance_after=issue.remote_value
+		      AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
+		      AND fill.applied_at BETWEEN $5 AND $3
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM reconciliation_issues reproduced
+		    WHERE reproduced.execution_account_id=issue.execution_account_id
+		      AND reproduced.run_id=$2 AND reproduced.status='OPEN'
+		      AND reproduced.issue_type=issue.issue_type
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, run.StartedAt.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("resolve finalized-fill balance drift issues: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count finalized-fill balance drift issues: %w", err)
+	}
+	resolved += int(affected)
+
+	result, err = tx.ExecContext(ctx, `
+		UPDATE reconciliation_issues issue
+		SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+		    details=issue.details || $4
+		FROM execution_positions position
+		WHERE issue.execution_account_id=$1 AND issue.status='OPEN'
+		  AND issue.resolution='MANUAL_REVIEW'
+		  AND issue.issue_type IN ('PHANTOM_POSITION','POSITION_DRIFT')
+		  AND issue.run_id<>$2
+		  AND position.execution_account_id=issue.execution_account_id
+		  AND position.token_id=issue.token_id
+		  AND issue.remote_value IS NOT NULL
+		  AND position.total_shares=issue.remote_value
+		  AND EXISTS (
+		    SELECT 1 FROM execution_fills fill
+		    WHERE fill.execution_account_id=issue.execution_account_id
+		      AND fill.token_id=issue.token_id
+		      AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
+		      AND fill.applied_at BETWEEN $5 AND $3
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM reconciliation_issues reproduced
+		    WHERE reproduced.execution_account_id=issue.execution_account_id
+		      AND reproduced.run_id=$2 AND reproduced.status='OPEN'
+		      AND reproduced.issue_type=issue.issue_type
+		      AND reproduced.token_id=issue.token_id
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, run.StartedAt.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("resolve finalized-fill position drift issues: %w", err)
+	}
+	affected, err = result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count finalized-fill position drift issues: %w", err)
+	}
+	return resolved + int(affected), nil
 }
