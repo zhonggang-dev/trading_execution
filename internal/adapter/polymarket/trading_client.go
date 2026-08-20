@@ -135,8 +135,9 @@ type marketFeeSchedule struct {
 	TakerOnly bool
 }
 
-// UnmarshalJSON converts V2 response quantities from canonical six-decimal
-// uint256 base units. Prices and fee-rate metadata remain decimal strings.
+// UnmarshalJSON converts the V2 order REST response quantities from canonical
+// six-decimal uint256 base units. Trade REST responses use human decimal share
+// strings and are intentionally decoded separately below.
 func (raw *rawOrder) UnmarshalJSON(data []byte) error {
 	type rawOrderAlias rawOrder
 	var decoded rawOrderAlias
@@ -170,20 +171,19 @@ func (raw *rawOrder) UnmarshalJSON(data []byte) error {
 func (trade *Trade) UnmarshalJSON(data []byte) error {
 	type tradeAlias Trade
 	var decoded tradeAlias
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	var quantity struct {
-		Size json.RawMessage `json:"size"`
-	}
-	if err := json.Unmarshal(data, &quantity); err != nil {
-		return err
-	}
-	size, err := decimalFromWireBaseUnits(quantity.Size, "size")
+	normalized, err := defaultEmptyDecimalField(data, "fee_rate_bps")
 	if err != nil {
-		return err
+		return fmt.Errorf("normalize trade fee-rate metadata: %w", err)
 	}
-	decoded.Size = size
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		return fmt.Errorf("decode trade fields: %w", err)
+	}
+	if decoded.Size.IsEmpty() {
+		return fmt.Errorf("decode trade size: decimal is required")
+	}
+	if sign, err := decoded.Size.Sign(); err != nil || sign < 0 {
+		return fmt.Errorf("decode trade size: size must be a non-negative decimal")
+	}
 	*trade = Trade(decoded)
 	return nil
 }
@@ -191,22 +191,45 @@ func (trade *Trade) UnmarshalJSON(data []byte) error {
 func (maker *MakerOrder) UnmarshalJSON(data []byte) error {
 	type makerOrderAlias MakerOrder
 	var decoded makerOrderAlias
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	var quantity struct {
-		MatchedAmount json.RawMessage `json:"matched_amount"`
-	}
-	if err := json.Unmarshal(data, &quantity); err != nil {
-		return err
-	}
-	matched, err := decimalFromWireBaseUnits(quantity.MatchedAmount, "matched_amount")
+	normalized, err := defaultEmptyDecimalField(data, "fee_rate_bps")
 	if err != nil {
-		return err
+		return fmt.Errorf("normalize maker-order fee-rate metadata: %w", err)
 	}
-	decoded.MatchedAmount = matched
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		return fmt.Errorf("decode maker-order fields: %w", err)
+	}
+	if decoded.MatchedAmount.IsEmpty() {
+		return fmt.Errorf("decode maker-order matched amount: decimal is required")
+	}
+	if sign, err := decoded.MatchedAmount.Sign(); err != nil || sign < 0 {
+		return fmt.Errorf("decode maker-order matched amount: amount must be a non-negative decimal")
+	}
 	*maker = MakerOrder(decoded)
 	return nil
+}
+
+// V2 historical trade rows may encode the deprecated fee-rate metadata as an
+// empty string. The value is not authoritative money evidence; final cash
+// accounting comes exclusively from the Polygon OrderFilled event. Normalize
+// absent/null/empty metadata to zero so historical reconciliation can proceed
+// while keeping malformed non-empty values fail-closed.
+func defaultEmptyDecimalField(data []byte, field string) ([]byte, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, err
+	}
+	raw, exists := object[field]
+	if exists && string(raw) != "null" {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return data, nil
+		}
+		if strings.TrimSpace(value) != "" {
+			return data, nil
+		}
+	}
+	object[field] = json.RawMessage(`"0"`)
+	return json.Marshal(object)
 }
 
 // OpenOrderFilter 表示后端使用的 OpenOrderFilter 类型。

@@ -30,6 +30,18 @@ func reconciliationScanStart(now time.Time, lookback time.Duration, trigger doma
 	return now.Add(-lookback)
 }
 
+// applyStartupAccountBaseline treats a deliberately reconciled current ledger
+// snapshot as the ownership boundary for an onboarded wallet. Historical venue
+// activity before that timestamp belongs to the retired execution system and
+// must not be reported as an unexplained trade on every new-service restart.
+// A wallet without a baseline remains full-history fail-closed.
+func applyStartupAccountBaseline(scanAfter time.Time, trigger domain.ReconciliationTrigger, balance domain.AccountBalance) time.Time {
+	if trigger != domain.ReconciliationTriggerStartup || balance.ReconciledAt == nil || balance.ReconciledAt.IsZero() {
+		return scanAfter
+	}
+	return balance.ReconciledAt.UTC()
+}
+
 // loadLocalAuthority 读取本地权威账户和订单，任一失败都停止后续外部对账。
 func (state *runState) loadLocalAuthority(ctx context.Context, scope accountRunScope) (domain.AccountBalance, []domain.Order, error) {
 	balance, err := state.service.ledger.GetBalance(ctx, scope.executionAccountID)

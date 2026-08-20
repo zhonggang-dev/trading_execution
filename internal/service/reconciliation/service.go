@@ -155,6 +155,7 @@ func (service *Service) RunAccount(ctx context.Context, params RunAccountParams)
 	if err != nil {
 		return service.finish(ctx, state, errors.Join(err, errors.Join(state.errors...)))
 	}
+	scope.scanAfter = applyStartupAccountBaseline(scope.scanAfter, params.Trigger, balance)
 	evidence, venueErr := state.collectVenueEvidence(ctx, scope, orders)
 	state.reconcileOrders(ctx, reconcileOrdersParams{orders: orders, focusOrderID: scope.focusOrderID, evidence: evidence})
 	positionErr := state.reconcilePositions(ctx, scope.executionAccountID, balance.WalletAddress)

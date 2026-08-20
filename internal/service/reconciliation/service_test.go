@@ -68,6 +68,57 @@ func TestRunAccountRepairsOnlyProvableFacts(t *testing.T) {
 	}
 }
 
+func TestStartupUsesExplicitAccountReconciliationBaselineForVenueTrades(t *testing.T) {
+	baseline := testNow.Add(-2 * time.Minute)
+	balance := testBalance("100")
+	balance.ReconciledAt = &baseline
+	venue := &fakeVenue{}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{}, Venue: venue, Ledger: &fakeLedger{balance: balance},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{},
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerStartup,
+	})
+	if err != nil || result.Run.Status != domain.ReconciliationRunCompleted {
+		t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+	}
+	if !venue.tradesAfter.Equal(baseline) {
+		t.Fatalf("venue trades after = %s, want %s", venue.tradesAfter, baseline)
+	}
+}
+
+func TestStartupWithoutAccountBaselineStillScansFullVenueHistory(t *testing.T) {
+	venue := &fakeVenue{}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{}, Venue: venue, Ledger: &fakeLedger{balance: testBalance("100")},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{},
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+
+	_, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerStartup,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !venue.tradesAfter.IsZero() {
+		t.Fatalf("venue trades after = %s, want full-history zero time", venue.tradesAfter)
+	}
+}
+
 // TestRunAccountLeavesUnattributableStateForManualReview 验证 Run Account Leaves Unattributable State For Manual Review 场景下的行为。
 func TestRunAccountLeavesUnattributableStateForManualReview(t *testing.T) {
 	unknown := testOrder("order-unknown", "", domain.OrderStatusUnknown)
@@ -264,6 +315,7 @@ type fakeVenue struct {
 	trades     []domain.VenueTradeSnapshot
 	openErr    error
 	tradesErr  error
+	tradesAfter time.Time
 }
 
 // ListReconciliationOpenOrders 返回模拟数据源中的测试列表。
@@ -272,7 +324,8 @@ func (venue *fakeVenue) ListReconciliationOpenOrders(context.Context, string) ([
 }
 
 // ListReconciliationTrades 返回模拟数据源中的测试列表。
-func (venue *fakeVenue) ListReconciliationTrades(context.Context, string, time.Time) ([]domain.VenueTradeSnapshot, error) {
+func (venue *fakeVenue) ListReconciliationTrades(_ context.Context, _ string, after time.Time) ([]domain.VenueTradeSnapshot, error) {
+	venue.tradesAfter = after
 	return append([]domain.VenueTradeSnapshot(nil), venue.trades...), venue.tradesErr
 }
 
