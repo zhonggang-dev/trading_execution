@@ -10,25 +10,34 @@
 Go 启动时注入绑定表，例如：
 
 ```text
-model-a / strategy-v1 / account-model-a-strategy-v1
-model-a / strategy-v2 / account-model-a-strategy-v2
-model-b / strategy-v1 / account-model-b-strategy-v1
-model-b / strategy-v2 / account-model-b-strategy-v2
-model-c / strategy-v1 / account-model-c-strategy-v1
-model-c / strategy-v2 / account-model-c-strategy-v2
+echo / multfactor_v1 / main
+echo / multfactor_v2 / wallet-1
+gemini_masked / multfactor_v1 / wallet-2
+gemini_masked / multfactor_v2 / wallet-3
 ```
 
 框架拒绝重复的 model/strategy 组合，也拒绝把同一个 execution account 绑定两次。
+这里的 `model_id` 是策略、订单和风控使用的稳定业务身份。可选的
+`prediction_model_id` 是 prediction snapshot 里 `model.name` 的精确值；两者不同时，
+Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `prediction.model.name`
+投影为 `model_id`。Python 协议不增加字段，它仍会看到
+`prediction.model.name == context.model_id`。
+
+当前四钱包配置中，`#0` 是现有 literal account ID `main`，不是隐式的
+`wallet-0` 别名。上线前必须从当前 PIT snapshot 确认 `prediction_model_id`；
+例如已验证过的 masked producer 可能是 `gemini-3.6-flash`，但该值不能由
+`gemini_masked` 业务名猜测。
 
 ## 周期顺序
 
 ```text
 10-minute UTC boundary T
   -> GET prediction_infra snapshot(as_of=T)
-  -> select predictions belonging to configured model IDs
+  -> select each Market by configured prediction_model_id
   -> load every binding's OPEN position lots
   -> capture CLOB books and [T-48h,T] midpoint histories once for the prediction/position token union
   -> normalize bids DESC / asks ASC / top 15 each side
+  -> project source identity to logical model_id
   -> expand configured (model, strategy, execution account) bindings
   -> one isolated trading.strategy_input.v4 per binding
   -> POST strategy /api/v4/decisions (Idempotency-Key: cycle_id)
@@ -48,12 +57,12 @@ model-c / strategy-v2 / account-model-c-strategy-v2
 ```json
 {
   "schema_version": "trading.strategy_input.v4",
-  "cycle_id": "account-model-a-strategy-v1:20260818T042000Z",
+  "cycle_id": "main:20260818T042000Z",
   "input_id": "strategy-input-...",
   "context": {
-    "model_id": "model-a",
-    "strategy_id": "strategy-v1",
-    "execution_account_id": "account-model-a-strategy-v1"
+    "model_id": "echo",
+    "strategy_id": "multfactor_v1",
+    "execution_account_id": "main"
   },
   "decision_at": "2026-08-18T04:20:00Z",
   "generated_at": "2026-08-18T04:20:04Z",
@@ -74,9 +83,15 @@ model-c / strategy-v2 / account-model-c-strategy-v2
 }
 ```
 
-`predictions` 每个周期发送 `model.name == context.model_id` 的全部当前有效 producer 结果，不是增量；每条结果包含两个
-按原始 Outcome 顺序对齐的概率和 token。不同策略处理同一模型时复用完全相同的冻结
+`predictions` 每个周期发送当前 binding 所属模型的全部当前有效 Market，不要求
+同一 Market 同时具有所有模型的概率。一条 Market/Model 预测仍包含两个按原始
+Outcome 顺序对齐且和为 1 的概率和 token，而不是只传一个脱离 Outcome 的 `prob`。
+同一 Market 可以有不同模型的独立预测，但同一 `(market_id, prediction_model_id)`
+在一个冻结快照中必须恰好只有一条；重复时 Trading 会 fail closed，避免同一概率维度触发两次买入。
+发往 Python 前已确保 `prediction.model.name == context.model_id`。不同策略处理同一模型时复用完全相同的冻结
 prob 和盘口，但使用不同 `strategy_id`、`execution_account_id`、`cycle_id` 和 `input_id`。
+某个模型当轮没有 Market 时仍调用对应 binding，因为该钱包可能还有需要退出的
+OPEN lots；运行日志会逐 binding 记录上游模型和 prediction count，空预测不再与“未调用”混淆。
 `positions` 按开仓批次发送当前 binding 的全部 OPEN lot，不按 token 聚合。`orderbooks` 覆盖
 prediction 和 position 的 token 并固定请求 top 15，每侧返回实际存在的最多 15 档；价格和数量必须使用 JSON string decimal。
 `mid_price_histories` 也按 token 一一对应，`mid_prices[].p` 直接来自 Polymarket
@@ -121,13 +136,31 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
   `DECISION_CYCLE_ORDER_SUBMISSION_ENABLED` 默认 `false`，关闭时仍构建并记录合法 OrderIntent，
   但明确标记 `submission_disabled` 且绝不调用 `execution.Submit`；
 - Go 绑定表保证一个 `(model_id, strategy_id)` 只对应一个唯一 `execution_account_id`，同一
-  execution account 不能重复绑定。
+  execution account 不能重复绑定；同一逻辑 `model_id` 不能来自多个 `prediction_model_id`，
+  同一 `prediction_model_id` 也不能路由到多个逻辑模型。
 
 生产装配使用 migrations `0012_strategy_decision_cycles.sql`、
 `0013_strategy_intent_deliveries.sql` 和 PostgreSQL `DecisionRecorder` 持久化完整输入、输出与
 订单意图投递状态。配置通过 `DECISION_CYCLE_BINDINGS_JSON` 注入，并要求绑定账户存在于
 受限钱包文件。只有 live 模式且两个显式开关都打开，OrderIntent 才会进入执行层；之后仍受
 数据库 Kill Switch、账户/策略暂停、binding、余额和 reconciliation freshness 等硬风控阻断。
+
+四钱包示例配置（`echo` 的上游精确名需在部署前核对）：
+
+```json
+[
+  {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
+  {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"wallet-1"},
+  {"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
+  {"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
+]
+```
+
+`execution_strategy_bindings.model_id` 必须使用逻辑名 `echo` / `gemini_masked`，并与
+`strategy_id + execution_account_id` 组成相同的四条绑定；上游真实名只存在运行配置中。
+因为 SELL intent 和目标 lot 会端到端严格比对 `model_id`，从上游原始名切换到
+逻辑名前，四个账户必须没有仍归属旧模型名的 OPEN lot。不能只改 env 或
+`execution_strategy_bindings` 就带仓切换；历史已关闭订单也不应被改写。
 最新 BBO 和价格保护由独立 Market Validation 层负责，详见
 [`market-validation.md`](market-validation.md)；余额、仓位、敞口与暂停检查由 Go Hard Risk
 负责，详见 [`risk-control.md`](risk-control.md)。

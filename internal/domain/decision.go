@@ -38,7 +38,7 @@ type PredictionModel struct {
 	PromptVersion    string `json:"prompt_version,omitempty"`
 }
 
-// Prediction 表示单个模型生产者的预测结果，同一 condition 的多条预测在进入策略请求前始终保持独立。
+// Prediction 表示一个 Market/Model 组合的预测结果；同一 Market 的不同模型仍保持独立。
 type Prediction struct {
 	PredictionID   string              `json:"prediction_id"`
 	SourceJobID    string              `json:"source_job_id"`
@@ -356,8 +356,18 @@ func (history MidPriceHistory) Validate() error {
 	return nil
 }
 
-// StrategyExecutionContext 表示服务端维护的执行绑定：ModelID 标识预测生产者，StrategyID 选择 Python 策略，ExecutionAccountID 选择隔离账户。
+// StrategyExecutionContext 是发给策略、写入订单和风控绑定的稳定业务身份。
 type StrategyExecutionContext struct {
+	ModelID            string `json:"model_id"`
+	StrategyID         string `json:"strategy_id"`
+	ExecutionAccountID string `json:"execution_account_id"`
+}
+
+// StrategyExecutionBinding 把上游预测生产者身份与下游稳定业务身份分开。
+// PredictionModelID 只用于从 prediction snapshot 精确选择记录，不会发给 Python。
+// 为了兼容旧的三字段配置，留空时它默认等于 ModelID。
+type StrategyExecutionBinding struct {
+	PredictionModelID  string `json:"prediction_model_id,omitempty"`
 	ModelID            string `json:"model_id"`
 	StrategyID         string `json:"strategy_id"`
 	ExecutionAccountID string `json:"execution_account_id"`
@@ -374,6 +384,37 @@ func (executionContext StrategyExecutionContext) Normalize() StrategyExecutionCo
 	executionContext.StrategyID = CanonicalStrategyID(executionContext.StrategyID)
 	executionContext.ExecutionAccountID = strings.TrimSpace(executionContext.ExecutionAccountID)
 	return executionContext
+}
+
+// Normalize 规范化预测路由和执行上下文。
+func (binding StrategyExecutionBinding) Normalize() StrategyExecutionBinding {
+	binding.PredictionModelID = strings.TrimSpace(binding.PredictionModelID)
+	binding.ModelID = strings.TrimSpace(binding.ModelID)
+	binding.StrategyID = CanonicalStrategyID(binding.StrategyID)
+	binding.ExecutionAccountID = strings.TrimSpace(binding.ExecutionAccountID)
+	if binding.PredictionModelID == "" {
+		binding.PredictionModelID = binding.ModelID
+	}
+	return binding
+}
+
+// Context 返回不包含上游路由细节的策略线上上下文。
+func (binding StrategyExecutionBinding) Context() StrategyExecutionContext {
+	binding = binding.Normalize()
+	return StrategyExecutionContext{
+		ModelID:            binding.ModelID,
+		StrategyID:         binding.StrategyID,
+		ExecutionAccountID: binding.ExecutionAccountID,
+	}
+}
+
+// Validate 校验预测路由与执行绑定。
+func (binding StrategyExecutionBinding) Validate() error {
+	binding = binding.Normalize()
+	if binding.PredictionModelID == "" {
+		return fmt.Errorf("prediction_model_id is required")
+	}
+	return binding.Context().Validate()
 }
 
 // CanonicalStrategyID 将历史策略别名规范化为当前协议标识。

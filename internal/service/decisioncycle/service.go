@@ -41,7 +41,7 @@ type Params struct {
 	// SubmitEnabled is an independent, fail-closed gate. A disabled cycle still
 	// records the validated strategy output but never invokes execution.Submit.
 	SubmitEnabled      bool
-	Bindings           []domain.StrategyExecutionContext
+	Bindings           []domain.StrategyExecutionBinding
 	Venue              string
 	PredictionLookback time.Duration
 	MidPriceLookback   time.Duration
@@ -59,7 +59,7 @@ type Service struct {
 	recorder           port.DecisionRecorder
 	executor           port.OrderExecutor
 	submitEnabled      bool
-	bindings           []domain.StrategyExecutionContext
+	bindings           []domain.StrategyExecutionBinding
 	venue              string
 	predictionLookback time.Duration
 	midPriceLookback   time.Duration
@@ -79,11 +79,14 @@ type IntentResult struct {
 
 // BindingRunResult 表示后端使用的 BindingRunResult 类型。
 type BindingRunResult struct {
-	Context  domain.StrategyExecutionContext
-	Request  domain.StrategyDecisionRequest
-	Response domain.StrategyDecisionResponse
-	Intents  []IntentResult
-	Error    error
+	Context           domain.StrategyExecutionContext
+	PredictionModelID string
+	PredictionCount   int
+	PositionCount     int
+	Request           domain.StrategyDecisionRequest
+	Response          domain.StrategyDecisionResponse
+	Intents           []IntentResult
+	Error             error
 }
 
 // RunResult 表示后端使用的 RunResult 类型。
@@ -165,6 +168,9 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err := snapshot.Validate(decisionAt); err != nil {
 		return RunResult{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}
+	if err := validatePredictionDimensions(snapshot.Predictions, service.bindings); err != nil {
+		return RunResult{}, err
+	}
 	selectedPredictions := predictionsForBindings(snapshot.Predictions, service.bindings)
 	positionLots, err := service.loadPositionLots(ctx, decisionAt)
 	if err != nil {
@@ -202,18 +208,25 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	}
 	runErrors := make([]error, 0)
 	for _, binding := range service.bindings {
-		predictions := predictionsForModel(snapshot.Predictions, binding.ModelID)
+		executionContext := binding.Context()
+		predictions := predictionsForBinding(snapshot.Predictions, binding)
 		positions := positionLots[binding.ExecutionAccountID]
 		bindingTargets, selectErr := buildInputTargets(predictions, positions)
 		if selectErr != nil {
-			run := BindingRunResult{Context: binding, Error: selectErr}
+			run := BindingRunResult{
+				Context: executionContext, PredictionModelID: binding.PredictionModelID,
+				PredictionCount: len(predictions), PositionCount: len(positions), Error: selectErr,
+			}
 			result.Runs = append(result.Runs, run)
 			runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
 			continue
 		}
 		bindingBooks, selectErr := booksForTargets(bindingTargets, books)
 		if selectErr != nil {
-			run := BindingRunResult{Context: binding, Error: selectErr}
+			run := BindingRunResult{
+				Context: executionContext, PredictionModelID: binding.PredictionModelID,
+				PredictionCount: len(predictions), PositionCount: len(positions), Error: selectErr,
+			}
 			result.Runs = append(result.Runs, run)
 			runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
 			continue
@@ -222,14 +235,20 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		if binding.StrategyID == domain.StrategyIDMultfactorV2 {
 			if historyCaptureErr != nil {
 				selectErr = fmt.Errorf("capture mid-price histories: %w", historyCaptureErr)
-				run := BindingRunResult{Context: binding, Error: selectErr}
+				run := BindingRunResult{
+					Context: executionContext, PredictionModelID: binding.PredictionModelID,
+					PredictionCount: len(predictions), PositionCount: len(positions), Error: selectErr,
+				}
 				result.Runs = append(result.Runs, run)
 				runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
 				continue
 			}
 			bindingHistories, selectErr = midPriceHistoriesForTargets(bindingTargets, histories)
 			if selectErr != nil {
-				run := BindingRunResult{Context: binding, Error: selectErr}
+				run := BindingRunResult{
+					Context: executionContext, PredictionModelID: binding.PredictionModelID,
+					PredictionCount: len(predictions), PositionCount: len(positions), Error: selectErr,
+				}
 				result.Runs = append(result.Runs, run)
 				runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
 				continue
@@ -243,9 +262,10 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			}
 		}
 		run, runErr := service.runBinding(ctx, runBindingParams{
-			decisionAt: decisionAt, predictionSnapshotID: snapshot.SnapshotID, binding: binding,
+			decisionAt: decisionAt, predictionSnapshotID: snapshot.SnapshotID, binding: executionContext,
 			predictions: predictions, positions: positions, books: bindingBooks, histories: bindingHistories,
 		})
+		run.PredictionModelID = binding.PredictionModelID
 		run.Error = runErr
 		result.Runs = append(result.Runs, run)
 		if runErr != nil {
@@ -343,7 +363,7 @@ func (service *Service) captureMarketData(
 func buildHistoryTargets(
 	predictions []domain.Prediction,
 	positions map[string][]domain.StrategyPositionLot,
-	bindings []domain.StrategyExecutionContext,
+	bindings []domain.StrategyExecutionBinding,
 ) ([]domain.BookTarget, error) {
 	var selectedPredictions []domain.Prediction
 	var selectedPositions []domain.StrategyPositionLot
@@ -351,7 +371,7 @@ func buildHistoryTargets(
 		if binding.StrategyID != domain.StrategyIDMultfactorV2 {
 			continue
 		}
-		selectedPredictions = append(selectedPredictions, predictionsForModel(predictions, binding.ModelID)...)
+		selectedPredictions = append(selectedPredictions, predictionsForModel(predictions, binding.PredictionModelID)...)
 		selectedPositions = append(selectedPositions, positions[binding.ExecutionAccountID]...)
 	}
 	return buildInputTargets(selectedPredictions, selectedPositions)
@@ -407,7 +427,9 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 		OrderBooks:           params.books,
 		MidPriceHistories:    params.histories,
 	}).Build()
-	run := BindingRunResult{Context: params.binding, Request: request}
+	run := BindingRunResult{
+		Context: params.binding, PredictionCount: len(params.predictions), PositionCount: len(params.positions), Request: request,
+	}
 	if err != nil {
 		return run, err
 	}
@@ -576,13 +598,15 @@ func decisionIntentCompletion(result port.OrderSubmitResult, submitErr error) (d
 }
 
 // normalizeBindings 规范化 Bindings 的字段和表示。
-func normalizeBindings(bindings []domain.StrategyExecutionContext) ([]domain.StrategyExecutionContext, error) {
+func normalizeBindings(bindings []domain.StrategyExecutionBinding) ([]domain.StrategyExecutionBinding, error) {
 	if len(bindings) == 0 {
 		return nil, fmt.Errorf("at least one model/strategy/execution account binding is required")
 	}
-	result := make([]domain.StrategyExecutionContext, len(bindings))
+	result := make([]domain.StrategyExecutionBinding, len(bindings))
 	seenPairs := make(map[string]struct{}, len(bindings))
 	seenAccounts := make(map[string]struct{}, len(bindings))
+	logicalModelSources := make(map[string]string, len(bindings))
+	sourceModelTargets := make(map[string]string, len(bindings))
 	for index, binding := range bindings {
 		binding = binding.Normalize()
 		if err := binding.Validate(); err != nil {
@@ -595,8 +619,16 @@ func normalizeBindings(bindings []domain.StrategyExecutionContext) ([]domain.Str
 		if _, exists := seenAccounts[binding.ExecutionAccountID]; exists {
 			return nil, fmt.Errorf("execution account %q is bound more than once", binding.ExecutionAccountID)
 		}
+		if sourceModelID, exists := logicalModelSources[binding.ModelID]; exists && sourceModelID != binding.PredictionModelID {
+			return nil, fmt.Errorf("logical model %q is routed from multiple prediction models", binding.ModelID)
+		}
+		if logicalModelID, exists := sourceModelTargets[binding.PredictionModelID]; exists && logicalModelID != binding.ModelID {
+			return nil, fmt.Errorf("prediction model %q is routed to multiple logical models", binding.PredictionModelID)
+		}
 		seenPairs[pairKey] = struct{}{}
 		seenAccounts[binding.ExecutionAccountID] = struct{}{}
+		logicalModelSources[binding.ModelID] = binding.PredictionModelID
+		sourceModelTargets[binding.PredictionModelID] = binding.ModelID
 		result[index] = binding
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -612,16 +644,54 @@ func normalizeBindings(bindings []domain.StrategyExecutionContext) ([]domain.Str
 }
 
 // predictionsForBindings 筛选所有已配置模型对应的预测记录。
-func predictionsForBindings(predictions []domain.Prediction, bindings []domain.StrategyExecutionContext) []domain.Prediction {
+func predictionsForBindings(predictions []domain.Prediction, bindings []domain.StrategyExecutionBinding) []domain.Prediction {
 	models := make(map[string]struct{}, len(bindings))
 	for _, binding := range bindings {
-		models[binding.ModelID] = struct{}{}
+		models[binding.PredictionModelID] = struct{}{}
 	}
 	result := make([]domain.Prediction, 0, len(predictions))
 	for _, prediction := range predictions {
 		if _, selected := models[strings.TrimSpace(prediction.Model.Name)]; selected {
 			result = append(result, prediction)
 		}
+	}
+	return result
+}
+
+// validatePredictionDimensions enforces the trading identity promised to the strategy:
+// one immutable probability record per (market, configured source model). The same
+// Market may still have independent probabilities from different models.
+func validatePredictionDimensions(predictions []domain.Prediction, bindings []domain.StrategyExecutionBinding) error {
+	models := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		models[binding.PredictionModelID] = struct{}{}
+	}
+	seen := make(map[string]string)
+	for _, prediction := range predictions {
+		predictionModelID := strings.TrimSpace(prediction.Model.Name)
+		if _, selected := models[predictionModelID]; !selected {
+			continue
+		}
+		key := strings.TrimSpace(prediction.MarketID) + "\x00" + predictionModelID
+		if previousPredictionID, exists := seen[key]; exists {
+			return fmt.Errorf(
+				"prediction snapshot has multiple probabilities for market %q and prediction model %q (%s, %s)",
+				prediction.MarketID, predictionModelID, previousPredictionID, prediction.PredictionID,
+			)
+		}
+		seen[key] = prediction.PredictionID
+	}
+	return nil
+}
+
+// predictionsForBinding 选择一个上游预测模型的 Market，再投影为 Python 和执行层使用的稳定业务模型。
+// 只修改副本，原始 PIT snapshot 始终保留上游 producer identity。
+func predictionsForBinding(predictions []domain.Prediction, binding domain.StrategyExecutionBinding) []domain.Prediction {
+	selected := predictionsForModel(predictions, binding.PredictionModelID)
+	result := make([]domain.Prediction, len(selected))
+	for index, prediction := range selected {
+		result[index] = prediction
+		result[index].Model.Name = binding.ModelID
 	}
 	return result
 }

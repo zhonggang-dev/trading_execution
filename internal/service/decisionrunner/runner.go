@@ -239,12 +239,41 @@ func (runner *Runner) logResult(boundary time.Time, result decisioncycle.RunResu
 		"submitted", submitted,
 		"submission_disabled", disabled,
 		"failed_intents", failed,
+		"binding_runs", bindingRunSummaries(result),
 	}
 	if runErr != nil {
 		runner.logger.Error("decision cycle completed with errors", append(attributes, "error", runErr)...)
 		return
 	}
 	runner.logger.Info("decision cycle completed", attributes...)
+}
+
+type bindingRunSummary struct {
+	ModelID            string `json:"model_id"`
+	PredictionModelID  string `json:"prediction_model_id"`
+	StrategyID         string `json:"strategy_id"`
+	ExecutionAccountID string `json:"execution_account_id"`
+	Predictions        int    `json:"predictions"`
+	Positions          int    `json:"positions"`
+	Intents            int    `json:"intents"`
+	Failed             bool   `json:"failed"`
+}
+
+func bindingRunSummaries(result decisioncycle.RunResult) []bindingRunSummary {
+	summaries := make([]bindingRunSummary, 0, len(result.Runs))
+	for _, run := range result.Runs {
+		summaries = append(summaries, bindingRunSummary{
+			ModelID:            run.Context.ModelID,
+			PredictionModelID:  run.PredictionModelID,
+			StrategyID:         run.Context.StrategyID,
+			ExecutionAccountID: run.Context.ExecutionAccountID,
+			Predictions:        run.PredictionCount,
+			Positions:          run.PositionCount,
+			Intents:            len(run.Intents),
+			Failed:             run.Error != nil,
+		})
+	}
+	return summaries
 }
 
 func summarize(result decisioncycle.RunResult) (bindings, intents, submitted, disabled, failed int) {

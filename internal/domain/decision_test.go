@@ -21,6 +21,36 @@ func TestStrategyExecutionContextRejectsUnknownStrategy(t *testing.T) {
 	}
 }
 
+func TestStrategyExecutionBindingSeparatesPredictionAndLogicalModels(t *testing.T) {
+	binding := StrategyExecutionBinding{
+		PredictionModelID:  " gemini-3.6-flash ",
+		ModelID:            " gemini_masked ",
+		StrategyID:         "strategy-v1",
+		ExecutionAccountID: " wallet-2 ",
+	}.Normalize()
+	if err := binding.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if binding.PredictionModelID != "gemini-3.6-flash" || binding.ModelID != "gemini_masked" ||
+		binding.StrategyID != StrategyIDMultfactorV1 || binding.ExecutionAccountID != "wallet-2" {
+		t.Fatalf("normalized binding = %#v", binding)
+	}
+	payload, err := json.Marshal(binding.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "prediction_model_id") || !strings.Contains(string(payload), `"model_id":"gemini_masked"`) {
+		t.Fatalf("strategy context JSON = %s", payload)
+	}
+
+	legacy := StrategyExecutionBinding{
+		ModelID: "echo", StrategyID: StrategyIDMultfactorV2, ExecutionAccountID: "wallet-1",
+	}.Normalize()
+	if legacy.PredictionModelID != "echo" {
+		t.Fatalf("legacy prediction model = %q", legacy.PredictionModelID)
+	}
+}
+
 // TestMidPricePointWireFormatIsUnambiguousRawP 验证 Mid Price Point Wire Format Is Unambiguous Raw P 场景下的行为。
 func TestMidPricePointWireFormatIsUnambiguousRawP(t *testing.T) {
 	point := MidPricePoint{IntervalEndAt: time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC), P: "0.41"}

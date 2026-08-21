@@ -33,8 +33,43 @@ func TestLoadAcceptsDecisionCycleWithSubmissionDisabled(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if !config.DecisionCycle.Enabled || config.DecisionCycle.OrderSubmissionEnabled ||
-		len(config.DecisionCycle.Bindings) != 1 || config.DecisionCycle.Interval != 10*time.Minute {
+		len(config.DecisionCycle.Bindings) != 1 || config.DecisionCycle.Interval != 10*time.Minute ||
+		config.DecisionCycle.Bindings[0].PredictionModelID != "model-a" {
 		t.Fatalf("decision cycle config = %#v", config.DecisionCycle)
+	}
+}
+
+func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
+	]`)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(config.DecisionCycle.Bindings) != 4 ||
+		config.DecisionCycle.Bindings[2].PredictionModelID != "gemini-3.6-flash" ||
+		config.DecisionCycle.Bindings[2].ModelID != "gemini_masked" {
+		t.Fatalf("decision routes = %#v", config.DecisionCycle.Bindings)
+	}
+}
+
+func TestLoadRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"producer-a","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
+		{"prediction_model_id":"producer-a","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"}
+	]`)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "multiple logical models") {
+		t.Fatalf("Load() error = %v", err)
 	}
 }
 

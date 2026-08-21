@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -312,7 +313,7 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		Recorder:        recorder,
 		Executor:        executor,
 		SubmitEnabled:   true,
-		Bindings:        []domain.StrategyExecutionContext{testBinding()},
+		Bindings:        []domain.StrategyExecutionBinding{testExecutionBinding()},
 		Venue:           "polymarket-paper",
 		Now:             func() time.Time { return decisionAt.Add(5 * time.Second) },
 	})
@@ -354,25 +355,25 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 	}
 }
 
-// TestRunExpandsThreeModelsAndTwoStrategiesIntoSixAccounts 验证 Run Expands Three Models And Two Strategies Into Six Accounts 场景下的行为。
-func TestRunExpandsThreeModelsAndTwoStrategiesIntoSixAccounts(t *testing.T) {
+// TestRunRoutesTwoAssignedModelsIntoFourWallets 验证两个互不混合的 Market/Model 集合各自复用到 v1/v2 钱包。
+func TestRunRoutesTwoAssignedModelsIntoFourWallets(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
-	models := []string{"model-a", "model-b", "model-c"}
-	predictions := make([]domain.Prediction, 0, len(models))
-	bindings := make([]domain.StrategyExecutionContext, 0, 6)
-	for _, modelID := range models {
-		prediction := validPrediction(decisionAt)
-		prediction.PredictionID = "pred-" + modelID
-		prediction.Model.Name = modelID
-		predictions = append(predictions, prediction)
-		for _, strategyID := range []string{"strategy-v1", "strategy-v2"} {
-			bindings = append(bindings, domain.StrategyExecutionContext{
-				ModelID:            modelID,
-				StrategyID:         strategyID,
-				ExecutionAccountID: "account-" + modelID + "-" + strategyID,
-			})
-		}
-	}
+	echoPrediction := validPrediction(decisionAt)
+	echoPrediction.PredictionID = "pred-echo"
+	echoPrediction.Model.Name = "echo-producer-v7"
+	echoPrediction.MarketID = "market-echo"
+	echoPrediction.ConditionID = "condition-echo"
+	echoPrediction.Outcomes[0].TokenID = "echo-yes"
+	echoPrediction.Outcomes[1].TokenID = "echo-no"
+	maskedPrediction := validPrediction(decisionAt)
+	maskedPrediction.PredictionID = "pred-masked"
+	maskedPrediction.Model.Name = "gemini-3.6-flash"
+	maskedPrediction.MarketID = "market-masked"
+	maskedPrediction.ConditionID = "condition-masked"
+	maskedPrediction.Outcomes[0].TokenID = "masked-yes"
+	maskedPrediction.Outcomes[1].TokenID = "masked-no"
+	predictions := []domain.Prediction{echoPrediction, maskedPrediction}
+	bindings := fourWalletBindings()
 	bookSource := &fakeOrderBookSource{}
 	midPriceSource := &fakeMidPriceHistorySource{}
 	strategy := &matrixStrategy{}
@@ -401,27 +402,116 @@ func TestRunExpandsThreeModelsAndTwoStrategiesIntoSixAccounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if len(result.Runs) != 6 || len(strategy.requests) != 6 {
-		t.Fatalf("runs/requests = %d/%d, want 6/6", len(result.Runs), len(strategy.requests))
+	if len(result.Runs) != 4 || len(strategy.requests) != 4 {
+		t.Fatalf("runs/requests = %d/%d, want 4/4", len(result.Runs), len(strategy.requests))
 	}
-	if len(bookSource.targets) != 2 {
-		t.Fatalf("shared orderbook targets = %d, want two deduplicated outcome tokens", len(bookSource.targets))
+	if len(bookSource.targets) != 4 {
+		t.Fatalf("shared orderbook targets = %d, want four assigned outcome tokens", len(bookSource.targets))
 	}
-	if len(midPriceSource.targets) != 2 {
-		t.Fatalf("shared mid-price targets = %d, want two deduplicated outcome tokens", len(midPriceSource.targets))
+	if len(midPriceSource.targets) != 4 {
+		t.Fatalf("shared mid-price targets = %d, want four assigned outcome tokens", len(midPriceSource.targets))
 	}
-	seenAccounts := make(map[string]struct{}, 6)
+	seenAccounts := make(map[string]struct{}, 4)
 	for _, request := range strategy.requests {
 		if len(request.Predictions) != 1 || request.Predictions[0].Model.Name != request.Context.ModelID {
 			t.Fatalf("request mixes model predictions: %#v", request)
+		}
+		if request.Context.ModelID == "echo" && request.Predictions[0].MarketID != "market-echo" {
+			t.Fatalf("echo received another model's market: %#v", request.Predictions)
+		}
+		if request.Context.ModelID == "gemini_masked" && request.Predictions[0].MarketID != "market-masked" {
+			t.Fatalf("gemini_masked received another model's market: %#v", request.Predictions)
 		}
 		if request.CycleID != request.Context.ExecutionAccountID+":"+decisionAt.Format("20060102T150405Z") {
 			t.Fatalf("cycle_id = %q", request.CycleID)
 		}
 		seenAccounts[request.Context.ExecutionAccountID] = struct{}{}
 	}
-	if len(seenAccounts) != 6 {
-		t.Fatalf("execution accounts = %#v, want six isolated accounts", seenAccounts)
+	if len(seenAccounts) != 4 {
+		t.Fatalf("execution accounts = %#v, want four isolated accounts", seenAccounts)
+	}
+	if predictions[0].Model.Name != "echo-producer-v7" || predictions[1].Model.Name != "gemini-3.6-flash" {
+		t.Fatalf("source snapshot was mutated: %#v", predictions)
+	}
+}
+
+func TestRunStillCallsAllFourWalletsWhenOneModelHasNoMarket(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	prediction.Model.Name = "echo-producer-v7"
+	strategy := &matrixStrategy{}
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
+			SnapshotID:    "predsnap-one-model",
+			DecisionAt:    decisionAt,
+			Predictions:   []domain.Prediction{prediction},
+		}},
+		PositionSource:  fakePositionSource{},
+		OrderBookSource: &fakeOrderBookSource{},
+		MidPriceSource:  &fakeMidPriceHistorySource{},
+		Strategy:        strategy,
+		Recorder:        &fakeRecorder{},
+		Bindings:        fourWalletBindings(),
+		Venue:           "polymarket-paper",
+		Now:             func() time.Time { return decisionAt.Add(2 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(result.Runs) != 4 || len(strategy.requests) != 4 {
+		t.Fatalf("runs/requests = %d/%d, want 4/4", len(result.Runs), len(strategy.requests))
+	}
+	maskedCalls := 0
+	for _, request := range strategy.requests {
+		if request.Context.ModelID != "gemini_masked" {
+			continue
+		}
+		maskedCalls++
+		if len(request.Predictions) != 0 {
+			t.Fatalf("empty masked route received predictions: %#v", request.Predictions)
+		}
+	}
+	if maskedCalls != 2 {
+		t.Fatalf("gemini_masked calls = %d, want 2", maskedCalls)
+	}
+}
+
+func TestRunRejectsMultipleProbabilitiesForSameMarketAndModel(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	first := validPrediction(decisionAt)
+	first.Model.Name = "echo-producer-v7"
+	second := first
+	second.PredictionID = "pred-2"
+	second.SourceJobID = "job-2"
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
+			SnapshotID:    "predsnap-duplicate-market-model",
+			DecisionAt:    decisionAt,
+			Predictions:   []domain.Prediction{first, second},
+		}},
+		PositionSource:  fakePositionSource{},
+		OrderBookSource: &fakeOrderBookSource{},
+		MidPriceSource:  &fakeMidPriceHistorySource{},
+		Strategy:        &matrixStrategy{},
+		Recorder:        &fakeRecorder{},
+		Bindings: []domain.StrategyExecutionBinding{{
+			PredictionModelID: "echo-producer-v7", ModelID: "echo",
+			StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main",
+		}},
+		Venue: "polymarket-paper",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := service.Run(context.Background(), decisionAt); err == nil ||
+		!strings.Contains(err.Error(), "multiple probabilities for market") {
+		t.Fatalf("Run() error = %v", err)
 	}
 }
 
@@ -446,7 +536,7 @@ func TestRunFailsClosedWhenInputCannotBeRecorded(t *testing.T) {
 		Recorder:        recorder,
 		Executor:        executor,
 		SubmitEnabled:   true,
-		Bindings:        []domain.StrategyExecutionContext{testBinding()},
+		Bindings:        []domain.StrategyExecutionBinding{testExecutionBinding()},
 		Venue:           "polymarket-paper",
 	})
 	if err != nil {
@@ -495,7 +585,7 @@ func TestRunRejectsStrategyResponseThatOmitsAnOutcome(t *testing.T) {
 		Recorder:        recorder,
 		Executor:        executor,
 		SubmitEnabled:   true,
-		Bindings:        []domain.StrategyExecutionContext{testBinding()},
+		Bindings:        []domain.StrategyExecutionBinding{testExecutionBinding()},
 		Venue:           "polymarket-paper",
 	})
 	if err != nil {
@@ -526,7 +616,7 @@ func TestRunRejectsStrategyResponseThatChangesExecutionAccount(t *testing.T) {
 		Recorder:        &fakeRecorder{},
 		Executor:        &fakeExecutor{},
 		SubmitEnabled:   true,
-		Bindings:        []domain.StrategyExecutionContext{testBinding()},
+		Bindings:        []domain.StrategyExecutionBinding{testExecutionBinding()},
 		Venue:           "polymarket-paper",
 	})
 	if err != nil {
@@ -560,7 +650,7 @@ func TestRunRejectsFutureStrategyDecisionTime(t *testing.T) {
 		Recorder:        recorder,
 		Executor:        &fakeExecutor{},
 		SubmitEnabled:   true,
-		Bindings:        []domain.StrategyExecutionContext{testBinding()},
+		Bindings:        []domain.StrategyExecutionBinding{testExecutionBinding()},
 		Venue:           "polymarket-paper",
 		Now:             func() time.Time { return decisionAt.Add(2 * time.Second) },
 	})
@@ -577,7 +667,7 @@ func TestRunRejectsFutureStrategyDecisionTime(t *testing.T) {
 
 // TestNewRejectsDuplicateAccountBinding 验证 New Rejects Duplicate Account Binding 场景下的行为。
 func TestNewRejectsDuplicateAccountBinding(t *testing.T) {
-	first := testBinding()
+	first := testExecutionBinding()
 	second := first
 	second.ModelID = "another-model"
 	_, err := New(Params{
@@ -589,11 +679,30 @@ func TestNewRejectsDuplicateAccountBinding(t *testing.T) {
 		Recorder:         &fakeRecorder{},
 		Executor:         &fakeExecutor{},
 		SubmitEnabled:    true,
-		Bindings:         []domain.StrategyExecutionContext{first, second},
+		Bindings:         []domain.StrategyExecutionBinding{first, second},
 		Venue:            "polymarket-paper",
 	})
 	if err == nil {
 		t.Fatal("New() error = nil, want duplicate execution account rejection")
+	}
+}
+
+func TestNewRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
+	_, err := New(Params{
+		PredictionSource: fakePredictionSource{},
+		PositionSource:   fakePositionSource{},
+		OrderBookSource:  &fakeOrderBookSource{},
+		MidPriceSource:   &fakeMidPriceHistorySource{},
+		Strategy:         &fakeStrategy{},
+		Recorder:         &fakeRecorder{},
+		Bindings: []domain.StrategyExecutionBinding{
+			{PredictionModelID: "producer-a", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main"},
+			{PredictionModelID: "producer-a", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2"},
+		},
+		Venue: "polymarket-paper",
+	})
+	if err == nil || !strings.Contains(err.Error(), "multiple logical models") {
+		t.Fatalf("New() error = %v", err)
 	}
 }
 
@@ -608,7 +717,7 @@ func TestRunRejectsNonBoundaryTime(t *testing.T) {
 		Recorder:         &fakeRecorder{},
 		Executor:         &fakeExecutor{},
 		SubmitEnabled:    true,
-		Bindings:         []domain.StrategyExecutionContext{testBinding()},
+		Bindings:         []domain.StrategyExecutionBinding{testExecutionBinding()},
 		Venue:            "polymarket-paper",
 	})
 	if err != nil {
@@ -701,7 +810,7 @@ func TestV1OnlyCycleDoesNotCallMidPriceSource(t *testing.T) {
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
 		MidPriceSource: historySource, Strategy: strategy, Recorder: &fakeRecorder{},
-		Bindings: []domain.StrategyExecutionContext{{
+		Bindings: []domain.StrategyExecutionBinding{{
 			ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-v1",
 		}},
 		Venue: "polymarket", Now: func() time.Time { return decisionAt.Add(time.Second) },
@@ -736,7 +845,7 @@ func TestMixedCycleHistoryFailureDoesNotBlockV1Binding(t *testing.T) {
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
 		MidPriceSource: historySource, Strategy: strategy, Recorder: &fakeRecorder{},
-		Bindings: []domain.StrategyExecutionContext{
+		Bindings: []domain.StrategyExecutionBinding{
 			{ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-v1"},
 			{ModelID: "test", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "account-v2"},
 		},
@@ -751,7 +860,7 @@ func TestMixedCycleHistoryFailureDoesNotBlockV1Binding(t *testing.T) {
 	}
 	if historySource.calls != 1 || len(strategy.requests) != 1 ||
 		strategy.requests[0].Context.StrategyID != domain.StrategyIDMultfactorV1 || len(result.Runs) != 2 ||
-		result.Runs[0].Error != nil || result.Runs[1].Error == nil {
+		result.Runs[0].Error != nil || result.Runs[1].Error == nil || result.Runs[1].PredictionCount != 1 {
 		t.Fatalf("mixed result=%#v history calls=%d strategy requests=%#v", result, historySource.calls, strategy.requests)
 	}
 }
@@ -980,5 +1089,23 @@ func testBinding() domain.StrategyExecutionContext {
 		ModelID:            "test",
 		StrategyID:         "strategy-v2",
 		ExecutionAccountID: "account-test-v2",
+	}
+}
+
+func testExecutionBinding() domain.StrategyExecutionBinding {
+	context := testBinding()
+	return domain.StrategyExecutionBinding{
+		ModelID:            context.ModelID,
+		StrategyID:         context.StrategyID,
+		ExecutionAccountID: context.ExecutionAccountID,
+	}
+}
+
+func fourWalletBindings() []domain.StrategyExecutionBinding {
+	return []domain.StrategyExecutionBinding{
+		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main"},
+		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-1"},
+		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2"},
+		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-3"},
 	}
 }

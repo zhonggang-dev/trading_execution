@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisioncycle"
 )
 
@@ -118,6 +119,28 @@ func TestNextScheduleUsesUTCBoundaryAndSkipsExpiredWindow(t *testing.T) {
 	gotBoundary, _ = nextSchedule(boundary, boundary, RequiredInterval, 0)
 	if !gotBoundary.Equal(boundary.Add(RequiredInterval)) {
 		t.Fatalf("already scheduled boundary replayed as %s", gotBoundary)
+	}
+}
+
+func TestBindingRunSummariesExposePredictionRoutingAndCounts(t *testing.T) {
+	summaries := bindingRunSummaries(decisioncycle.RunResult{Runs: []decisioncycle.BindingRunResult{{
+		Context: domain.StrategyExecutionContext{
+			ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-3",
+		},
+		PredictionModelID: "gemini-3.6-flash",
+		PredictionCount:   2,
+		PositionCount:     1,
+		Request: domain.StrategyDecisionRequest{
+			Predictions: []domain.Prediction{{}, {}},
+			Positions:   []domain.StrategyPositionLot{{}},
+		},
+		Intents: []decisioncycle.IntentResult{{}},
+		Error:   errors.New("strategy unavailable"),
+	}}})
+	if len(summaries) != 1 || summaries[0].PredictionModelID != "gemini-3.6-flash" ||
+		summaries[0].ModelID != "gemini_masked" || summaries[0].ExecutionAccountID != "wallet-3" ||
+		summaries[0].Predictions != 2 || summaries[0].Positions != 1 || summaries[0].Intents != 1 || !summaries[0].Failed {
+		t.Fatalf("binding summaries = %#v", summaries)
 	}
 }
 

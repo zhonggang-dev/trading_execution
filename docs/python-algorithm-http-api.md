@@ -10,6 +10,9 @@
 
 两个接口都按照 `(model_id, strategy_id, execution_account_id)` 隔离调用。同一个模型运行两个策略，
 会收到两次独立请求；新增模型、策略或钱包只新增绑定，不改变接口结构。
+Trading 可在内部用 `prediction_model_id` 将上游具体 producer 名投影为稳定的
+`context.model_id`；该路由字段不进入 HTTP 协议。Python 仍只需要校验每条
+`prediction.model.name == context.model_id`，不需要修改代码。
 
 ## 1. 通用 HTTP 规则
 

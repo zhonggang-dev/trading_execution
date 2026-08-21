@@ -212,7 +212,7 @@ func newPipelineFixture(t *testing.T, maxNotional domain.Decimal, submitEnabled 
 			validMidPriceHistory(prediction, 0, decisionAt),
 		}},
 		Strategy: strategy, Recorder: recorder, Executor: executor, SubmitEnabled: enabled,
-		Bindings: []domain.StrategyExecutionContext{testBinding()}, Venue: "polymarket-paper",
+		Bindings: []domain.StrategyExecutionBinding{testExecutionBinding()}, Venue: "polymarket-paper",
 		Now: func() time.Time { return decisionAt.Add(5 * time.Second) },
 	})
 	if err != nil {

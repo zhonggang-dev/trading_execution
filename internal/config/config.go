@@ -70,7 +70,7 @@ type DecisionCycle struct {
 	Timeout                time.Duration
 	PredictionLookback     time.Duration
 	MidPriceLookback       time.Duration
-	Bindings               []domain.StrategyExecutionContext
+	Bindings               []domain.StrategyExecutionBinding
 }
 
 // Database 表示后端使用的 Database 类型。
@@ -508,14 +508,14 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	}, nil
 }
 
-func decodeDecisionBindings(value string) ([]domain.StrategyExecutionContext, error) {
+func decodeDecisionBindings(value string) ([]domain.StrategyExecutionBinding, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return nil, nil
 	}
 	decoder := json.NewDecoder(strings.NewReader(value))
 	decoder.DisallowUnknownFields()
-	var bindings []domain.StrategyExecutionContext
+	var bindings []domain.StrategyExecutionBinding
 	if err := decoder.Decode(&bindings); err != nil {
 		return nil, fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON: %w", err)
 	}
@@ -525,12 +525,14 @@ func decodeDecisionBindings(value string) ([]domain.StrategyExecutionContext, er
 	return bindings, nil
 }
 
-func validateDecisionBindings(bindings []domain.StrategyExecutionContext) error {
+func validateDecisionBindings(bindings []domain.StrategyExecutionBinding) error {
 	if len(bindings) == 0 {
 		return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON must contain at least one binding")
 	}
 	modelStrategies := make(map[string]struct{}, len(bindings))
 	accounts := make(map[string]struct{}, len(bindings))
+	logicalModelSources := make(map[string]string, len(bindings))
+	sourceModelTargets := make(map[string]string, len(bindings))
 	for index, binding := range bindings {
 		binding = binding.Normalize()
 		if err := binding.Validate(); err != nil {
@@ -543,8 +545,16 @@ func validateDecisionBindings(bindings []domain.StrategyExecutionContext) error 
 		if _, exists := accounts[binding.ExecutionAccountID]; exists {
 			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON contains duplicate execution account")
 		}
+		if sourceModelID, exists := logicalModelSources[binding.ModelID]; exists && sourceModelID != binding.PredictionModelID {
+			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON maps logical model %q to multiple prediction models", binding.ModelID)
+		}
+		if logicalModelID, exists := sourceModelTargets[binding.PredictionModelID]; exists && logicalModelID != binding.ModelID {
+			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON maps prediction model %q to multiple logical models", binding.PredictionModelID)
+		}
 		modelStrategies[pair] = struct{}{}
 		accounts[binding.ExecutionAccountID] = struct{}{}
+		logicalModelSources[binding.ModelID] = binding.PredictionModelID
+		sourceModelTargets[binding.PredictionModelID] = binding.ModelID
 		bindings[index] = binding
 	}
 	return nil
