@@ -30,6 +30,7 @@ import errno
 import fcntl
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import pathlib
@@ -37,6 +38,7 @@ import pwd
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -307,6 +309,49 @@ EXPECTED_PREVIOUS_RELEASE = RELEASES / "49f5053"
 EXECUTE_TOKEN = "ADOPT_EXTERNAL_POSITIONS_WITH_GATES_CLOSED_20260821"
 MIGRATION_0016_ABSENT = "false|false|false|false|false|false"
 MIGRATION_0016_PRESENT = "true|true|true|true|true|true"
+RPC_MAX_ATTEMPTS = 5
+RPC_REQUEST_TIMEOUT_SECONDS = 20.0
+RPC_RETRY_BUDGET_SECONDS = 90.0
+RPC_RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
+RPC_RETRYABLE_HTTP_STATUSES = frozenset({408, 429})
+RPC_IDEMPOTENT_READ_METHODS = frozenset(
+    {
+        "eth_blockNumber",
+        "eth_call",
+        "eth_chainId",
+        "eth_getBlockByHash",
+        "eth_getBlockByNumber",
+        "eth_getTransactionReceipt",
+    }
+)
+RPC_RETRYABLE_ERRNOS = frozenset(
+    value
+    for value in (
+        errno.ETIMEDOUT,
+        errno.ECONNRESET,
+        errno.ECONNABORTED,
+        errno.EPIPE,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+        errno.ECONNREFUSED,
+    )
+    if value is not None
+)
+RESUME_IDENTITY_KEYS = (
+    "schema",
+    "actor",
+    "candidate_commit",
+    "candidate_binary_sha256",
+    "cutover_script_path",
+    "cutover_script_sha256",
+    "migration_path",
+    "migration_sha256",
+)
+RESUME_SUPERSEDE_AUDIT_KEYS = (
+    "superseded_from_prepared_marker",
+    "superseded_from_marker_sha256",
+    "superseded_at",
+)
 PUSD_ADDRESS = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
 LEGACY_USDC_E_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 CONDITIONAL_TOKENS_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
@@ -794,7 +839,65 @@ def get_json(url: str, headers: dict[str, str] | None = None) -> object:
         raise CutoverError("GET response was not JSON") from error
 
 
-def rpc_json(url: str, method: str, params: list[object]) -> object:
+def _rpc_http_status_is_retryable(status: int) -> bool:
+    return status in RPC_RETRYABLE_HTTP_STATUSES or 500 <= status <= 599
+
+
+def _rpc_transient_network_error(error: BaseException) -> bool:
+    """Classify only explicit timeout/temporary transport failures as retryable."""
+
+    if isinstance(error, urllib.error.HTTPError):
+        return _rpc_http_status_is_retryable(error.code)
+    if isinstance(error, urllib.error.URLError):
+        reason = error.reason
+        if isinstance(reason, BaseException) and reason is not error:
+            return _rpc_transient_network_error(reason)
+        return False
+    if isinstance(
+        error,
+        (
+            TimeoutError,
+            socket.timeout,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            http.client.RemoteDisconnected,
+            http.client.IncompleteRead,
+        ),
+    ):
+        return True
+    if isinstance(error, socket.gaierror):
+        return error.errno == getattr(socket, "EAI_AGAIN", None)
+    return isinstance(error, OSError) and error.errno in RPC_RETRYABLE_ERRNOS
+
+
+def _rpc_http_call(
+    request: urllib.request.Request, timeout: float
+) -> tuple[int, bytes]:
+    with NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
+        body = response.read((16 << 20) + 1)
+        return int(response.status), body
+
+
+def rpc_json(
+    url: str,
+    method: str,
+    params: list[object],
+    *,
+    http_call: object = None,
+    sleeper: object = None,
+    monotonic: object = None,
+) -> object:
+    """Perform one idempotent JSON-RPC read with a strict retry budget.
+
+    Only HTTP 408/429/5xx and explicitly classified transient transport
+    failures are retried.  A successful HTTP response is parsed exactly once;
+    malformed JSON, JSON-RPC errors, missing results, and evidence semantics
+    remain immediate fail-closed errors.
+    """
+
+    if method not in RPC_IDEMPOTENT_READ_METHODS:
+        raise CutoverError("Polygon RPC method is not an approved idempotent read")
     payload = canonical_json(
         {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     )
@@ -807,10 +910,70 @@ def rpc_json(url: str, method: str, params: list[object]) -> object:
         },
         method="POST",
     )
-    with NO_REDIRECT_OPENER.open(request, timeout=30) as response:
-        body = response.read((16 << 20) + 1)
-        if response.status != 200:
-            raise CutoverError(f"Polygon RPC returned HTTP {response.status}")
+    caller = _rpc_http_call if http_call is None else http_call
+    sleep_call = time.sleep if sleeper is None else sleeper
+    clock = time.monotonic if monotonic is None else monotonic
+    started = clock()
+    body: bytes | None = None
+    for attempt in range(1, RPC_MAX_ATTEMPTS + 1):
+        remaining = RPC_RETRY_BUDGET_SECONDS - (clock() - started)
+        if remaining <= 0:
+            raise CutoverError("Polygon RPC retry budget was exhausted")
+        request_timeout = min(RPC_REQUEST_TIMEOUT_SECONDS, remaining)
+        retry_reason = ""
+        try:
+            status, response_body = caller(request, request_timeout)
+        except Exception as error:
+            retryable = _rpc_transient_network_error(error)
+            http_error_code = (
+                error.code if isinstance(error, urllib.error.HTTPError) else None
+            )
+            if isinstance(error, urllib.error.HTTPError):
+                with contextlib.suppress(Exception):
+                    error.close()
+            if not retryable:
+                if isinstance(error, urllib.error.HTTPError):
+                    raise CutoverError(
+                        f"Polygon RPC returned HTTP {http_error_code}"
+                    ) from None
+                if isinstance(
+                    error,
+                    (urllib.error.URLError, OSError, http.client.HTTPException),
+                ):
+                    raise CutoverError(
+                        "Polygon RPC failed with a non-retryable transport error"
+                    ) from None
+                raise
+            retry_reason = (
+                f"http-{http_error_code}"
+                if http_error_code is not None
+                else "transient-network"
+            )
+        else:
+            if status == 200:
+                body = response_body
+                break
+            if not _rpc_http_status_is_retryable(status):
+                raise CutoverError(f"Polygon RPC returned HTTP {status}")
+            retry_reason = f"http-{status}"
+
+        if attempt >= RPC_MAX_ATTEMPTS:
+            raise CutoverError(
+                "Polygon RPC retry attempts were exhausted "
+                f"after {RPC_MAX_ATTEMPTS} attempts"
+            ) from None
+        remaining = RPC_RETRY_BUDGET_SECONDS - (clock() - started)
+        delay = min(RPC_RETRY_BACKOFF_SECONDS[attempt - 1], remaining)
+        if delay <= 0:
+            raise CutoverError("Polygon RPC retry budget was exhausted") from None
+        log(
+            f"RPC_RETRY method={method} attempt={attempt} "
+            f"reason={retry_reason} delay_seconds={delay:g}"
+        )
+        sleep_call(delay)
+
+    if body is None:
+        raise CutoverError("Polygon RPC did not return a response")
     if len(body) > 16 << 20:
         raise CutoverError("Polygon RPC response exceeded 16 MiB")
     try:
@@ -3499,9 +3662,9 @@ def _secure_marker_parent_fd(
     return fd
 
 
-def _decode_secure_resume_marker(
+def _read_secure_resume_marker_payload(
     fd: int, expected_uid: int, expected_gid: int
-) -> dict[str, object]:
+) -> bytes:
     info = os.fstat(fd)
     if (
         not stat.S_ISREG(info.st_mode)
@@ -3521,8 +3684,12 @@ def _decode_secure_resume_marker(
             raise CutoverError("resume marker was truncated during read")
         chunks.append(value)
         remaining -= len(value)
+    return b"".join(chunks)
+
+
+def _decode_resume_marker_payload(payload: bytes) -> dict[str, object]:
     try:
-        decoded = json.loads(b"".join(chunks))
+        decoded = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise CutoverError("resume marker is not valid JSON") from error
     if not isinstance(decoded, dict):
@@ -3530,11 +3697,11 @@ def _decode_secure_resume_marker(
     return decoded
 
 
-def read_secure_resume_marker_if_present(
+def read_secure_resume_marker_with_sha256_if_present(
     path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
     expected_uid: int = 0,
     expected_gid: int = 0,
-) -> dict[str, object] | None:
+) -> tuple[dict[str, object], str] | None:
     parent_fd = _secure_marker_parent_fd(path, expected_uid, expected_gid)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
@@ -3547,11 +3714,38 @@ def read_secure_resume_marker_if_present(
         except OSError as error:
             raise CutoverError("resume marker pathname is unsafe or unreadable") from error
         try:
-            return _decode_secure_resume_marker(fd, expected_uid, expected_gid)
+            payload = _read_secure_resume_marker_payload(
+                fd, expected_uid, expected_gid
+            )
+            return _decode_resume_marker_payload(payload), sha256_bytes(payload)
         finally:
             os.close(fd)
     finally:
         os.close(parent_fd)
+
+
+def read_secure_resume_marker_if_present(
+    path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> dict[str, object] | None:
+    result = read_secure_resume_marker_with_sha256_if_present(
+        path, expected_uid, expected_gid
+    )
+    return None if result is None else result[0]
+
+
+def read_secure_resume_marker_with_sha256(
+    path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> tuple[dict[str, object], str]:
+    result = read_secure_resume_marker_with_sha256_if_present(
+        path, expected_uid, expected_gid
+    )
+    if result is None:
+        raise CutoverError("required resume marker is unavailable")
+    return result
 
 
 def read_secure_resume_marker(
@@ -3588,10 +3782,17 @@ def write_secure_resume_marker(
     value: dict[str, object],
     *,
     create: bool,
+    expected_existing_sha256: str | None = None,
     path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
     expected_uid: int = 0,
     expected_gid: int = 0,
 ) -> dict[str, object]:
+    if create and expected_existing_sha256 is not None:
+        raise CutoverError("new resume marker cannot expect an existing SHA-256")
+    if expected_existing_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", expected_existing_sha256
+    ):
+        raise CutoverError("expected existing resume marker SHA-256 is invalid")
     parent_fd = _secure_marker_parent_fd(path, expected_uid, expected_gid)
     temporary_name = "." + path.name + "." + os.urandom(12).hex()
     temporary_fd = -1
@@ -3606,7 +3807,13 @@ def write_secure_resume_marker(
         else:
             # Refuse to replace an unsafe pathname, even though rename itself
             # would not follow a final-component symlink.
-            read_secure_resume_marker(path, expected_uid, expected_gid)
+            _, existing_sha256 = read_secure_resume_marker_with_sha256(
+                path, expected_uid, expected_gid
+            )
+            if expected_existing_sha256 is not None and not hmac.compare_digest(
+                existing_sha256, expected_existing_sha256
+            ):
+                raise CutoverError("resume marker SHA-256 changed before replacement")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -3642,6 +3849,16 @@ def write_secure_resume_marker(
                 raise CutoverError("resume marker already exists") from error
             os.unlink(temporary_name, dir_fd=parent_fd)
         else:
+            if expected_existing_sha256 is not None:
+                _, current_sha256 = read_secure_resume_marker_with_sha256(
+                    path, expected_uid, expected_gid
+                )
+                if not hmac.compare_digest(
+                    current_sha256, expected_existing_sha256
+                ):
+                    raise CutoverError(
+                        "resume marker SHA-256 changed before atomic replacement"
+                    )
             os.replace(
                 temporary_name,
                 path.name,
@@ -3841,26 +4058,93 @@ def migration_0016_resume_identity(
     }
 
 
+def validate_resume_identity(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != set(RESUME_IDENTITY_KEYS):
+        raise CutoverError("resume marker identity fields are incomplete")
+    if any(not isinstance(value[key], str) for key in RESUME_IDENTITY_KEYS):
+        raise CutoverError("resume marker identity fields must be strings")
+    identity = {key: value[key] for key in RESUME_IDENTITY_KEYS}
+    if identity["schema"] != "trading.position-adoption-resume.v1":
+        raise CutoverError("resume marker identity schema changed")
+    if identity["actor"] != ACTOR:
+        raise CutoverError("resume marker identity actor changed")
+    if not re.fullmatch(r"[0-9a-f]{40}", identity["candidate_commit"]):
+        raise CutoverError("resume marker candidate commit is invalid")
+    for key in (
+        "candidate_binary_sha256",
+        "cutover_script_sha256",
+        "migration_sha256",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", identity[key]):
+            raise CutoverError(f"resume marker {key} is invalid")
+    if (
+        identity["cutover_script_path"]
+        != "deploy/deploy_position_adoption_20260821.py"
+        or identity["migration_path"]
+        != "migrations/0016_external_position_dispositions.sql"
+    ):
+        raise CutoverError("resume marker artifact path changed")
+    return identity
+
+
 def validate_migration_resume_marker(
     marker: dict[str, object],
     expected_identity: dict[str, str],
     schema_state: str,
 ) -> str:
+    expected_identity = validate_resume_identity(expected_identity)
     phase = str(marker.get("phase", ""))
     allowed_keys = set(expected_identity) | {
         "phase",
         "prepared_at",
         "applied_at",
         "adoption_committed_at",
-    }
+    } | set(RESUME_SUPERSEDE_AUDIT_KEYS)
     if set(marker) - allowed_keys:
         raise CutoverError("resume marker contains unsupported fields")
     if {key: marker.get(key) for key in expected_identity} != expected_identity:
         raise CutoverError("resume marker candidate/migration identity changed")
+    present_audit_keys = set(marker) & set(RESUME_SUPERSEDE_AUDIT_KEYS)
+    if present_audit_keys and present_audit_keys != set(RESUME_SUPERSEDE_AUDIT_KEYS):
+        raise CutoverError("resume marker supersede audit is incomplete")
+    if present_audit_keys:
+        previous_marker = marker.get("superseded_from_prepared_marker")
+        if not isinstance(previous_marker, dict):
+            raise CutoverError("resume marker supersede source marker is invalid")
+        if set(previous_marker) & set(RESUME_SUPERSEDE_AUDIT_KEYS):
+            raise CutoverError("resume marker contains a nested supersede audit")
+        previous_identity = validate_resume_identity(
+            {key: previous_marker.get(key) for key in RESUME_IDENTITY_KEYS}
+        )
+        if (
+            validate_migration_resume_marker(
+                previous_marker, previous_identity, "absent"
+            )
+            != "PREPARED"
+        ):
+            raise CutoverError("resume marker supersede source was not PREPARED")
+        previous_marker_sha256 = marker.get("superseded_from_marker_sha256")
+        superseded_at = marker.get("superseded_at")
+        if not isinstance(previous_marker_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", previous_marker_sha256
+        ):
+            raise CutoverError("resume marker supersede source SHA-256 is invalid")
+        if not isinstance(superseded_at, str):
+            raise CutoverError("resume marker superseded_at is missing")
+        parse_rfc3339(superseded_at)
+        if previous_identity["candidate_commit"] == expected_identity["candidate_commit"]:
+            raise CutoverError("resume marker supersede source is not a prior candidate")
+        for key in ("schema", "actor", "migration_path", "migration_sha256"):
+            if previous_identity[key] != expected_identity[key]:
+                raise CutoverError(
+                    "resume marker supersede audit migration identity changed"
+                )
     prepared_at = marker.get("prepared_at")
     if not isinstance(prepared_at, str):
         raise CutoverError("resume marker prepared_at is missing")
     parse_rfc3339(prepared_at)
+    if present_audit_keys and marker.get("superseded_at") != prepared_at:
+        raise CutoverError("superseded marker prepared_at/audit timestamp differ")
     if phase == "PREPARED":
         if marker.get("applied_at") is not None or marker.get(
             "adoption_committed_at"
@@ -3896,6 +4180,123 @@ def validate_migration_resume_marker(
     return phase
 
 
+def supersede_secure_prepared_resume_marker(
+    expected_identity: dict[str, str],
+    expected_previous_candidate_commit: str,
+    expected_previous_marker_sha256: str,
+    *,
+    pre_replace_guard: object = None,
+    path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> dict[str, object]:
+    """Atomically replace one exact PREPARED marker with a new candidate marker."""
+
+    expected_identity = validate_resume_identity(expected_identity)
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_previous_candidate_commit):
+        raise CutoverError("expected previous marker candidate commit is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_previous_marker_sha256):
+        raise CutoverError("expected previous marker SHA-256 is invalid")
+    previous, observed_sha256 = read_secure_resume_marker_with_sha256(
+        path, expected_uid, expected_gid
+    )
+    if not hmac.compare_digest(observed_sha256, expected_previous_marker_sha256):
+        raise CutoverError("PREPARED resume marker SHA-256 did not match approval")
+    previous_identity = validate_resume_identity(
+        {key: previous.get(key) for key in RESUME_IDENTITY_KEYS}
+    )
+    if (
+        validate_migration_resume_marker(previous, previous_identity, "absent")
+        != "PREPARED"
+    ):
+        raise CutoverError("only a PREPARED resume marker may be superseded")
+    if set(previous) & set(RESUME_SUPERSEDE_AUDIT_KEYS):
+        raise CutoverError("a superseded PREPARED marker cannot be superseded again")
+    if previous_identity["candidate_commit"] != expected_previous_candidate_commit:
+        raise CutoverError("PREPARED marker candidate identity did not match approval")
+    if previous_identity["candidate_commit"] == expected_identity["candidate_commit"]:
+        raise CutoverError("PREPARED marker already belongs to the current candidate")
+    for key in ("schema", "actor", "migration_path", "migration_sha256"):
+        if previous_identity[key] != expected_identity[key]:
+            raise CutoverError(
+                "PREPARED marker migration identity differs from the new candidate"
+            )
+    if pre_replace_guard is not None:
+        pre_replace_guard()
+    superseded_at = rfc3339(utc_now())
+    replacement = write_secure_resume_marker(
+        {
+            **expected_identity,
+            "phase": "PREPARED",
+            "prepared_at": superseded_at,
+            "superseded_from_prepared_marker": previous,
+            "superseded_from_marker_sha256": observed_sha256,
+            "superseded_at": superseded_at,
+        },
+        create=False,
+        expected_existing_sha256=observed_sha256,
+        path=path,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if (
+        validate_migration_resume_marker(replacement, expected_identity, "absent")
+        != "PREPARED"
+    ):
+        raise CutoverError("superseded resume marker failed validation")
+    return replacement
+
+
+def linked_adoption_event_counts(database: DatabaseSession) -> str:
+    return db_scalar(
+        database,
+        "SELECT concat_ws('|',"
+        "(SELECT count(*) FROM position_events WHERE event_type='ADOPTED')::text,"
+        "(SELECT count(*) FROM execution_account_events "
+        " WHERE event_type='EXTERNAL_POSITION_DISPOSITION')::text)",
+    )
+
+
+def require_prepared_marker_supersede_database_state(
+    database: DatabaseSession,
+) -> None:
+    state = classify_migration_0016_presence(migration_0016_presence(database))
+    if state != "absent":
+        raise CutoverError(
+            "PREPARED marker supersede is forbidden unless 0016 is fully absent"
+        )
+    if linked_adoption_event_counts(database) != "0|0":
+        raise CutoverError(
+            "PREPARED marker supersede requires zero linked adoption events"
+        )
+
+
+def supersede_prepared_resume_marker(
+    database: DatabaseSession,
+    expected_identity: dict[str, str],
+    expected_previous_candidate_commit: str,
+    expected_previous_marker_sha256: str,
+) -> dict[str, object]:
+    """Authorize exactly one candidate switch at the first resume preflight."""
+
+    require_prepared_marker_supersede_database_state(database)
+    replacement = supersede_secure_prepared_resume_marker(
+        expected_identity,
+        expected_previous_candidate_commit,
+        expected_previous_marker_sha256,
+        pre_replace_guard=lambda: require_prepared_marker_supersede_database_state(
+            database
+        ),
+    )
+    require_prepared_marker_supersede_database_state(database)
+    log(
+        "RESUME_MARKER=SUPERSEDED phase=PREPARED migration_0016=absent "
+        f"previous_candidate={expected_previous_candidate_commit} "
+        f"previous_marker_sha256={expected_previous_marker_sha256}"
+    )
+    return replacement
+
+
 def mark_resume_adoption_committed(expected_identity: dict[str, str]) -> dict[str, object]:
     marker = read_secure_resume_marker()
     phase = validate_migration_resume_marker(marker, expected_identity, "present")
@@ -3923,13 +4324,7 @@ def require_resume_migration_state(
 ) -> str:
     state = classify_migration_0016_presence(migration_0016_presence(database))
     if state == "absent":
-        linked = db_scalar(
-            database,
-            "SELECT concat_ws('|',"
-            "(SELECT count(*) FROM position_events WHERE event_type='ADOPTED')::text,"
-            "(SELECT count(*) FROM execution_account_events "
-            " WHERE event_type='EXTERNAL_POSITION_DISPOSITION')::text)",
-        )
+        linked = linked_adoption_event_counts(database)
         if linked != "0|0":
             raise CutoverError("resume found linked adoption events without 0016 schema")
         marker = read_secure_resume_marker_if_present()
@@ -5795,6 +6190,214 @@ def fix_forward_failure(
 
 
 def self_test() -> None:
+    rpc_success = canonical_json(
+        {"jsonrpc": "2.0", "id": 1, "result": "0x89"}
+    )
+    rpc_statuses = [408, 429, 503, 200]
+    rpc_status_calls: list[float] = []
+    rpc_sleeps: list[float] = []
+
+    def rpc_status_sequence(
+        _request: urllib.request.Request, timeout: float
+    ) -> tuple[int, bytes]:
+        rpc_status_calls.append(timeout)
+        status = rpc_statuses.pop(0)
+        return status, rpc_success if status == 200 else b""
+
+    if rpc_json(
+        "https://rpc.invalid",
+        "eth_chainId",
+        [],
+        http_call=rpc_status_sequence,
+        sleeper=rpc_sleeps.append,
+    ) != "0x89" or rpc_sleeps != [1.0, 2.0, 4.0]:
+        raise CutoverError("retryable RPC HTTP status self-test failed")
+    if len(rpc_status_calls) != 4 or any(
+        timeout > RPC_REQUEST_TIMEOUT_SECONDS for timeout in rpc_status_calls
+    ):
+        raise CutoverError("RPC request timeout bound self-test failed")
+    if (
+        RPC_RETRY_BUDGET_SECONDS > 120
+        or RPC_MAX_ATTEMPTS != len(RPC_RETRY_BACKOFF_SECONDS) + 1
+    ):
+        raise CutoverError("RPC total retry budget self-test failed")
+
+    class TrackingHTTPError(urllib.error.HTTPError):
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    tracking_http_error = TrackingHTTPError(
+        "https://rpc.invalid", 408, "timeout", {}, None
+    )
+    http_error_calls = 0
+
+    def rpc_http_error_then_success(
+        _request: urllib.request.Request, _timeout: float
+    ) -> tuple[int, bytes]:
+        nonlocal http_error_calls
+        http_error_calls += 1
+        if http_error_calls == 1:
+            raise tracking_http_error
+        return 200, rpc_success
+
+    if rpc_json(
+        "https://rpc.invalid",
+        "eth_chainId",
+        [],
+        http_call=rpc_http_error_then_success,
+        sleeper=lambda _delay: None,
+    ) != "0x89" or http_error_calls != 2 or not tracking_http_error.closed:
+        raise CutoverError("retryable RPC HTTPError close self-test failed")
+
+    transient_calls = 0
+
+    def rpc_timeout_then_success(
+        _request: urllib.request.Request, _timeout: float
+    ) -> tuple[int, bytes]:
+        nonlocal transient_calls
+        transient_calls += 1
+        if transient_calls == 1:
+            raise TimeoutError("self-test timeout")
+        return 200, rpc_success
+
+    if rpc_json(
+        "https://rpc.invalid",
+        "eth_chainId",
+        [],
+        http_call=rpc_timeout_then_success,
+        sleeper=lambda _delay: None,
+    ) != "0x89" or transient_calls != 2:
+        raise CutoverError("transient RPC timeout retry self-test failed")
+
+    for semantic_body, label in (
+        (b"not-json", "invalid JSON"),
+        (
+            canonical_json(
+                {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000}}
+            ),
+            "JSON-RPC error",
+        ),
+    ):
+        semantic_calls = 0
+
+        def rpc_semantic_failure(
+            _request: urllib.request.Request,
+            _timeout: float,
+            body: bytes = semantic_body,
+        ) -> tuple[int, bytes]:
+            nonlocal semantic_calls
+            semantic_calls += 1
+            return 200, body
+
+        try:
+            rpc_json(
+                "https://rpc.invalid",
+                "eth_chainId",
+                [],
+                http_call=rpc_semantic_failure,
+                sleeper=lambda _delay: None,
+            )
+        except CutoverError:
+            pass
+        else:
+            raise CutoverError(f"RPC {label} self-test failed open")
+        if semantic_calls != 1:
+            raise CutoverError(f"RPC {label} was retried")
+
+    nonretryable_calls = 0
+
+    def rpc_bad_request(
+        _request: urllib.request.Request, _timeout: float
+    ) -> tuple[int, bytes]:
+        nonlocal nonretryable_calls
+        nonretryable_calls += 1
+        return 400, b""
+
+    try:
+        rpc_json(
+            "https://rpc.invalid",
+            "eth_chainId",
+            [],
+            http_call=rpc_bad_request,
+            sleeper=lambda _delay: None,
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("non-retryable RPC HTTP status self-test failed open")
+    if nonretryable_calls != 1:
+        raise CutoverError("non-retryable RPC HTTP status was retried")
+
+    exhausted_calls = 0
+    exhausted_sleeps: list[float] = []
+
+    def rpc_always_unavailable(
+        _request: urllib.request.Request, _timeout: float
+    ) -> tuple[int, bytes]:
+        nonlocal exhausted_calls
+        exhausted_calls += 1
+        return 408, b""
+
+    try:
+        rpc_json(
+            "https://rpc.invalid",
+            "eth_chainId",
+            [],
+            http_call=rpc_always_unavailable,
+            sleeper=exhausted_sleeps.append,
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("RPC attempt bound self-test failed open")
+    if (
+        exhausted_calls != RPC_MAX_ATTEMPTS
+        or exhausted_sleeps != list(RPC_RETRY_BACKOFF_SECONDS)
+        or max(RPC_RETRY_BACKOFF_SECONDS) > 60
+    ):
+        raise CutoverError("RPC retry attempt/backoff bound self-test failed")
+
+    permanent_dns = urllib.error.URLError(
+        socket.gaierror(getattr(socket, "EAI_NONAME", -2), "self-test")
+    )
+    if (
+        not _rpc_transient_network_error(TimeoutError())
+        or not _rpc_transient_network_error(
+            urllib.error.URLError(socket.timeout("self-test"))
+        )
+        or _rpc_transient_network_error(permanent_dns)
+        or _rpc_http_status_is_retryable(400)
+        or not all(
+            _rpc_http_status_is_retryable(status) for status in (408, 429, 500, 599)
+        )
+    ):
+        raise CutoverError("RPC retry allowlist self-test failed")
+    unsupported_calls = 0
+
+    def unsupported_rpc_call(
+        _request: urllib.request.Request, _timeout: float
+    ) -> tuple[int, bytes]:
+        nonlocal unsupported_calls
+        unsupported_calls += 1
+        return 200, rpc_success
+
+    try:
+        rpc_json(
+            "https://rpc.invalid",
+            "eth_sendRawTransaction",
+            [],
+            http_call=unsupported_rpc_call,
+            sleeper=lambda _delay: None,
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("non-read RPC method self-test failed open")
+    if unsupported_calls != 0:
+        raise CutoverError("non-read RPC method reached the transport")
+
     if keccak_256(b"").hex() != (
         "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
     ):
@@ -6668,6 +7271,97 @@ def self_test() -> None:
             pass
         else:
             raise CutoverError("cross-candidate resume marker self-test failed open")
+
+        supersede_marker_path = directory / "supersede-resume.json"
+        prior_prepared_marker = write_secure_resume_marker(
+            prepared_marker,
+            create=True,
+            path=supersede_marker_path,
+            expected_uid=test_uid,
+            expected_gid=test_gid,
+        )
+        _, prior_marker_sha256 = read_secure_resume_marker_with_sha256(
+            supersede_marker_path, test_uid, test_gid
+        )
+        next_identity = {
+            **marker_identity,
+            "candidate_commit": "5" * 40,
+            "candidate_binary_sha256": "6" * 64,
+            "cutover_script_sha256": "7" * 64,
+        }
+
+        def require_supersede_failure_without_mutation(
+            identity: dict[str, str], previous_commit: str, previous_sha256: str
+        ) -> None:
+            before = supersede_marker_path.read_bytes()
+            try:
+                supersede_secure_prepared_resume_marker(
+                    identity,
+                    previous_commit,
+                    previous_sha256,
+                    path=supersede_marker_path,
+                    expected_uid=test_uid,
+                    expected_gid=test_gid,
+                )
+            except CutoverError:
+                pass
+            else:
+                raise CutoverError("unsafe PREPARED marker supersede self-test opened")
+            if supersede_marker_path.read_bytes() != before:
+                raise CutoverError("failed PREPARED marker supersede mutated marker")
+
+        require_supersede_failure_without_mutation(
+            next_identity, marker_identity["candidate_commit"], "8" * 64
+        )
+        require_supersede_failure_without_mutation(
+            next_identity, "9" * 40, prior_marker_sha256
+        )
+        require_supersede_failure_without_mutation(
+            {**next_identity, "migration_sha256": "a" * 64},
+            marker_identity["candidate_commit"],
+            prior_marker_sha256,
+        )
+        superseded_marker = supersede_secure_prepared_resume_marker(
+            next_identity,
+            marker_identity["candidate_commit"],
+            prior_marker_sha256,
+            path=supersede_marker_path,
+            expected_uid=test_uid,
+            expected_gid=test_gid,
+        )
+        if (
+            superseded_marker.get("superseded_from_prepared_marker")
+            != prior_prepared_marker
+            or superseded_marker.get("superseded_from_marker_sha256")
+            != prior_marker_sha256
+            or superseded_marker.get("prepared_at")
+            != superseded_marker.get("superseded_at")
+        ):
+            raise CutoverError("PREPARED marker supersede audit self-test failed")
+        _, superseded_marker_sha256 = read_secure_resume_marker_with_sha256(
+            supersede_marker_path, test_uid, test_gid
+        )
+        require_supersede_failure_without_mutation(
+            {
+                **next_identity,
+                "candidate_commit": "b" * 40,
+                "candidate_binary_sha256": "c" * 64,
+                "cutover_script_sha256": "d" * 64,
+            },
+            next_identity["candidate_commit"],
+            superseded_marker_sha256,
+        )
+        tampered_audit = json.loads(json.dumps(superseded_marker))
+        tampered_audit["superseded_from_prepared_marker"][
+            "migration_sha256"
+        ] = "e" * 64
+        try:
+            validate_migration_resume_marker(tampered_audit, next_identity, "absent")
+        except CutoverError:
+            pass
+        else:
+            raise CutoverError("supersede migration audit self-test failed open")
+
         applied_marker = write_secure_resume_marker(
             {
                 **prepared_marker,
@@ -6813,6 +7507,9 @@ def self_test() -> None:
         "verify_resume_environment(trading_environment)",
         "require_resume_runtime_state(args.expected_previous_commit)",
         "initial_state = read_database_preflight(database)",
+        "baseline_observed_at = validate_database_preflight(initial_state)",
+        "if args.supersede_prepared_marker:",
+        "supersede_prepared_resume_marker(",
         "require_resume_migration_state(",
     )
     cursor = -1
@@ -6820,6 +7517,35 @@ def self_test() -> None:
         cursor = cutover_source.find(marker, cursor + 1)
         if cursor < 0:
             raise CutoverError("resume stopped-runtime bootstrap gate self-test failed")
+    apply_migration_source = source[
+        source.index("def apply_migration_0016(") : source.index(
+            "def stop_service()"
+        )
+    ]
+    if "supersede_prepared_resume_marker(" in apply_migration_source:
+        raise CutoverError("migration recheck must not permit marker supersede")
+    supersede_source = source[
+        source.index("def supersede_prepared_resume_marker(") : source.index(
+            "def mark_resume_adoption_committed("
+        )
+    ]
+    if (
+        supersede_source.count(
+            "require_prepared_marker_supersede_database_state(database)"
+        )
+        != 2
+        or "supersede_secure_prepared_resume_marker(" not in supersede_source
+    ):
+        raise CutoverError("PREPARED marker database gate self-test failed")
+    if not all(
+        flag in source
+        for flag in (
+            '"--supersede-prepared-marker"',
+            '"--expected-previous-marker-candidate-commit"',
+            '"--expected-previous-marker-sha256"',
+        )
+    ):
+        raise CutoverError("PREPARED marker explicit CLI gate self-test failed")
     resume_state_source = source[
         source.index("def require_resume_migration_state(") : source.index(
             "def apply_migration_0016("
@@ -6872,6 +7598,24 @@ def parse_args() -> argparse.Namespace:
             "database, and empty-adoption resume gates"
         ),
     )
+    parser.add_argument(
+        "--supersede-prepared-marker",
+        action="store_true",
+        help=(
+            "replace one explicitly pinned prior-candidate PREPARED marker only "
+            "during the first strict resume preflight while 0016 is absent"
+        ),
+    )
+    parser.add_argument(
+        "--expected-previous-marker-candidate-commit",
+        default="",
+        help="full commit identity embedded in the PREPARED marker being replaced",
+    )
+    parser.add_argument(
+        "--expected-previous-marker-sha256",
+        default="",
+        help="SHA-256 of the exact root-owned PREPARED marker file being replaced",
+    )
     parser.add_argument("--binary-relative-path", default="bin/trading-execution")
     parser.add_argument("--binding-log-timeout-seconds", type=int, default=1200)
     return parser.parse_args()
@@ -6895,6 +7639,37 @@ def validate_production_args(args: argparse.Namespace) -> None:
         and args.expected_previous_commit != EXPECTED_PREVIOUS_COMMIT
     ):
         raise CutoverError("--resume-pre-adoption requires pinned previous commit 49f5053")
+    supersede_identity_arguments = bool(
+        args.expected_previous_marker_candidate_commit
+        or args.expected_previous_marker_sha256
+    )
+    if args.supersede_prepared_marker:
+        if not args.resume_pre_adoption:
+            raise CutoverError(
+                "--supersede-prepared-marker requires --resume-pre-adoption"
+            )
+        if not re.fullmatch(
+            r"[0-9a-f]{40}", args.expected_previous_marker_candidate_commit
+        ):
+            raise CutoverError(
+                "--expected-previous-marker-candidate-commit must be a full "
+                "lowercase SHA-1"
+            )
+        if not re.fullmatch(
+            r"[0-9a-f]{64}", args.expected_previous_marker_sha256
+        ):
+            raise CutoverError(
+                "--expected-previous-marker-sha256 must be lowercase SHA-256"
+            )
+        if args.expected_previous_marker_candidate_commit == args.expected_commit:
+            raise CutoverError(
+                "the PREPARED marker supersede source must be a prior candidate"
+            )
+    elif supersede_identity_arguments:
+        raise CutoverError(
+            "previous marker identity arguments require "
+            "--supersede-prepared-marker"
+        )
     if not re.fullmatch(r"[0-9a-f]{64}", args.expected_binary_sha256):
         raise CutoverError("--expected-binary-sha256 must be lowercase SHA-256")
     if pathlib.PurePosixPath(args.binary_relative_path).is_absolute() or ".." in pathlib.PurePosixPath(
@@ -6972,6 +7747,13 @@ def execute_cutover(args: argparse.Namespace) -> int:
             migration = migration_session(
                 database, trading_environment, prediction_environment
             )
+            if args.supersede_prepared_marker:
+                supersede_prepared_resume_marker(
+                    database,
+                    resume_identity,
+                    args.expected_previous_marker_candidate_commit,
+                    args.expected_previous_marker_sha256,
+                )
             resume_schema_state = require_resume_migration_state(
                 database, migration, resume_identity
             )
