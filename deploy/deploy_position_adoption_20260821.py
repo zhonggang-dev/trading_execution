@@ -352,6 +352,15 @@ RESUME_SUPERSEDE_AUDIT_KEYS = (
     "superseded_from_marker_sha256",
     "superseded_at",
 )
+MIGRATION_APPLIED_RESUME_AUDIT_KEYS = (
+    "resumed_from_migration_applied_marker",
+    "resumed_from_marker_sha256",
+    "resume_cutover_script_commit",
+    "resume_cutover_script_sha256",
+    "resumed_at",
+)
+CUTOVER_SCRIPT_PATH = "deploy/deploy_position_adoption_20260821.py"
+RECONCILIATION_RUN_LEASE = dt.timedelta(minutes=30)
 PUSD_ADDRESS = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
 LEGACY_USDC_E_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 CONDITIONAL_TOKENS_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
@@ -3333,6 +3342,145 @@ def validate_database_preflight(state: dict[str, object]) -> dt.datetime:
     return main_baseline_at
 
 
+def validate_database_preflight_before_stale_run_recovery(
+    state: dict[str, object],
+) -> dt.datetime:
+    running = state.get("running_reconciliations")
+    if not isinstance(running, int) or running not in {0, 1}:
+        raise CutoverError(
+            "MIGRATION_APPLIED resume permits at most one pinned RUNNING reconciliation"
+        )
+    return validate_database_preflight(
+        {**state, "running_reconciliations": 0}
+    )
+
+
+def recover_pinned_stale_reconciliation_run(
+    database: DatabaseSession,
+    expected_run_id: str,
+    expected_account_id: str,
+    expected_started_at: str,
+) -> dict[str, object]:
+    """CAS one explicitly approved abandoned run using the Go recorder lease."""
+
+    if not re.fullmatch(r"[A-Za-z0-9:_-]{1,200}", expected_run_id):
+        raise CutoverError("pinned stale reconciliation run_id is invalid")
+    if expected_account_id not in ACCOUNT_ADDRESSES:
+        raise CutoverError("pinned stale reconciliation account is invalid")
+    expected_started = parse_rfc3339(expected_started_at)
+
+    def snapshot() -> dict[str, object]:
+        value = db_json(
+            database,
+            f"""
+SELECT json_build_object(
+  'pinned',(SELECT row_to_json(x) FROM (
+    SELECT run_id,execution_account_id,trigger,status,error,started_at,completed_at,
+           started_at < clock_timestamp()-interval '30 minutes' lease_expired
+      FROM reconciliation_runs WHERE run_id={sql_text(expected_run_id)}
+  ) x),
+  'running',(SELECT COALESCE(json_agg(row_to_json(x) ORDER BY execution_account_id,run_id),'[]'::json)
+    FROM (SELECT run_id,execution_account_id,trigger,status,error,started_at,completed_at
+            FROM reconciliation_runs
+           WHERE execution_account_id IN ('main','wallet-1','wallet-2','wallet-3')
+             AND status='RUNNING') x)
+);
+""",
+        )
+        if not isinstance(value, dict):
+            raise CutoverError("stale reconciliation snapshot is invalid")
+        return value
+
+    before = snapshot()
+    pinned = before.get("pinned")
+    running = before.get("running")
+    if not isinstance(pinned, dict) or not isinstance(running, list):
+        raise CutoverError("pinned stale reconciliation run is missing")
+    if (
+        pinned.get("run_id") != expected_run_id
+        or pinned.get("execution_account_id") != expected_account_id
+        or pinned.get("trigger") != "STARTUP"
+        or parse_rfc3339(str(pinned.get("started_at"))) != expected_started
+    ):
+        raise CutoverError("pinned stale reconciliation identity changed")
+    other_running = [
+        item for item in running
+        if not isinstance(item, dict) or item.get("run_id") != expected_run_id
+    ]
+    if other_running:
+        raise CutoverError("an unapproved RUNNING reconciliation exists")
+    status = pinned.get("status")
+    if status == "RUNNING":
+        if len(running) != 1 or pinned.get("completed_at") is not None:
+            raise CutoverError("pinned RUNNING reconciliation shape changed")
+        if pinned.get("lease_expired") is not True:
+            raise CutoverError(
+                "pinned RUNNING reconciliation has not exceeded its 30-minute lease"
+            )
+        db_execute(
+            database,
+            f"""
+BEGIN;
+SET LOCAL lock_timeout='5s';
+SET LOCAL statement_timeout='30s';
+LOCK TABLE reconciliation_runs IN SHARE ROW EXCLUSIVE MODE;
+DO $guard$
+DECLARE changed integer;
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM reconciliation_runs
+     WHERE execution_account_id IN ('main','wallet-1','wallet-2','wallet-3')
+       AND status='RUNNING' AND run_id<>{sql_text(expected_run_id)}
+  ) THEN
+    RAISE EXCEPTION 'unapproved RUNNING reconciliation appeared';
+  END IF;
+  UPDATE reconciliation_runs
+     SET status='FAILED',error='reconciliation worker lease expired',
+         completed_at=clock_timestamp()
+   WHERE run_id={sql_text(expected_run_id)}
+     AND execution_account_id={sql_text(expected_account_id)}
+     AND trigger='STARTUP' AND status='RUNNING'
+     AND started_at={sql_text(rfc3339(expected_started))}::timestamptz
+     AND started_at < clock_timestamp()-interval '30 minutes';
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  IF changed <> 1 THEN
+    RAISE EXCEPTION 'pinned stale reconciliation CAS failed';
+  END IF;
+END
+$guard$;
+COMMIT;
+""",
+        )
+        log(
+            "STALE_RECONCILIATION=FAILED lease=30m "
+            f"account={expected_account_id} run_id={expected_run_id}"
+        )
+    elif status == "FAILED":
+        if (
+            running
+            or pinned.get("error") != "reconciliation worker lease expired"
+            or pinned.get("completed_at") is None
+            or pinned.get("lease_expired") is not True
+            or parse_rfc3339(str(pinned.get("completed_at")))
+            < expected_started + RECONCILIATION_RUN_LEASE
+        ):
+            raise CutoverError("pinned FAILED reconciliation is not an idempotent lease expiry")
+    else:
+        raise CutoverError("pinned stale reconciliation is not RUNNING or lease-FAILED")
+
+    after = snapshot()
+    final = after.get("pinned")
+    if (
+        not isinstance(final, dict)
+        or after.get("running") != []
+        or final.get("status") != "FAILED"
+        or final.get("error") != "reconciliation worker lease expired"
+        or final.get("completed_at") is None
+    ):
+        raise CutoverError("stale reconciliation recovery did not converge")
+    return final
+
+
 def validate_onchain_balances(
     database_state: dict[str, object],
     environment: dict[str, str],
@@ -3491,6 +3639,50 @@ def require_resume_runtime_state(expected_previous_commit: str) -> pathlib.Path:
     return expected_release
 
 
+def require_migration_applied_runtime_state(
+    runtime_identity: dict[str, str],
+) -> pathlib.Path:
+    """Pin the stopped runtime that applied 0016; no old-runtime rollback exists."""
+
+    runtime_identity = validate_resume_identity(runtime_identity)
+    runtime_commit = runtime_identity["candidate_commit"]
+    expected_release = RELEASES / runtime_commit[:8]
+    try:
+        release_info = expected_release.lstat()
+    except FileNotFoundError as error:
+        raise CutoverError("MIGRATION_APPLIED candidate release is missing") from error
+    if not stat.S_ISDIR(release_info.st_mode) or stat.S_ISLNK(release_info.st_mode):
+        raise CutoverError("MIGRATION_APPLIED candidate release is not a real directory")
+    if not CURRENT.is_symlink():
+        raise CutoverError("current release path is not a symlink")
+    try:
+        selected_release = CURRENT.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise CutoverError("current release symlink is broken") from error
+    if selected_release != expected_release:
+        raise CutoverError(
+            "MIGRATION_APPLIED resume current release is not the marker candidate"
+        )
+    deploy.require_regular(
+        expected_release / "trading-execution",
+        runtime_identity["candidate_binary_sha256"],
+    )
+    require_service_stopped()
+    listeners = listening_tcp_ports(SERVICE_PORTS)
+    if listeners:
+        raise CutoverError(
+            "MIGRATION_APPLIED resume HTTP ports still have listeners: "
+            + ",".join(str(port) for port in listeners)
+        )
+    process_ids = trading_execution_process_ids()
+    if process_ids:
+        raise CutoverError(
+            "MIGRATION_APPLIED trading-execution process still exists: "
+            + ",".join(str(pid) for pid in process_ids)
+        )
+    return expected_release
+
+
 def verify_runtime_environment(environment: dict[str, str]) -> None:
     if environment.get("EXECUTION_MODE") != "live":
         raise CutoverError("Trading is not in live execution mode")
@@ -3515,6 +3707,15 @@ def verify_resume_environment(environment: dict[str, str]) -> None:
     if entry_disabled not in {None, "true"}:
         raise CutoverError(
             "resume entry-submission gate must be absent or explicitly true"
+        )
+
+
+def verify_migration_applied_resume_environment(
+    environment: dict[str, str],
+) -> None:
+    if environment.get("DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED") != "true":
+        raise CutoverError(
+            "MIGRATION_APPLIED resume requires the candidate entry gate closed"
         )
 
 
@@ -3595,6 +3796,115 @@ def verify_candidate(
     binary = source_tree / args.binary_relative_path
     deploy.require_regular(binary, args.expected_binary_sha256)
     return binary, {"path": relative_script, "sha256": script_sha256}
+
+
+def git_committed_bytes(
+    source_tree: pathlib.Path, commit: str, relative_path: str
+) -> bytes:
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise CutoverError("Git object commit identity is invalid")
+    return deploy.run(
+        [
+            "git",
+            "-c",
+            f"safe.directory={source_tree}",
+            "-C",
+            str(source_tree),
+            "show",
+            f"{commit}:{relative_path}",
+        ],
+        capture=True,
+    ).stdout.encode("utf-8")
+
+
+def migration_applied_runtime_identity(
+    source_tree: pathlib.Path,
+    runtime_commit: str,
+    runtime_binary_sha256: str,
+) -> dict[str, str]:
+    migration_path = "migrations/0016_external_position_dispositions.sql"
+    migration = source_tree / migration_path
+    deploy.require_regular(migration)
+    return {
+        "schema": "trading.position-adoption-resume.v1",
+        "actor": ACTOR,
+        "candidate_commit": runtime_commit,
+        "candidate_binary_sha256": runtime_binary_sha256,
+        "cutover_script_path": CUTOVER_SCRIPT_PATH,
+        "cutover_script_sha256": sha256_bytes(
+            git_committed_bytes(source_tree, runtime_commit, CUTOVER_SCRIPT_PATH)
+        ),
+        "migration_path": migration_path,
+        "migration_sha256": deploy.sha256(migration),
+    }
+
+
+def verify_script_only_migration_applied_resume_candidate(
+    source_tree: pathlib.Path,
+    script_commit: str,
+    expected_script_sha256: str,
+    cutover_script: dict[str, str],
+    runtime_identity: dict[str, str],
+) -> None:
+    """Prove the recovery commit changes only this orchestrator, not runtime."""
+
+    runtime_identity = validate_resume_identity(runtime_identity)
+    if cutover_script != {
+        "path": CUTOVER_SCRIPT_PATH,
+        "sha256": expected_script_sha256,
+    }:
+        raise CutoverError("recovery cutover script did not match its explicit SHA-256")
+    runtime_commit = runtime_identity["candidate_commit"]
+    if script_commit == runtime_commit:
+        raise CutoverError("MIGRATION_APPLIED recovery requires a distinct script commit")
+    ancestor = deploy.run(
+        [
+            "git",
+            "-c",
+            f"safe.directory={source_tree}",
+            "-C",
+            str(source_tree),
+            "merge-base",
+            "--is-ancestor",
+            runtime_commit,
+            script_commit,
+        ],
+        capture=True,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise CutoverError("recovery script commit does not descend from runtime commit")
+    changed = deploy.run(
+        [
+            "git",
+            "-c",
+            f"safe.directory={source_tree}",
+            "-C",
+            str(source_tree),
+            "diff",
+            "--name-only",
+            "--diff-filter=ACDMRTUXB",
+            runtime_commit,
+            script_commit,
+        ],
+        capture=True,
+    ).stdout.splitlines()
+    if changed != [CUTOVER_SCRIPT_PATH]:
+        raise CutoverError(
+            "MIGRATION_APPLIED recovery commit must change only the cutover script"
+        )
+    if (
+        sha256_bytes(
+            git_committed_bytes(source_tree, runtime_commit, CUTOVER_SCRIPT_PATH)
+        )
+        != runtime_identity["cutover_script_sha256"]
+    ):
+        raise CutoverError("runtime marker does not match its committed cutover script")
+    migration_path = runtime_identity["migration_path"]
+    if deploy.sha256(source_tree / migration_path) != runtime_identity[
+        "migration_sha256"
+    ]:
+        raise CutoverError("recovery commit changed the applied migration")
 
 
 def install_release(binary: pathlib.Path, commit: str, expected_sha256: str) -> pathlib.Path:
@@ -3695,6 +4005,10 @@ def _decode_resume_marker_payload(payload: bytes) -> dict[str, object]:
     if not isinstance(decoded, dict):
         raise CutoverError("resume marker is not a JSON object")
     return decoded
+
+
+def _encode_resume_marker_payload(value: dict[str, object]) -> bytes:
+    return json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
 
 
 def read_secure_resume_marker_with_sha256_if_present(
@@ -3827,7 +4141,7 @@ def write_secure_resume_marker(
         ):
             os.fchown(temporary_fd, expected_uid, expected_gid)
         os.fchmod(temporary_fd, 0o600)
-        payload = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        payload = _encode_resume_marker_payload(value)
         offset = 0
         while offset < len(payload):
             offset += os.write(temporary_fd, payload[offset:])
@@ -4099,7 +4413,9 @@ def validate_migration_resume_marker(
         "prepared_at",
         "applied_at",
         "adoption_committed_at",
-    } | set(RESUME_SUPERSEDE_AUDIT_KEYS)
+    } | set(RESUME_SUPERSEDE_AUDIT_KEYS) | set(
+        MIGRATION_APPLIED_RESUME_AUDIT_KEYS
+    )
     if set(marker) - allowed_keys:
         raise CutoverError("resume marker contains unsupported fields")
     if {key: marker.get(key) for key in expected_identity} != expected_identity:
@@ -4139,6 +4455,71 @@ def validate_migration_resume_marker(
                 raise CutoverError(
                     "resume marker supersede audit migration identity changed"
                 )
+    migration_resume_audit_keys = set(marker) & set(
+        MIGRATION_APPLIED_RESUME_AUDIT_KEYS
+    )
+    if migration_resume_audit_keys and migration_resume_audit_keys != set(
+        MIGRATION_APPLIED_RESUME_AUDIT_KEYS
+    ):
+        raise CutoverError("MIGRATION_APPLIED resume audit is incomplete")
+    if migration_resume_audit_keys:
+        previous_applied_marker = marker.get(
+            "resumed_from_migration_applied_marker"
+        )
+        if not isinstance(previous_applied_marker, dict):
+            raise CutoverError("MIGRATION_APPLIED resume source marker is invalid")
+        if set(previous_applied_marker) & set(
+            MIGRATION_APPLIED_RESUME_AUDIT_KEYS
+        ):
+            raise CutoverError("MIGRATION_APPLIED resume audit cannot be nested")
+        if (
+            validate_migration_resume_marker(
+                previous_applied_marker, expected_identity, "present"
+            )
+            != "MIGRATION_APPLIED"
+        ):
+            raise CutoverError(
+                "MIGRATION_APPLIED resume source was not at the applied boundary"
+            )
+        source_sha256 = marker.get("resumed_from_marker_sha256")
+        script_commit = marker.get("resume_cutover_script_commit")
+        script_sha256 = marker.get("resume_cutover_script_sha256")
+        resumed_at = marker.get("resumed_at")
+        if not isinstance(source_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", source_sha256
+        ):
+            raise CutoverError("MIGRATION_APPLIED resume source SHA-256 is invalid")
+        if source_sha256 != sha256_bytes(
+            _encode_resume_marker_payload(previous_applied_marker)
+        ):
+            raise CutoverError("MIGRATION_APPLIED resume source marker hash changed")
+        if not isinstance(script_commit, str) or not re.fullmatch(
+            r"[0-9a-f]{40}", script_commit
+        ):
+            raise CutoverError("MIGRATION_APPLIED resume script commit is invalid")
+        if not isinstance(script_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", script_sha256
+        ):
+            raise CutoverError("MIGRATION_APPLIED resume script SHA-256 is invalid")
+        if (
+            script_commit == expected_identity["candidate_commit"]
+            or script_sha256 == expected_identity["cutover_script_sha256"]
+        ):
+            raise CutoverError(
+                "MIGRATION_APPLIED resume script did not change identity"
+            )
+        if not isinstance(resumed_at, str):
+            raise CutoverError("MIGRATION_APPLIED resumed_at is missing")
+        resumed_time = parse_rfc3339(resumed_at)
+        if resumed_time < parse_rfc3339(
+            str(previous_applied_marker.get("applied_at"))
+        ):
+            raise CutoverError("MIGRATION_APPLIED resumed_at predates migration")
+        for key in ("prepared_at", "applied_at"):
+            if marker.get(key) != previous_applied_marker.get(key):
+                raise CutoverError(
+                    "MIGRATION_APPLIED resume changed an earlier phase timestamp"
+                )
     prepared_at = marker.get("prepared_at")
     if not isinstance(prepared_at, str):
         raise CutoverError("resume marker prepared_at is missing")
@@ -4166,6 +4547,11 @@ def validate_migration_resume_marker(
         parse_rfc3339(committed_at)
     else:
         raise CutoverError("resume marker phase is unsupported")
+    if migration_resume_audit_keys and phase not in {
+        "MIGRATION_APPLIED",
+        "ADOPTION_COMMITTED",
+    }:
+        raise CutoverError("MIGRATION_APPLIED resume audit has an invalid phase")
     if schema_state == "absent" and phase != "PREPARED":
         raise CutoverError("resume marker says migration applied but 0016 is absent")
     if schema_state == "present" and phase not in {
@@ -4393,6 +4779,74 @@ def require_zero_resume_artifact_counts(raw: str) -> None:
         )
 
 
+def authorize_migration_applied_resume_marker(
+    runtime_identity: dict[str, str],
+    expected_marker_sha256: str,
+    resume_script_commit: str,
+    resume_script_sha256: str,
+    *,
+    path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> dict[str, object]:
+    """Atomically append recovery-script provenance to the exact applied marker."""
+
+    runtime_identity = validate_resume_identity(runtime_identity)
+    marker, observed_sha256 = read_secure_resume_marker_with_sha256(
+        path, expected_uid, expected_gid
+    )
+    if (
+        validate_migration_resume_marker(marker, runtime_identity, "present")
+        != "MIGRATION_APPLIED"
+    ):
+        raise CutoverError("resume marker is not exactly MIGRATION_APPLIED")
+    present = set(marker) & set(MIGRATION_APPLIED_RESUME_AUDIT_KEYS)
+    approved_current = hmac.compare_digest(
+        observed_sha256, expected_marker_sha256
+    )
+    approved_original = bool(present) and hmac.compare_digest(
+        str(marker.get("resumed_from_marker_sha256", "")),
+        expected_marker_sha256,
+    )
+    if not approved_current and not approved_original:
+        raise CutoverError("MIGRATION_APPLIED marker SHA-256 did not match approval")
+    if present:
+        if (
+            marker.get("resume_cutover_script_commit") != resume_script_commit
+            or marker.get("resume_cutover_script_sha256") != resume_script_sha256
+        ):
+            raise CutoverError(
+                "MIGRATION_APPLIED marker was already authorized by another script"
+            )
+        return marker
+    resumed = write_secure_resume_marker(
+        {
+            **marker,
+            "resumed_from_migration_applied_marker": marker,
+            "resumed_from_marker_sha256": observed_sha256,
+            "resume_cutover_script_commit": resume_script_commit,
+            "resume_cutover_script_sha256": resume_script_sha256,
+            "resumed_at": rfc3339(utc_now()),
+        },
+        create=False,
+        expected_existing_sha256=observed_sha256,
+        path=path,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if (
+        validate_migration_resume_marker(resumed, runtime_identity, "present")
+        != "MIGRATION_APPLIED"
+    ):
+        raise CutoverError("MIGRATION_APPLIED marker audit upgrade failed")
+    log(
+        "RESUME_MARKER=AUDITED phase=MIGRATION_APPLIED "
+        f"runtime_candidate={runtime_identity['candidate_commit']} "
+        f"resume_script_commit={resume_script_commit}"
+    )
+    return resumed
+
+
 def apply_migration_0016(
     database: DatabaseSession,
     migration: MigrationSession,
@@ -4590,14 +5044,13 @@ def run_candidate_pre_adoption_reconciliation(
         os.setuid(service.pw_uid)
 
     query = f"""
-SELECT COALESCE(json_agg(row_to_json(x) ORDER BY execution_account_id),'[]'::json)
+SELECT COALESCE(json_agg(row_to_json(x) ORDER BY execution_account_id,started_at,run_id),'[]'::json)
 FROM (
-  SELECT DISTINCT ON (execution_account_id)
-         execution_account_id,run_id,trigger,status,summary,error,started_at,completed_at
+  SELECT execution_account_id,run_id,trigger,status,summary,error,started_at,completed_at
     FROM reconciliation_runs
    WHERE execution_account_id IN ('main','wallet-1','wallet-2','wallet-3')
+     AND trigger='STARTUP'
      AND started_at>={sql_text(rfc3339(started_at))}::timestamptz
-   ORDER BY execution_account_id,started_at DESC,run_id DESC
 ) x;
 """
     log_path = backup.directory / "candidate-pre-adoption-reconciliation.log"
@@ -4613,18 +5066,66 @@ FROM (
         )
         try:
             deadline = time.monotonic() + 660
+            terminal_statuses = {"COMPLETED", "ATTENTION_REQUIRED", "FAILED"}
+            process_exit_drain_deadline: float | None = None
             while time.monotonic() < deadline:
                 result = db_json(database, query)
-                if isinstance(result, list) and len(result) == 4:
-                    break
-                if process.poll() is not None:
+                if isinstance(result, list) and len(result) > 4:
                     raise CutoverError(
-                        "candidate exited before recording four reconciliation runs"
+                        "candidate recorded duplicate pre-adoption reconciliation runs"
                     )
-                time.sleep(5)
+                if isinstance(result, list) and len(result) == 4:
+                    indexed = {
+                        str(item.get("execution_account_id")): item
+                        for item in result
+                        if isinstance(item, dict)
+                    }
+                    if (
+                        set(indexed) != set(ACCOUNT_ADDRESSES)
+                        or len(indexed) != 4
+                        or any(item.get("trigger") != "STARTUP" for item in result)
+                    ):
+                        raise CutoverError(
+                            "candidate pre-adoption reconciliation run identity changed"
+                        )
+                    if all(
+                        item.get("status") in terminal_statuses
+                        and item.get("completed_at") is not None
+                        for item in result
+                    ):
+                        # ATTENTION_REQUIRED makes live startup fail closed.  Give
+                        # the process time to observe all terminal account results
+                        # and exit naturally before using termination as cleanup.
+                        natural_exit_deadline = min(
+                            deadline, time.monotonic() + 30
+                        )
+                        while (
+                            process.poll() is None
+                            and time.monotonic() < natural_exit_deadline
+                        ):
+                            time.sleep(1)
+                        if process.poll() is None:
+                            raise CutoverError(
+                                "candidate did not exit after terminal startup reconciliation"
+                            )
+                        if process.returncode == 0:
+                            raise CutoverError(
+                                "candidate did not fail closed after main reconciliation drift"
+                            )
+                        break
+                if process.poll() is not None:
+                    if process_exit_drain_deadline is None:
+                        process_exit_drain_deadline = time.monotonic() + 10
+                    elif time.monotonic() >= process_exit_drain_deadline:
+                        raise CutoverError(
+                            "candidate exited before four terminal reconciliation runs"
+                        )
+                    time.sleep(1)
+                else:
+                    time.sleep(5)
             else:
                 raise CutoverError(
-                    "candidate did not record four pre-adoption reconciliation runs"
+                    "candidate did not record four terminal pre-adoption reconciliation runs"
                 )
         finally:
             if process.poll() is None:
@@ -7380,6 +7881,56 @@ def self_test() -> None:
             != "MIGRATION_APPLIED"
         ):
             raise CutoverError("applied resume marker self-test failed")
+        _, applied_marker_sha256 = read_secure_resume_marker_with_sha256(
+            marker_path, test_uid, test_gid
+        )
+        resume_script_commit = "5" * 40
+        resume_script_sha256 = "6" * 64
+        audited_applied_marker = authorize_migration_applied_resume_marker(
+            marker_identity,
+            applied_marker_sha256,
+            resume_script_commit,
+            resume_script_sha256,
+            path=marker_path,
+            expected_uid=test_uid,
+            expected_gid=test_gid,
+        )
+        if (
+            audited_applied_marker.get("resumed_from_migration_applied_marker")
+            != applied_marker
+            or audited_applied_marker.get("resumed_from_marker_sha256")
+            != applied_marker_sha256
+        ):
+            raise CutoverError("MIGRATION_APPLIED resume audit self-test failed")
+        if (
+            authorize_migration_applied_resume_marker(
+                marker_identity,
+                applied_marker_sha256,
+                resume_script_commit,
+                resume_script_sha256,
+                path=marker_path,
+                expected_uid=test_uid,
+                expected_gid=test_gid,
+            )
+            != audited_applied_marker
+        ):
+            raise CutoverError("MIGRATION_APPLIED resume idempotency self-test failed")
+        try:
+            authorize_migration_applied_resume_marker(
+                marker_identity,
+                applied_marker_sha256,
+                "7" * 40,
+                "8" * 64,
+                path=marker_path,
+                expected_uid=test_uid,
+                expected_gid=test_gid,
+            )
+        except CutoverError:
+            pass
+        else:
+            raise CutoverError(
+                "cross-script MIGRATION_APPLIED resume self-test failed open"
+            )
         try:
             require_resume_marker_absent(marker_path, test_uid, test_gid)
         except CutoverError:
@@ -7496,7 +8047,7 @@ def self_test() -> None:
     resume_markers = (
         "verify_resume_environment(trading_environment)",
         "require_resume_runtime_state(args.expected_previous_commit)",
-        "resume_identity = migration_0016_resume_identity(",
+        "script_identity = migration_0016_resume_identity(",
         "require_resume_migration_state(",
         "require_resume_marker_absent()",
         "evidence_reuse=false",
@@ -7517,6 +8068,56 @@ def self_test() -> None:
         cursor = cutover_source.find(marker, cursor + 1)
         if cursor < 0:
             raise CutoverError("resume stopped-runtime bootstrap gate self-test failed")
+    migration_applied_gate_order = (
+        "verify_migration_applied_resume_environment(trading_environment)",
+        "resume_identity = migration_applied_runtime_identity(",
+        "verify_script_only_migration_applied_resume_candidate(",
+        "migration_applied_release = require_migration_applied_runtime_state(",
+        "validate_database_preflight_before_stale_run_recovery(",
+        "marker, marker_sha256 = read_secure_resume_marker_with_sha256()",
+        'validate_migration_resume_marker(\n                    marker, resume_identity, "present"',
+        "resume_schema_state = require_resume_migration_state(",
+        "recover_pinned_stale_reconciliation_run(",
+        "initial_state = read_database_preflight(database)",
+        "validate_database_preflight(initial_state)",
+        "authorize_migration_applied_resume_marker(",
+        "selected_release = require_migration_applied_runtime_state(resume_identity)",
+    )
+    cursor = -1
+    for marker in migration_applied_gate_order:
+        cursor = cutover_source.find(marker, cursor + 1)
+        if cursor < 0:
+            raise CutoverError(
+                "MIGRATION_APPLIED fix-forward gate order self-test failed"
+            )
+    if not all(
+        marker in cutover_source
+        for marker in (
+            "irreversible = args.resume_migration_applied",
+            "args.resume_pre_adoption or args.resume_migration_applied",
+            "backup, runtime_commit",
+            "candidate_commit=runtime_commit",
+            "wait_for_candidate_health(runtime_commit)",
+        )
+    ):
+        raise CutoverError("runtime/script identity split self-test failed")
+    reconciliation_source = source[
+        source.index("def run_candidate_pre_adoption_reconciliation(") : source.index(
+            "def classify_open_issues("
+        )
+    ]
+    if not all(
+        marker in reconciliation_source
+        for marker in (
+            "AND trigger='STARTUP'",
+            'terminal_statuses = {"COMPLETED", "ATTENTION_REQUIRED", "FAILED"}',
+            'item.get("completed_at") is not None',
+            "process_exit_drain_deadline",
+            "candidate did not exit after terminal startup reconciliation",
+            "process.returncode == 0",
+        )
+    ):
+        raise CutoverError("terminal reconciliation wait self-test failed")
     apply_migration_source = source[
         source.index("def apply_migration_0016(") : source.index(
             "def stop_service()"
@@ -7599,6 +8200,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--resume-migration-applied",
+        action="store_true",
+        help=(
+            "fix-forward only from one exact stopped candidate whose 0016 marker "
+            "is MIGRATION_APPLIED and whose immutable adoption artifacts are empty"
+        ),
+    )
+    parser.add_argument(
+        "--expected-migration-applied-marker-candidate-commit", default=""
+    )
+    parser.add_argument(
+        "--expected-migration-applied-marker-sha256", default=""
+    )
+    parser.add_argument("--expected-cutover-script-sha256", default="")
+    parser.add_argument("--expected-stale-reconciliation-run-id", default="")
+    parser.add_argument("--expected-stale-reconciliation-account-id", default="")
+    parser.add_argument("--expected-stale-reconciliation-started-at", default="")
+    parser.add_argument(
         "--supersede-prepared-marker",
         action="store_true",
         help=(
@@ -7634,6 +8253,8 @@ def validate_production_args(args: argparse.Namespace) -> None:
         raise CutoverError("--expected-commit must be a full lowercase SHA-1")
     if not re.fullmatch(r"[0-9a-f]{40}", args.expected_previous_commit):
         raise CutoverError("--expected-previous-commit must be a full lowercase SHA-1")
+    if args.resume_pre_adoption and args.resume_migration_applied:
+        raise CutoverError("resume modes are mutually exclusive")
     if (
         args.resume_pre_adoption
         and args.expected_previous_commit != EXPECTED_PREVIOUS_COMMIT
@@ -7669,6 +8290,61 @@ def validate_production_args(args: argparse.Namespace) -> None:
         raise CutoverError(
             "previous marker identity arguments require "
             "--supersede-prepared-marker"
+        )
+    migration_applied_arguments = bool(
+        args.expected_migration_applied_marker_candidate_commit
+        or args.expected_migration_applied_marker_sha256
+        or args.expected_cutover_script_sha256
+        or args.expected_stale_reconciliation_run_id
+        or args.expected_stale_reconciliation_account_id
+        or args.expected_stale_reconciliation_started_at
+    )
+    if args.resume_migration_applied:
+        if args.supersede_prepared_marker:
+            raise CutoverError(
+                "MIGRATION_APPLIED resume cannot supersede a PREPARED marker"
+            )
+        if not re.fullmatch(
+            r"[0-9a-f]{40}",
+            args.expected_migration_applied_marker_candidate_commit,
+        ):
+            raise CutoverError(
+                "--expected-migration-applied-marker-candidate-commit must be a "
+                "full lowercase SHA-1"
+            )
+        if not re.fullmatch(
+            r"[0-9a-f]{64}", args.expected_migration_applied_marker_sha256
+        ):
+            raise CutoverError(
+                "--expected-migration-applied-marker-sha256 must be lowercase SHA-256"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", args.expected_cutover_script_sha256):
+            raise CutoverError(
+                "--expected-cutover-script-sha256 must be lowercase SHA-256"
+            )
+        if (
+            args.expected_migration_applied_marker_candidate_commit
+            == args.expected_commit
+        ):
+            raise CutoverError(
+                "recovery script commit must differ from the runtime marker candidate"
+            )
+        if not re.fullmatch(
+            r"[A-Za-z0-9:_-]{1,200}",
+            args.expected_stale_reconciliation_run_id,
+        ):
+            raise CutoverError(
+                "--expected-stale-reconciliation-run-id is required and invalid"
+            )
+        if args.expected_stale_reconciliation_account_id not in ACCOUNT_ADDRESSES:
+            raise CutoverError(
+                "--expected-stale-reconciliation-account-id is required and invalid"
+            )
+        parse_rfc3339(args.expected_stale_reconciliation_started_at)
+    elif migration_applied_arguments:
+        raise CutoverError(
+            "MIGRATION_APPLIED identity and stale-run pins require "
+            "--resume-migration-applied"
         )
     if not re.fullmatch(r"[0-9a-f]{64}", args.expected_binary_sha256):
         raise CutoverError("--expected-binary-sha256 must be lowercase SHA-256")
@@ -7720,18 +8396,37 @@ def verify_final_closed_gates(database: DatabaseSession) -> None:
 def execute_cutover(args: argparse.Namespace) -> int:
     source_tree = args.candidate_source_tree.resolve(strict=True)
     binary, cutover_script = verify_candidate(args)
-    resume_identity = migration_0016_resume_identity(
+    script_identity = migration_0016_resume_identity(
         source_tree,
         args.expected_commit,
         args.expected_binary_sha256,
         cutover_script,
     )
+    resume_identity = script_identity
+    runtime_commit = args.expected_commit
     trading_environment = deploy.environment_file(ENV)
     prediction_environment = deploy.environment_file(PREDICTION_ENV)
     verify_runtime_environment(trading_environment)
+    migration_applied_release: pathlib.Path | None = None
     if args.resume_pre_adoption:
         verify_resume_environment(trading_environment)
         require_resume_runtime_state(args.expected_previous_commit)
+    elif args.resume_migration_applied:
+        verify_migration_applied_resume_environment(trading_environment)
+        runtime_commit = args.expected_migration_applied_marker_candidate_commit
+        resume_identity = migration_applied_runtime_identity(
+            source_tree, runtime_commit, args.expected_binary_sha256
+        )
+        verify_script_only_migration_applied_resume_candidate(
+            source_tree,
+            args.expected_commit,
+            args.expected_cutover_script_sha256,
+            cutover_script,
+            resume_identity,
+        )
+        migration_applied_release = require_migration_applied_runtime_state(
+            resume_identity
+        )
     else:
         current_health(args.expected_previous_commit)
     records = wallet_records()
@@ -7739,10 +8434,84 @@ def execute_cutover(args: argparse.Namespace) -> int:
     migration: MigrationSession | None = None
     backup: RuntimeBackup | None = None
     release: pathlib.Path | None = None
-    irreversible = False
+    irreversible = args.resume_migration_applied
     try:
         initial_state = read_database_preflight(database)
-        baseline_observed_at = validate_database_preflight(initial_state)
+        if args.resume_migration_applied:
+            baseline_observed_at = (
+                validate_database_preflight_before_stale_run_recovery(
+                    initial_state
+                )
+            )
+            migration = migration_session(
+                database, trading_environment, prediction_environment
+            )
+            marker, marker_sha256 = read_secure_resume_marker_with_sha256()
+            if (
+                validate_migration_resume_marker(
+                    marker, resume_identity, "present"
+                )
+                != "MIGRATION_APPLIED"
+            ):
+                raise CutoverError("resume marker is not exactly MIGRATION_APPLIED")
+            marker_audited = bool(
+                set(marker) & set(MIGRATION_APPLIED_RESUME_AUDIT_KEYS)
+            )
+            if not hmac.compare_digest(
+                marker_sha256,
+                args.expected_migration_applied_marker_sha256,
+            ) and not (
+                marker_audited
+                and hmac.compare_digest(
+                    str(marker.get("resumed_from_marker_sha256", "")),
+                    args.expected_migration_applied_marker_sha256,
+                )
+                and marker.get("resume_cutover_script_commit")
+                == args.expected_commit
+                and marker.get("resume_cutover_script_sha256")
+                == args.expected_cutover_script_sha256
+            ):
+                raise CutoverError(
+                    "MIGRATION_APPLIED marker SHA-256 did not match approval"
+                )
+            resume_schema_state = require_resume_migration_state(
+                database, migration, resume_identity
+            )
+            if resume_schema_state != "present":
+                raise CutoverError(
+                    "MIGRATION_APPLIED resume requires the complete 0016 schema"
+                )
+            if require_migration_applied_runtime_state(
+                resume_identity
+            ) != migration_applied_release:
+                raise CutoverError(
+                    "MIGRATION_APPLIED runtime changed before stale-run recovery"
+                )
+            recover_pinned_stale_reconciliation_run(
+                database,
+                args.expected_stale_reconciliation_run_id,
+                args.expected_stale_reconciliation_account_id,
+                args.expected_stale_reconciliation_started_at,
+            )
+            initial_state = read_database_preflight(database)
+            if validate_database_preflight(initial_state) != baseline_observed_at:
+                raise CutoverError(
+                    "immutable baseline changed during stale-run recovery"
+                )
+            require_resume_migration_state(database, migration, resume_identity)
+            authorize_migration_applied_resume_marker(
+                resume_identity,
+                args.expected_migration_applied_marker_sha256,
+                args.expected_commit,
+                args.expected_cutover_script_sha256,
+            )
+            log(
+                "RESUME_MIGRATION_APPLIED=AUTHORIZED runtime_health=stopped "
+                "migration_0016=present immutable_artifacts=0 "
+                "evidence_reuse=false old_binary_rollback_forbidden=true"
+            )
+        else:
+            baseline_observed_at = validate_database_preflight(initial_state)
         if args.resume_pre_adoption:
             migration = migration_session(
                 database, trading_environment, prediction_environment
@@ -7761,7 +8530,7 @@ def execute_cutover(args: argparse.Namespace) -> int:
                 "RESUME_PRE_ADOPTION=AUTHORIZED old_health=skipped "
                 f"migration_0016={resume_schema_state} evidence_reuse=false"
             )
-        else:
+        elif not args.resume_migration_applied:
             require_resume_marker_absent()
             if classify_migration_0016_presence(
                 migration_0016_presence(database)
@@ -7781,9 +8550,16 @@ def execute_cutover(args: argparse.Namespace) -> int:
             str(wallet_1_baseline_rows[0]["observed_at"])
         )
         backup = backup_runtime(ENV.read_text(encoding="utf-8"))
-        release = install_release(
-            binary, args.expected_commit, args.expected_binary_sha256
-        )
+        if args.resume_migration_applied:
+            if migration_applied_release is None:
+                raise CutoverError("MIGRATION_APPLIED candidate release was not pinned")
+            selected_release = require_migration_applied_runtime_state(resume_identity)
+            if selected_release != migration_applied_release:
+                raise CutoverError("MIGRATION_APPLIED candidate release changed")
+        else:
+            release = install_release(
+                binary, args.expected_commit, args.expected_binary_sha256
+            )
 
         log("PHASE=close-gates-and-stop")
         close_mutable_gates(database, "POSITION_ADOPTION_STAGING")
@@ -7836,12 +8612,12 @@ def execute_cutover(args: argparse.Namespace) -> int:
             migration,
             source_tree,
             resume_identity,
-            args.resume_pre_adoption,
+            args.resume_pre_adoption or args.resume_migration_applied,
         )
         configure_candidate_environment()
         run_candidate_schema_probe(
             binary, {**trading_environment, "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "true"},
-            backup, args.expected_commit
+            backup, runtime_commit
         )
 
         log("PHASE=candidate-account-isolated-reconciliation")
@@ -7849,6 +8625,8 @@ def execute_cutover(args: argparse.Namespace) -> int:
         # update account/position ledgers, or refresh an order before returning.
         # From process launch onward, selecting the old binary is therefore not
         # a safe recovery action even though the adoption transaction has not run.
+        if args.resume_migration_applied:
+            release = migration_applied_release
         irreversible = True
         pre_reconciliation = run_candidate_pre_adoption_reconciliation(
             binary,
@@ -7874,7 +8652,7 @@ def execute_cutover(args: argparse.Namespace) -> int:
         sell_plan = build_sell_plan(trading_environment, fifo, state)
         adopted_at = database_clock(database)
         manifest = build_evidence_manifest(
-            candidate_commit=args.expected_commit,
+            candidate_commit=runtime_commit,
             candidate_binary_sha256=args.expected_binary_sha256,
             cutover_script=cutover_script,
             migration=migration_result,
@@ -8013,7 +8791,7 @@ def execute_cutover(args: argparse.Namespace) -> int:
         configure_candidate_environment()
         start_at = database_clock(database)
         start_service()
-        health = wait_for_candidate_health(args.expected_commit)
+        health = wait_for_candidate_health(runtime_commit)
         verify_running_candidate(release, args.expected_binary_sha256)
         reconciliation = verify_post_adoption_reconciliation(database, start_at)
         python_inputs = wait_for_python_inputs(
@@ -8023,7 +8801,8 @@ def execute_cutover(args: argparse.Namespace) -> int:
 
         result = {
             "completed_at": rfc3339(utc_now()),
-            "candidate_commit": args.expected_commit,
+            "candidate_commit": runtime_commit,
+            "cutover_script_commit": args.expected_commit,
             "candidate_binary_sha256": args.expected_binary_sha256,
             "release": str(release),
             "previous_release": str(backup.previous_release),
