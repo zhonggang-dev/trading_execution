@@ -44,8 +44,8 @@ func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
-		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
 	]`)
@@ -55,6 +55,10 @@ func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if !config.DecisionCycle.RequireCompleteModelCoverage || len(config.DecisionCycle.Bindings) != 4 ||
+		config.DecisionCycle.Bindings[0].ExecutionAccountID != "main" ||
+		config.DecisionCycle.Bindings[0].StrategyID != "multfactor_v2" ||
+		config.DecisionCycle.Bindings[1].ExecutionAccountID != "wallet-1" ||
+		config.DecisionCycle.Bindings[1].StrategyID != "multfactor_v1" ||
 		config.DecisionCycle.Bindings[2].PredictionModelID != "gemini-3.6-flash" ||
 		config.DecisionCycle.Bindings[2].ModelID != "gemini_masked" {
 		t.Fatalf("decision routes = %#v", config.DecisionCycle.Bindings)
@@ -79,8 +83,8 @@ func TestLoadAcceptsExplicitLiveDecisionSubmission(t *testing.T) {
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
-		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
 	]`)
