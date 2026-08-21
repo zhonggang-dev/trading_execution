@@ -9,9 +9,11 @@ lots.  It never enables order submission and never opens the database kill
 switch.
 
 The migration is additive and is installed before a candidate paper-mode
-schema probe.  The adoption transaction is the irreversible boundary.  A
-failure before that boundary restores the old runtime; a failure afterwards
-keeps the candidate selected, keeps all gates closed, and requires fix-forward.
+schema probe.  Launching the live candidate reconciliation is the irreversible
+boundary because it can durably recover a fill before the adoption transaction.
+A failure before that boundary restores the old runtime files while deliberately
+leaving the service stopped; a failure afterwards keeps the candidate selected,
+keeps all gates closed, and requires fix-forward.
 
 Running without the exact --execute-token performs local argument/self checks
 only and cannot touch production.
@@ -21,8 +23,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import datetime as dt
+import errno
+import fcntl
 import hashlib
 import hmac
 import json
@@ -40,8 +45,8 @@ import time
 import urllib.parse
 import urllib.error
 import urllib.request
-from collections.abc import Iterable
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from collections.abc import Iterable, Iterator
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -291,10 +296,21 @@ SERVICE = "trading-execution.service"
 HEALTH_URL = "http://127.0.0.1:14000/health/live"
 READY_URL = "http://127.0.0.1:14000/health/ready"
 PROBE_URL = "http://127.0.0.1:14101/health/ready"
+CUTOVER_LOCK = pathlib.Path("/run/lock/trading-execution-position-adoption.lock")
+MIGRATION_0016_RESUME_MARKER = pathlib.Path(
+    "/etc/trading-execution/position-adoption-0016-resume.json"
+)
+SERVICE_PORTS = (14000, 14101)
 ACTOR = "position-adoption-cutover-20260821"
 EXPECTED_PREVIOUS_COMMIT = "49f50538f3189e82738f291ed3e923b0caaa8512"
+EXPECTED_PREVIOUS_RELEASE = RELEASES / "49f5053"
 EXECUTE_TOKEN = "ADOPT_EXTERNAL_POSITIONS_WITH_GATES_CLOSED_20260821"
+MIGRATION_0016_ABSENT = "false|false|false|false|false|false"
+MIGRATION_0016_PRESENT = "true|true|true|true|true|true"
 PUSD_ADDRESS = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+LEGACY_USDC_E_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+CONDITIONAL_TOKENS_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 POLYGON_CHAIN_ID = 137
 STANDARD_EXCHANGE = "0xe111180000d2663c0091e4f400237545b87b996b"
 NEG_RISK_EXCHANGE = "0xe2222d279d744050d28e00520010520000310f59"
@@ -303,6 +319,15 @@ ORDER_FILLED_TOPIC = (
 )
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+)
+ERC1155_TRANSFER_SINGLE_TOPIC = (
+    "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+)
+ERC1155_TRANSFER_BATCH_TOPIC = (
+    "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
+)
+POSITIONS_MERGE_TOPIC = (
+    "0x6f13ca62553fcc2bcd2372180a43949c1e4cebba603901ede2f4e14f36b282ca"
 )
 
 NONTERMINAL_ORDER_STATUSES = (
@@ -370,6 +395,24 @@ WALLET_3_TOKEN_A = (
 WALLET_3_TOKEN_B = (
     "94909497204791422218953326989433848804063787259853889845128791095089809741999"
 )
+WALLET_1_POSITION_DEBIT = {
+    "event_type": "POSITION_DEBIT",
+    "activity_type": "MERGE",
+    "condition_id": "0x1e5204036bd51e6ca0e0da6221319c5839bd9940782adc6d0f6fa703aa8a3bf4",
+    "token_id": WALLET_1_TOKEN,
+    "shares": "0.99111",
+    "timestamp": 1786280847,
+    "transaction_hash": "0xbafae73b80a44dc62203898124ab41a504715d874cac0e449de92eb0e9925d2e",
+    "block_number": 91717213,
+    "block_hash": "0x710401b78a6ef29891227f8c40c74dea8026deb61b5b16ae1e38df73f222b947",
+    "ctf_burn_log_index": 1161,
+    "collateral_transfer_log_index": 1162,
+    "positions_merge_log_index": 1163,
+    "data_api_avg_price": "0.5526",
+    "clob_component_count": 14,
+    "post_merge_buy_shares": "72",
+    "post_merge_buy_gross": "39.79",
+}
 
 KNOWN_POSITIONS = {
     "main": {
@@ -507,6 +550,45 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
+@contextlib.contextmanager
+def exclusive_cutover_lock(path: pathlib.Path = CUTOVER_LOCK) -> Iterator[None]:
+    """Hold one non-inheritable host lock for the complete production run."""
+
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError as error:
+            raise CutoverError(f"cannot open exclusive cutover lock: {path}") from error
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+        ):
+            raise CutoverError("exclusive cutover lock file ownership/type is unsafe")
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise CutoverError("another position-adoption cutover is running") from error
+            raise CutoverError("cannot acquire exclusive cutover lock") from error
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+        os.fsync(fd)
+        yield
+    finally:
+        if fd >= 0:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -544,6 +626,22 @@ def decimal_text(value: object, field: str = "decimal") -> str:
     if "." in rendered:
         rendered = rendered.rstrip("0").rstrip(".")
     return rendered or "0"
+
+
+def decimal_display_precision(value: object, field: str = "decimal") -> int:
+    """Return the decimal places carried by a wire/display value."""
+    result = decimal(value, field)
+    precision = max(0, -result.as_tuple().exponent)
+    if precision > 18:
+        raise CutoverError(f"{field} carries unsupported display precision")
+    return precision
+
+
+def round_half_up(value: Decimal, precision: int) -> Decimal:
+    if isinstance(precision, bool) or precision < 0 or precision > 18:
+        raise CutoverError("decimal display precision is invalid")
+    quantum = Decimal(1).scaleb(-precision)
+    return value.quantize(quantum, rounding=ROUND_HALF_UP)
 
 
 def base_units(value: int, decimals: int = 6) -> Decimal:
@@ -984,6 +1082,72 @@ def fetch_data_api_positions(base_url: str, account_id: str) -> dict[str, object
     }
 
 
+def fetch_wallet_1_merge_activity(base_url: str) -> dict[str, object]:
+    started_at = utc_now()
+    pages: list[object] = []
+    matches: list[dict[str, object]] = []
+    expected_tx = str(WALLET_1_POSITION_DEBIT["transaction_hash"])
+    for page_number in range(20):
+        endpoint = urllib.parse.urljoin(base_url.rstrip("/") + "/", "activity")
+        endpoint += "?" + urllib.parse.urlencode(
+            {
+                "user": ACCOUNT_ADDRESSES["wallet-1"],
+                "type": "MERGE",
+                "limit": "500",
+                "offset": str(page_number * 500),
+            }
+        )
+        page = get_json(endpoint)
+        if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+            raise CutoverError("Data API activity response is not an object array")
+        pages.append(page)
+        for item in page:
+            transaction_hash = str(
+                item.get("transactionHash") or item.get("transaction_hash") or ""
+            ).strip().lower()
+            if transaction_hash == expected_tx:
+                matches.append(item)
+        if len(page) < 500:
+            break
+    else:
+        raise CutoverError("Data API MERGE activity pagination exceeded 20 pages")
+    if len(matches) != 1:
+        raise CutoverError("Data API did not return one exact wallet-1 MERGE activity")
+    value = matches[0]
+    raw_timestamp = value.get("timestamp")
+    if isinstance(raw_timestamp, bool) or not str(raw_timestamp).isdigit():
+        raise CutoverError("Data API MERGE activity timestamp is invalid")
+    timestamp = int(str(raw_timestamp))
+    canonical = {
+        "proxy_wallet": str(
+            value.get("proxyWallet") or value.get("proxy_wallet") or ""
+        ).strip().lower(),
+        "transaction_hash": expected_tx,
+        "condition_id": str(
+            value.get("conditionId") or value.get("condition_id") or ""
+        ).strip().lower(),
+        "activity_type": str(value.get("type", "")).strip().upper(),
+        "shares": decimal_text(value.get("size"), "Data API MERGE size"),
+        "timestamp": timestamp,
+    }
+    if (
+        canonical["proxy_wallet"] != ACCOUNT_ADDRESSES["wallet-1"]
+        or canonical["condition_id"] != WALLET_1_POSITION_DEBIT["condition_id"]
+        or canonical["activity_type"] != "MERGE"
+        or canonical["shares"] != WALLET_1_POSITION_DEBIT["shares"]
+        or canonical["timestamp"] != WALLET_1_POSITION_DEBIT["timestamp"]
+    ):
+        raise CutoverError("Data API wallet-1 MERGE activity identity changed")
+    completed_at = utc_now()
+    return {
+        "started_at": rfc3339(started_at),
+        "completed_at": rfc3339(completed_at),
+        "raw_sha256": sha256_bytes(canonical_json(pages)),
+        "canonical_sha256": sha256_bytes(canonical_json(canonical)),
+        "canonical_activity": canonical,
+    }
+
+
 def validate_known_position_snapshot(
     account_id: str, items: list[dict[str, object]]
 ) -> None:
@@ -1155,14 +1319,16 @@ def dual_venue_snapshot(
     dict[str, dict[str, object]],
     dict[str, dict[str, object]],
     dict[str, dict[str, object]],
+    dict[str, object],
 ]:
     first = capture_all_positions(data_api_url)
     first_gamma = capture_gamma_identities(gamma_url, first)
+    first_merge_activity = fetch_wallet_1_merge_activity(data_api_url)
     boundary = database_clock(database).replace(microsecond=0) + dt.timedelta(seconds=4)
     if any(
         parse_rfc3339(str(item["completed_at"])) >= boundary
         for item in first.values()
-    ):
+    ) or parse_rfc3339(str(first_merge_activity["completed_at"])) >= boundary:
         raise CutoverError("snapshot A did not complete before the evidence boundary")
     while utc_now() <= boundary + dt.timedelta(seconds=1):
         time.sleep(0.25)
@@ -1170,10 +1336,11 @@ def dual_venue_snapshot(
         raise CutoverError("database clock did not cross the evidence boundary")
     second = capture_all_positions(data_api_url)
     second_gamma = capture_gamma_identities(gamma_url, second)
+    second_merge_activity = fetch_wallet_1_merge_activity(data_api_url)
     if any(
         parse_rfc3339(str(item["started_at"])) <= boundary
         for item in second.values()
-    ):
+    ) or parse_rfc3339(str(second_merge_activity["started_at"])) <= boundary:
         raise CutoverError("snapshot B did not begin after the evidence boundary")
     for account_id in ACCOUNT_ADDRESSES:
         if position_stability_projection(
@@ -1182,7 +1349,14 @@ def dual_venue_snapshot(
             raise CutoverError(f"dual Data API snapshots differ for {account_id}")
     if first_gamma != second_gamma:
         raise CutoverError("dual Gamma identity snapshots differ")
-    return boundary, first, second, second_gamma
+    if first_merge_activity["canonical_activity"] != second_merge_activity[
+        "canonical_activity"
+    ]:
+        raise CutoverError("dual Data API MERGE activity snapshots differ")
+    return boundary, first, second, second_gamma, {
+        "snapshot_a": first_merge_activity,
+        "snapshot_b": second_merge_activity,
+    }
 
 
 def clob_server_time(base_url: str) -> int:
@@ -1222,6 +1396,28 @@ def clob_auth_headers(
     }
 
 
+def require_confirmed_component_economics(component: dict[str, object]) -> None:
+    if component.get("status") != "CONFIRMED":
+        raise CutoverError("non-confirmed CLOB component cannot enter economic history")
+    side = str(component.get("side", "")).strip().upper()
+    shares = decimal_text(component.get("shares"), "confirmed CLOB component shares")
+    price = decimal_text(component.get("price"), "confirmed CLOB component price")
+    price_display_precision = component.get("price_display_precision")
+    if (
+        side not in {"BUY", "SELL"}
+        or decimal(shares) <= 0
+        or not (Decimal(0) < decimal(price) < Decimal(1))
+        or component.get("side") != side
+        or component.get("shares") != shares
+        or component.get("price") != price
+        or isinstance(price_display_precision, bool)
+        or not isinstance(price_display_precision, int)
+        or price_display_precision < 1
+        or price_display_precision > 18
+    ):
+        raise CutoverError("confirmed CLOB component has invalid economic identity")
+
+
 def clob_history_for_token(
     account_index: dict[str, object],
     account_id: str,
@@ -1235,11 +1431,15 @@ def clob_history_for_token(
         not isinstance(item, dict) for item in components
     ):
         raise CutoverError("CLOB account component history is invalid")
-    normalized = [
-        item
-        for item in components
-        if item.get("condition_id") == condition_id and item.get("token_id") == token_id
-    ]
+    normalized: list[dict[str, object]] = []
+    for item in components:
+        if (
+            item.get("condition_id") == condition_id
+            and item.get("token_id") == token_id
+            and item.get("status") == "CONFIRMED"
+        ):
+            require_confirmed_component_economics(item)
+            normalized.append(item)
     if not normalized:
         raise CutoverError(f"CLOB account history is empty for {account_id}/{token_id}")
     indexed: dict[tuple[str, str], dict[str, object]] = {}
@@ -1347,6 +1547,306 @@ def stable_receipt(
     return first, confirmations
 
 
+def stable_receipt_block(
+    rpc_url: str, receipt: dict[str, object]
+) -> dict[str, object]:
+    block_hash = str(receipt.get("blockHash", "")).strip().lower()
+    first = rpc_json(rpc_url, "eth_getBlockByHash", [block_hash, False])
+    second = rpc_json(rpc_url, "eth_getBlockByHash", [block_hash, False])
+    if not isinstance(first, dict) or first != second:
+        raise CutoverError("Polygon receipt block changed across reads")
+    number = _hex_quantity(first.get("number"), "receipt block number")
+    timestamp = _hex_quantity(first.get("timestamp"), "receipt block timestamp")
+    if (
+        str(first.get("hash", "")).strip().lower() != block_hash
+        or number != _hex_quantity(receipt.get("blockNumber"), "receipt blockNumber")
+        or timestamp <= 0
+    ):
+        raise CutoverError("Polygon receipt block identity changed")
+    return {
+        "block_number": number,
+        "block_hash": block_hash,
+        "block_timestamp": timestamp,
+    }
+
+
+def _hex_data(value: object, field: str) -> bytes:
+    raw = str(value or "").strip().lower()
+    if not re.fullmatch(r"0x(?:[0-9a-f]{2})*", raw):
+        raise CutoverError(f"{field} is not canonical hex data")
+    return bytes.fromhex(raw[2:])
+
+
+def _address_word(value: bytes, field: str) -> str:
+    if len(value) != 32 or any(value[:12]):
+        raise CutoverError(f"{field} is not a canonical ABI address")
+    return "0x" + value[12:].hex()
+
+
+def decode_erc20_transfer_events(
+    receipt: dict[str, object], token_address: str
+) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for item in receipt["logs"]:
+        if str(item.get("address", "")).strip().lower() != token_address:
+            continue
+        topics = item.get("topics")
+        if (
+            not isinstance(topics, list)
+            or not topics
+            or str(topics[0]).strip().lower() != ERC20_TRANSFER_TOPIC
+        ):
+            continue
+        if len(topics) != 3:
+            raise CutoverError("ERC20 Transfer event has an unexpected topic count")
+        amount = int.from_bytes(
+            _hex_bytes(item.get("data"), 32, "ERC20 Transfer amount"), "big"
+        )
+        result.append(
+            {
+                "log_index": _hex_quantity(item.get("logIndex"), "ERC20 Transfer logIndex"),
+                "source": _address_topic(topics[1], "ERC20 Transfer from"),
+                "target": _address_topic(topics[2], "ERC20 Transfer to"),
+                "amount_base_units": str(amount),
+                "amount": decimal_text(base_units(amount)),
+            }
+        )
+    return result
+
+
+def erc20_transfer_delta(
+    receipt: dict[str, object], token_address: str, wallet_address: str
+) -> Decimal:
+    delta = 0
+    for event in decode_erc20_transfer_events(receipt, token_address):
+        amount = int(str(event["amount_base_units"]))
+        if event["target"] == wallet_address:
+            delta += amount
+        if event["source"] == wallet_address:
+            delta -= amount
+    return base_units(delta)
+
+
+def ctf_balance_of_evidence(
+    rpc_url: str,
+    wallet_address: str,
+    token_id: str,
+    rpc_call: object = None,
+) -> dict[str, object]:
+    if not re.fullmatch(r"[0-9]+", token_id):
+        raise CutoverError("CTF balanceOf token id is invalid")
+    numeric_token_id = int(token_id)
+    if numeric_token_id >= 1 << 256:
+        raise CutoverError("CTF balanceOf token id exceeds uint256")
+    call_data = (
+        "0x00fdd58e"
+        + ("0" * 24)
+        + wallet_address[2:]
+        + numeric_token_id.to_bytes(32, "big").hex()
+    )
+    reader = rpc_json if rpc_call is None else rpc_call
+    if not callable(reader):
+        raise CutoverError("CTF balance RPC reader is invalid")
+    first_head_raw = reader(rpc_url, "eth_blockNumber", [])
+    pinned_block_number = _hex_quantity(first_head_raw, "first CTF balance head")
+    pinned_block_tag = hex(pinned_block_number)
+    first_block = reader(
+        rpc_url, "eth_getBlockByNumber", [pinned_block_tag, False]
+    )
+    first_raw = reader(
+        rpc_url,
+        "eth_call",
+        [{"to": CONDITIONAL_TOKENS_ADDRESS, "data": call_data}, pinned_block_tag],
+    )
+    second_raw = reader(
+        rpc_url,
+        "eth_call",
+        [{"to": CONDITIONAL_TOKENS_ADDRESS, "data": call_data}, pinned_block_tag],
+    )
+    second_block = reader(
+        rpc_url, "eth_getBlockByNumber", [pinned_block_tag, False]
+    )
+    second_head_raw = reader(rpc_url, "eth_blockNumber", [])
+    if (
+        not isinstance(first_block, dict)
+        or not isinstance(second_block, dict)
+        or first_block != second_block
+        or not isinstance(first_raw, str)
+        or not isinstance(second_raw, str)
+        or not re.fullmatch(r"0x[0-9a-fA-F]{64}", first_raw)
+        or not re.fullmatch(r"0x[0-9a-fA-F]{64}", second_raw)
+        or first_raw.lower() != second_raw.lower()
+    ):
+        raise CutoverError("CTF balanceOf pinned block/value changed across exact reads")
+    second_head = _hex_quantity(second_head_raw, "second CTF balance head")
+    block_number = _hex_quantity(first_block.get("number"), "CTF balance block number")
+    block_hash = str(first_block.get("hash", "")).strip().lower()
+    block_timestamp = _hex_quantity(
+        first_block.get("timestamp"), "CTF balance block timestamp"
+    )
+    if (
+        block_number != pinned_block_number
+        or not re.fullmatch(r"0x[0-9a-f]{64}", block_hash)
+        or block_hash == "0x" + "0" * 64
+        or block_timestamp <= 0
+    ):
+        raise CutoverError("CTF balance pinned block identity is invalid")
+    if second_head < pinned_block_number:
+        raise CutoverError("Polygon chain head regressed across CTF balance reads")
+    balance = base_units(int(first_raw, 16))
+    return {
+        "contract": CONDITIONAL_TOKENS_ADDRESS,
+        "method": "balanceOf(address,uint256)",
+        "wallet_address": wallet_address,
+        "token_id": token_id,
+        "block_tag": pinned_block_tag,
+        "block_number": block_number,
+        "block_hash": block_hash,
+        "block_timestamp": block_timestamp,
+        "call_data": call_data,
+        "observed_head_before": pinned_block_number,
+        "observed_head_after": second_head,
+        "response_a": first_raw.lower(),
+        "response_b": second_raw.lower(),
+        "balance": decimal_text(balance),
+    }
+
+
+def require_ctf_balance_progression(
+    previous: dict[str, object], current: dict[str, object], label: str
+) -> None:
+    identity_fields = ("contract", "method", "wallet_address", "token_id", "call_data")
+    if any(previous.get(field) != current.get(field) for field in identity_fields):
+        raise CutoverError(f"{label} CTF balance identity changed")
+    previous_number = previous.get("block_number")
+    current_number = current.get("block_number")
+    if (
+        isinstance(previous_number, bool)
+        or not isinstance(previous_number, int)
+        or isinstance(current_number, bool)
+        or not isinstance(current_number, int)
+        or current_number < previous_number
+        or (
+            current_number == previous_number
+            and current.get("block_hash") != previous.get("block_hash")
+        )
+    ):
+        raise CutoverError(f"{label} CTF balance block pin regressed or changed")
+
+
+def decode_ctf_transfer_events(receipt: dict[str, object]) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for item in receipt["logs"]:
+        if str(item.get("address", "")).strip().lower() != CONDITIONAL_TOKENS_ADDRESS:
+            continue
+        topics = item.get("topics")
+        if not isinstance(topics, list) or not topics:
+            continue
+        topic = str(topics[0]).strip().lower()
+        if topic not in {ERC1155_TRANSFER_SINGLE_TOPIC, ERC1155_TRANSFER_BATCH_TOPIC}:
+            continue
+        if len(topics) != 4:
+            raise CutoverError("CTF transfer event has an unexpected topic count")
+        common = {
+            "event_type": "TransferSingle" if topic == ERC1155_TRANSFER_SINGLE_TOPIC else "TransferBatch",
+            "log_index": _hex_quantity(item.get("logIndex"), "CTF transfer logIndex"),
+            "operator": _address_topic(topics[1], "CTF transfer operator"),
+            "source": _address_topic(topics[2], "CTF transfer from"),
+            "target": _address_topic(topics[3], "CTF transfer to"),
+        }
+        if topic == ERC1155_TRANSFER_SINGLE_TOPIC:
+            data = _hex_bytes(item.get("data"), 64, "CTF TransferSingle data")
+            token_ids = [int.from_bytes(data[:32], "big")]
+            amounts = [int.from_bytes(data[32:], "big")]
+        else:
+            data = _hex_data(item.get("data"), "CTF TransferBatch data")
+            if len(data) < 128 or len(data) % 32:
+                raise CutoverError("CTF TransferBatch data length is invalid")
+            token_offset = int.from_bytes(data[:32], "big")
+            amount_offset = int.from_bytes(data[32:64], "big")
+            if token_offset != 64:
+                raise CutoverError("CTF TransferBatch token offset is non-canonical")
+            token_count = int.from_bytes(data[64:96], "big")
+            expected_amount_offset = 96 + token_count * 32
+            if amount_offset != expected_amount_offset or amount_offset + 32 > len(data):
+                raise CutoverError("CTF TransferBatch amount offset is non-canonical")
+            amount_count = int.from_bytes(data[amount_offset : amount_offset + 32], "big")
+            expected_length = amount_offset + 32 + amount_count * 32
+            if token_count != amount_count or expected_length != len(data):
+                raise CutoverError("CTF TransferBatch arrays are not exact parallel arrays")
+            token_ids = [
+                int.from_bytes(data[96 + index * 32 : 128 + index * 32], "big")
+                for index in range(token_count)
+            ]
+            amounts = [
+                int.from_bytes(
+                    data[amount_offset + 32 + index * 32 : amount_offset + 64 + index * 32],
+                    "big",
+                )
+                for index in range(amount_count)
+            ]
+        result.append(
+            {
+                **common,
+                "transfers": [
+                    {
+                        "token_id": str(token_id),
+                        "amount_base_units": str(amount),
+                        "amount": decimal_text(base_units(amount)),
+                    }
+                    for token_id, amount in zip(token_ids, amounts)
+                ],
+            }
+        )
+    return result
+
+
+def decode_positions_merge_events(receipt: dict[str, object]) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for item in receipt["logs"]:
+        if str(item.get("address", "")).strip().lower() != CONDITIONAL_TOKENS_ADDRESS:
+            continue
+        topics = item.get("topics")
+        if (
+            not isinstance(topics, list)
+            or not topics
+            or str(topics[0]).strip().lower() != POSITIONS_MERGE_TOPIC
+        ):
+            continue
+        if len(topics) != 4:
+            raise CutoverError("PositionsMerge event has an unexpected topic count")
+        data = _hex_data(item.get("data"), "PositionsMerge data")
+        if len(data) < 128 or len(data) % 32:
+            raise CutoverError("PositionsMerge data length is invalid")
+        collateral = _address_word(data[:32], "PositionsMerge collateral")
+        partition_offset = int.from_bytes(data[32:64], "big")
+        amount = int.from_bytes(data[64:96], "big")
+        if partition_offset != 96:
+            raise CutoverError("PositionsMerge partition offset is non-canonical")
+        partition_count = int.from_bytes(data[96:128], "big")
+        if len(data) != 128 + partition_count * 32:
+            raise CutoverError("PositionsMerge partition length is non-canonical")
+        partition = [
+            int.from_bytes(data[128 + index * 32 : 160 + index * 32], "big")
+            for index in range(partition_count)
+        ]
+        result.append(
+            {
+                "log_index": _hex_quantity(item.get("logIndex"), "PositionsMerge logIndex"),
+                "stakeholder": _address_topic(topics[1], "PositionsMerge stakeholder"),
+                "parent_collection_id": "0x"
+                + _hex_bytes(topics[2], 32, "PositionsMerge parentCollectionId").hex(),
+                "condition_id": "0x"
+                + _hex_bytes(topics[3], 32, "PositionsMerge conditionId").hex(),
+                "collateral": collateral,
+                "partition": partition,
+                "amount_base_units": str(amount),
+                "amount": decimal_text(base_units(amount)),
+            }
+        )
+    return result
+
+
 def decode_order_filled_events(
     receipt: dict[str, object], confirmations: int
 ) -> list[dict[str, object]]:
@@ -1391,25 +1891,59 @@ def decode_order_filled_events(
 
 
 def pusd_transfer_delta(receipt: dict[str, object], wallet_address: str) -> Decimal:
-    delta = 0
-    for item in receipt["logs"]:
-        if str(item.get("address", "")).strip().lower() != PUSD_ADDRESS:
-            continue
-        topics = item.get("topics")
-        if (
-            not isinstance(topics, list)
-            or len(topics) != 3
-            or str(topics[0]).strip().lower() != ERC20_TRANSFER_TOPIC
-        ):
-            continue
-        source = _address_topic(topics[1], "pUSD Transfer from")
-        target = _address_topic(topics[2], "pUSD Transfer to")
-        amount = int.from_bytes(_hex_bytes(item.get("data"), 32, "pUSD Transfer amount"), "big")
-        if target == wallet_address:
-            delta += amount
-        if source == wallet_address:
-            delta -= amount
-    return base_units(delta)
+    return erc20_transfer_delta(receipt, PUSD_ADDRESS, wallet_address)
+
+
+def finalized_order_filled_economics(
+    trade: dict[str, object], event: dict[str, object]
+) -> dict[str, str]:
+    """Derive economics from the finalized event; CLOB price is display-only."""
+    if trade.get("side") != event.get("side"):
+        raise CutoverError("CLOB side differs from finalized OrderFilled side")
+    if trade["side"] == "BUY":
+        gross = base_units(int(str(event["maker_amount_base_units"])))
+        shares = base_units(int(str(event["taker_amount_base_units"])))
+    elif trade["side"] == "SELL":
+        shares = base_units(int(str(event["maker_amount_base_units"])))
+        gross = base_units(int(str(event["taker_amount_base_units"])))
+    else:
+        raise CutoverError("CLOB trade side is invalid")
+    fee = base_units(int(str(event["fee_base_units"])))
+    if shares <= 0 or gross <= 0 or fee < 0:
+        raise CutoverError("finalized OrderFilled economics are not positive")
+
+    # Shares still provide an exact CLOB/on-chain identity cross-check.  Price
+    # does not: /data/trades can expose a rounded display value.  The receipt
+    # amounts are authoritative, and the effective price need only round
+    # HALF_UP to the CLOB value at the precision actually returned by CLOB.
+    clob_shares = decimal(trade["shares"], "CLOB shares")
+    clob_price = decimal(trade["price"], "CLOB display price")
+    precision = trade.get("price_display_precision")
+    if shares != clob_shares:
+        raise CutoverError("CLOB shares differ from finalized OrderFilled shares")
+    if (
+        isinstance(precision, bool)
+        or not isinstance(precision, int)
+        or precision < 1
+        or precision > 18
+    ):
+        raise CutoverError("CLOB display price precision is invalid")
+    effective_price = gross / shares
+    if round_half_up(effective_price, precision) != clob_price:
+        raise CutoverError(
+            "CLOB display price is inconsistent with finalized OrderFilled amounts"
+        )
+
+    net_cash = -(gross + fee) if trade["side"] == "BUY" else gross - fee
+    if trade["side"] == "SELL" and net_cash < 0:
+        raise CutoverError("finalized SELL fee exceeds gross proceeds")
+    return {
+        "shares": decimal_text(shares),
+        "effective_price": decimal_text(effective_price),
+        "gross_notional": decimal_text(gross),
+        "total_fee": decimal_text(fee),
+        "net_cash_delta": decimal_text(net_cash),
+    }
 
 
 def verify_trade_event(
@@ -1433,32 +1967,320 @@ def verify_trade_event(
     if len(matches) != 1:
         raise CutoverError("receipt does not contain one exact account OrderFilled event")
     event = matches[0]
-    if trade["side"] == "BUY":
-        gross = base_units(int(str(event["maker_amount_base_units"])))
-        shares = base_units(int(str(event["taker_amount_base_units"])))
-    else:
-        shares = base_units(int(str(event["maker_amount_base_units"])))
-        gross = base_units(int(str(event["taker_amount_base_units"])))
-    fee = base_units(int(str(event["fee_base_units"])))
-    if shares != decimal(trade["shares"]):
-        raise CutoverError("CLOB shares differ from finalized OrderFilled shares")
-    expected_micro = decimal(trade["shares"]) * decimal(trade["price"]) * Decimal(1_000_000)
-    allowed = {
-        int(expected_micro.to_integral_value(rounding=ROUND_FLOOR)),
-        int(expected_micro.to_integral_value(rounding=ROUND_CEILING)),
-    }
-    if int(gross * Decimal(1_000_000)) not in allowed:
-        raise CutoverError("CLOB price/shares differ from finalized OrderFilled gross")
-    net_cash = -(gross + fee) if trade["side"] == "BUY" else gross - fee
-    if trade["side"] == "SELL" and net_cash < 0:
-        raise CutoverError("finalized SELL fee exceeds gross proceeds")
+    economics = finalized_order_filled_economics(trade, event)
     return {
         **trade,
-        "gross_notional": decimal_text(gross),
-        "total_fee": decimal_text(fee),
-        "net_cash_delta": decimal_text(net_cash),
+        "clob_reported_shares": trade["shares"],
+        "clob_reported_price": trade["price"],
+        "shares": economics["shares"],
+        "price": economics["effective_price"],
+        **economics,
         "settlement_evidence": event,
     }
+
+
+def verify_wallet_1_fifo_component_chronology(
+    rpc_url: str,
+    required_confirmations: int,
+    trades: list[dict[str, object]],
+    receipt_cache: dict[str, tuple[dict[str, object], int]],
+    merge_block_number: int,
+    merge_time: dt.datetime,
+    receipt_reader: object = stable_receipt,
+    block_reader: object = stable_receipt_block,
+    event_verifier: object = verify_trade_event,
+) -> list[dict[str, object]]:
+    """Pin every wallet-1 FIFO component and its order around the MERGE."""
+
+    if not all(callable(value) for value in (receipt_reader, block_reader, event_verifier)):
+        raise CutoverError("wallet-1 FIFO evidence reader is invalid")
+    verified_components: list[dict[str, object]] = []
+    previous_chain_order: tuple[int, int, int] | None = None
+    for trade in trades:
+        require_confirmed_component_economics(trade)
+        match_time = parse_rfc3339(str(trade["match_time"]))
+        if match_time == merge_time:
+            raise CutoverError("wallet-1 CLOB history is ambiguous at the MERGE second")
+        tx_hash = str(trade["transaction_hash"])
+        if tx_hash not in receipt_cache:
+            receipt_cache[tx_hash] = receipt_reader(
+                rpc_url, tx_hash, required_confirmations
+            )
+        receipt, confirmations = receipt_cache[tx_hash]
+        verified = event_verifier(
+            trade, receipt, confirmations, "wallet-1", False
+        )
+        block = block_reader(rpc_url, receipt)
+        transaction_index = _hex_quantity(
+            receipt.get("transactionIndex"), "wallet-1 receipt transactionIndex"
+        )
+        settlement = verified.get("settlement_evidence")
+        if (
+            not isinstance(settlement, dict)
+            or settlement.get("block_number") != block["block_number"]
+            or settlement.get("block_hash") != block["block_hash"]
+        ):
+            raise CutoverError("wallet-1 OrderFilled block evidence changed")
+        if match_time < merge_time:
+            chronology_side = "PRE_MERGE"
+            if int(block["block_number"]) >= merge_block_number:
+                raise CutoverError(
+                    "wallet-1 pre-MERGE CLOB match finalized at/after the MERGE"
+                )
+        else:
+            chronology_side = "POST_MERGE"
+            if int(block["block_number"]) <= merge_block_number:
+                raise CutoverError(
+                    "wallet-1 post-MERGE CLOB match finalized at/before the MERGE"
+                )
+        chain_order = (
+            int(block["block_number"]),
+            transaction_index,
+            int(settlement["log_index"]),
+        )
+        if previous_chain_order is not None and chain_order <= previous_chain_order:
+            raise CutoverError(
+                "wallet-1 CLOB match-time order differs from finalized chain order"
+            )
+        previous_chain_order = chain_order
+        verified_components.append(
+            {
+                **verified,
+                "chronology_side": chronology_side,
+                "settlement_block": block,
+                "transaction_index": transaction_index,
+                "chain_order": list(chain_order),
+                "polygon_receipt_sha256": sha256_bytes(canonical_json(receipt)),
+            }
+        )
+    if not verified_components:
+        raise CutoverError("wallet-1 finalized FIFO component evidence is empty")
+    return verified_components
+
+
+def verify_wallet_1_position_debit(
+    rpc_url: str,
+    required_confirmations: int,
+    snapshot_a: dict[str, dict[str, object]],
+    snapshot_b: dict[str, dict[str, object]],
+    gamma: dict[str, dict[str, object]],
+    merge_activity_evidence: dict[str, object],
+    wallet_1_baseline_observed_at: dt.datetime,
+) -> dict[str, object]:
+    expected = WALLET_1_POSITION_DEBIT
+    wallet = ACCOUNT_ADDRESSES["wallet-1"]
+    condition_id = str(expected["condition_id"])
+    token_id = str(expected["token_id"])
+    transaction_hash = str(expected["transaction_hash"])
+
+    def position_item(
+        snapshot: dict[str, dict[str, object]], label: str
+    ) -> dict[str, object]:
+        account = snapshot.get("wallet-1")
+        if not isinstance(account, dict):
+            raise CutoverError(f"{label} omitted wallet-1")
+        items = account.get("canonical_items")
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise CutoverError(f"{label} wallet-1 position set is invalid")
+        matches = [item for item in items if item.get("token_id") == token_id]
+        if len(matches) != 1:
+            raise CutoverError(f"{label} omitted exact wallet-1 target position")
+        return matches[0]
+
+    position_a = position_item(snapshot_a, "Data API snapshot A")
+    position_b = position_item(snapshot_b, "Data API snapshot B")
+    if position_stability_projection({"canonical_items": [position_a]}) != (
+        position_stability_projection({"canonical_items": [position_b]})
+    ):
+        raise CutoverError("wallet-1 target position changed across Data API snapshots")
+    if (
+        position_b.get("condition_id") != condition_id
+        or position_b.get("shares") != KNOWN_POSITIONS["wallet-1"][token_id]["shares"]
+        or position_b.get("avg_price") != expected["data_api_avg_price"]
+    ):
+        raise CutoverError("wallet-1 Data API shares/avgPrice changed from approved values")
+
+    activity_a = merge_activity_evidence.get("snapshot_a")
+    activity_b = merge_activity_evidence.get("snapshot_b")
+    if not isinstance(activity_a, dict) or not isinstance(activity_b, dict):
+        raise CutoverError("wallet-1 MERGE dual activity evidence is invalid")
+    canonical_activity_a = activity_a.get("canonical_activity")
+    canonical_activity_b = activity_b.get("canonical_activity")
+    if (
+        not isinstance(canonical_activity_a, dict)
+        or canonical_activity_a != canonical_activity_b
+        or canonical_activity_a.get("transaction_hash") != transaction_hash
+        or canonical_activity_a.get("condition_id") != condition_id
+        or canonical_activity_a.get("shares") != expected["shares"]
+        or canonical_activity_a.get("timestamp") != expected["timestamp"]
+    ):
+        raise CutoverError("wallet-1 MERGE activity evidence changed identity")
+
+    occurred_at = dt.datetime.fromtimestamp(
+        int(str(expected["timestamp"])), tz=dt.timezone.utc
+    )
+    if occurred_at > wallet_1_baseline_observed_at:
+        raise CutoverError("wallet-1 MERGE is not pre-baseline POSITION_DEBIT evidence")
+
+    market = gamma.get(condition_id)
+    if not isinstance(market, dict):
+        raise CutoverError("Gamma omitted wallet-1 MERGE market")
+    outcomes = market.get("outcomes")
+    if (
+        not isinstance(outcomes, list)
+        or len(outcomes) != 2
+        or any(not isinstance(item, dict) for item in outcomes)
+    ):
+        raise CutoverError("Gamma wallet-1 MERGE outcome mapping is invalid")
+    outcome_tokens = [str(item.get("token_id", "")) for item in outcomes]
+    if token_id not in outcome_tokens or len(set(outcome_tokens)) != 2:
+        raise CutoverError("Gamma wallet-1 target/complement mapping changed")
+    complement_token_id = next(item for item in outcome_tokens if item != token_id)
+
+    receipt, confirmations = stable_receipt(
+        rpc_url, transaction_hash, required_confirmations
+    )
+    if (
+        str(receipt.get("from", "")).strip().lower() != wallet
+        or str(receipt.get("to", "")).strip().lower()
+        != CONDITIONAL_TOKENS_ADDRESS
+    ):
+        raise CutoverError("wallet-1 MERGE transaction is not a direct funder-to-CTF call")
+    block = stable_receipt_block(rpc_url, receipt)
+    if (
+        block["block_number"] != expected["block_number"]
+        or block["block_hash"] != expected["block_hash"]
+        or block["block_timestamp"] != expected["timestamp"]
+    ):
+        raise CutoverError("wallet-1 MERGE finalized block identity changed")
+    if decode_order_filled_events(receipt, confirmations):
+        raise CutoverError("wallet-1 MERGE receipt unexpectedly contains OrderFilled")
+
+    ctf_events = decode_ctf_transfer_events(receipt)
+    wallet_ctf_events = [
+        item
+        for item in ctf_events
+        if item["source"] == wallet or item["target"] == wallet
+    ]
+    burn_matches = [
+        item
+        for item in wallet_ctf_events
+        if item["log_index"] == expected["ctf_burn_log_index"]
+    ]
+    if len(wallet_ctf_events) != 1 or len(burn_matches) != 1:
+        raise CutoverError("wallet-1 MERGE has ambiguous CTF wallet transfers")
+    burn = burn_matches[0]
+    transfers = burn.get("transfers")
+    if not isinstance(transfers, list) or len(transfers) != 2:
+        raise CutoverError("wallet-1 MERGE CTF burn is not an exact pair")
+    transfer_amounts = {
+        str(item.get("token_id")): str(item.get("amount_base_units"))
+        for item in transfers
+        if isinstance(item, dict)
+    }
+    expected_base_units = str(int(decimal(expected["shares"]) * Decimal(1_000_000)))
+    if (
+        burn["event_type"] != "TransferBatch"
+        or burn["operator"] != wallet
+        or burn["source"] != wallet
+        or burn["target"] != ZERO_ADDRESS
+        or transfer_amounts
+        != {token_id: expected_base_units, complement_token_id: expected_base_units}
+    ):
+        raise CutoverError("wallet-1 MERGE CTF burn identity/economics changed")
+
+    collateral_events = decode_erc20_transfer_events(receipt, LEGACY_USDC_E_ADDRESS)
+    wallet_collateral_events = [
+        item
+        for item in collateral_events
+        if item["source"] == wallet or item["target"] == wallet
+    ]
+    collateral_matches = [
+        item
+        for item in wallet_collateral_events
+        if item["log_index"] == expected["collateral_transfer_log_index"]
+    ]
+    if len(wallet_collateral_events) != 1 or len(collateral_matches) != 1:
+        raise CutoverError("wallet-1 MERGE has ambiguous legacy collateral transfers")
+    collateral_transfer = collateral_matches[0]
+    if (
+        collateral_transfer["source"] != CONDITIONAL_TOKENS_ADDRESS
+        or collateral_transfer["target"] != wallet
+        or collateral_transfer["amount_base_units"] != expected_base_units
+        or erc20_transfer_delta(receipt, LEGACY_USDC_E_ADDRESS, wallet)
+        != decimal(expected["shares"])
+    ):
+        raise CutoverError("wallet-1 MERGE legacy collateral transfer changed")
+    if pusd_transfer_delta(receipt, wallet) != 0:
+        raise CutoverError("wallet-1 legacy MERGE unexpectedly changed current pUSD")
+
+    merge_events = decode_positions_merge_events(receipt)
+    wallet_merge_events = [item for item in merge_events if item["stakeholder"] == wallet]
+    merge_matches = [
+        item
+        for item in wallet_merge_events
+        if item["log_index"] == expected["positions_merge_log_index"]
+    ]
+    if len(wallet_merge_events) != 1 or len(merge_matches) != 1:
+        raise CutoverError("wallet-1 MERGE has ambiguous PositionsMerge events")
+    merge = merge_matches[0]
+    if (
+        merge["parent_collection_id"] != "0x" + "0" * 64
+        or merge["condition_id"] != condition_id
+        or merge["collateral"] != LEGACY_USDC_E_ADDRESS
+        or merge["partition"] != [1, 2]
+        or merge["amount_base_units"] != expected_base_units
+    ):
+        raise CutoverError("wallet-1 PositionsMerge identity/economics changed")
+
+    latest_balance = ctf_balance_of_evidence(rpc_url, wallet, token_id)
+    if latest_balance["balance"] != position_b["shares"] or latest_balance[
+        "balance"
+    ] != "1":
+        raise CutoverError("wallet-1 CTF balance does not equal Data API/approved shares")
+
+    fifo_event = {
+        "event_type": "POSITION_DEBIT",
+        "side": "POSITION_DEBIT",
+        "source": "POLYGON_CTF_POSITIONS_MERGE",
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "shares": str(expected["shares"]),
+        "match_time": rfc3339(occurred_at),
+        "last_update": rfc3339(occurred_at),
+        "transaction_hash": transaction_hash,
+        "position_debit_id": stable_id(
+            "position-debit", "wallet-1", token_id, transaction_hash
+        ),
+    }
+    evidence = {
+        "schema": "trading.external-position-debit-evidence.v1",
+        "execution_account_id": "wallet-1",
+        "economic_treatment": (
+            "PRE_BASELINE_POSITION_DEBIT_LEGACY_COLLATERAL_ALREADY_CAPTURED_"
+            "NO_CURRENT_PUSD_CASH_ADJUSTMENT"
+        ),
+        "fifo_event": fifo_event,
+        "data_api_merge_activity": merge_activity_evidence,
+        "data_api_position_snapshot_a": position_a,
+        "data_api_position_snapshot_b": position_b,
+        "gamma_market": market,
+        "complement_token_id": complement_token_id,
+        "transaction": {
+            "transaction_hash": transaction_hash,
+            "from": str(receipt["from"]).lower(),
+            "to": str(receipt["to"]).lower(),
+        },
+        "polygon_receipt_sha256": sha256_bytes(canonical_json(receipt)),
+        "confirmations": confirmations,
+        "block": block,
+        "ctf_burn": burn,
+        "legacy_collateral_transfer": collateral_transfer,
+        "positions_merge": merge,
+        "current_pusd_cash_delta": "0",
+        "latest_ctf_balance": latest_balance,
+    }
+    return {**evidence, "evidence_sha256": sha256_bytes(canonical_json(evidence))}
 
 
 def reconstruct_fifo(
@@ -1470,14 +2292,18 @@ def reconstruct_fifo(
         if trade["side"] == "BUY":
             queue.append({**trade, "remaining_shares": shares})
             continue
-        remaining_sell = shares
-        while remaining_sell > 0:
+        if trade["side"] not in {"SELL", "POSITION_DEBIT"}:
+            raise CutoverError("FIFO history contains an unsupported position event")
+        remaining_debit = shares
+        while remaining_debit > 0:
             if not queue:
-                raise CutoverError("FIFO history has a SELL before sufficient account BUYs")
+                raise CutoverError(
+                    "FIFO history has a position debit before sufficient account BUYs"
+                )
             head = queue[0]
-            consumed = min(decimal(head["remaining_shares"]), remaining_sell)
+            consumed = min(decimal(head["remaining_shares"]), remaining_debit)
             head["remaining_shares"] = decimal(head["remaining_shares"]) - consumed
-            remaining_sell -= consumed
+            remaining_debit -= consumed
             if decimal(head["remaining_shares"]) == 0:
                 queue.pop(0)
     residual = [item for item in queue if decimal(item["remaining_shares"]) > 0]
@@ -1505,8 +2331,12 @@ def reconstruct_fifo(
 def collect_trade_and_fifo_evidence(
     environment: dict[str, str],
     records: dict[str, dict[str, object]],
-    snapshot: dict[str, dict[str, object]],
-    baseline_observed_at: dt.datetime,
+    snapshot_a: dict[str, dict[str, object]],
+    snapshot_b: dict[str, dict[str, object]],
+    gamma: dict[str, dict[str, object]],
+    merge_activity_evidence: dict[str, object],
+    main_baseline_observed_at: dt.datetime,
+    wallet_1_baseline_observed_at: dt.datetime,
 ) -> tuple[
     dict[str, object],
     dict[tuple[str, str], dict[str, object]],
@@ -1522,6 +2352,15 @@ def collect_trade_and_fifo_evidence(
     histories: dict[str, object] = {}
     fifo: dict[tuple[str, str], dict[str, object]] = {}
     receipt_cache: dict[str, tuple[dict[str, object], int]] = {}
+    wallet_1_position_debit = verify_wallet_1_position_debit(
+        rpc_url,
+        required_confirmations,
+        snapshot_a,
+        snapshot_b,
+        gamma,
+        merge_activity_evidence,
+        wallet_1_baseline_observed_at,
+    )
     # Fetch one complete, funder-isolated history per account.  Token histories
     # are projections of owned components, never top-level trade.asset_id: a
     # MAKER trade can have a different top-level taker asset.
@@ -1531,6 +2370,18 @@ def collect_trade_and_fifo_evidence(
         )
         for account_id in ACCOUNT_ADDRESSES
     }
+    snapshot_items_a = {
+        (account_id, str(item["token_id"])): item
+        for account_id, value in snapshot_a.items()
+        for item in value["canonical_items"]
+    }
+    snapshot_items_b = {
+        (account_id, str(item["token_id"])): item
+        for account_id, value in snapshot_b.items()
+        for item in value["canonical_items"]
+    }
+    if set(snapshot_items_a) != set(snapshot_items_b):
+        raise CutoverError("dual Data API position identity sets differ")
     for account_id in ("main", "wallet-1", "wallet-3"):
         for token_id, approved in KNOWN_POSITIONS[account_id].items():
             if approved["action"] != "ADOPT":
@@ -1541,9 +2392,117 @@ def collect_trade_and_fifo_evidence(
                 str(approved["condition_id"]),
                 token_id,
             )
+            if account_id == "wallet-1" and token_id == WALLET_1_TOKEN:
+                fifo_event = wallet_1_position_debit["fifo_event"]
+                debit_time = parse_rfc3339(str(fifo_event["match_time"]))
+                finalized_components = verify_wallet_1_fifo_component_chronology(
+                    rpc_url,
+                    required_confirmations,
+                    history["trades"],
+                    receipt_cache,
+                    int(wallet_1_position_debit["block"]["block_number"]),
+                    debit_time,
+                )
+                if len(finalized_components) != int(
+                    WALLET_1_POSITION_DEBIT["clob_component_count"]
+                ):
+                    raise CutoverError(
+                        "wallet-1 finalized CLOB component count changed"
+                    )
+                clob_sha256 = history["normalized_sha256"]
+                ordered_events = sorted(
+                    [*history["trades"], fifo_event],
+                    key=lambda item: (
+                        parse_rfc3339(str(item["match_time"])),
+                        str(item.get("trade_id", "")),
+                        str(item.get("order_hash", "")),
+                        str(item.get("position_debit_id", "")),
+                    ),
+                )
+                history = {
+                    **history,
+                    "clob_normalized_sha256": clob_sha256,
+                    "finalized_clob_components": finalized_components,
+                    "finalized_clob_components_sha256": sha256_bytes(
+                        canonical_json(finalized_components)
+                    ),
+                    "position_debits": [fifo_event],
+                    "trades": ordered_events,
+                    "normalized_sha256": sha256_bytes(canonical_json(ordered_events)),
+                }
             key = account_id + ":" + token_id
             histories[key] = history
             rebuilt = reconstruct_fifo(history, str(approved["shares"]))
+
+            if account_id == "wallet-1" and token_id == WALLET_1_TOKEN:
+                debit_time = parse_rfc3339(
+                    str(wallet_1_position_debit["fifo_event"]["match_time"])
+                )
+                post_merge_buys = [
+                    item
+                    for item in history["trades"]
+                    if item["side"] == "BUY"
+                    and parse_rfc3339(str(item["match_time"])) > debit_time
+                ]
+                if not post_merge_buys:
+                    raise CutoverError("wallet-1 has no post-MERGE BUY evidence")
+                verified_post_merge_buys: list[dict[str, object]] = []
+                for trade in post_merge_buys:
+                    tx_hash = str(trade["transaction_hash"])
+                    if tx_hash not in receipt_cache:
+                        receipt_cache[tx_hash] = stable_receipt(
+                            rpc_url, tx_hash, required_confirmations
+                        )
+                    receipt, confirmations = receipt_cache[tx_hash]
+                    verified_post_merge_buys.append(
+                        verify_trade_event(
+                            trade,
+                            receipt,
+                            confirmations,
+                            "wallet-1",
+                            bool(approved["neg_risk"]),
+                        )
+                    )
+                post_merge_shares = sum(
+                    (decimal(item["shares"]) for item in verified_post_merge_buys),
+                    Decimal(0),
+                )
+                post_merge_gross = sum(
+                    (
+                        decimal(item["gross_notional"])
+                        for item in verified_post_merge_buys
+                    ),
+                    Decimal(0),
+                )
+                data_api_avg = decimal(
+                    snapshot_items_b[(account_id, token_id)]["avg_price"]
+                )
+                if (
+                    post_merge_shares
+                    != decimal(WALLET_1_POSITION_DEBIT["post_merge_buy_shares"])
+                    or post_merge_gross
+                    != decimal(WALLET_1_POSITION_DEBIT["post_merge_buy_gross"])
+                    or round_half_up(
+                        post_merge_gross / post_merge_shares,
+                        decimal_display_precision(
+                            snapshot_items_b[(account_id, token_id)]["avg_price"],
+                            "wallet-1 Data API avgPrice",
+                        ),
+                    )
+                    != data_api_avg
+                ):
+                    raise CutoverError(
+                        "wallet-1 post-MERGE finalized BUY basis no longer explains Data API avgPrice"
+                    )
+                wallet_1_position_debit["post_merge_buy_basis"] = {
+                    "verified_buys": verified_post_merge_buys,
+                    "shares": decimal_text(post_merge_shares),
+                    "gross_notional": decimal_text(post_merge_gross),
+                    "weighted_price": decimal_text(post_merge_gross / post_merge_shares),
+                    "data_api_avg_price": decimal_text(data_api_avg),
+                    "comparison": "HALF_UP_AT_DATA_API_DISPLAY_PRECISION",
+                }
+
             verified_acquisitions: list[dict[str, object]] = []
             total_cost = Decimal(0)
             total_gross = Decimal(0)
@@ -1579,20 +2538,56 @@ def collect_trade_and_fifo_evidence(
                 )
             shares = decimal(rebuilt["shares"])
             rebuilt["residual_acquisitions"] = verified_acquisitions
-            rebuilt["remaining_cost"] = decimal_text(total_cost)
-            rebuilt["average_entry_price"] = decimal_text(total_gross / shares)
+            data_item_a = snapshot_items_a.get((account_id, token_id))
+            data_item_b = snapshot_items_b.get((account_id, token_id))
+            if (
+                not isinstance(data_item_a, dict)
+                or not isinstance(data_item_b, dict)
+                or data_item_a.get("avg_price") != data_item_b.get("avg_price")
+                or data_item_b.get("shares") != rebuilt["shares"]
+            ):
+                raise CutoverError(
+                    f"dual Data API adoption basis changed for {account_id}/{token_id}"
+                )
+            data_api_average = decimal(
+                data_item_b["avg_price"], "Data API avgPrice adoption basis"
+            )
+            settlement_weighted_price = total_gross / shares
+            rebuilt["settlement_remaining_cost"] = decimal_text(total_cost)
+            rebuilt["settlement_remaining_gross"] = decimal_text(total_gross)
+            rebuilt["settlement_weighted_price"] = decimal_text(
+                settlement_weighted_price
+            )
+            rebuilt["settlement_weighted_rounds_to_data_api_avg"] = (
+                round_half_up(
+                    settlement_weighted_price,
+                    decimal_display_precision(
+                        data_item_b["avg_price"], "Data API avgPrice"
+                    ),
+                )
+                == data_api_average
+            )
+            # The externally visible/Python adoption price intentionally
+            # follows the stable dual Data API avgPrice.  FIFO settlement
+            # evidence proves continuity and the conservative hold clock, but
+            # does not create a synthetic historical fill or override the page.
+            rebuilt["remaining_cost"] = decimal_text(shares * data_api_average)
+            rebuilt["average_entry_price"] = decimal_text(data_api_average)
+            rebuilt["cost_basis_source"] = "DUAL_DATA_API_AVG_PRICE"
+            rebuilt["data_api_snapshot_a_avg_price"] = data_item_a["avg_price"]
+            rebuilt["data_api_snapshot_b_avg_price"] = data_item_b["avg_price"]
             fifo[(account_id, token_id)] = rebuilt
 
     main_history = histories["main:" + MAIN_ACTIVE_TOKEN]
     post_baseline = [
         item
         for item in main_history["trades"]
-        if parse_rfc3339(str(item["match_time"])) > baseline_observed_at
+        if parse_rfc3339(str(item["match_time"])) > main_baseline_observed_at
     ]
     if not post_baseline or any(item["side"] != "SELL" for item in post_baseline):
         raise CutoverError("main active token has a post-baseline trade that is not an external SELL")
     current_main_items = {
-        str(item["token_id"]): item for item in snapshot["main"]["canonical_items"]
+        str(item["token_id"]): item for item in snapshot_b["main"]["canonical_items"]
     }
     current_main_shares = decimal(current_main_items[MAIN_ACTIVE_TOKEN]["shares"])
     expected_disposed = Decimal("278.14") - current_main_shares
@@ -1639,10 +2634,20 @@ def collect_trade_and_fifo_evidence(
         Decimal(0),
     ) != total_cash:
         raise CutoverError("transaction pUSD deltas do not sum to the main cash adjustment")
+    position_debit_body = {
+        key: value
+        for key, value in wallet_1_position_debit.items()
+        if key != "evidence_sha256"
+    }
+    wallet_1_position_debit = {
+        **position_debit_body,
+        "evidence_sha256": sha256_bytes(canonical_json(position_debit_body)),
+    }
     evidence = {
         "schema": "trading.position-adoption-trade-evidence.v1",
         "captured_at": rfc3339(utc_now()),
         "histories": histories,
+        "wallet_1_pre_baseline_position_debit": wallet_1_position_debit,
         "fifo": {
             account + ":" + token: value
             for (account, token), value in sorted(fifo.items())
@@ -1665,13 +2670,15 @@ def normalize_owned_account_trade_components(
     trade_id = str(trade.get("id", "")).strip()
     condition_id = str(trade.get("market", "")).strip().lower()
     status = str(trade.get("status", "")).strip().upper()
+    status = status.removeprefix("TRADE_STATUS_")
     transaction_hash = str(trade.get("transaction_hash", "")).strip().lower()
     trader_side = str(trade.get("trader_side", "")).strip().upper()
     top_level_maker = str(trade.get("maker_address", "")).strip().lower()
+    supported_statuses = {"MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"}
     if (
         not trade_id
         or not re.fullmatch(r"0x[0-9a-f]{64}", condition_id)
-        or status != "CONFIRMED"
+        or status not in supported_statuses
         or not re.fullmatch(r"0x[0-9a-f]{64}", transaction_hash)
     ):
         raise CutoverError("CLOB account history contains incomplete trade identity")
@@ -1688,6 +2695,7 @@ def normalize_owned_account_trade_components(
     common = {
         "trade_id": trade_id,
         "condition_id": condition_id,
+        "status": status,
         "transaction_hash": transaction_hash,
         "match_time": rfc3339(match_time),
         "last_update": rfc3339(last_update),
@@ -1704,17 +2712,26 @@ def normalize_owned_account_trade_components(
         normalized_order = str(order_id or "").strip().lower()
         normalized_token = str(token_id or "").strip()
         side = str(side_value or "").strip().upper()
-        shares = decimal_text(shares_value, "owned CLOB component shares")
-        price = decimal_text(price_value, "owned CLOB component price")
         if (
             not re.fullmatch(r"0x[0-9a-f]{64}", normalized_order)
             or not re.fullmatch(r"[0-9]+", normalized_token)
-            or side not in {"BUY", "SELL"}
-            or decimal(shares) <= 0
-            or not (Decimal(0) < decimal(price) < Decimal(1))
         ):
-            raise CutoverError("owned CLOB trade component has invalid economic identity")
-        return {
+            raise CutoverError("owned CLOB trade component has invalid order/token identity")
+        if status == "CONFIRMED":
+            shares = decimal_text(shares_value, "confirmed CLOB component shares")
+            price = decimal_text(price_value, "confirmed CLOB component price")
+            price_display_precision: int | None = decimal_display_precision(
+                price_value, "confirmed CLOB component price"
+            )
+        else:
+            # Reconciliation ownership needs only the exact account/order/token
+            # identity.  Non-final wire rows can legitimately omit economics;
+            # retain their normalized raw values in the stability hash without
+            # treating them as a fill or FIFO acquisition.
+            shares = "" if shares_value is None else str(shares_value).strip()
+            price = "" if price_value is None else str(price_value).strip()
+            price_display_precision = None
+        result = {
             **common,
             "venue_order_id": normalized_order,
             "order_hash": normalized_order,
@@ -1722,9 +2739,13 @@ def normalize_owned_account_trade_components(
             "side": side,
             "shares": shares,
             "price": price,
+            "price_display_precision": price_display_precision,
             "ownership_role": role,
             "liquidity_role": "MAKER" if role == "MAKER" else "TAKER",
         }
+        if status == "CONFIRMED":
+            require_confirmed_component_economics(result)
+        return result
 
     owned_maker_rows = [
         item
@@ -1986,6 +3007,9 @@ SELECT json_build_object(
   'pending_buy_deliveries',(SELECT count(*) FROM strategy_order_intent_deliveries
     WHERE status IN ('PENDING','SUBMITTING')
       AND upper(COALESCE(intent_payload->>'side',intent_payload#>>'{{order,side}}',''))='BUY'),
+  'running_reconciliations',(SELECT count(*) FROM reconciliation_runs
+    WHERE execution_account_id IN ('main','wallet-1','wallet-2','wallet-3')
+      AND status='RUNNING'),
   'positions',(SELECT COALESCE(json_agg(row_to_json(x) ORDER BY execution_account_id,token_id),'[]'::json)
     FROM (SELECT execution_account_id,market_id,condition_id,token_id,outcome_index,outcome_name,
                  total_shares::text,available_shares::text,reserved_shares::text,
@@ -2065,7 +3089,13 @@ def validate_database_preflight(state: dict[str, object]) -> dt.datetime:
         or any(item.get("paused") is not False for item in controls)
     ):
         raise CutoverError("four-wallet risk authorization is not in the approved staged state")
-    for key in ("nonterminal_orders", "active_reservations", "pending_deliveries", "pending_buy_deliveries"):
+    for key in (
+        "nonterminal_orders",
+        "active_reservations",
+        "pending_deliveries",
+        "pending_buy_deliveries",
+        "running_reconciliations",
+    ):
         if state.get(key) != 0:
             raise CutoverError(f"unsafe pre-existing state: {key}={state.get(key)}")
 
@@ -2180,6 +3210,124 @@ def current_health(expected_commit: str) -> dict[str, object]:
     return result
 
 
+def require_service_stopped() -> None:
+    state = deploy.run(
+        ["systemctl", "is-active", SERVICE], capture=True, check=False
+    ).stdout.strip()
+    if state not in {"inactive", "failed"}:
+        raise CutoverError(f"Trading service is not stopped: {state or 'unknown'}")
+    main_pid = deploy.run(
+        ["systemctl", "show", SERVICE, "-p", "MainPID", "--value"], capture=True
+    ).stdout.strip()
+    if not main_pid.isdigit() or int(main_pid) != 0:
+        raise CutoverError("stopped Trading service still has a MainPID")
+
+
+def listening_tcp_ports(
+    ports: Iterable[int], proc_net_root: pathlib.Path = pathlib.Path("/proc/net")
+) -> list[int]:
+    expected = set(ports)
+    listening: set[int] = set()
+    inspected = 0
+    for name in ("tcp", "tcp6"):
+        path = proc_net_root / name
+        try:
+            lines = path.read_text(encoding="ascii").splitlines()
+        except FileNotFoundError:
+            continue
+        except PermissionError as error:
+            raise CutoverError(f"cannot inspect TCP listeners in {path}") from error
+        inspected += 1
+        for line in lines[1:]:
+            fields = line.split()
+            if len(fields) < 4:
+                raise CutoverError(f"invalid TCP listener data in {path}")
+            if fields[3] != "0A":
+                continue
+            try:
+                port = int(fields[1].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError) as error:
+                raise CutoverError(f"invalid TCP listener address in {path}") from error
+            if port in expected:
+                listening.add(port)
+    if inspected == 0:
+        raise CutoverError("/proc TCP listener tables are unavailable")
+    return sorted(listening)
+
+
+def trading_execution_process_ids(
+    proc_root: pathlib.Path = pathlib.Path("/proc"),
+) -> list[int]:
+    if not proc_root.is_dir():
+        raise CutoverError("/proc is unavailable for stopped-runtime verification")
+    result: list[int] = []
+    executable_name = "trading-execution"
+    truncated_comm = executable_name[:15]
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        identities: set[str] = set()
+        try:
+            identities.add(pathlib.Path(os.readlink(entry / "exe")).name)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        except PermissionError as error:
+            raise CutoverError(f"cannot inspect process {entry.name} executable") from error
+        try:
+            command = (entry / "cmdline").read_bytes().split(b"\0", 1)[0]
+            if command:
+                identities.add(pathlib.Path(os.fsdecode(command)).name)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        except PermissionError as error:
+            raise CutoverError(f"cannot inspect process {entry.name} command") from error
+        try:
+            command_name = (entry / "comm").read_text(encoding="utf-8").strip()
+            if command_name:
+                identities.add(command_name)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        except PermissionError as error:
+            raise CutoverError(f"cannot inspect process {entry.name} name") from error
+        if executable_name in identities or truncated_comm in identities:
+            result.append(int(entry.name))
+    return sorted(result)
+
+
+def require_resume_runtime_state(expected_previous_commit: str) -> pathlib.Path:
+    if expected_previous_commit != EXPECTED_PREVIOUS_COMMIT:
+        raise CutoverError("resume requires the pinned 49f5053 previous commit")
+    expected_release = EXPECTED_PREVIOUS_RELEASE
+    try:
+        release_info = expected_release.lstat()
+    except FileNotFoundError as error:
+        raise CutoverError("pinned previous release directory is missing") from error
+    if not stat.S_ISDIR(release_info.st_mode) or stat.S_ISLNK(release_info.st_mode):
+        raise CutoverError("pinned previous release path is not a real directory")
+    if not CURRENT.is_symlink():
+        raise CutoverError("current release path is not a symlink")
+    try:
+        selected_release = CURRENT.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise CutoverError("current release symlink is broken") from error
+    if selected_release != expected_release:
+        raise CutoverError("resume current release is not exactly pinned 49f5053")
+    require_service_stopped()
+    listeners = listening_tcp_ports(SERVICE_PORTS)
+    if listeners:
+        raise CutoverError(
+            "resume HTTP ports still have listeners: "
+            + ",".join(str(port) for port in listeners)
+        )
+    process_ids = trading_execution_process_ids()
+    if process_ids:
+        raise CutoverError(
+            "trading-execution process still exists: "
+            + ",".join(str(pid) for pid in process_ids)
+        )
+    return expected_release
+
+
 def verify_runtime_environment(environment: dict[str, str]) -> None:
     if environment.get("EXECUTION_MODE") != "live":
         raise CutoverError("Trading is not in live execution mode")
@@ -2197,6 +3345,14 @@ def verify_runtime_environment(environment: dict[str, str]) -> None:
         raise CutoverError("DECISION_CYCLE_BINDINGS_JSON is invalid") from error
     if bindings != BINDINGS:
         raise CutoverError("runtime four-wallet binding JSON changed")
+
+
+def verify_resume_environment(environment: dict[str, str]) -> None:
+    entry_disabled = environment.get("DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED")
+    if entry_disabled not in {None, "true"}:
+        raise CutoverError(
+            "resume entry-submission gate must be absent or explicitly true"
+        )
 
 
 def verify_candidate(
@@ -2319,6 +3475,191 @@ def write_private_json(path: pathlib.Path, value: object) -> None:
     )
 
 
+def _secure_marker_parent_fd(
+    path: pathlib.Path, expected_uid: int = 0, expected_gid: int = 0
+) -> int:
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        raise CutoverError("resume marker path is not an absolute file path")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path.parent, flags)
+    except OSError as error:
+        raise CutoverError("cannot open resume marker parent securely") from error
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != expected_uid
+        or info.st_gid != expected_gid
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        os.close(fd)
+        raise CutoverError("resume marker parent ownership/permissions are unsafe")
+    return fd
+
+
+def _decode_secure_resume_marker(
+    fd: int, expected_uid: int, expected_gid: int
+) -> dict[str, object]:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != expected_uid
+        or info.st_gid != expected_gid
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_size <= 0
+        or info.st_size > 64 * 1024
+    ):
+        raise CutoverError("resume marker ownership/type/permissions are unsafe")
+    chunks: list[bytes] = []
+    remaining = info.st_size
+    while remaining:
+        value = os.read(fd, min(remaining, 16 * 1024))
+        if not value:
+            raise CutoverError("resume marker was truncated during read")
+        chunks.append(value)
+        remaining -= len(value)
+    try:
+        decoded = json.loads(b"".join(chunks))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CutoverError("resume marker is not valid JSON") from error
+    if not isinstance(decoded, dict):
+        raise CutoverError("resume marker is not a JSON object")
+    return decoded
+
+
+def read_secure_resume_marker_if_present(
+    path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> dict[str, object] | None:
+    parent_fd = _secure_marker_parent_fd(path, expected_uid, expected_gid)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        try:
+            fd = os.open(path.name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise CutoverError("resume marker pathname is unsafe or unreadable") from error
+        try:
+            return _decode_secure_resume_marker(fd, expected_uid, expected_gid)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def read_secure_resume_marker(
+    path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> dict[str, object]:
+    marker = read_secure_resume_marker_if_present(path, expected_uid, expected_gid)
+    if marker is None:
+        raise CutoverError("required resume marker is unavailable")
+    return marker
+
+
+def require_resume_marker_absent(
+    path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    parent_fd = _secure_marker_parent_fd(path, expected_uid, expected_gid)
+    try:
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise CutoverError(
+            "fresh cutover found a resume marker; use the same candidate with "
+            "--resume-pre-adoption"
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def write_secure_resume_marker(
+    value: dict[str, object],
+    *,
+    create: bool,
+    path: pathlib.Path = MIGRATION_0016_RESUME_MARKER,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> dict[str, object]:
+    parent_fd = _secure_marker_parent_fd(path, expected_uid, expected_gid)
+    temporary_name = "." + path.name + "." + os.urandom(12).hex()
+    temporary_fd = -1
+    try:
+        if create:
+            try:
+                os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise CutoverError("resume marker already exists")
+        else:
+            # Refuse to replace an unsafe pathname, even though rename itself
+            # would not follow a final-component symlink.
+            read_secure_resume_marker(path, expected_uid, expected_gid)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        temporary_fd = os.open(
+            temporary_name, flags, 0o600, dir_fd=parent_fd
+        )
+        temporary_info = os.fstat(temporary_fd)
+        if (
+            temporary_info.st_uid != expected_uid
+            or temporary_info.st_gid != expected_gid
+        ):
+            os.fchown(temporary_fd, expected_uid, expected_gid)
+        os.fchmod(temporary_fd, 0o600)
+        payload = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(temporary_fd, payload[offset:])
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        if create:
+            # Publish without replacement: a concurrently-created marker (or
+            # any unsafe pathname) must win and make this bootstrap fail closed.
+            try:
+                os.link(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as error:
+                raise CutoverError("resume marker already exists") from error
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        else:
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        os.fsync(parent_fd)
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
+    return read_secure_resume_marker(path, expected_uid, expected_gid)
+
+
 def configure_candidate_environment() -> None:
     deploy.update_environment_file(
         ENV,
@@ -2345,6 +3686,34 @@ def require_migration_trigger_names(
         raise CutoverError(
             "0016 migration is missing required triggers: " + ",".join(missing)
         )
+
+
+def migration_0016_presence(database: DatabaseSession) -> str:
+    return db_scalar(
+        database,
+        r"""
+SELECT concat_ws('|',
+  (to_regclass('public.execution_external_position_adjustment_batches') IS NOT NULL)::text,
+  (to_regclass('public.execution_external_position_dispositions') IS NOT NULL)::text,
+  (to_regclass('public.execution_external_cash_adjustments') IS NOT NULL)::text,
+  (to_regclass('public.execution_external_position_adoptions') IS NOT NULL)::text,
+  EXISTS (SELECT 1 FROM information_schema.columns
+           WHERE table_schema='public' AND table_name='position_lots'
+             AND column_name='external_adoption_id')::text,
+  EXISTS (SELECT 1 FROM information_schema.columns
+           WHERE table_schema='public' AND table_name='position_events'
+             AND column_name='external_adoption_id')::text
+);
+""",
+    )
+
+
+def classify_migration_0016_presence(state: str) -> str:
+    if state == MIGRATION_0016_ABSENT:
+        return "absent"
+    if state == MIGRATION_0016_PRESENT:
+        return "present"
+    raise CutoverError("0016 schema is partially present")
 
 
 def migration_schema_assertions(database: DatabaseSession) -> None:
@@ -2444,43 +3813,230 @@ SELECT (
         raise CutoverError("0016 schema assertions failed")
 
 
+def migration_0016_resume_identity(
+    source_tree: pathlib.Path,
+    candidate_commit: str,
+    candidate_binary_sha256: str,
+    cutover_script: dict[str, str],
+) -> dict[str, str]:
+    relative_path = "migrations/0016_external_position_dispositions.sql"
+    path = source_tree / relative_path
+    deploy.require_regular(path)
+    script_path = str(cutover_script.get("path", ""))
+    script_sha256 = str(cutover_script.get("sha256", ""))
+    if (
+        script_path != "deploy/deploy_position_adoption_20260821.py"
+        or not re.fullmatch(r"[0-9a-f]{64}", script_sha256)
+    ):
+        raise CutoverError("candidate cutover script identity is invalid")
+    return {
+        "schema": "trading.position-adoption-resume.v1",
+        "actor": ACTOR,
+        "candidate_commit": candidate_commit,
+        "candidate_binary_sha256": candidate_binary_sha256,
+        "cutover_script_path": script_path,
+        "cutover_script_sha256": script_sha256,
+        "migration_path": relative_path,
+        "migration_sha256": deploy.sha256(path),
+    }
+
+
+def validate_migration_resume_marker(
+    marker: dict[str, object],
+    expected_identity: dict[str, str],
+    schema_state: str,
+) -> str:
+    phase = str(marker.get("phase", ""))
+    allowed_keys = set(expected_identity) | {
+        "phase",
+        "prepared_at",
+        "applied_at",
+        "adoption_committed_at",
+    }
+    if set(marker) - allowed_keys:
+        raise CutoverError("resume marker contains unsupported fields")
+    if {key: marker.get(key) for key in expected_identity} != expected_identity:
+        raise CutoverError("resume marker candidate/migration identity changed")
+    prepared_at = marker.get("prepared_at")
+    if not isinstance(prepared_at, str):
+        raise CutoverError("resume marker prepared_at is missing")
+    parse_rfc3339(prepared_at)
+    if phase == "PREPARED":
+        if marker.get("applied_at") is not None or marker.get(
+            "adoption_committed_at"
+        ) is not None:
+            raise CutoverError("PREPARED resume marker has later-phase timestamps")
+    elif phase == "MIGRATION_APPLIED":
+        applied_at = marker.get("applied_at")
+        if not isinstance(applied_at, str) or marker.get(
+            "adoption_committed_at"
+        ) is not None:
+            raise CutoverError("MIGRATION_APPLIED resume marker is malformed")
+        parse_rfc3339(applied_at)
+    elif phase == "ADOPTION_COMMITTED":
+        applied_at = marker.get("applied_at")
+        committed_at = marker.get("adoption_committed_at")
+        if not isinstance(applied_at, str) or not isinstance(committed_at, str):
+            raise CutoverError("ADOPTION_COMMITTED resume marker is malformed")
+        parse_rfc3339(applied_at)
+        parse_rfc3339(committed_at)
+    else:
+        raise CutoverError("resume marker phase is unsupported")
+    if schema_state == "absent" and phase != "PREPARED":
+        raise CutoverError("resume marker says migration applied but 0016 is absent")
+    if schema_state == "present" and phase not in {
+        "PREPARED",
+        "MIGRATION_APPLIED",
+    }:
+        raise CutoverError("resume marker is already past the pre-adoption boundary")
+    if schema_state == "committed" and phase != "ADOPTION_COMMITTED":
+        raise CutoverError("resume marker is not at the committed boundary")
+    if schema_state not in {"absent", "present", "committed"}:
+        raise CutoverError("resume marker schema state is unsupported")
+    return phase
+
+
+def mark_resume_adoption_committed(expected_identity: dict[str, str]) -> dict[str, object]:
+    marker = read_secure_resume_marker()
+    phase = validate_migration_resume_marker(marker, expected_identity, "present")
+    if phase != "MIGRATION_APPLIED":
+        raise CutoverError("adoption commit requires a MIGRATION_APPLIED resume marker")
+    committed = write_secure_resume_marker(
+        {
+            **marker,
+            "phase": "ADOPTION_COMMITTED",
+            "adoption_committed_at": rfc3339(utc_now()),
+        },
+        create=False,
+    )
+    if validate_migration_resume_marker(
+        committed, expected_identity, "committed"
+    ) != "ADOPTION_COMMITTED":
+        raise CutoverError("resume marker did not advance after adoption commit")
+    return committed
+
+
+def require_resume_migration_state(
+    database: DatabaseSession,
+    migration: MigrationSession,
+    expected_identity: dict[str, str],
+) -> str:
+    state = classify_migration_0016_presence(migration_0016_presence(database))
+    if state == "absent":
+        linked = db_scalar(
+            database,
+            "SELECT concat_ws('|',"
+            "(SELECT count(*) FROM position_events WHERE event_type='ADOPTED')::text,"
+            "(SELECT count(*) FROM execution_account_events "
+            " WHERE event_type='EXTERNAL_POSITION_DISPOSITION')::text)",
+        )
+        if linked != "0|0":
+            raise CutoverError("resume found linked adoption events without 0016 schema")
+        marker = read_secure_resume_marker_if_present()
+        if marker is None:
+            marker = write_secure_resume_marker(
+                {
+                    **expected_identity,
+                    "phase": "PREPARED",
+                    "prepared_at": rfc3339(utc_now()),
+                },
+                create=True,
+            )
+            log(
+                "RESUME_MARKER=BOOTSTRAPPED migration_0016=absent "
+                "linked_adoption_events=0"
+            )
+        validate_migration_resume_marker(marker, expected_identity, state)
+        return state
+
+    marker = read_secure_resume_marker()
+    validate_migration_resume_marker(marker, expected_identity, state)
+    migration_schema_assertions(database)
+    raw = migration_execute(
+        migration,
+        [
+            "-qAtc",
+            "SELECT concat_ws('|',"
+            "(SELECT count(*) FROM execution_external_position_adjustment_batches)::text,"
+            "(SELECT count(*) FROM execution_external_position_dispositions)::text,"
+            "(SELECT count(*) FROM execution_external_cash_adjustments)::text,"
+            "(SELECT count(*) FROM execution_external_position_adoptions)::text,"
+            "(SELECT count(*) FROM position_lots "
+            " WHERE external_adoption_id IS NOT NULL)::text,"
+            "(SELECT count(*) FROM position_events "
+            " WHERE external_adoption_id IS NOT NULL OR event_type='ADOPTED')::text,"
+            "(SELECT count(*) FROM execution_account_events "
+            " WHERE event_type='EXTERNAL_POSITION_DISPOSITION')::text)",
+        ],
+    )
+    require_zero_resume_artifact_counts(raw)
+    return state
+
+
+def require_zero_resume_artifact_counts(raw: str) -> None:
+    labels = (
+        "batches",
+        "dispositions",
+        "cash_adjustments",
+        "adoptions",
+        "linked_lots",
+        "linked_position_events",
+        "linked_account_events",
+    )
+    values = raw.split("|")
+    if len(values) != len(labels) or any(not value.isdigit() for value in values):
+        raise CutoverError("resume 0016 artifact count query was invalid")
+    nonzero = {
+        label: int(value)
+        for label, value in zip(labels, values)
+        if int(value) != 0
+    }
+    if nonzero:
+        raise CutoverError(
+            "resume requires zero immutable 0016/adoption artifacts: "
+            + ",".join(f"{key}={value}" for key, value in nonzero.items())
+        )
+
+
 def apply_migration_0016(
     database: DatabaseSession,
     migration: MigrationSession,
     source_tree: pathlib.Path,
+    resume_identity: dict[str, str],
+    resume: bool,
 ) -> dict[str, object]:
     path = source_tree / "migrations/0016_external_position_dispositions.sql"
     deploy.require_regular(path)
     require_migration_trigger_names(path.read_text(encoding="utf-8"))
     migration_sha256 = deploy.sha256(path)
-    state = db_scalar(
-        database,
-        r"""
-SELECT concat_ws('|',
-  (to_regclass('public.execution_external_position_adjustment_batches') IS NOT NULL)::text,
-  (to_regclass('public.execution_external_position_dispositions') IS NOT NULL)::text,
-  (to_regclass('public.execution_external_cash_adjustments') IS NOT NULL)::text,
-  (to_regclass('public.execution_external_position_adoptions') IS NOT NULL)::text,
-  EXISTS (SELECT 1 FROM information_schema.columns
-           WHERE table_schema='public' AND table_name='position_lots'
-             AND column_name='external_adoption_id')::text,
-  EXISTS (SELECT 1 FROM information_schema.columns
-           WHERE table_schema='public' AND table_name='position_events'
-             AND column_name='external_adoption_id')::text
-);
-""",
-    )
-    absent = "false|false|false|false|false|false"
-    present = "true|true|true|true|true|true"
-    if state == absent:
+    if migration_sha256 != resume_identity.get("migration_sha256"):
+        raise CutoverError("0016 migration changed after resume identity was sealed")
+    state = classify_migration_0016_presence(migration_0016_presence(database))
+    if resume:
+        require_resume_migration_state(database, migration, resume_identity)
+        marker = read_secure_resume_marker()
+    else:
+        if state != "absent":
+            raise CutoverError(
+                "fresh cutover found 0016 already present; verified resume is required"
+            )
+        require_resume_marker_absent()
+        marker = write_secure_resume_marker(
+            {
+                **resume_identity,
+                "phase": "PREPARED",
+                "prepared_at": rfc3339(utc_now()),
+            },
+            create=True,
+        )
+    phase = validate_migration_resume_marker(marker, resume_identity, state)
+    if state == "absent":
         migration_execute(migration, ["-v", "ON_ERROR_STOP=1", "-f", str(path)])
         applied = True
         log("MIGRATION=0016:APPLIED")
-    elif state == present:
+    elif state == "present":
         applied = False
         log("MIGRATION=0016:ALREADY_PRESENT")
-    else:
-        raise CutoverError("0016 schema is partially present")
 
     role = migration.application_role.replace('"', '""')
     migration_execute(
@@ -2496,10 +4052,21 @@ SELECT concat_ws('|',
         ],
     )
     migration_schema_assertions(database)
+    if phase == "PREPARED":
+        marker = write_secure_resume_marker(
+            {
+                **marker,
+                "phase": "MIGRATION_APPLIED",
+                "applied_at": rfc3339(utc_now()),
+            },
+            create=False,
+        )
+    validate_migration_resume_marker(marker, resume_identity, "present")
     return {
         "path": str(path),
         "sha256": migration_sha256,
         "applied": applied,
+        "resume_marker": marker,
         "application_role": migration.application_role,
         "migration_role": migration.migration_role,
     }
@@ -2815,9 +4382,21 @@ def classify_non_sell_external_trade(
     trade = exact_issue_trade_component(issue, account_trade_indexes[account_id])
     if trade is None:
         return "CLOB_ACCOUNT_FILTER_FALSE_ATTRIBUTION"
-    if parse_rfc3339(str(trade["match_time"])) > ownership_boundaries[account_id]:
+    ownership_boundary = ownership_boundaries[account_id]
+    if parse_rfc3339(str(trade["match_time"])) > ownership_boundary:
         raise CutoverError(
             "real post-ownership external trade remains unaccounted for: "
+            f"{account_id}/{trade['trade_id']}/{trade['venue_order_id']}"
+        )
+    if trade.get("status") != "CONFIRMED":
+        raise CutoverError(
+            "pre-ownership external component is not final and cannot be suppressed: "
+            f"{account_id}/{trade['trade_id']}/{trade['venue_order_id']}/"
+            f"{trade.get('status')}"
+        )
+    if parse_rfc3339(str(trade["last_update"])) > ownership_boundary:
+        raise CutoverError(
+            "external component was not confirmed by the ownership boundary: "
             f"{account_id}/{trade['trade_id']}/{trade['venue_order_id']}"
         )
     return "BASELINE_ACCOUNTED"
@@ -3341,8 +4920,14 @@ def build_adjustment_rows(
         cost = decimal(reconstruction["remaining_cost"])
         entry_price = decimal(reconstruction["average_entry_price"])
         current_price = decimal(item["current_price"])
-        if shares != decimal(item["shares"]) or cost <= 0 or not (
-            Decimal(0) < entry_price <= Decimal(1)
+        data_api_average = decimal(item["avg_price"])
+        if (
+            shares != decimal(item["shares"])
+            or reconstruction.get("cost_basis_source") != "DUAL_DATA_API_AVG_PRICE"
+            or entry_price != data_api_average
+            or cost != shares * data_api_average
+            or cost <= 0
+            or not (Decimal(0) < entry_price <= Decimal(1))
         ):
             raise CutoverError("adoption FIFO economics changed")
         if current_price <= 0:
@@ -4160,9 +5745,22 @@ def restore_before_irreversible(
             set(),
         )
         deploy.atomic_symlink(backup.previous_release, CURRENT)
-        start_service()
-        current_health(expected_previous_commit)
-        log("ROLLBACK=COMPLETE submission=false kill_switch=true")
+        selected = require_resume_runtime_state(expected_previous_commit)
+        if selected != backup.previous_release:
+            raise CutoverError("rollback selected release differs from captured previous release")
+        restored_environment = deploy.environment_file(ENV)
+        if restored_environment.get("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED") != "false":
+            raise CutoverError("rollback submission environment gate is not closed")
+        if db_scalar(
+            database,
+            "SELECT kill_switch::text FROM execution_risk_global_control "
+            "WHERE singleton=TRUE",
+        ) != "true":
+            raise CutoverError("rollback database kill switch is not closed")
+        log(
+            "ROLLBACK=COMPLETE runtime=stopped submission=false "
+            "kill_switch=true"
+        )
     except Exception:
         log("ROLLBACK_WARNING=previous_runtime_restore_failed")
 
@@ -4205,6 +5803,16 @@ def self_test() -> None:
         "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
     ):
         raise CutoverError("secp256k1 address self-test failed")
+    expected_event_topics = {
+        "TransferSingle(address,address,address,uint256,uint256)": ERC1155_TRANSFER_SINGLE_TOPIC,
+        "TransferBatch(address,address,address,uint256[],uint256[])": ERC1155_TRANSFER_BATCH_TOPIC,
+        "PositionsMerge(address,address,bytes32,bytes32,uint256[],uint256)": POSITIONS_MERGE_TOPIC,
+    }
+    if any(
+        "0x" + keccak_256(signature.encode("ascii")).hex() != expected
+        for signature, expected in expected_event_topics.items()
+    ):
+        raise CutoverError("wallet-1 MERGE event signature self-test failed")
     sample = {
         "trades": [
             {"side": "BUY", "shares": "7", "match_time": "2026-08-18T00:00:00Z"},
@@ -4232,6 +5840,363 @@ def self_test() -> None:
         or len(multi_residual["residual_acquisitions"]) != 2
     ):
         raise CutoverError("multi-acquisition FIFO hold-clock self-test failed")
+    debit_rebuilt = reconstruct_fifo(
+        {
+            "trades": [
+                {
+                    "side": "BUY",
+                    "shares": "0.99111",
+                    "match_time": "2026-08-08T00:00:00Z",
+                },
+                {
+                    "event_type": "POSITION_DEBIT",
+                    "side": "POSITION_DEBIT",
+                    "shares": "0.99111",
+                    "match_time": "2026-08-09T13:07:27Z",
+                },
+                {
+                    "side": "BUY",
+                    "shares": "72",
+                    "match_time": "2026-08-10T00:00:00Z",
+                },
+                {
+                    "side": "SELL",
+                    "shares": "71",
+                    "match_time": "2026-08-11T00:00:00Z",
+                },
+            ]
+        },
+        "1",
+    )
+    if (
+        debit_rebuilt["shares"] != "1"
+        or debit_rebuilt["entered_at"] != "2026-08-10T00:00:00Z"
+        or len(debit_rebuilt["residual_acquisitions"]) != 1
+    ):
+        raise CutoverError("POSITION_DEBIT FIFO continuity self-test failed")
+
+    aggregate_buy = finalized_order_filled_economics(
+        {
+            "side": "BUY",
+            "shares": "72",
+            "price": "0.5526",
+            "price_display_precision": 4,
+        },
+        {
+            "side": "BUY",
+            "maker_amount_base_units": "39790000",
+            "taker_amount_base_units": "72000000",
+            "fee_base_units": "0",
+        },
+    )
+    if (
+        aggregate_buy["shares"] != "72"
+        or aggregate_buy["gross_notional"] != "39.79"
+        or round_half_up(decimal(aggregate_buy["effective_price"]), 4)
+        != Decimal("0.5526")
+    ):
+        raise CutoverError("aggregate BUY OrderFilled economics self-test failed")
+    try:
+        finalized_order_filled_economics(
+            {
+                "side": "BUY",
+                "shares": "72",
+                "price": "0.5527",
+                "price_display_precision": 4,
+            },
+            {
+                "side": "BUY",
+                "maker_amount_base_units": "39790000",
+                "taker_amount_base_units": "72000000",
+                "fee_base_units": "0",
+            },
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("rounded CLOB price mismatch self-test failed open")
+
+    chronology_merge_time = parse_rfc3339("2026-08-09T13:07:27Z")
+    chronology_trades = [
+        {
+            "trade_id": f"trade-{index}",
+            "order_hash": "0x" + str(index) * 64,
+            "transaction_hash": "0x" + str(index + 3) * 64,
+            "condition_id": WALLET_1_POSITION_DEBIT["condition_id"],
+            "token_id": WALLET_1_TOKEN,
+            "status": "CONFIRMED",
+            "side": "BUY",
+            "shares": "1",
+            "price": "0.5",
+            "price_display_precision": 1,
+            "match_time": match_time,
+            "last_update": match_time,
+        }
+        for index, match_time in enumerate(
+            (
+                "2026-08-09T13:07:20Z",
+                "2026-08-09T13:07:21Z",
+                "2026-08-09T13:07:30Z",
+            ),
+            start=1,
+        )
+    ]
+    chronology_blocks = {
+        str(chronology_trades[0]["transaction_hash"]): 98,
+        str(chronology_trades[1]["transaction_hash"]): 99,
+        str(chronology_trades[2]["transaction_hash"]): 101,
+    }
+
+    def chronology_receipt(
+        _url: str, transaction_hash: str, _confirmations: int
+    ) -> tuple[dict[str, object], int]:
+        return {
+            "transactionHash": transaction_hash,
+            "transactionIndex": "0x0",
+            "_block_number": chronology_blocks[transaction_hash],
+        }, 100
+
+    def chronology_block(
+        _url: str, receipt: dict[str, object]
+    ) -> dict[str, object]:
+        number = int(receipt["_block_number"])
+        return {
+            "block_number": number,
+            "block_hash": "0x" + f"{number:064x}",
+            "block_timestamp": number,
+        }
+
+    def chronology_event(
+        trade: dict[str, object],
+        receipt: dict[str, object],
+        _confirmations: int,
+        _account_id: str,
+        _neg_risk: bool,
+    ) -> dict[str, object]:
+        block = chronology_block("", receipt)
+        return {
+            **trade,
+            "settlement_evidence": {
+                "block_number": block["block_number"],
+                "block_hash": block["block_hash"],
+                "log_index": 1,
+            },
+        }
+
+    chronology = verify_wallet_1_fifo_component_chronology(
+        "https://rpc.invalid",
+        1,
+        chronology_trades,
+        {},
+        100,
+        chronology_merge_time,
+        chronology_receipt,
+        chronology_block,
+        chronology_event,
+    )
+    if [item["chronology_side"] for item in chronology] != [
+        "PRE_MERGE",
+        "PRE_MERGE",
+        "POST_MERGE",
+    ]:
+        raise CutoverError("wallet-1 finalized chronology self-test failed")
+    chronology_blocks[str(chronology_trades[0]["transaction_hash"])] = 99
+    chronology_blocks[str(chronology_trades[1]["transaction_hash"])] = 98
+    try:
+        verify_wallet_1_fifo_component_chronology(
+            "https://rpc.invalid",
+            1,
+            chronology_trades,
+            {},
+            100,
+            chronology_merge_time,
+            chronology_receipt,
+            chronology_block,
+            chronology_event,
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("wallet-1 inverted finalized chronology self-test failed open")
+
+    def abi_word(number: int) -> str:
+        return number.to_bytes(32, "big").hex()
+
+    def abi_address(address: str) -> str:
+        return (b"\0" * 12 + bytes.fromhex(address[2:])).hex()
+
+    def address_topic(address: str) -> str:
+        return "0x" + abi_address(address)
+
+    condition_topic = "0x" + "11" * 32
+    ctf_batch_data = "0x" + "".join(
+        [
+            abi_word(64),
+            abi_word(160),
+            abi_word(2),
+            abi_word(101),
+            abi_word(202),
+            abi_word(2),
+            abi_word(991110),
+            abi_word(991110),
+        ]
+    )
+    merge_data = "0x" + "".join(
+        [
+            abi_address(LEGACY_USDC_E_ADDRESS),
+            abi_word(96),
+            abi_word(991110),
+            abi_word(2),
+            abi_word(1),
+            abi_word(2),
+        ]
+    )
+    merge_receipt = {
+        "logs": [
+            {
+                "address": CONDITIONAL_TOKENS_ADDRESS,
+                "topics": [
+                    ERC1155_TRANSFER_BATCH_TOPIC,
+                    address_topic(ACCOUNT_ADDRESSES["wallet-1"]),
+                    address_topic(ACCOUNT_ADDRESSES["wallet-1"]),
+                    address_topic(ZERO_ADDRESS),
+                ],
+                "data": ctf_batch_data,
+                "logIndex": hex(1161),
+            },
+            {
+                "address": LEGACY_USDC_E_ADDRESS,
+                "topics": [
+                    ERC20_TRANSFER_TOPIC,
+                    address_topic(CONDITIONAL_TOKENS_ADDRESS),
+                    address_topic(ACCOUNT_ADDRESSES["wallet-1"]),
+                ],
+                "data": "0x" + abi_word(991110),
+                "logIndex": hex(1162),
+            },
+            {
+                "address": CONDITIONAL_TOKENS_ADDRESS,
+                "topics": [
+                    POSITIONS_MERGE_TOPIC,
+                    address_topic(ACCOUNT_ADDRESSES["wallet-1"]),
+                    "0x" + "0" * 64,
+                    condition_topic,
+                ],
+                "data": merge_data,
+                "logIndex": hex(1163),
+            },
+        ]
+    }
+    decoded_batch = decode_ctf_transfer_events(merge_receipt)
+    decoded_collateral = decode_erc20_transfer_events(
+        merge_receipt, LEGACY_USDC_E_ADDRESS
+    )
+    decoded_merge = decode_positions_merge_events(merge_receipt)
+    if (
+        len(decoded_batch) != 1
+        or decoded_batch[0]["operator"] != ACCOUNT_ADDRESSES["wallet-1"]
+        or decoded_batch[0]["transfers"]
+        != [
+            {"token_id": "101", "amount_base_units": "991110", "amount": "0.99111"},
+            {"token_id": "202", "amount_base_units": "991110", "amount": "0.99111"},
+        ]
+        or len(decoded_collateral) != 1
+        or decoded_collateral[0]["source"] != CONDITIONAL_TOKENS_ADDRESS
+        or decoded_collateral[0]["amount"] != "0.99111"
+        or erc20_transfer_delta(
+            merge_receipt,
+            LEGACY_USDC_E_ADDRESS,
+            ACCOUNT_ADDRESSES["wallet-1"],
+        )
+        != Decimal("0.99111")
+        or len(decoded_merge) != 1
+        or decoded_merge[0]["condition_id"] != condition_topic
+        or decoded_merge[0]["collateral"] != LEGACY_USDC_E_ADDRESS
+        or decoded_merge[0]["partition"] != [1, 2]
+        or decoded_merge[0]["amount"] != "0.99111"
+    ):
+        raise CutoverError("wallet-1 MERGE ABI evidence self-test failed")
+
+    balance_block = {
+        "number": "0x10",
+        "hash": "0x" + "ab" * 32,
+        "timestamp": "0x1234",
+    }
+    balance_responses: list[object] = [
+        "0x10",
+        balance_block,
+        "0x" + abi_word(1_000_000),
+        "0x" + abi_word(1_000_000),
+        balance_block,
+        "0x11",
+    ]
+    balance_calls: list[tuple[str, list[object]]] = []
+
+    def balance_rpc(_url: str, _method: str, _params: list[object]) -> object:
+        balance_calls.append((_method, _params))
+        return balance_responses.pop(0)
+
+    balance_evidence = ctf_balance_of_evidence(
+        "https://rpc.invalid",
+        ACCOUNT_ADDRESSES["wallet-1"],
+        WALLET_1_TOKEN,
+        balance_rpc,
+    )
+    if (
+        balance_responses
+        or balance_evidence["balance"] != "1"
+        or balance_evidence["block_number"] != 16
+        or balance_evidence["block_hash"] != balance_block["hash"]
+        or balance_evidence["block_tag"] != "0x10"
+        or balance_evidence["contract"] != CONDITIONAL_TOKENS_ADDRESS
+        or not str(balance_evidence["call_data"]).startswith("0x00fdd58e")
+        or [params[1] for method, params in balance_calls if method == "eth_call"]
+        != ["0x10", "0x10"]
+    ):
+        raise CutoverError("CTF balanceOf exact block-pin self-test failed")
+    changed_balance_responses: list[object] = [
+        "0x10",
+        balance_block,
+        "0x" + abi_word(1_000_000),
+        "0x" + abi_word(999_999),
+        balance_block,
+        "0x11",
+    ]
+
+    def changed_balance_rpc(
+        _url: str, _method: str, _params: list[object]
+    ) -> object:
+        return changed_balance_responses.pop(0)
+
+    try:
+        ctf_balance_of_evidence(
+            "https://rpc.invalid",
+            ACCOUNT_ADDRESSES["wallet-1"],
+            WALLET_1_TOKEN,
+            changed_balance_rpc,
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("CTF balanceOf changed-value self-test failed open")
+    require_ctf_balance_progression(
+        balance_evidence,
+        {**balance_evidence, "block_number": 17, "block_tag": "0x11"},
+        "self-test",
+    )
+    try:
+        require_ctf_balance_progression(
+            balance_evidence,
+            {
+                **balance_evidence,
+                "block_hash": "0x" + "cd" * 32,
+            },
+            "self-test",
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("CTF same-height reorg self-test failed open")
     stable_item = {
         "token_id": "1",
         "condition_id": "0x" + "1" * 64,
@@ -4327,6 +6292,146 @@ def self_test() -> None:
         or reconstruct_fifo(maker_token_history, "5")["shares"] != "5"
     ):
         raise CutoverError("MAKER component FIFO self-test failed")
+    identity_only_maker_order = {
+        "maker_address": ACCOUNT_ADDRESSES["main"],
+        "order_id": owned_order_b,
+        "asset_id": "222",
+    }
+    matched_components = normalize_owned_account_trade_components(
+        {
+            **maker_trade,
+            "id": "Trade-Matched",
+            "status": "TRADE_STATUS_MATCHED",
+            "maker_orders": [identity_only_maker_order],
+        },
+        "main",
+    )
+    if (
+        len(matched_components) != 1
+        or matched_components[0]["status"] != "MATCHED"
+        or matched_components[0]["side"] != ""
+        or matched_components[0]["shares"] != ""
+        or matched_components[0]["price"] != ""
+    ):
+        raise CutoverError("non-final identity-only CLOB normalization self-test failed")
+    for index, status in enumerate(("MINED", "RETRYING", "FAILED"), start=1):
+        values = normalize_owned_account_trade_components(
+            {
+                **maker_trade,
+                "id": f"Trade-Nonfinal-{index}",
+                "status": status,
+                "maker_orders": [identity_only_maker_order],
+            },
+            "main",
+        )
+        if len(values) != 1 or values[0]["status"] != status:
+            raise CutoverError("supported non-final CLOB status self-test failed")
+    prefixed_confirmed = normalize_owned_account_trade_components(
+        {**maker_trade, "id": "Trade-Prefixed", "status": "TRADE_STATUS_CONFIRMED"},
+        "main",
+    )
+    if any(item["status"] != "CONFIRMED" for item in prefixed_confirmed):
+        raise CutoverError("TRADE_STATUS_ normalization self-test failed")
+    try:
+        normalize_owned_account_trade_components(
+            {
+                **maker_trade,
+                "id": "Trade-Broken-Confirmed",
+                "maker_orders": [identity_only_maker_order],
+            },
+            "main",
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("confirmed CLOB economics self-test failed open")
+    mixed_components = owned_components + matched_components
+    mixed_index = {
+        "execution_account_id": "main",
+        "maker_address_filter": ACCOUNT_ADDRESSES["main"],
+        "canonical_sha256": sha256_bytes(canonical_json(mixed_components)),
+        "trade_components": mixed_components,
+        "trade_index": {
+            "trade-a": owned_components,
+            "trade-matched": matched_components,
+        },
+    }
+    confirmed_history = clob_history_for_token(mixed_index, "main", condition, "222")
+    if (
+        len(confirmed_history["trades"]) != 1
+        or confirmed_history["trades"][0]["status"] != "CONFIRMED"
+        or exact_issue_trade_component(
+            {**exact_issue, "venue_trade_id": "trade-matched"}, mixed_index
+        )["status"]
+        != "MATCHED"
+    ):
+        raise CutoverError("non-final CLOB history isolation self-test failed")
+    broken_confirmed = [{**owned_components[1], "shares": ""}]
+    broken_confirmed_index = {
+        **component_index,
+        "canonical_sha256": sha256_bytes(canonical_json(broken_confirmed)),
+        "trade_components": broken_confirmed,
+        "trade_index": {"trade-a": broken_confirmed},
+    }
+    try:
+        clob_history_for_token(broken_confirmed_index, "main", condition, "222")
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("confirmed history projection self-test failed open")
+    issue_with_account = {**exact_issue, "execution_account_id": "main"}
+    ownership_boundaries = {
+        "main": parse_rfc3339("2026-08-18T00:00:02Z")
+    }
+    if (
+        classify_non_sell_external_trade(
+            issue_with_account, {"main": component_index}, ownership_boundaries
+        )
+        != "BASELINE_ACCOUNTED"
+    ):
+        raise CutoverError("confirmed pre-boundary classification self-test failed")
+    try:
+        classify_non_sell_external_trade(
+            {
+                **issue_with_account,
+                "venue_trade_id": "trade-matched",
+            },
+            {"main": mixed_index},
+            ownership_boundaries,
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("non-final pre-boundary classification self-test failed open")
+    late_components = [
+        {
+            **item,
+            "last_update": "2026-08-18T00:00:03Z",
+        }
+        for item in owned_components
+    ]
+    late_index = {
+        **component_index,
+        "canonical_sha256": sha256_bytes(canonical_json(late_components)),
+        "trade_components": late_components,
+        "trade_index": {"trade-a": late_components},
+    }
+    try:
+        classify_non_sell_external_trade(
+            issue_with_account, {"main": late_index}, ownership_boundaries
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("post-boundary confirmation self-test failed open")
+    try:
+        normalize_owned_account_trade_components(
+            {**maker_trade, "status": "UNKNOWN"}, "main"
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("unsupported CLOB status self-test failed open")
     foreign_trade = {**maker_trade, "maker_orders": [maker_trade["maker_orders"][2]]}
     try:
         normalize_owned_account_trade_components(foreign_trade, "main")
@@ -4400,6 +6505,24 @@ def self_test() -> None:
     }
     copied_indexes = json.loads(json.dumps(stable_indexes))
     require_account_trade_indexes_unchanged(stable_indexes, copied_indexes)
+    status_before = json.loads(json.dumps(stable_indexes))
+    status_after = json.loads(json.dumps(stable_indexes))
+    before_component = {**owned_components[0], "status": "MATCHED"}
+    after_component = {**before_component, "status": "CONFIRMED"}
+    status_before["main"]["trade_components"] = [before_component]
+    status_before["main"]["canonical_sha256"] = sha256_bytes(
+        canonical_json([before_component])
+    )
+    status_after["main"]["trade_components"] = [after_component]
+    status_after["main"]["canonical_sha256"] = sha256_bytes(
+        canonical_json([after_component])
+    )
+    try:
+        require_account_trade_indexes_unchanged(status_before, status_after)
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("CLOB status-transition stability self-test failed open")
     copied_indexes["wallet-3"]["canonical_sha256"] = "0" * 64
     try:
         require_account_trade_indexes_unchanged(stable_indexes, copied_indexes)
@@ -4466,6 +6589,166 @@ def self_test() -> None:
         pass
     else:
         raise CutoverError("ownership-boundary SQL self-test failed open")
+    if EXPECTED_PREVIOUS_RELEASE != pathlib.Path(
+        "/opt/trading-execution/releases/49f5053"
+    ):
+        raise CutoverError("pinned seven-character previous release self-test failed")
+    if classify_migration_0016_presence(MIGRATION_0016_ABSENT) != "absent":
+        raise CutoverError("absent 0016 resume self-test failed")
+    if classify_migration_0016_presence(MIGRATION_0016_PRESENT) != "present":
+        raise CutoverError("present 0016 resume self-test failed")
+    try:
+        classify_migration_0016_presence("true|false|false|false|false|false")
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("partial 0016 resume self-test failed open")
+    require_zero_resume_artifact_counts("0|0|0|0|0|0|0")
+    try:
+        require_zero_resume_artifact_counts("0|0|0|1|0|0|0")
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("nonempty adoption resume self-test failed open")
+    verify_resume_environment({})
+    verify_resume_environment({"DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "true"})
+    try:
+        verify_resume_environment(
+            {"DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "false"}
+        )
+    except CutoverError:
+        pass
+    else:
+        raise CutoverError("open resume entry gate self-test failed open")
+    with tempfile.TemporaryDirectory(prefix="cutover-resume-selftest.") as temporary:
+        directory = pathlib.Path(temporary)
+        marker_path = directory / "resume.json"
+        test_uid = os.geteuid()
+        test_gid = os.getegid()
+        marker_identity = {
+            "schema": "trading.position-adoption-resume.v1",
+            "actor": ACTOR,
+            "candidate_commit": "1" * 40,
+            "candidate_binary_sha256": "2" * 64,
+            "cutover_script_path": "deploy/deploy_position_adoption_20260821.py",
+            "cutover_script_sha256": "3" * 64,
+            "migration_path": "migrations/0016_external_position_dispositions.sql",
+            "migration_sha256": "4" * 64,
+        }
+        require_resume_marker_absent(marker_path, test_uid, test_gid)
+        if read_secure_resume_marker_if_present(
+            marker_path, test_uid, test_gid
+        ) is not None:
+            raise CutoverError("absent optional resume marker self-test failed")
+        prepared_marker = write_secure_resume_marker(
+            {
+                **marker_identity,
+                "phase": "PREPARED",
+                "prepared_at": "2026-08-21T00:00:00Z",
+            },
+            create=True,
+            path=marker_path,
+            expected_uid=test_uid,
+            expected_gid=test_gid,
+        )
+        if (
+            validate_migration_resume_marker(
+                prepared_marker, marker_identity, "absent"
+            )
+            != "PREPARED"
+        ):
+            raise CutoverError("prepared resume marker self-test failed")
+        try:
+            validate_migration_resume_marker(
+                prepared_marker,
+                {**marker_identity, "candidate_commit": "5" * 40},
+                "absent",
+            )
+        except CutoverError:
+            pass
+        else:
+            raise CutoverError("cross-candidate resume marker self-test failed open")
+        applied_marker = write_secure_resume_marker(
+            {
+                **prepared_marker,
+                "phase": "MIGRATION_APPLIED",
+                "applied_at": "2026-08-21T00:00:01Z",
+            },
+            create=False,
+            path=marker_path,
+            expected_uid=test_uid,
+            expected_gid=test_gid,
+        )
+        if (
+            validate_migration_resume_marker(
+                applied_marker, marker_identity, "present"
+            )
+            != "MIGRATION_APPLIED"
+        ):
+            raise CutoverError("applied resume marker self-test failed")
+        try:
+            require_resume_marker_absent(marker_path, test_uid, test_gid)
+        except CutoverError:
+            pass
+        else:
+            raise CutoverError("existing resume marker self-test failed open")
+        marker_path.chmod(0o644)
+        try:
+            read_secure_resume_marker(marker_path, test_uid, test_gid)
+        except CutoverError:
+            pass
+        else:
+            raise CutoverError("world-readable resume marker self-test failed open")
+        marker_path.chmod(0o600)
+        marker_target = directory / "resume-target.json"
+        marker_path.replace(marker_target)
+        marker_path.symlink_to(marker_target)
+        try:
+            read_secure_resume_marker_if_present(marker_path, test_uid, test_gid)
+        except CutoverError:
+            pass
+        else:
+            raise CutoverError("symlink resume marker self-test failed open")
+        marker_path.unlink()
+
+        lock_path = directory / "cutover.lock"
+        with exclusive_cutover_lock(lock_path):
+            try:
+                with exclusive_cutover_lock(lock_path):
+                    pass
+            except CutoverError:
+                pass
+            else:
+                raise CutoverError("exclusive cutover lock self-test failed open")
+        with exclusive_cutover_lock(lock_path):
+            pass
+
+        proc_net = directory / "net"
+        proc_net.mkdir()
+        tcp_header = (
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
+            "retrnsmt   uid  timeout inode\n"
+        )
+        (proc_net / "tcp").write_text(
+            tcp_header
+            + "   0: 0100007F:36B0 00000000:0000 0A 00000000:00000000 "
+            "00:00000000 00000000 0 0 1\n",
+            encoding="ascii",
+        )
+        if listening_tcp_ports(SERVICE_PORTS, proc_net) != [14000]:
+            raise CutoverError("TCP listener resume self-test failed")
+        (proc_net / "tcp").write_text(tcp_header, encoding="ascii")
+        if listening_tcp_ports(SERVICE_PORTS, proc_net):
+            raise CutoverError("empty TCP listener resume self-test failed")
+
+        proc_root = directory / "proc"
+        process = proc_root / "999999"
+        process.mkdir(parents=True)
+        (process / "exe").symlink_to(directory / "trading-execution")
+        (process / "cmdline").write_bytes(b"/opt/trading-execution\0")
+        (process / "comm").write_text("trading-executi\n", encoding="utf-8")
+        if trading_execution_process_ids(proc_root) != [999999]:
+            raise CutoverError("Trading process resume self-test failed")
     source = pathlib.Path(__file__).read_text(encoding="utf-8")
     if EXECUTE_TOKEN not in source:
         raise CutoverError("execute-token guard is missing")
@@ -4477,10 +6760,11 @@ def self_test() -> None:
         raise CutoverError(
             "transaction outcome-unknown boundary must precede transaction execution"
         )
-    main_source = source[source.index("def main() -> int:") :]
+    cutover_source = source[source.rindex("def execute_cutover(") :]
     evidence_markers = (
         "deploy.atomic_symlink(release, CURRENT)",
         "final_onchain_balances = validate_onchain_balances(",
+        "final_wallet_1_ctf_balance = ctf_balance_of_evidence(",
         "final_account_trade_indexes = {",
         "require_account_trade_indexes_unchanged(\n            account_trade_indexes, final_account_trade_indexes",
         "irreversible = True",
@@ -4488,13 +6772,85 @@ def self_test() -> None:
     )
     cursor = -1
     for marker in evidence_markers:
-        cursor = main_source.find(marker, cursor + 1)
+        cursor = cutover_source.find(marker, cursor + 1)
         if cursor < 0:
             raise CutoverError(
                 "pre-transaction evidence/PID boundary static self-test failed"
             )
+    post_transaction_markers = (
+        "transaction = execute_adjustment_transaction(",
+        "post_transaction_wallet_1_ctf_balance = ctf_balance_of_evidence(",
+        'log("PHASE=start-candidate-with-all-gates-closed")',
+    )
+    cursor = -1
+    for marker in post_transaction_markers:
+        cursor = cutover_source.find(marker, cursor + 1)
+        if cursor < 0:
+            raise CutoverError("post-transaction CTF gate static self-test failed")
     if 'pathlib.Path(f"/proc/{pid}/exe")' not in source:
         raise CutoverError("running candidate PID executable pin is missing")
+    rollback_source = source[
+        source.index("def restore_before_irreversible(") : source.index(
+            "def fix_forward_failure("
+        )
+    ]
+    if "start_service(" in rollback_source or "current_health(" in rollback_source:
+        raise CutoverError("pre-adoption rollback must keep the old service stopped")
+    main_source = source[source.rindex("def main() -> int:") :]
+    if "with exclusive_cutover_lock():" not in main_source:
+        raise CutoverError("production main does not hold the exclusive cutover lock")
+    resume_markers = (
+        "verify_resume_environment(trading_environment)",
+        "require_resume_runtime_state(args.expected_previous_commit)",
+        "resume_identity = migration_0016_resume_identity(",
+        "require_resume_migration_state(",
+        "require_resume_marker_absent()",
+        "evidence_reuse=false",
+    )
+    if any(marker not in cutover_source for marker in resume_markers):
+        raise CutoverError("resume fail-closed gate static self-test failed")
+    resume_gate_order = (
+        "verify_resume_environment(trading_environment)",
+        "require_resume_runtime_state(args.expected_previous_commit)",
+        "initial_state = read_database_preflight(database)",
+        "require_resume_migration_state(",
+    )
+    cursor = -1
+    for marker in resume_gate_order:
+        cursor = cutover_source.find(marker, cursor + 1)
+        if cursor < 0:
+            raise CutoverError("resume stopped-runtime bootstrap gate self-test failed")
+    resume_state_source = source[
+        source.index("def require_resume_migration_state(") : source.index(
+            "def apply_migration_0016("
+        )
+    ]
+    resume_bootstrap_order = (
+        'if state == "absent":',
+        'if linked != "0|0":',
+        "read_secure_resume_marker_if_present()",
+        '"phase": "PREPARED"',
+        "create=True",
+        "return state",
+        "marker = read_secure_resume_marker()",
+    )
+    cursor = -1
+    for marker in resume_bootstrap_order:
+        cursor = resume_state_source.find(marker, cursor + 1)
+        if cursor < 0:
+            raise CutoverError("resume marker bootstrap static self-test failed")
+    reconciliation_boundary = (
+        'log("PHASE=candidate-account-isolated-reconciliation")',
+        "irreversible = True",
+        "pre_reconciliation = run_candidate_pre_adoption_reconciliation(",
+    )
+    cursor = -1
+    for marker in reconciliation_boundary:
+        cursor = cutover_source.find(marker, cursor + 1)
+        if cursor < 0:
+            raise CutoverError(
+                "live pre-adoption reconciliation is outside irreversible recovery"
+            )
     log("STATIC_SELF_TEST=PASS")
 
 
@@ -4508,6 +6864,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-commit", default="")
     parser.add_argument("--expected-binary-sha256", default="")
     parser.add_argument("--expected-previous-commit", default=EXPECTED_PREVIOUS_COMMIT)
+    parser.add_argument(
+        "--resume-pre-adoption",
+        action="store_true",
+        help=(
+            "skip only the stopped old-runtime health check after strict runtime, "
+            "database, and empty-adoption resume gates"
+        ),
+    )
     parser.add_argument("--binary-relative-path", default="bin/trading-execution")
     parser.add_argument("--binding-log-timeout-seconds", type=int, default=1200)
     return parser.parse_args()
@@ -4526,6 +6890,11 @@ def validate_production_args(args: argparse.Namespace) -> None:
         raise CutoverError("--expected-commit must be a full lowercase SHA-1")
     if not re.fullmatch(r"[0-9a-f]{40}", args.expected_previous_commit):
         raise CutoverError("--expected-previous-commit must be a full lowercase SHA-1")
+    if (
+        args.resume_pre_adoption
+        and args.expected_previous_commit != EXPECTED_PREVIOUS_COMMIT
+    ):
+        raise CutoverError("--resume-pre-adoption requires pinned previous commit 49f5053")
     if not re.fullmatch(r"[0-9a-f]{64}", args.expected_binary_sha256):
         raise CutoverError("--expected-binary-sha256 must be lowercase SHA-256")
     if pathlib.PurePosixPath(args.binary_relative_path).is_absolute() or ".." in pathlib.PurePosixPath(
@@ -4541,9 +6910,11 @@ def assert_snapshot_unchanged(
     gamma_url: str,
     expected_positions: dict[str, dict[str, object]],
     expected_gamma: dict[str, dict[str, object]],
+    expected_merge_activity: dict[str, object],
 ) -> dict[str, dict[str, object]]:
     actual = capture_all_positions(data_api_url)
     actual_gamma = capture_gamma_identities(gamma_url, actual)
+    actual_merge_activity = fetch_wallet_1_merge_activity(data_api_url)
     for account_id in ACCOUNT_ADDRESSES:
         if position_stability_projection(
             actual[account_id]
@@ -4551,6 +6922,10 @@ def assert_snapshot_unchanged(
             raise CutoverError(f"external position changed after evidence for {account_id}")
     if actual_gamma != expected_gamma:
         raise CutoverError("Gamma identity changed after evidence")
+    if actual_merge_activity["canonical_activity"] != expected_merge_activity.get(
+        "canonical_activity"
+    ):
+        raise CutoverError("wallet-1 MERGE activity changed after evidence")
     return actual
 
 
@@ -4567,19 +6942,23 @@ def verify_final_closed_gates(database: DatabaseSession) -> None:
         raise CutoverError("entry submission environment gate reopened")
 
 
-def main() -> int:
-    args = parse_args()
-    if args.self_test:
-        self_test()
-        return 0
-    validate_production_args(args)
-
+def execute_cutover(args: argparse.Namespace) -> int:
     source_tree = args.candidate_source_tree.resolve(strict=True)
     binary, cutover_script = verify_candidate(args)
+    resume_identity = migration_0016_resume_identity(
+        source_tree,
+        args.expected_commit,
+        args.expected_binary_sha256,
+        cutover_script,
+    )
     trading_environment = deploy.environment_file(ENV)
     prediction_environment = deploy.environment_file(PREDICTION_ENV)
     verify_runtime_environment(trading_environment)
-    current_health(args.expected_previous_commit)
+    if args.resume_pre_adoption:
+        verify_resume_environment(trading_environment)
+        require_resume_runtime_state(args.expected_previous_commit)
+    else:
+        current_health(args.expected_previous_commit)
     records = wallet_records()
     database = database_session(trading_environment)
     migration: MigrationSession | None = None
@@ -4589,6 +6968,36 @@ def main() -> int:
     try:
         initial_state = read_database_preflight(database)
         baseline_observed_at = validate_database_preflight(initial_state)
+        if args.resume_pre_adoption:
+            migration = migration_session(
+                database, trading_environment, prediction_environment
+            )
+            resume_schema_state = require_resume_migration_state(
+                database, migration, resume_identity
+            )
+            log(
+                "RESUME_PRE_ADOPTION=AUTHORIZED old_health=skipped "
+                f"migration_0016={resume_schema_state} evidence_reuse=false"
+            )
+        else:
+            require_resume_marker_absent()
+            if classify_migration_0016_presence(
+                migration_0016_presence(database)
+            ) != "absent":
+                raise CutoverError(
+                    "fresh cutover found 0016 already present; verified resume is required"
+                )
+        wallet_1_baseline_rows = [
+            item
+            for item in initial_state["baselines"]
+            if item["execution_account_id"] == "wallet-1"
+            and item["token_id"] == WALLET_1_TOKEN
+        ]
+        if len(wallet_1_baseline_rows) != 1:
+            raise CutoverError("wallet-1 immutable baseline header is unavailable")
+        wallet_1_baseline_observed_at = parse_rfc3339(
+            str(wallet_1_baseline_rows[0]["observed_at"])
+        )
         backup = backup_runtime(ENV.read_text(encoding="utf-8"))
         release = install_release(
             binary, args.expected_commit, args.expected_binary_sha256
@@ -4605,16 +7014,30 @@ def main() -> int:
             raise CutoverError("Data API, Gamma, and CLOB URLs are required")
 
         log("PHASE=dual-data-api-gamma-snapshot")
-        snapshot_boundary, snapshot_a, snapshot_b, gamma = dual_venue_snapshot(
-            database, data_api_url, gamma_url
-        )
+        (
+            snapshot_boundary,
+            snapshot_a,
+            snapshot_b,
+            gamma,
+            merge_activity_evidence,
+        ) = dual_venue_snapshot(database, data_api_url, gamma_url)
         trade_evidence, fifo, initial_account_trade_indexes = collect_trade_and_fifo_evidence(
             trading_environment,
             records,
+            snapshot_a,
             snapshot_b,
+            gamma,
+            merge_activity_evidence,
             baseline_observed_at,
+            wallet_1_baseline_observed_at,
         )
-        assert_snapshot_unchanged(data_api_url, gamma_url, snapshot_b, gamma)
+        assert_snapshot_unchanged(
+            data_api_url,
+            gamma_url,
+            snapshot_b,
+            gamma,
+            merge_activity_evidence["snapshot_b"],
+        )
         onchain_balances = validate_onchain_balances(
             initial_state,
             trading_environment,
@@ -4622,10 +7045,17 @@ def main() -> int:
         )
 
         log("PHASE=apply-additive-0016")
-        migration = migration_session(
-            database, trading_environment, prediction_environment
+        if migration is None:
+            migration = migration_session(
+                database, trading_environment, prediction_environment
+            )
+        migration_result = apply_migration_0016(
+            database,
+            migration,
+            source_tree,
+            resume_identity,
+            args.resume_pre_adoption,
         )
-        migration_result = apply_migration_0016(database, migration, source_tree)
         configure_candidate_environment()
         run_candidate_schema_probe(
             binary, {**trading_environment, "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "true"},
@@ -4633,6 +7063,11 @@ def main() -> int:
         )
 
         log("PHASE=candidate-account-isolated-reconciliation")
+        # This live reconciliation can durably apply a previously missed fill,
+        # update account/position ledgers, or refresh an order before returning.
+        # From process launch onward, selecting the old binary is therefore not
+        # a safe recovery action even though the adoption transaction has not run.
+        irreversible = True
         pre_reconciliation = run_candidate_pre_adoption_reconciliation(
             binary,
             {**trading_environment, "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "true"},
@@ -4694,7 +7129,13 @@ def main() -> int:
         # Re-read every external evidence surface only after the last local
         # pre-transaction changes.  Any wallet activity during probe/reconcile
         # therefore fails before the outcome-unknown database boundary.
-        assert_snapshot_unchanged(data_api_url, gamma_url, snapshot_b, gamma)
+        assert_snapshot_unchanged(
+            data_api_url,
+            gamma_url,
+            snapshot_b,
+            gamma,
+            merge_activity_evidence["snapshot_b"],
+        )
         final_onchain_balances = validate_onchain_balances(
             state,
             trading_environment,
@@ -4702,6 +7143,25 @@ def main() -> int:
         )
         if final_onchain_balances != onchain_balances:
             raise CutoverError("four-account pUSD balances changed before adoption transaction")
+        final_wallet_1_ctf_balance = ctf_balance_of_evidence(
+            trading_environment["POLYGON_RPC_URL"],
+            ACCOUNT_ADDRESSES["wallet-1"],
+            WALLET_1_TOKEN,
+        )
+        initial_wallet_1_ctf_balance = trade_evidence[
+            "wallet_1_pre_baseline_position_debit"
+        ]["latest_ctf_balance"]
+        require_ctf_balance_progression(
+            initial_wallet_1_ctf_balance,
+            final_wallet_1_ctf_balance,
+            "pre-transaction wallet-1",
+        )
+        if (
+            final_wallet_1_ctf_balance["balance"] != "1"
+            or final_wallet_1_ctf_balance["balance"]
+            != initial_wallet_1_ctf_balance["balance"]
+        ):
+            raise CutoverError("wallet-1 CTF balance changed before adoption transaction")
         final_account_trade_indexes = {
             account_id: fetch_clob_account_trade_ids(
                 clob_url, records[account_id], account_id
@@ -4717,6 +7177,7 @@ def main() -> int:
                 "verified_at": rfc3339(utc_now()),
                 "manifest_sha256": manifest["manifest_sha256"],
                 "onchain_pusd_balances": final_onchain_balances,
+                "wallet_1_ctf_balance": final_wallet_1_ctf_balance,
                 "account_component_sha256": {
                     account_id: value["canonical_sha256"]
                     for account_id, value in sorted(final_account_trade_indexes.items())
@@ -4734,10 +7195,35 @@ def main() -> int:
         transaction = execute_adjustment_transaction(
             migration, backup, manifest, rows, classified_issues, state
         )
+        adoption_resume_marker = mark_resume_adoption_committed(resume_identity)
 
         # This post-commit read cannot make venue+database atomic, but it makes
         # any race visible and forces fix-forward before the service can trade.
-        assert_snapshot_unchanged(data_api_url, gamma_url, snapshot_b, gamma)
+        assert_snapshot_unchanged(
+            data_api_url,
+            gamma_url,
+            snapshot_b,
+            gamma,
+            merge_activity_evidence["snapshot_b"],
+        )
+        post_transaction_wallet_1_ctf_balance = ctf_balance_of_evidence(
+            trading_environment["POLYGON_RPC_URL"],
+            ACCOUNT_ADDRESSES["wallet-1"],
+            WALLET_1_TOKEN,
+        )
+        require_ctf_balance_progression(
+            final_wallet_1_ctf_balance,
+            post_transaction_wallet_1_ctf_balance,
+            "post-transaction wallet-1",
+        )
+        if (
+            post_transaction_wallet_1_ctf_balance["balance"] != "1"
+            or post_transaction_wallet_1_ctf_balance["balance"]
+            != initial_wallet_1_ctf_balance["balance"]
+        ):
+            raise CutoverError(
+                "wallet-1 CTF balance changed during adoption transaction; fix-forward required"
+            )
         post_state = read_database_preflight(database)
         validate_onchain_balances(post_state, trading_environment, "0")
 
@@ -4762,9 +7248,13 @@ def main() -> int:
             "evidence_path": str(evidence_path),
             "manifest_sha256": manifest["manifest_sha256"],
             "transaction": transaction,
+            "adoption_resume_marker": adoption_resume_marker,
             "health": health,
             "reconciliation": reconciliation,
             "python_inputs": python_inputs,
+            "post_transaction_wallet_1_ctf_balance": (
+                post_transaction_wallet_1_ctf_balance
+            ),
             "sell_plan": sell_plan,
             "order_submission_enabled": False,
             "entry_submission_disabled": True,
@@ -4791,6 +7281,16 @@ def main() -> int:
         database.pgpass.unlink(missing_ok=True)
         if migration is not None and migration.extra_pgpass is not None:
             migration.extra_pgpass.unlink(missing_ok=True)
+
+
+def main() -> int:
+    args = parse_args()
+    if args.self_test:
+        self_test()
+        return 0
+    validate_production_args(args)
+    with exclusive_cutover_lock():
+        return execute_cutover(args)
 
 
 if __name__ == "__main__":
