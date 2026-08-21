@@ -1,10 +1,13 @@
-.PHONY: fmt test test-postgres vet run wallet-check check
+.PHONY: fmt test test-deploy test-postgres vet run wallet-check check
 
 fmt:
 	go fmt ./...
 
 test:
 	go test ./...
+
+test-deploy:
+	python3 -m unittest discover -s deploy -p 'test_*.py'
 
 test-postgres:
 	@test -n "$(TRADING_EXECUTION_TEST_DATABASE_URL)" || (echo "TRADING_EXECUTION_TEST_DATABASE_URL is required" && exit 1)
@@ -20,4 +23,4 @@ wallet-check:
 	@test -n "$(POLYMARKET_ACCOUNTS_FILE)" || (echo "POLYMARKET_ACCOUNTS_FILE is required" && exit 1)
 	go run ./cmd/walletcheck
 
-check: fmt test vet
+check: fmt test test-deploy vet

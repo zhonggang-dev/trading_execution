@@ -43,6 +43,23 @@ func TestSnapshotReadsPointInTimeResponse(t *testing.T) {
 					"completed_at":"2026-08-18T04:10:00Z",
 					"available_at":"2026-08-18T04:10:01Z",
 					"model":{"name":"test"}
+				}],
+				"expected_predictions":[{
+					"prediction_id":"pred-1",
+					"source_job_id":"job-1",
+					"prediction_model_id":"test",
+					"selection_id":11,
+					"selection_run_id":7,
+					"market_id":"market-1",
+					"condition_id":"condition-1",
+					"outcomes":[
+						{"index":0,"name":"Yes","token_id":"yes-token"},
+						{"index":1,"name":"No","token_id":"no-token"}
+					],
+					"prediction_as_of":"2026-08-18T04:00:00Z",
+					"task_available_at":"2026-08-18T04:00:01Z",
+					"status":"COMPLETED",
+					"result_available_at":"2026-08-18T04:10:01Z"
 				}]
 			}
 		}`))
@@ -57,8 +74,10 @@ func TestSnapshotReadsPointInTimeResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Snapshot() error = %v", err)
 	}
-	if snapshot.SnapshotID != "predsnap-test" || len(snapshot.Predictions) != 1 {
-		t.Fatalf("snapshot = %#v, want one prediction", snapshot)
+	if snapshot.SnapshotID != "predsnap-test" || len(snapshot.Predictions) != 1 ||
+		len(snapshot.ExpectedPredictions) != 1 || snapshot.ExpectedPredictions[0].SourceJobID != "job-1" ||
+		snapshot.ExpectedPredictions[0].SelectionRunID != 7 {
+		t.Fatalf("snapshot = %#v, want one prediction and its producer task manifest", snapshot)
 	}
 }
 

@@ -65,19 +65,20 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		return nil, fmt.Errorf("build strategy decision recorder: %w", err)
 	}
 	cycle, err := decisioncycle.New(decisioncycle.Params{
-		PredictionSource:   predictionClient,
-		PositionSource:     params.positionSource,
-		OrderBookSource:    params.orderBooks,
-		MidPriceSource:     midPrices,
-		Strategy:           strategyClient,
-		Recorder:           recorder,
-		Executor:           params.executor,
-		SubmitEnabled:      cycleConfig.OrderSubmissionEnabled,
-		Bindings:           cycleConfig.Bindings,
-		Venue:              params.cfg.Execution.Venue,
-		PredictionLookback: cycleConfig.PredictionLookback,
-		MidPriceLookback:   cycleConfig.MidPriceLookback,
-		DeliveryStaleAge:   cycleConfig.Timeout,
+		PredictionSource:             predictionClient,
+		PositionSource:               params.positionSource,
+		OrderBookSource:              params.orderBooks,
+		MidPriceSource:               midPrices,
+		Strategy:                     strategyClient,
+		Recorder:                     recorder,
+		Executor:                     params.executor,
+		SubmitEnabled:                cycleConfig.OrderSubmissionEnabled,
+		RequireCompleteModelCoverage: cycleConfig.RequireCompleteModelCoverage,
+		Bindings:                     cycleConfig.Bindings,
+		Venue:                        params.cfg.Execution.Venue,
+		PredictionLookback:           cycleConfig.PredictionLookback,
+		MidPriceLookback:             cycleConfig.MidPriceLookback,
+		DeliveryStaleAge:             cycleConfig.Timeout,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build decision cycle: %w", err)

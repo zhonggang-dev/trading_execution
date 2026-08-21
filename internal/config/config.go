@@ -58,19 +58,20 @@ type LiveOperations struct {
 // workflow. OrderSubmissionEnabled is deliberately independent from Enabled so
 // production can run the complete decision path without creating orders.
 type DecisionCycle struct {
-	Enabled                bool
-	OrderSubmissionEnabled bool
-	PredictionInfraBaseURL string
-	PredictionInfraToken   string
-	StrategyBaseURL        string
-	StrategyToken          string
-	Interval               time.Duration
-	StartupDelay           time.Duration
-	MaxStartLateness       time.Duration
-	Timeout                time.Duration
-	PredictionLookback     time.Duration
-	MidPriceLookback       time.Duration
-	Bindings               []domain.StrategyExecutionBinding
+	Enabled                      bool
+	OrderSubmissionEnabled       bool
+	RequireCompleteModelCoverage bool
+	PredictionInfraBaseURL       string
+	PredictionInfraToken         string
+	StrategyBaseURL              string
+	StrategyToken                string
+	Interval                     time.Duration
+	StartupDelay                 time.Duration
+	MaxStartLateness             time.Duration
+	Timeout                      time.Duration
+	PredictionLookback           time.Duration
+	MidPriceLookback             time.Duration
+	Bindings                     []domain.StrategyExecutionBinding
 }
 
 // Database 表示后端使用的 Database 类型。
@@ -409,6 +410,9 @@ func (config Config) Validate() error {
 	if config.DecisionCycle.OrderSubmissionEnabled && !config.DecisionCycle.Enabled {
 		return fmt.Errorf("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED requires DECISION_CYCLE_ENABLED=true")
 	}
+	if config.DecisionCycle.OrderSubmissionEnabled && !config.DecisionCycle.RequireCompleteModelCoverage {
+		return fmt.Errorf("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED requires DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true")
+	}
 	if config.DecisionCycle.Enabled {
 		if config.Execution.Mode != "live" {
 			return fmt.Errorf("DECISION_CYCLE_ENABLED requires EXECUTION_MODE=live")
@@ -454,6 +458,11 @@ func (config Config) Validate() error {
 		if err := validateDecisionBindings(config.DecisionCycle.Bindings); err != nil {
 			return err
 		}
+		if config.DecisionCycle.OrderSubmissionEnabled {
+			if err := validateFourWalletSubmissionTopology(config.DecisionCycle.Bindings); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -464,6 +473,10 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		return DecisionCycle{}, err
 	}
 	submitEnabled, err := boolean("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", false)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	requireCompleteModelCoverage, err := boolean("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", false)
 	if err != nil {
 		return DecisionCycle{}, err
 	}
@@ -497,11 +510,12 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	}
 	return DecisionCycle{
 		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
-		PredictionInfraBaseURL: strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_URL")),
-		PredictionInfraToken:   strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_TOKEN")),
-		StrategyBaseURL:        strings.TrimSpace(os.Getenv("DECISION_CYCLE_STRATEGY_URL")),
-		StrategyToken:          strings.TrimSpace(os.Getenv("DECISION_CYCLE_STRATEGY_TOKEN")),
-		Interval:               interval, StartupDelay: startupDelay,
+		RequireCompleteModelCoverage: requireCompleteModelCoverage,
+		PredictionInfraBaseURL:       strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_URL")),
+		PredictionInfraToken:         strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_TOKEN")),
+		StrategyBaseURL:              strings.TrimSpace(os.Getenv("DECISION_CYCLE_STRATEGY_URL")),
+		StrategyToken:                strings.TrimSpace(os.Getenv("DECISION_CYCLE_STRATEGY_TOKEN")),
+		Interval:                     interval, StartupDelay: startupDelay,
 		MaxStartLateness: maxStartLateness, Timeout: timeout,
 		PredictionLookback: predictionLookback, MidPriceLookback: midPriceLookback,
 		Bindings: bindings,
@@ -556,6 +570,51 @@ func validateDecisionBindings(bindings []domain.StrategyExecutionBinding) error 
 		logicalModelSources[binding.ModelID] = binding.PredictionModelID
 		sourceModelTargets[binding.PredictionModelID] = binding.ModelID
 		bindings[index] = binding
+	}
+	return nil
+}
+
+// validateFourWalletSubmissionTopology prevents a legacy one-binding canary
+// from becoming production merely by enabling the two generic cycle gates.
+// Changing the live topology is a deliberate code/config contract change.
+func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBinding) error {
+	if len(bindings) != 4 {
+		return fmt.Errorf("live decision submission requires the exact 2 models x 2 strategies x 4 accounts topology")
+	}
+	expectedAccounts := map[string]struct{}{
+		"main": {}, "wallet-1": {}, "wallet-2": {}, "wallet-3": {},
+	}
+	expectedStrategies := map[string]struct{}{
+		domain.StrategyIDMultfactorV1: {}, domain.StrategyIDMultfactorV2: {},
+	}
+	accounts := make(map[string]struct{}, len(bindings))
+	logicalModels := make(map[string]struct{}, 2)
+	predictionModels := make(map[string]struct{}, 2)
+	pairs := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		binding = binding.Normalize()
+		accounts[binding.ExecutionAccountID] = struct{}{}
+		logicalModels[binding.ModelID] = struct{}{}
+		predictionModels[binding.PredictionModelID] = struct{}{}
+		if _, expected := expectedStrategies[binding.StrategyID]; !expected {
+			return fmt.Errorf("live decision submission requires multfactor_v1 and multfactor_v2 for every model")
+		}
+		pairs[binding.ModelID+"\x00"+binding.StrategyID] = struct{}{}
+	}
+	if len(logicalModels) != 2 || len(predictionModels) != 2 || len(pairs) != 4 {
+		return fmt.Errorf("live decision submission requires the exact 2 models x 2 strategies x 4 accounts topology")
+	}
+	for accountID := range expectedAccounts {
+		if _, exists := accounts[accountID]; !exists {
+			return fmt.Errorf("live decision submission requires execution accounts main, wallet-1, wallet-2, and wallet-3")
+		}
+	}
+	for modelID := range logicalModels {
+		for strategyID := range expectedStrategies {
+			if _, exists := pairs[modelID+"\x00"+strategyID]; !exists {
+				return fmt.Errorf("live decision submission requires both strategies for logical model %q", modelID)
+			}
+		}
 	}
 	return nil
 }

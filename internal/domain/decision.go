@@ -59,14 +59,39 @@ type Prediction struct {
 	Model          PredictionModel     `json:"model"`
 }
 
+type PredictionExpectationStatus string
+
+const (
+	PredictionExpectationPending   PredictionExpectationStatus = "PENDING"
+	PredictionExpectationCompleted PredictionExpectationStatus = "COMPLETED"
+)
+
+// PredictionExpectation is the immutable producer task manifest. Unlike a
+// result row it exists even when a model callback is still missing.
+type PredictionExpectation struct {
+	PredictionID      string                      `json:"prediction_id"`
+	SourceJobID       string                      `json:"source_job_id"`
+	PredictionModelID string                      `json:"prediction_model_id"`
+	SelectionID       int64                       `json:"selection_id"`
+	SelectionRunID    int64                       `json:"selection_run_id"`
+	MarketID          string                      `json:"market_id"`
+	ConditionID       string                      `json:"condition_id"`
+	Outcomes          []PredictionOutcome         `json:"outcomes"`
+	PredictionAsOf    time.Time                   `json:"prediction_as_of"`
+	TaskAvailableAt   time.Time                   `json:"task_available_at"`
+	Status            PredictionExpectationStatus `json:"status"`
+	ResultAvailableAt *time.Time                  `json:"result_available_at,omitempty"`
+}
+
 // PredictionSnapshot 表示后端使用的 PredictionSnapshot 类型。
 type PredictionSnapshot struct {
-	SchemaVersion  string       `json:"schema_version"`
-	SnapshotID     string       `json:"snapshot_id"`
-	DecisionAt     time.Time    `json:"decision_at"`
-	CompletedAfter time.Time    `json:"completed_after"`
-	GeneratedAt    time.Time    `json:"generated_at"`
-	Predictions    []Prediction `json:"predictions"`
+	SchemaVersion       string                  `json:"schema_version"`
+	SnapshotID          string                  `json:"snapshot_id"`
+	DecisionAt          time.Time               `json:"decision_at"`
+	CompletedAfter      time.Time               `json:"completed_after"`
+	GeneratedAt         time.Time               `json:"generated_at"`
+	Predictions         []Prediction            `json:"predictions"`
+	ExpectedPredictions []PredictionExpectation `json:"expected_predictions"`
 }
 
 // Validate 校验当前模型的字段完整性和业务约束。
@@ -86,6 +111,72 @@ func (snapshot PredictionSnapshot) Validate(expectedDecisionAt time.Time) error 
 			return fmt.Errorf("prediction snapshot contains duplicate prediction_id %q", prediction.PredictionID)
 		}
 		seenPredictions[prediction.PredictionID] = struct{}{}
+	}
+	seenExpectedPredictions := make(map[string]struct{}, len(snapshot.ExpectedPredictions))
+	seenExpectedJobs := make(map[string]struct{}, len(snapshot.ExpectedPredictions))
+	seenExpectedDimensions := make(map[string]struct{}, len(snapshot.ExpectedPredictions))
+	for index, expectation := range snapshot.ExpectedPredictions {
+		if err := expectation.Validate(snapshot.DecisionAt); err != nil {
+			return fmt.Errorf("expected prediction %d: %w", index, err)
+		}
+		if _, exists := seenExpectedPredictions[expectation.PredictionID]; exists {
+			return fmt.Errorf("prediction snapshot contains duplicate expected prediction_id %q", expectation.PredictionID)
+		}
+		if _, exists := seenExpectedJobs[expectation.SourceJobID]; exists {
+			return fmt.Errorf("prediction snapshot contains duplicate expected source_job_id %q", expectation.SourceJobID)
+		}
+		dimension := fmt.Sprintf("%d\x00%s\x00%s", expectation.SelectionRunID, expectation.MarketID, expectation.PredictionModelID)
+		if _, exists := seenExpectedDimensions[dimension]; exists {
+			return fmt.Errorf("prediction snapshot contains duplicate expected Market/Model task")
+		}
+		seenExpectedPredictions[expectation.PredictionID] = struct{}{}
+		seenExpectedJobs[expectation.SourceJobID] = struct{}{}
+		seenExpectedDimensions[dimension] = struct{}{}
+	}
+	return nil
+}
+
+func (expectation PredictionExpectation) Validate(decisionAt time.Time) error {
+	if strings.TrimSpace(expectation.PredictionID) == "" || strings.TrimSpace(expectation.SourceJobID) == "" ||
+		strings.TrimSpace(expectation.PredictionModelID) == "" || expectation.SelectionID < 1 || expectation.SelectionRunID < 1 ||
+		strings.TrimSpace(expectation.MarketID) == "" || strings.TrimSpace(expectation.ConditionID) == "" {
+		return fmt.Errorf("task, selection, Market, and model identifiers are required")
+	}
+	decisionAt = decisionAt.UTC()
+	if expectation.PredictionAsOf.IsZero() || expectation.TaskAvailableAt.IsZero() ||
+		expectation.PredictionAsOf.After(decisionAt) || expectation.TaskAvailableAt.After(decisionAt) {
+		return fmt.Errorf("expected prediction task is not point-in-time available")
+	}
+	if expectation.TaskAvailableAt.Before(expectation.PredictionAsOf) {
+		return fmt.Errorf("expected prediction task is available before its prediction_as_of")
+	}
+	if len(expectation.Outcomes) != 2 {
+		return fmt.Errorf("expected prediction task must contain two outcomes")
+	}
+	seenTokens := make(map[string]struct{}, len(expectation.Outcomes))
+	for index, outcome := range expectation.Outcomes {
+		if outcome.Index != index || strings.TrimSpace(outcome.Name) == "" || strings.TrimSpace(outcome.TokenID) == "" {
+			return fmt.Errorf("expected outcome %d identity is invalid", index)
+		}
+		if _, exists := seenTokens[outcome.TokenID]; exists {
+			return fmt.Errorf("expected prediction task contains duplicate token ids")
+		}
+		seenTokens[outcome.TokenID] = struct{}{}
+	}
+	switch expectation.Status {
+	case PredictionExpectationPending:
+		if expectation.ResultAvailableAt != nil {
+			return fmt.Errorf("pending expected prediction must not have result_available_at")
+		}
+	case PredictionExpectationCompleted:
+		if expectation.ResultAvailableAt == nil || expectation.ResultAvailableAt.IsZero() || expectation.ResultAvailableAt.After(decisionAt) {
+			return fmt.Errorf("completed expected prediction requires a PIT-visible result_available_at")
+		}
+		if expectation.ResultAvailableAt.Before(expectation.TaskAvailableAt) {
+			return fmt.Errorf("completed expected prediction result is available before its task")
+		}
+	default:
+		return fmt.Errorf("expected prediction status %q is invalid", expectation.Status)
 	}
 	return nil
 }
@@ -123,6 +214,9 @@ func (prediction Prediction) Validate(decisionAt time.Time) error {
 	if prediction.PredictionAsOf.IsZero() || prediction.CompletedAt.IsZero() || prediction.AvailableAt.IsZero() ||
 		prediction.PredictionAsOf.After(decisionAt) || prediction.CompletedAt.After(decisionAt) || prediction.AvailableAt.After(decisionAt) {
 		return fmt.Errorf("prediction is not point-in-time available at the decision boundary")
+	}
+	if prediction.CompletedAt.Before(prediction.PredictionAsOf) || prediction.AvailableAt.Before(prediction.CompletedAt) {
+		return fmt.Errorf("prediction completion and availability timestamps are out of order")
 	}
 	return nil
 }
@@ -480,7 +574,7 @@ type StrategyExecutionConstraints struct {
 // DefaultStrategyExecutionConstraints 返回策略下单协议的默认执行约束。
 func DefaultStrategyExecutionConstraints() StrategyExecutionConstraints {
 	return StrategyExecutionConstraints{
-		SizeUnit: "SHARES", SizeDecimalPlaces: 2, BuyNotionalDecimals: 2,
+		SizeUnit: "SHARES", SizeDecimalPlaces: 2, BuyNotionalDecimals: 4,
 		MinimumBuyNotional: "1", AllowedTimeInForce: []TimeInForce{TimeInForceFOK},
 		PriceProtectionPolicy: "EXACT_TOP_OF_BOOK",
 	}
@@ -624,6 +718,16 @@ type StrategyExit struct {
 	Order      *StrategyOrderParams `json:"order"`
 }
 
+const StrategyEntryBlockIncompleteModelCoverage = "INCOMPLETE_MODEL_COVERAGE"
+
+// StrategyEntryPolicy is appended by Trading only when entries are blocked so
+// the durable output explains why BUY intents were suppressed. It is absent on
+// a healthy cycle for replay compatibility and is never trusted from Python.
+type StrategyEntryPolicy struct {
+	Enabled     bool   `json:"enabled"`
+	BlockReason string `json:"block_reason,omitempty"`
+}
+
 // StrategyDecisionResponse 表示后端使用的 StrategyDecisionResponse 类型。
 type StrategyDecisionResponse struct {
 	SchemaVersion string                   `json:"schema_version"`
@@ -633,4 +737,5 @@ type StrategyDecisionResponse struct {
 	DecidedAt     time.Time                `json:"decided_at"`
 	Evaluations   []StrategyEvaluation     `json:"evaluations"`
 	Exits         []StrategyExit           `json:"exits"`
+	EntryPolicy   *StrategyEntryPolicy     `json:"entry_policy,omitempty"`
 }

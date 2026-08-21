@@ -40,31 +40,36 @@ type Params struct {
 	Executor         port.OrderExecutor
 	// SubmitEnabled is an independent, fail-closed gate. A disabled cycle still
 	// records the validated strategy output but never invokes execution.Submit.
-	SubmitEnabled      bool
-	Bindings           []domain.StrategyExecutionBinding
-	Venue              string
-	PredictionLookback time.Duration
-	MidPriceLookback   time.Duration
-	DeliveryStaleAge   time.Duration
-	Now                func() time.Time
+	SubmitEnabled bool
+	// RequireCompleteModelCoverage rejects a cycle unless every effective
+	// Market has one PIT-selected probability from every configured prediction
+	// model. This is the production guard for same-Market model comparisons.
+	RequireCompleteModelCoverage bool
+	Bindings                     []domain.StrategyExecutionBinding
+	Venue                        string
+	PredictionLookback           time.Duration
+	MidPriceLookback             time.Duration
+	DeliveryStaleAge             time.Duration
+	Now                          func() time.Time
 }
 
 // Service 表示后端使用的 Service 类型。
 type Service struct {
-	predictionSource   port.PredictionSource
-	positionSource     port.StrategyPositionSource
-	orderBookSource    port.OrderBookSource
-	midPriceSource     port.MidPriceHistorySource
-	strategy           port.StrategyClient
-	recorder           port.DecisionRecorder
-	executor           port.OrderExecutor
-	submitEnabled      bool
-	bindings           []domain.StrategyExecutionBinding
-	venue              string
-	predictionLookback time.Duration
-	midPriceLookback   time.Duration
-	deliveryStaleAge   time.Duration
-	now                func() time.Time
+	predictionSource             port.PredictionSource
+	positionSource               port.StrategyPositionSource
+	orderBookSource              port.OrderBookSource
+	midPriceSource               port.MidPriceHistorySource
+	strategy                     port.StrategyClient
+	recorder                     port.DecisionRecorder
+	executor                     port.OrderExecutor
+	submitEnabled                bool
+	requireCompleteModelCoverage bool
+	bindings                     []domain.StrategyExecutionBinding
+	venue                        string
+	predictionLookback           time.Duration
+	midPriceLookback             time.Duration
+	deliveryStaleAge             time.Duration
+	now                          func() time.Time
 }
 
 // IntentResult 表示后端使用的 IntentResult 类型。
@@ -79,14 +84,16 @@ type IntentResult struct {
 
 // BindingRunResult 表示后端使用的 BindingRunResult 类型。
 type BindingRunResult struct {
-	Context           domain.StrategyExecutionContext
-	PredictionModelID string
-	PredictionCount   int
-	PositionCount     int
-	Request           domain.StrategyDecisionRequest
-	Response          domain.StrategyDecisionResponse
-	Intents           []IntentResult
-	Error             error
+	Context                domain.StrategyExecutionContext
+	PredictionModelID      string
+	PredictionCount        int
+	PositionCount          int
+	EntrySubmissionEnabled bool
+	EntryBlockReason       string
+	Request                domain.StrategyDecisionRequest
+	Response               domain.StrategyDecisionResponse
+	Intents                []IntentResult
+	Error                  error
 }
 
 // RunResult 表示后端使用的 RunResult 类型。
@@ -104,6 +111,9 @@ func New(params Params) (*Service, error) {
 	}
 	if params.SubmitEnabled && params.Executor == nil {
 		return nil, fmt.Errorf("order executor is required when decision-cycle submission is enabled")
+	}
+	if params.SubmitEnabled && !params.RequireCompleteModelCoverage {
+		return nil, fmt.Errorf("complete prediction-model coverage is required when decision-cycle submission is enabled")
 	}
 	params.Venue = strings.ToLower(strings.TrimSpace(params.Venue))
 	bindings, err := normalizeBindings(params.Bindings)
@@ -135,20 +145,21 @@ func New(params Params) (*Service, error) {
 		params.Now = time.Now
 	}
 	return &Service{
-		predictionSource:   params.PredictionSource,
-		positionSource:     params.PositionSource,
-		orderBookSource:    params.OrderBookSource,
-		midPriceSource:     params.MidPriceSource,
-		strategy:           params.Strategy,
-		recorder:           params.Recorder,
-		executor:           params.Executor,
-		submitEnabled:      params.SubmitEnabled,
-		bindings:           bindings,
-		venue:              params.Venue,
-		predictionLookback: params.PredictionLookback,
-		midPriceLookback:   params.MidPriceLookback,
-		deliveryStaleAge:   params.DeliveryStaleAge,
-		now:                params.Now,
+		predictionSource:             params.PredictionSource,
+		positionSource:               params.PositionSource,
+		orderBookSource:              params.OrderBookSource,
+		midPriceSource:               params.MidPriceSource,
+		strategy:                     params.Strategy,
+		recorder:                     params.Recorder,
+		executor:                     params.Executor,
+		submitEnabled:                params.SubmitEnabled,
+		requireCompleteModelCoverage: params.RequireCompleteModelCoverage,
+		bindings:                     bindings,
+		venue:                        params.Venue,
+		predictionLookback:           params.PredictionLookback,
+		midPriceLookback:             params.MidPriceLookback,
+		deliveryStaleAge:             params.DeliveryStaleAge,
+		now:                          params.Now,
 	}, nil
 }
 
@@ -168,10 +179,37 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err := snapshot.Validate(decisionAt); err != nil {
 		return RunResult{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}
-	if err := validatePredictionDimensions(snapshot.Predictions, service.bindings); err != nil {
-		return RunResult{}, err
+	modelIDs := configuredPredictionModels(service.bindings)
+	selectedPredictions := make([]domain.Prediction, 0)
+	var coverageErr error
+	if service.requireCompleteModelCoverage {
+		expectations, expectationErr := domain.SelectEffectivePredictionExpectations(snapshot.ExpectedPredictions, modelIDs)
+		if expectationErr == nil {
+			freshAfter := decisionAt.Add(-service.predictionLookback)
+			selectedPredictions, coverageErr = selectCompleteModelCoverage(
+				snapshot.Predictions, expectations, service.bindings, freshAfter,
+			)
+			if coverageErr != nil {
+				// Keep only exact current manifest results in degraded requests.
+				// A previous generation must not influence either BUY or SELL
+				// decisions when the current task for that pair is PENDING.
+				selectedPredictions, err = selectCompletedManifestResults(
+					snapshot.Predictions, expectations, modelIDs, freshAfter,
+				)
+				if err != nil {
+					coverageErr = errors.Join(coverageErr, err)
+					selectedPredictions = nil
+				}
+			}
+		} else {
+			coverageErr = expectationErr
+		}
+	} else {
+		selectedPredictions, err = domain.SelectEffectivePredictions(snapshot.Predictions, modelIDs)
+		if err != nil {
+			return RunResult{}, err
+		}
 	}
-	selectedPredictions := predictionsForBindings(snapshot.Predictions, service.bindings)
 	positionLots, err := service.loadPositionLots(ctx, decisionAt)
 	if err != nil {
 		return RunResult{}, err
@@ -207,9 +245,12 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		Runs:                 make([]BindingRunResult, 0, len(service.bindings)),
 	}
 	runErrors := make([]error, 0)
+	if coverageErr != nil {
+		runErrors = append(runErrors, coverageErr)
+	}
 	for _, binding := range service.bindings {
 		executionContext := binding.Context()
-		predictions := predictionsForBinding(snapshot.Predictions, binding)
+		predictions := predictionsForBinding(selectedPredictions, binding)
 		positions := positionLots[binding.ExecutionAccountID]
 		bindingTargets, selectErr := buildInputTargets(predictions, positions)
 		if selectErr != nil {
@@ -264,6 +305,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		run, runErr := service.runBinding(ctx, runBindingParams{
 			decisionAt: decisionAt, predictionSnapshotID: snapshot.SnapshotID, binding: executionContext,
 			predictions: predictions, positions: positions, books: bindingBooks, histories: bindingHistories,
+			allowEntries:     coverageErr == nil,
+			entryBlockReason: entryBlockReason(coverageErr),
 		})
 		run.PredictionModelID = binding.PredictionModelID
 		run.Error = runErr
@@ -403,6 +446,13 @@ func wrapError(operation string, err error) error {
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
+func entryBlockReason(coverageErr error) string {
+	if coverageErr == nil {
+		return ""
+	}
+	return domain.StrategyEntryBlockIncompleteModelCoverage
+}
+
 // runBindingParams 收拢单个模型策略绑定执行一次决策所需的冻结输入。
 type runBindingParams struct {
 	decisionAt           time.Time
@@ -412,6 +462,8 @@ type runBindingParams struct {
 	positions            []domain.StrategyPositionLot
 	books                []domain.OrderBookSnapshot
 	histories            []domain.MidPriceHistory
+	allowEntries         bool
+	entryBlockReason     string
 }
 
 // runBinding 为单个绑定冻结输入、调用策略、持久化输出并提交订单意图。
@@ -428,7 +480,8 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 		MidPriceHistories:    params.histories,
 	}).Build()
 	run := BindingRunResult{
-		Context: params.binding, PredictionCount: len(params.predictions), PositionCount: len(params.positions), Request: request,
+		Context: params.binding, PredictionCount: len(params.predictions), PositionCount: len(params.positions),
+		EntrySubmissionEnabled: params.allowEntries, EntryBlockReason: params.entryBlockReason, Request: request,
 	}
 	if err != nil {
 		return run, err
@@ -443,14 +496,24 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 		return run, err
 	}
 	response, err := service.strategy.Decide(ctx, request)
-	run.Response = response
 	if err != nil {
+		run.Response = response
 		return run, fmt.Errorf("request strategy decision: %w", err)
 	}
+	// EntryPolicy is a Go-owned additive audit field. Keep it absent during a
+	// normal cycle so replay of pre-upgrade v1 output stays byte-compatible;
+	// overwrite any untrusted Python value in both modes.
+	response.EntryPolicy = nil
+	if !params.allowEntries {
+		response.EntryPolicy = &domain.StrategyEntryPolicy{
+			Enabled: false, BlockReason: params.entryBlockReason,
+		}
+	}
+	run.Response = response
 	if response.DecidedAt.After(service.now().UTC()) {
 		return run, fmt.Errorf("%w: decided_at must not be in the future", ErrInvalidStrategy)
 	}
-	intents, err := validateResponse(request, response, service.venue)
+	intents, err := validateResponseWithEntryPolicy(request, response, service.venue, params.allowEntries)
 	if err != nil {
 		return run, err
 	}
@@ -459,7 +522,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, fmt.Errorf("record strategy output: %w", err)
 	}
-	intents, err = validateResponse(request, response, service.venue)
+	intents, err = validateResponseWithEntryPolicy(request, response, service.venue, params.allowEntries)
 	if err != nil {
 		return run, fmt.Errorf("validate recorded strategy output: %w", err)
 	}
@@ -643,45 +706,177 @@ func normalizeBindings(bindings []domain.StrategyExecutionBinding) ([]domain.Str
 	return result, nil
 }
 
-// predictionsForBindings 筛选所有已配置模型对应的预测记录。
-func predictionsForBindings(predictions []domain.Prediction, bindings []domain.StrategyExecutionBinding) []domain.Prediction {
+// configuredPredictionModels 返回去重且稳定排序的上游模型身份。
+func configuredPredictionModels(bindings []domain.StrategyExecutionBinding) []string {
 	models := make(map[string]struct{}, len(bindings))
 	for _, binding := range bindings {
 		models[binding.PredictionModelID] = struct{}{}
 	}
-	result := make([]domain.Prediction, 0, len(predictions))
-	for _, prediction := range predictions {
-		if _, selected := models[strings.TrimSpace(prediction.Model.Name)]; selected {
-			result = append(result, prediction)
-		}
+	result := make([]string, 0, len(models))
+	for modelID := range models {
+		result = append(result, modelID)
 	}
+	sort.Strings(result)
 	return result
 }
 
-// validatePredictionDimensions enforces the trading identity promised to the strategy:
-// one immutable probability record per (market, configured source model). The same
-// Market may still have independent probabilities from different models.
-func validatePredictionDimensions(predictions []domain.Prediction, bindings []domain.StrategyExecutionBinding) error {
-	models := make(map[string]struct{}, len(bindings))
-	for _, binding := range bindings {
-		models[binding.PredictionModelID] = struct{}{}
+// selectCompleteModelCoverage makes the producer task manifest authoritative
+// for a strict cycle. It requires one current COMPLETED task for every
+// Market/model pair, verifies the models belong to the same selection
+// generation, and returns only the exact result rows named by those tasks.
+// Older lookback rows and non-manifest rows can never make coverage pass.
+func selectCompleteModelCoverage(
+	predictions []domain.Prediction,
+	expectations []domain.PredictionExpectation,
+	bindings []domain.StrategyExecutionBinding,
+	freshAfter time.Time,
+) ([]domain.Prediction, error) {
+	models := configuredPredictionModels(bindings)
+	if len(expectations) == 0 {
+		return nil, fmt.Errorf("prediction snapshot has no expected prediction task manifest for configured models %q", models)
 	}
-	seen := make(map[string]string)
-	for _, prediction := range predictions {
-		predictionModelID := strings.TrimSpace(prediction.Model.Name)
-		if _, selected := models[predictionModelID]; !selected {
+	type generation struct {
+		selectionID    int64
+		selectionRunID int64
+		predictionAsOf time.Time
+	}
+	expectedByPair := make(map[string]domain.PredictionExpectation, len(expectations))
+	marketsSet := make(map[string]struct{})
+	generationByMarket := make(map[string]generation)
+	for _, expectation := range expectations {
+		marketID := strings.TrimSpace(expectation.MarketID)
+		modelID := strings.TrimSpace(expectation.PredictionModelID)
+		key := coveragePairKey(marketID, modelID)
+		expectedByPair[key] = expectation
+		marketsSet[marketID] = struct{}{}
+		candidate := generation{
+			selectionID: expectation.SelectionID, selectionRunID: expectation.SelectionRunID,
+			predictionAsOf: expectation.PredictionAsOf,
+		}
+		current, exists := generationByMarket[marketID]
+		if !exists {
+			generationByMarket[marketID] = candidate
 			continue
 		}
-		key := strings.TrimSpace(prediction.MarketID) + "\x00" + predictionModelID
-		if previousPredictionID, exists := seen[key]; exists {
-			return fmt.Errorf(
-				"prediction snapshot has multiple probabilities for market %q and prediction model %q (%s, %s)",
-				prediction.MarketID, predictionModelID, previousPredictionID, prediction.PredictionID,
+		if current.selectionID != candidate.selectionID || current.selectionRunID != candidate.selectionRunID ||
+			!current.predictionAsOf.Equal(candidate.predictionAsOf) {
+			return nil, fmt.Errorf(
+				"prediction task manifest mixes model generations for market %q", marketID,
 			)
 		}
-		seen[key] = prediction.PredictionID
 	}
-	return nil
+	markets := make([]string, 0, len(marketsSet))
+	for marketID := range marketsSet {
+		markets = append(markets, marketID)
+	}
+	sort.Strings(markets)
+	missing := make([]string, 0)
+	for _, marketID := range markets {
+		for _, modelID := range models {
+			expectation, exists := expectedByPair[coveragePairKey(marketID, modelID)]
+			if !exists || expectation.Status != domain.PredictionExpectationCompleted ||
+				expectation.PredictionAsOf.Before(freshAfter) {
+				missing = append(missing, marketID+"/"+modelID)
+			}
+		}
+	}
+	if len(missing) != 0 {
+		return nil, fmt.Errorf("prediction snapshot has incomplete configured model coverage; pending, missing, or stale market/model pairs: %s", strings.Join(missing, ", "))
+	}
+
+	selected, err := selectCompletedManifestResults(predictions, expectations, models, freshAfter)
+	if err != nil {
+		return nil, err
+	}
+	if len(selected) != len(expectedByPair) {
+		return nil, fmt.Errorf("prediction snapshot is missing one or more exact completed manifest results")
+	}
+	return selected, nil
+}
+
+func selectCompletedManifestResults(
+	predictions []domain.Prediction,
+	expectations []domain.PredictionExpectation,
+	modelIDs []string,
+	freshAfter time.Time,
+) ([]domain.Prediction, error) {
+	type generation struct {
+		selectionID    int64
+		selectionRunID int64
+		predictionAsOf time.Time
+	}
+	generationByMarket := make(map[string]generation)
+	inconsistentMarkets := make(map[string]struct{})
+	for _, expectation := range expectations {
+		marketID := strings.TrimSpace(expectation.MarketID)
+		candidate := generation{
+			selectionID: expectation.SelectionID, selectionRunID: expectation.SelectionRunID,
+			predictionAsOf: expectation.PredictionAsOf,
+		}
+		current, exists := generationByMarket[marketID]
+		if !exists {
+			generationByMarket[marketID] = candidate
+			continue
+		}
+		if current.selectionID != candidate.selectionID || current.selectionRunID != candidate.selectionRunID ||
+			!current.predictionAsOf.Equal(candidate.predictionAsOf) {
+			inconsistentMarkets[marketID] = struct{}{}
+		}
+	}
+	resultsByPredictionID := make(map[string]domain.Prediction, len(predictions))
+	for _, prediction := range predictions {
+		resultsByPredictionID[prediction.PredictionID] = prediction
+	}
+	matched := make([]domain.Prediction, 0, len(expectations))
+	for _, expectation := range expectations {
+		if _, inconsistent := inconsistentMarkets[strings.TrimSpace(expectation.MarketID)]; inconsistent {
+			continue
+		}
+		if expectation.Status != domain.PredictionExpectationCompleted || expectation.PredictionAsOf.Before(freshAfter) {
+			continue
+		}
+		prediction, exists := resultsByPredictionID[expectation.PredictionID]
+		if !exists || !predictionMatchesExpectation(prediction, expectation) {
+			return nil, fmt.Errorf(
+				"prediction snapshot is missing the exact completed result for market/model pair %s/%s",
+				expectation.MarketID, expectation.PredictionModelID,
+			)
+		}
+		matched = append(matched, prediction)
+	}
+	selected, err := domain.SelectEffectivePredictions(matched, modelIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(selected) != len(matched) {
+		return nil, fmt.Errorf("prediction task manifest resolves to duplicate Market/model results")
+	}
+	return selected, nil
+}
+
+func coveragePairKey(marketID, modelID string) string {
+	return strings.TrimSpace(marketID) + "\x00" + strings.TrimSpace(modelID)
+}
+
+func predictionMatchesExpectation(prediction domain.Prediction, expectation domain.PredictionExpectation) bool {
+	if prediction.PredictionID != expectation.PredictionID || prediction.SourceJobID != expectation.SourceJobID ||
+		strings.TrimSpace(prediction.SandboxID) != "" ||
+		strings.TrimSpace(prediction.Model.Name) != strings.TrimSpace(expectation.PredictionModelID) ||
+		strings.TrimSpace(prediction.MarketID) != strings.TrimSpace(expectation.MarketID) ||
+		strings.TrimSpace(prediction.ConditionID) != strings.TrimSpace(expectation.ConditionID) ||
+		!prediction.PredictionAsOf.Equal(expectation.PredictionAsOf) || expectation.ResultAvailableAt == nil ||
+		!prediction.AvailableAt.Equal(*expectation.ResultAvailableAt) || len(prediction.Outcomes) != len(expectation.Outcomes) {
+		return false
+	}
+	for index := range prediction.Outcomes {
+		resultOutcome := prediction.Outcomes[index]
+		expectedOutcome := expectation.Outcomes[index]
+		if resultOutcome.Index != expectedOutcome.Index || strings.TrimSpace(resultOutcome.Name) != strings.TrimSpace(expectedOutcome.Name) ||
+			strings.TrimSpace(resultOutcome.TokenID) != strings.TrimSpace(expectedOutcome.TokenID) {
+			return false
+		}
+	}
+	return true
 }
 
 // predictionsForBinding 选择一个上游预测模型的 Market，再投影为 Python 和执行层使用的稳定业务模型。
@@ -986,7 +1181,7 @@ func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleI
 
 // validateExecutionConstraints 校验 Execution Constraints 的字段和业务约束。
 func validateExecutionConstraints(constraints domain.StrategyExecutionConstraints) error {
-	if constraints.SizeUnit != "SHARES" || constraints.SizeDecimalPlaces != 2 || constraints.BuyNotionalDecimals != 2 ||
+	if constraints.SizeUnit != "SHARES" || constraints.SizeDecimalPlaces != 2 || constraints.BuyNotionalDecimals != 4 ||
 		constraints.PriceProtectionPolicy != "EXACT_TOP_OF_BOOK" || len(constraints.AllowedTimeInForce) != 1 ||
 		constraints.AllowedTimeInForce[0] != domain.TimeInForceFOK {
 		return fmt.Errorf("unsupported strategy execution constraint set")
@@ -1005,8 +1200,29 @@ type expectedEvaluation struct {
 
 // validateResponse 校验 Response 的字段和业务约束。
 func validateResponse(request domain.StrategyDecisionRequest, response domain.StrategyDecisionResponse, venue string) ([]domain.OrderIntent, error) {
+	return validateResponseWithEntryPolicy(request, response, venue, true)
+}
+
+// validateResponseWithEntryPolicy keeps the frozen input truthful during a
+// model-coverage incident while enforcing a hard Go-side entry gate. Blocked
+// BUY proposals are audited in the strategy response but never become durable
+// OrderIntents; valid exits in the same response remain executable.
+func validateResponseWithEntryPolicy(
+	request domain.StrategyDecisionRequest,
+	response domain.StrategyDecisionResponse,
+	venue string,
+	allowEntries bool,
+) ([]domain.OrderIntent, error) {
 	if err := request.Context.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: request execution context: %v", ErrInvalidStrategy, err)
+	}
+	if allowEntries {
+		if response.EntryPolicy != nil {
+			return nil, fmt.Errorf("%w: healthy Trading entry policy must be absent", ErrInvalidStrategy)
+		}
+	} else if response.EntryPolicy == nil || response.EntryPolicy.Enabled ||
+		response.EntryPolicy.BlockReason != domain.StrategyEntryBlockIncompleteModelCoverage {
+		return nil, fmt.Errorf("%w: blocked Trading entry policy mismatch", ErrInvalidStrategy)
 	}
 	if response.SchemaVersion != domain.StrategyOutputSchemaVersion || response.CycleID != request.CycleID ||
 		response.InputID != request.InputID || !response.Context.Equal(request.Context) {
@@ -1025,6 +1241,7 @@ func validateResponse(request domain.StrategyDecisionRequest, response domain.St
 		return nil, fmt.Errorf("%w: expected %d evaluations, got %d", ErrInvalidStrategy, len(expected), len(response.Evaluations))
 	}
 	seenEvaluations := make(map[string]struct{}, len(response.Evaluations))
+	seenEvaluationDecisions := make(map[string]struct{}, len(response.Evaluations))
 	seenDecisions := make(map[string]struct{}, len(response.Evaluations)+len(response.Exits))
 	intents := make([]domain.OrderIntent, 0)
 	for index, evaluation := range response.Evaluations {
@@ -1043,15 +1260,27 @@ func validateResponse(request domain.StrategyDecisionRequest, response domain.St
 		if evaluation.DecisionID == "" || evaluation.ReasonCode == "" {
 			return nil, fmt.Errorf("%w: evaluation %d requires decision_id and reason_code", ErrInvalidStrategy, index)
 		}
-		if _, exists := seenDecisions[evaluation.DecisionID]; exists {
+		if _, exists := seenEvaluationDecisions[evaluation.DecisionID]; exists {
 			return nil, fmt.Errorf("%w: duplicate decision_id %q", ErrInvalidStrategy, evaluation.DecisionID)
 		}
-		seenDecisions[evaluation.DecisionID] = struct{}{}
+		seenEvaluationDecisions[evaluation.DecisionID] = struct{}{}
+		// A coverage-suppressed SUBMIT never becomes an intent, so its
+		// audit-only decision ID must not be able to suppress an independent
+		// SELL exit. It remains unique among evaluations.
+		if evaluation.Action != domain.StrategyActionSubmit || allowEntries {
+			if _, exists := seenDecisions[evaluation.DecisionID]; exists {
+				return nil, fmt.Errorf("%w: duplicate decision_id %q", ErrInvalidStrategy, evaluation.DecisionID)
+			}
+			seenDecisions[evaluation.DecisionID] = struct{}{}
+		}
 		if math.IsNaN(evaluation.Evidence.Probability) || math.IsInf(evaluation.Evidence.Probability, 0) ||
 			math.Abs(evaluation.Evidence.Probability-expectedValue.outcome.Probability) > 1e-12 {
 			return nil, fmt.Errorf("%w: evaluation %d probability does not match the input", ErrInvalidStrategy, index)
 		}
-		if err := validateEvidenceMetrics(evaluation.Evidence, request, evaluation.TokenID, evaluation.Action == domain.StrategyActionSubmit); err != nil {
+		if err := validateEvidenceMetrics(
+			evaluation.Evidence, request, evaluation.TokenID,
+			evaluation.Action == domain.StrategyActionSubmit && allowEntries,
+		); err != nil {
 			return nil, fmt.Errorf("%w: evaluation %d: %v", ErrInvalidStrategy, index, err)
 		}
 		requiredReason := inputFailureReason(request, evaluation.TokenID)
@@ -1067,6 +1296,9 @@ func validateResponse(request domain.StrategyDecisionRequest, response domain.St
 				return nil, fmt.Errorf("%w: evaluation %d must map input status to %s", ErrInvalidStrategy, index, requiredReason)
 			}
 		case domain.StrategyActionSubmit:
+			if !allowEntries {
+				continue
+			}
 			if requiredReason != "" {
 				return nil, fmt.Errorf("%w: evaluation %d cannot SUBMIT with %s input", ErrInvalidStrategy, index, requiredReason)
 			}
@@ -1113,6 +1345,7 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 	if evaluation.Order == nil {
 		return domain.OrderIntent{}, fmt.Errorf("SUBMIT requires order parameters")
 	}
+	order := *evaluation.Order
 	strategyID := request.Context.Normalize().StrategyID
 	if strategyID != domain.StrategyIDMultfactorV1 && strategyID != domain.StrategyIDMultfactorV2 {
 		return domain.OrderIntent{}, fmt.Errorf("unsupported strategy_id %q", strategyID)
@@ -1127,9 +1360,14 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 			return domain.OrderIntent{}, fmt.Errorf("multfactor_v2 SUBMIT requires usable raw mid-price history")
 		}
 	}
-	if err := validateStrategyOrder(*evaluation.Order, domain.SideBuy, book.Asks[0].Price, book, request.ExecutionConstraints); err != nil {
+	if err := validateStrategyOrder(order, domain.SideBuy, book.Asks[0].Price, book, request.ExecutionConstraints); err != nil {
 		return domain.OrderIntent{}, err
 	}
+	roundedSize, err := roundBuyShares(order.Size)
+	if err != nil {
+		return domain.OrderIntent{}, fmt.Errorf("round BUY order.size: %w", err)
+	}
+	order.Size = roundedSize
 	prediction, found := strategyPrediction(request.Predictions, evaluation.PredictionID)
 	if !found || evaluation.OutcomeIndex < 0 || evaluation.OutcomeIndex >= len(prediction.Outcomes) {
 		return domain.OrderIntent{}, fmt.Errorf("strategy prediction/outcome identity is missing")
@@ -1139,8 +1377,8 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 	marketSnapshotAt := book.SourceAt
 	signalAt = signalAt.UTC()
 	limitPrice := domain.Decimal("")
-	if evaluation.Order.Type == domain.OrderTypeLimit {
-		limitPrice = evaluation.Order.WorstPrice
+	if order.Type == domain.OrderTypeLimit {
+		limitPrice = order.WorstPrice
 	}
 	metadata := map[string]string{
 		"cycle_id":                 request.CycleID,
@@ -1149,7 +1387,7 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		"strategy_decision_id":     evaluation.DecisionID,
 		"strategy_reason_code":     string(evaluation.ReasonCode),
 		"strategy_reference_price": book.Asks[0].Price.String(),
-		"strategy_worst_price":     evaluation.Order.WorstPrice.String(),
+		"strategy_worst_price":     order.WorstPrice.String(),
 		"predicted_probability":    strconv.FormatFloat(evaluation.Evidence.Probability, 'f', -1, 64),
 		"market_question":          prediction.Question,
 		"model_id":                 request.Context.ModelID,
@@ -1157,6 +1395,9 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 	}
 	if !evaluation.Evidence.Edge.IsEmpty() {
 		metadata["strategy_edge"] = evaluation.Evidence.Edge.String()
+	}
+	if !order.Size.Equal(evaluation.Order.Size) {
+		metadata["strategy_requested_size"] = evaluation.Order.Size.String()
 	}
 	intent, err := (domain.OrderIntentParams{
 		ModelID:            request.Context.ModelID,
@@ -1174,12 +1415,12 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		MarketSnapshotAt:   &marketSnapshotAt,
 		SignalAt:           &signalAt,
 		Side:               domain.SideBuy,
-		Type:               evaluation.Order.Type,
+		Type:               order.Type,
 		Price:              limitPrice,
-		WorstPrice:         evaluation.Order.WorstPrice,
-		Size:               evaluation.Order.Size,
-		TimeInForce:        evaluation.Order.TimeInForce,
-		ExpiresAt:          evaluation.Order.ExpiresAt,
+		WorstPrice:         order.WorstPrice,
+		Size:               order.Size,
+		TimeInForce:        order.TimeInForce,
+		ExpiresAt:          order.ExpiresAt,
 		Metadata:           metadata,
 	}).Build()
 	return intent, err
@@ -1254,13 +1495,35 @@ func validateStrategyOrder(order domain.StrategyOrderParams, side domain.Side, t
 	if decimalPlaces(order.Size) > constraints.SizeDecimalPlaces {
 		return fmt.Errorf("order.size exceeds %d decimal places", constraints.SizeDecimalPlaces)
 	}
+	effectiveSize := order.Size
+	if side == domain.SideBuy {
+		var err error
+		effectiveSize, err = roundBuyShares(order.Size)
+		if err != nil {
+			return fmt.Errorf("round BUY order.size: %w", err)
+		}
+		if sign, err := effectiveSize.Sign(); err != nil || sign <= 0 {
+			return fmt.Errorf("BUY order.size rounds below one whole share")
+		}
+	}
 	if !book.MinOrderSize.IsEmpty() {
-		if comparison, err := order.Size.Compare(book.MinOrderSize); err != nil || comparison < 0 {
+		if comparison, err := effectiveSize.Compare(book.MinOrderSize); err != nil || comparison < 0 {
 			return fmt.Errorf("order.size is below orderbook min_order_size")
 		}
 	}
 	if side == domain.SideBuy {
-		notional, err := order.WorstPrice.Multiply(order.Size)
+		availableShares, err := protectedPriceLiquidity(book.Asks, order.WorstPrice)
+		if err != nil {
+			return fmt.Errorf("calculate best-ask liquidity: %w", err)
+		}
+		requestedShares, err := effectiveSize.Multiply("1")
+		if err != nil {
+			return fmt.Errorf("calculate rounded BUY shares: %w", err)
+		}
+		if len(book.Asks) > 0 && requestedShares.Cmp(availableShares) > 0 {
+			return fmt.Errorf("rounded BUY order.size exceeds best-ask liquidity")
+		}
+		notional, err := order.WorstPrice.Multiply(effectiveSize)
 		if err != nil {
 			return fmt.Errorf("calculate BUY notional: %w", err)
 		}
@@ -1273,6 +1536,40 @@ func validateStrategyOrder(order domain.StrategyOrderParams, side domain.Side, t
 		}
 	}
 	return nil
+}
+
+// protectedPriceLiquidity 汇总保护价上的 shares，兼容订单簿中连续的重复同价档。
+func protectedPriceLiquidity(levels []domain.PriceLevel, protectedPrice domain.Decimal) (*big.Rat, error) {
+	total := new(big.Rat)
+	for _, level := range levels {
+		if !level.Price.Equal(protectedPrice) {
+			break
+		}
+		size, err := level.Size.Multiply("1")
+		if err != nil {
+			return nil, err
+		}
+		total.Add(total, size)
+	}
+	return total, nil
+}
+
+// roundBuyShares 使用精确有理数运算将 BUY shares 四舍五入为整数，半数向上。
+func roundBuyShares(size domain.Decimal) (domain.Decimal, error) {
+	value, err := size.Multiply("1")
+	if err != nil {
+		return "", err
+	}
+	quotient, remainder := new(big.Int).QuoRem(value.Num(), value.Denom(), new(big.Int))
+	doubleRemainder := new(big.Int).Mul(new(big.Int).Abs(remainder), big.NewInt(2))
+	if doubleRemainder.Cmp(value.Denom()) >= 0 {
+		if value.Sign() >= 0 {
+			quotient.Add(quotient, big.NewInt(1))
+		} else {
+			quotient.Sub(quotient, big.NewInt(1))
+		}
+	}
+	return domain.Decimal(quotient.String()), nil
 }
 
 // decimalPlaces 计算十进制值所需的小数位数。

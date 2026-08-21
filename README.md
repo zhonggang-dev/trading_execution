@@ -105,11 +105,12 @@ PostgreSQL 订单/预占/Fill/仓位账本、启动与持续 reconciliation、he
    正确，并让每个确认 Fill 都取得足够确认数的链上 `OrderFilled` 证据；
 4. 使用专用小额空钱包完成一次人工批准的 BUY/SELL/Cancel canary 后再逐步放量。
 
-transactional outbox 会与账本同事务写入，但生产消息 publisher 仍需按部署环境注入；Position Exit
-和链上 redeem 仍未在 `cmd/server` 装配。策略周期已经使用 prediction_infra HTTP snapshot、
+transactional outbox 会与账本同事务写入，但生产消息 publisher 仍需按部署环境注入；独立 Position Exit
+runner 和链上 redeem 仍未在 `cmd/server` 装配（OPEN-lot 退出当前由 decision cycle 处理）。策略周期已经使用 prediction_infra HTTP snapshot、
 Python `/api/v4/decisions`、PostgreSQL 输入/输出审计和精确 UTC Runner 完成 live 装配，但默认
-`DECISION_CYCLE_ENABLED=false`，且独立的订单提交开关也默认关闭。两个开关未同时明确开启时，
-不会由周期创建订单。提交开关打开时，经过校验的 OrderIntent 会先与策略输出在同一事务中写入
+`DECISION_CYCLE_ENABLED=false`，且独立的订单提交开关也默认关闭。订单提交还强制要求
+`DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true` 和精确的 2 模型 × 2 策略 × 4 钱包拓扑；
+缺少任一门禁都不会由周期创建 BUY 订单。提交开关打开时，经过校验的 OrderIntent 会先与策略输出在同一事务中写入
 PostgreSQL 投递表，再由带租约和 fencing attempt 的 worker 调用幂等执行服务；进程崩溃后只会按
 稳定 `client_order_id` 恢复，不会把一次算法响应直接当成一次不可靠的内存下单。
 
@@ -154,6 +155,7 @@ POST /api/v1/orders/{order_id}/cancel
 GET  /api/v1/orders/{order_id}/events
 GET  /api/v1/orders/{order_id}/attempts
 GET  /api/v1/trades                              # 已确认且已入账的真实 Fill
+GET  /api/v1/daily-pnl                           # UTC 日 × 执行账户 × 策略的净已实现盈亏
 POST /internal/jobs/position-exit-evaluation/run  # 仅在注入 PositionExitJob 后注册，当前 cmd/server 未装配
 POST /internal/jobs/reconciliation/run             # live 模式注册；paper 模式不注册
 ```
@@ -163,6 +165,9 @@ POST /internal/jobs/reconciliation/run             # live 模式注册；paper �
 ```bash
 curl 'http://127.0.0.1:8090/api/v1/trades?from=2026-08-01T00:00:00Z&side=SELL&model_id=forecast-v2&strategy_id=multfactor_v2&limit=20&offset=0' \
   -H "Authorization: Bearer ${EXECUTION_API_TOKEN}"
+
+curl 'http://127.0.0.1:8090/api/v1/daily-pnl?days=14' \
+  -H "Authorization: Bearer ${EXECUTION_API_TOKEN}"
 ```
 
 该接口只读取 `execution_fills.status=CONFIRMED AND applied_at IS NOT NULL` 的记录，
@@ -171,6 +176,11 @@ curl 'http://127.0.0.1:8090/api/v1/trades?from=2026-08-01T00:00:00Z&side=SELL&mo
 `TRADING_EXECUTION_DATABASE_URL` 后读取 PostgreSQL；未配置时 paper 模式返回空列表，
 不会把 paper 订单状态伪装成真实成交。生产库需按顺序执行至
 `migrations/0015_position_lot_model_routes.sql`。
+
+每日盈亏接口最多查询 90 天，固定使用 UTC 自然日。收益按
+`position_lot_closures -> position_lots` 的开仓批次来源归因到准确的
+`execution_account_id + model_id + strategy_id`；当前启用的策略绑定即使某天没有平仓，
+也会返回 `realized_pnl="0"`，供前端区分零收益与数据缺失。该接口不返回真实钱包地址。
 
 创建限价单：
 

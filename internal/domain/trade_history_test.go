@@ -35,3 +35,20 @@ func TestTradeHistoryFilterRejectsUnsafePaginationAndRange(t *testing.T) {
 		}
 	}
 }
+
+// TestDailyPnLFilterNormalizesAndValidates 验证每日盈亏窗口有安全默认值和 UTC 截止时间。
+func TestDailyPnLFilterNormalizesAndValidates(t *testing.T) {
+	asOf := time.Date(2026, 8, 21, 9, 30, 0, 0, time.FixedZone("CST", 8*60*60))
+	filter := (DailyPnLFilter{AsOf: asOf}).Normalize()
+	if filter.Days != DefaultDailyPnLDays || filter.AsOf.Location() != time.UTC {
+		t.Fatalf("normalized filter = %#v", filter)
+	}
+	if err := filter.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	for _, days := range []int{-1, MaxDailyPnLDays + 1} {
+		if err := (DailyPnLFilter{Days: days, AsOf: asOf}).Validate(); err == nil {
+			t.Fatalf("Validate(days=%d) unexpectedly succeeded", days)
+		}
+	}
+}

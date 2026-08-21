@@ -49,6 +49,7 @@ type reconciliationJob interface {
 // tradeHistoryService 表示后端使用的 tradeHistoryService 类型。
 type tradeHistoryService interface {
 	List(context.Context, domain.TradeHistoryFilter) (domain.TradeHistoryPage, error)
+	DailyPnL(context.Context, domain.DailyPnLFilter) (domain.DailyPnLReport, error)
 }
 
 // liveOperationsService 提供已经在后台完成聚合的实盘只读快照。
@@ -130,6 +131,7 @@ func New(params Params) (*Server, error) {
 	mux.Handle("GET /api/v1/orders/{order_id}/attempts", server.authenticate(http.HandlerFunc(server.attempts)))
 	if server.tradeHistory != nil {
 		mux.Handle("GET /api/v1/trades", server.authenticate(http.HandlerFunc(server.trades)))
+		mux.Handle("GET /api/v1/daily-pnl", server.authenticate(http.HandlerFunc(server.dailyPnL)))
 	}
 	if server.liveOperations != nil {
 		mux.Handle("GET /api/v1/live-operations", server.authenticateReadOnly(http.HandlerFunc(server.getLiveOperations)))
@@ -284,6 +286,23 @@ func (server *Server) trades(writer http.ResponseWriter, request *http.Request) 
 	writeJSON(writer, http.StatusOK, map[string]any{"data": page})
 }
 
+// dailyPnL 返回连续 UTC 日内按执行账户和来源策略归因的净已实现盈亏。
+func (server *Server) dailyPnL(writer http.ResponseWriter, request *http.Request) {
+	filter, err := parseDailyPnLFilter(request)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_DAILY_PNL_FILTER", err.Error())
+		return
+	}
+	report, err := server.tradeHistory.DailyPnL(request.Context(), filter)
+	if err != nil {
+		server.logger.Error("daily pnl query failed", "error", err)
+		writeError(writer, http.StatusBadGateway, "DAILY_PNL_UNAVAILABLE", "daily pnl is temporarily unavailable")
+		return
+	}
+	writer.Header().Set("Cache-Control", "no-store")
+	writeJSON(writer, http.StatusOK, map[string]any{"data": report})
+}
+
 // getLiveOperations 直接返回后台原子快照，不在请求路径串行调用外部交易接口。
 func (server *Server) getLiveOperations(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Cache-Control", "no-store")
@@ -345,6 +364,32 @@ func parseTradeHistoryFilter(request *http.Request) (domain.TradeHistoryFilter, 
 	filter = filter.Normalize()
 	if err := filter.Validate(); err != nil {
 		return domain.TradeHistoryFilter{}, err
+	}
+	return filter, nil
+}
+
+// parseDailyPnLFilter 只接受有限天数，日期边界始终由服务端按 UTC 当前日计算。
+func parseDailyPnLFilter(request *http.Request) (domain.DailyPnLFilter, error) {
+	query := request.URL.Query()
+	for key, values := range query {
+		if key != "days" {
+			return domain.DailyPnLFilter{}, fmt.Errorf("unsupported query parameter %q", key)
+		}
+		if len(values) != 1 {
+			return domain.DailyPnLFilter{}, fmt.Errorf("query parameter %q must be provided once", key)
+		}
+	}
+	filter := domain.DailyPnLFilter{Days: domain.DefaultDailyPnLDays}
+	if raw := query.Get("days"); raw != "" {
+		var err error
+		filter.Days, err = strconv.Atoi(raw)
+		if err != nil {
+			return domain.DailyPnLFilter{}, fmt.Errorf("days must be an integer")
+		}
+	}
+	filter = filter.Normalize()
+	if err := filter.Validate(); err != nil {
+		return domain.DailyPnLFilter{}, err
 	}
 	return filter, nil
 }

@@ -91,8 +91,8 @@ func buildRawAmounts(intent domain.OrderIntent, tickSize, minOrderSize, minBuyNo
 		// The matching endpoint applies a flat precision constraint to
 		// marketable FAK/FOK amounts. Reject instead of silently changing size.
 		if intent.Side == domain.SideBuy {
-			if ratDecimalPlaces(notional) > 2 || decimalPlaces(intent.Size) > 4 {
-				return rawAmounts{}, newInvalidError("INVALID_FAK_FOK_PRECISION", "FAK/FOK BUY requires maker notional <=2 decimals and shares <=4 decimals")
+			if ratDecimalPlaces(notional) > 4 || decimalPlaces(intent.Size) > 4 {
+				return rawAmounts{}, newInvalidError("INVALID_FAK_FOK_PRECISION", "FAK/FOK BUY requires maker notional <=4 decimals and shares <=4 decimals")
 			}
 		} else if decimalPlaces(intent.Size) > 2 || ratDecimalPlaces(notional) > 4 {
 			return rawAmounts{}, newInvalidError("INVALID_FAK_FOK_PRECISION", "FAK/FOK SELL requires shares <=2 decimals and taker notional <=4 decimals")

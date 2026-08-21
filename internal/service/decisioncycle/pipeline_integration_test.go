@@ -197,6 +197,7 @@ func newPipelineFixture(t *testing.T, maxNotional domain.Decimal, submitEnabled 
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-pipeline-1",
 			DecisionAt: decisionAt, CompletedAfter: decisionAt.Add(-3 * time.Hour),
 			GeneratedAt: decisionAt.Add(time.Second), Predictions: []domain.Prediction{prediction},
+			ExpectedPredictions: []domain.PredictionExpectation{completedPredictionExpectation(prediction, 1, 1)},
 		}},
 		PositionSource: fakePositionSource{},
 		OrderBookSource: &fakeOrderBookSource{books: []domain.OrderBookSnapshot{{
@@ -212,7 +213,8 @@ func newPipelineFixture(t *testing.T, maxNotional domain.Decimal, submitEnabled 
 			validMidPriceHistory(prediction, 0, decisionAt),
 		}},
 		Strategy: strategy, Recorder: recorder, Executor: executor, SubmitEnabled: enabled,
-		Bindings: []domain.StrategyExecutionBinding{testExecutionBinding()}, Venue: "polymarket-paper",
+		RequireCompleteModelCoverage: enabled,
+		Bindings:                     []domain.StrategyExecutionBinding{testExecutionBinding()}, Venue: "polymarket-paper",
 		Now: func() time.Time { return decisionAt.Add(5 * time.Second) },
 	})
 	if err != nil {

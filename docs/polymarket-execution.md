@@ -44,13 +44,14 @@ verifyingContract = standard V2 exchange 或 neg-risk V2 exchange
 
 - price 必须是最新 tick size 的整数倍；
 - shares 当前最多 2 位小数，与官方 V2 rounding table 一致；
+- 策略 BUY 输入的 shares 在金额、最小下单量和风控校验前按四舍五入转为整数；
 - `price × shares` 必须能按对应 tick 的 amount precision 精确表达；
 - raw maker/taker amount 和 CLOB order/trade quantity 使用 6 位 token decimals；例如 wire
   `100000000` 必须显式解码为 `100` shares；
 - size 必须不低于 `/book.min_order_size`；
 - BUY notional 默认不得低于 `1 pUSD`，可配置但不能为零；
-- FAK/FOK 使用更严格的 marketable-order amount precision；
-- 不合法的策略数量直接拒绝，Go 不会为了通过交易所校验而静默改小 shares 或改变方向。
+- FAK/FOK BUY 的 maker notional 最多 4 位小数；SELL 的 taker notional 保持最多 4 位小数；
+- 除上述明确的 BUY 整数化外，不合法的策略数量直接拒绝；Go 不会为了通过交易所校验而二次改小 shares 或改变方向。
 
 旧 `execute.py` 用 float 先算 USD、再除以价格、再交给 SDK 二次 round-down，可能把 `16.90` 变成 `16.89`。新实现直接生成 6-decimal 整数，例如 `16.90 shares → 16900000`，彻底移除双重舍入。
 

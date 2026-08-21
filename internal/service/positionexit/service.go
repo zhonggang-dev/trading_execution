@@ -69,12 +69,13 @@ type IntentResult struct {
 
 // BindingRunResult 表示后端使用的 BindingRunResult 类型。
 type BindingRunResult struct {
-	Context  domain.StrategyExecutionContext `json:"context"`
-	Status   string                          `json:"status"`
-	Request  domain.PositionExitRequest      `json:"request"`
-	Response domain.PositionExitResponse     `json:"response,omitempty"`
-	Intents  []IntentResult                  `json:"intents"`
-	Error    string                          `json:"error,omitempty"`
+	Context           domain.StrategyExecutionContext `json:"context"`
+	PredictionModelID string                          `json:"prediction_model_id"`
+	Status            string                          `json:"status"`
+	Request           domain.PositionExitRequest      `json:"request"`
+	Response          domain.PositionExitResponse     `json:"response,omitempty"`
+	Intents           []IntentResult                  `json:"intents"`
+	Error             string                          `json:"error,omitempty"`
 }
 
 // RunResult 表示后端使用的 RunResult 类型。
@@ -159,11 +160,23 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		prepared = append(prepared, item)
 	}
 	var predictionSnapshot domain.PredictionSnapshot
+	var effectivePredictions []domain.Prediction
 	var predictionErr error
 	if needsNewInput {
 		predictionSnapshot, predictionErr = service.predictionSource.Snapshot(ctx, decisionAt, service.predictionLookback)
 		if predictionErr == nil {
 			predictionErr = predictionSnapshot.Validate(decisionAt)
+		}
+		if predictionErr == nil {
+			effectivePredictions, predictionErr = domain.SelectEffectivePredictions(
+				liveDirectPredictions(predictionSnapshot.Predictions),
+				predictionModelsForExitBindings(service.bindings),
+			)
+			if predictionErr == nil {
+				effectivePredictions = freshPredictions(
+					effectivePredictions, decisionAt.Add(-service.predictionLookback),
+				)
+			}
 		}
 		if predictionErr != nil {
 			predictionErr = fmt.Errorf("load point-in-time prediction snapshot: %w", predictionErr)
@@ -187,7 +200,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	for _, item := range prepared {
 		executionContext := item.binding.Context()
 		if item.err != nil {
-			run := failedRun(executionContext, item.err)
+			run := failedRun(item.binding, item.err)
 			result.Runs = append(result.Runs, run)
 			runErrors = append(runErrors, item.err)
 			continue
@@ -197,14 +210,14 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		if !item.stored {
 			if predictionErr != nil || marketErr != nil || captureErr != nil {
 				err := fmt.Errorf("capture exit decision data: %w", errors.Join(predictionErr, marketErr, captureErr))
-				result.Runs = append(result.Runs, failedRun(executionContext, err))
+				result.Runs = append(result.Runs, failedRun(item.binding, err))
 				runErrors = append(runErrors, err)
 				continue
 			}
 			request, err = buildRequest(buildRequestParams{
 				binding: executionContext, decisionAt: decisionAt, generatedAt: service.now().UTC(),
 				predictionSnapshotID: predictionSnapshot.SnapshotID,
-				predictions:          predictionsForExitBinding(predictionSnapshot.Predictions, item.binding),
+				predictions:          predictionsForExitBinding(effectivePredictions, item.binding),
 				trades:               item.trades, marketByCondition: marketByCondition,
 				bookByToken: bookByToken, historyByToken: historyByToken,
 			})
@@ -213,12 +226,12 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			}
 			if err != nil {
 				err = fmt.Errorf("record position exit input: %w", err)
-				result.Runs = append(result.Runs, failedRun(executionContext, err))
+				result.Runs = append(result.Runs, failedRun(item.binding, err))
 				runErrors = append(runErrors, err)
 				continue
 			}
 		}
-		run, err := service.runBinding(ctx, request)
+		run, err := service.runBinding(ctx, item.binding, request)
 		if err != nil {
 			run.Error = err.Error()
 			runErrors = append(runErrors, fmt.Errorf("position exit %s/%s/%s: %w",
@@ -227,6 +240,35 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		result.Runs = append(result.Runs, run)
 	}
 	return result, errors.Join(runErrors...)
+}
+
+// liveDirectPredictions keeps Sandbox results out of a live exit decision. A
+// newer Sandbox row may share the same model and Market identity, but it must
+// never replace the Direct probability used by a production account.
+func liveDirectPredictions(predictions []domain.Prediction) []domain.Prediction {
+	result := make([]domain.Prediction, 0, len(predictions))
+	for _, prediction := range predictions {
+		if strings.TrimSpace(prediction.SandboxID) != "" {
+			continue
+		}
+		result = append(result, prediction)
+	}
+	return result
+}
+
+// freshPredictions prevents an old point-in-time probability from silently
+// influencing an exit decision merely because it is still present in the
+// snapshot lookback window. Existing positions continue through the exit
+// strategy with an empty prediction set when no fresh probability is present.
+func freshPredictions(predictions []domain.Prediction, freshAfter time.Time) []domain.Prediction {
+	result := make([]domain.Prediction, 0, len(predictions))
+	for _, prediction := range predictions {
+		if prediction.PredictionAsOf.Before(freshAfter) {
+			continue
+		}
+		result = append(result, prediction)
+	}
+	return result
 }
 
 // prepareBinding 补全并校验 Binding。
@@ -358,8 +400,11 @@ func (service *Service) captureMarketData(ctx context.Context, decisionAt time.T
 }
 
 // runBinding 校验单个账户的退出响应并持久化后逐笔提交卖出意图。
-func (service *Service) runBinding(ctx context.Context, request domain.PositionExitRequest) (BindingRunResult, error) {
-	run := BindingRunResult{Context: request.Context, Request: request, Intents: []IntentResult{}}
+func (service *Service) runBinding(ctx context.Context, binding domain.StrategyExecutionBinding, request domain.PositionExitRequest) (BindingRunResult, error) {
+	run := BindingRunResult{
+		Context: request.Context, PredictionModelID: binding.PredictionModelID,
+		Request: request, Intents: []IntentResult{},
+	}
 	inputParams := validateInputParams{request: request, expectedCycleID: request.CycleID, expectedContext: request.Context, expectedDecisionAt: request.DecisionAt}
 	if err := validateInput(inputParams); err != nil {
 		return run, err
@@ -456,9 +501,10 @@ type validateInputParams struct {
 	expectedDecisionAt time.Time
 }
 
-// predictionsForExitBinding 选择上游预测模型的记录，再把副本投影为 Python
-// 和执行层使用的稳定逻辑模型。原始 PIT snapshot 始终保留 producer identity。
+// predictionsForExitBinding 按上游生产者模型筛选退出预测，再投影为策略与执行侧稳定的逻辑模型。
+// 只修改预测副本，原始 PIT snapshot 始终保留上游 producer identity。
 func predictionsForExitBinding(predictions []domain.Prediction, binding domain.StrategyExecutionBinding) []domain.Prediction {
+	binding = binding.Normalize()
 	result := make([]domain.Prediction, 0)
 	for _, prediction := range predictions {
 		if strings.TrimSpace(prediction.Model.Name) == binding.PredictionModelID {
@@ -467,6 +513,19 @@ func predictionsForExitBinding(predictions []domain.Prediction, binding domain.S
 			result = append(result, cloned)
 		}
 	}
+	return result
+}
+
+func predictionModelsForExitBindings(bindings []domain.StrategyExecutionBinding) []string {
+	models := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		models[binding.PredictionModelID] = struct{}{}
+	}
+	result := make([]string, 0, len(models))
+	for modelID := range models {
+		result = append(result, modelID)
+	}
+	sort.Strings(result)
 	return result
 }
 
@@ -921,6 +980,9 @@ func clientOrderID(cycle, lotID, decisionID string) string {
 }
 
 // failedRun 根据绑定和错误构建失败的账户运行结果。
-func failedRun(binding domain.StrategyExecutionContext, err error) BindingRunResult {
-	return BindingRunResult{Context: binding, Status: "FAILED", Intents: []IntentResult{}, Error: err.Error()}
+func failedRun(binding domain.StrategyExecutionBinding, err error) BindingRunResult {
+	return BindingRunResult{
+		Context: binding.Context(), PredictionModelID: binding.PredictionModelID,
+		Status: "FAILED", Intents: []IntentResult{}, Error: err.Error(),
+	}
 }

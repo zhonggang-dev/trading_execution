@@ -9,6 +9,8 @@ import (
 const (
 	DefaultTradeHistoryLimit = 20
 	MaxTradeHistoryLimit     = 100
+	DefaultDailyPnLDays      = 14
+	MaxDailyPnLDays          = 90
 )
 
 // TradeRecord 表示一笔已确认且已入账的 Polymarket 成交，并包含运维页面需要的策略身份和批次账本信息。
@@ -72,6 +74,56 @@ type TradeHistoryFilter struct {
 	StrategyID         string
 	ExecutionAccountID string
 	Search             string
+}
+
+// DailyPnLPoint 是一个 UTC 自然日内、按执行账户与开仓策略归因的已实现盈亏。
+// RealizedPnL 已使用批次账本的净收入和成本口径，不把当前未实现浮盈混入历史收益。
+type DailyPnLPoint struct {
+	Day                string  `json:"day"`
+	ExecutionAccountID string  `json:"execution_account_id"`
+	ModelID            string  `json:"model_id"`
+	StrategyID         string  `json:"strategy_id"`
+	RealizedPnL        Decimal `json:"realized_pnl"`
+	ClosedTradeCount   int64   `json:"closed_trade_count"`
+	ClosedShares       Decimal `json:"closed_shares"`
+}
+
+// DailyPnLReport 包含连续自然日。当前启用的绑定即使当天没有平仓也会返回零值点。
+type DailyPnLReport struct {
+	Items       []DailyPnLPoint `json:"items"`
+	Days        int             `json:"days"`
+	FromDay     string          `json:"from_day"`
+	ToDay       string          `json:"to_day"`
+	Timezone    string          `json:"timezone"`
+	GeneratedAt time.Time       `json:"generated_at"`
+}
+
+// DailyPnLFilter 限制查询窗口；AsOf 由服务端设置，不接受浏览器任意覆盖。
+type DailyPnLFilter struct {
+	Days int
+	AsOf time.Time
+}
+
+// Normalize 补齐默认天数与服务端当前时间，并统一为 UTC。
+func (filter DailyPnLFilter) Normalize() DailyPnLFilter {
+	if filter.Days == 0 {
+		filter.Days = DefaultDailyPnLDays
+	}
+	if filter.AsOf.IsZero() {
+		filter.AsOf = time.Now().UTC()
+	} else {
+		filter.AsOf = filter.AsOf.UTC()
+	}
+	return filter
+}
+
+// Validate 限制可视化窗口，避免绑定数量与日期做无上限笛卡尔积。
+func (filter DailyPnLFilter) Validate() error {
+	filter = filter.Normalize()
+	if filter.Days < 1 || filter.Days > MaxDailyPnLDays {
+		return fmt.Errorf("days must be between 1 and %d", MaxDailyPnLDays)
+	}
+	return nil
 }
 
 // Normalize 规范化交易历史筛选条件并补充分页默认值。

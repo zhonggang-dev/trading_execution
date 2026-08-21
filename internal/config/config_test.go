@@ -19,7 +19,7 @@ func TestLoadSafeDefaults(t *testing.T) {
 	if config.Execution.AllowMarketOrders {
 		t.Fatal("market orders must be disabled by default")
 	}
-	if config.DecisionCycle.Enabled || config.DecisionCycle.OrderSubmissionEnabled {
+	if config.DecisionCycle.Enabled || config.DecisionCycle.OrderSubmissionEnabled || config.DecisionCycle.RequireCompleteModelCoverage {
 		t.Fatalf("decision cycle safe defaults = %#v", config.DecisionCycle)
 	}
 }
@@ -49,11 +49,12 @@ func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
 	]`)
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 	config, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(config.DecisionCycle.Bindings) != 4 ||
+	if !config.DecisionCycle.RequireCompleteModelCoverage || len(config.DecisionCycle.Bindings) != 4 ||
 		config.DecisionCycle.Bindings[2].PredictionModelID != "gemini-3.6-flash" ||
 		config.DecisionCycle.Bindings[2].ModelID != "gemini_masked" {
 		t.Fatalf("decision routes = %#v", config.DecisionCycle.Bindings)
@@ -77,13 +78,41 @@ func TestLoadAcceptsExplicitLiveDecisionSubmission(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
+	]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 	config, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if !config.DecisionCycle.OrderSubmissionEnabled {
 		t.Fatal("decision-cycle order submission was not enabled")
+	}
+}
+
+func TestLoadRejectsSingleBindingLiveDecisionSubmission(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "2 models x 2 strategies x 4 accounts") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadRejectsDecisionSubmissionWithoutCompleteModelCoverage(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REQUIRE_COMPLETE_MODEL_COVERAGE") {
+		t.Fatalf("Load() error = %v", err)
 	}
 }
 
@@ -247,7 +276,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"RECONCILIATION_POSITION_EPSILON", "RECONCILIATION_BALANCE_EPSILON",
 		"CANCEL_FILL_FINALITY_GRACE", "MAX_ORDER_RECONCILE_ATTEMPTS",
 		"POLYMARKET_MAX_BUY_FEE_RATE_BPS", "POLYGON_ORDER_FILLED_CONFIRMATIONS",
-		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED",
+		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",
 		"DECISION_CYCLE_PREDICTION_INFRA_URL", "DECISION_CYCLE_PREDICTION_INFRA_TOKEN",
 		"DECISION_CYCLE_STRATEGY_URL", "DECISION_CYCLE_STRATEGY_TOKEN",
 		"DECISION_CYCLE_INTERVAL", "DECISION_CYCLE_STARTUP_DELAY", "DECISION_CYCLE_MAX_START_LATENESS", "DECISION_CYCLE_TIMEOUT",

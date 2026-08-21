@@ -249,28 +249,32 @@ func (runner *Runner) logResult(boundary time.Time, result decisioncycle.RunResu
 }
 
 type bindingRunSummary struct {
-	ModelID            string `json:"model_id"`
-	PredictionModelID  string `json:"prediction_model_id"`
-	StrategyID         string `json:"strategy_id"`
-	ExecutionAccountID string `json:"execution_account_id"`
-	Predictions        int    `json:"predictions"`
-	Positions          int    `json:"positions"`
-	Intents            int    `json:"intents"`
-	Failed             bool   `json:"failed"`
+	ModelID                string `json:"model_id"`
+	PredictionModelID      string `json:"prediction_model_id"`
+	StrategyID             string `json:"strategy_id"`
+	ExecutionAccountID     string `json:"execution_account_id"`
+	Predictions            int    `json:"predictions"`
+	Positions              int    `json:"positions"`
+	Intents                int    `json:"intents"`
+	EntrySubmissionEnabled bool   `json:"entry_submission_enabled"`
+	EntryBlockReason       string `json:"entry_block_reason,omitempty"`
+	Failed                 bool   `json:"failed"`
 }
 
 func bindingRunSummaries(result decisioncycle.RunResult) []bindingRunSummary {
 	summaries := make([]bindingRunSummary, 0, len(result.Runs))
 	for _, run := range result.Runs {
 		summaries = append(summaries, bindingRunSummary{
-			ModelID:            run.Context.ModelID,
-			PredictionModelID:  run.PredictionModelID,
-			StrategyID:         run.Context.StrategyID,
-			ExecutionAccountID: run.Context.ExecutionAccountID,
-			Predictions:        run.PredictionCount,
-			Positions:          run.PositionCount,
-			Intents:            len(run.Intents),
-			Failed:             run.Error != nil,
+			ModelID:                run.Context.ModelID,
+			PredictionModelID:      run.PredictionModelID,
+			StrategyID:             run.Context.StrategyID,
+			ExecutionAccountID:     run.Context.ExecutionAccountID,
+			Predictions:            run.PredictionCount,
+			Positions:              run.PositionCount,
+			Intents:                len(run.Intents),
+			EntrySubmissionEnabled: run.EntrySubmissionEnabled,
+			EntryBlockReason:       run.EntryBlockReason,
+			Failed:                 run.Error != nil || run.EntryBlockReason != "",
 		})
 	}
 	return summaries

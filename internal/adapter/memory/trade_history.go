@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
@@ -27,4 +28,21 @@ func (*TradeHistoryRepository) ListTradeHistory(_ context.Context, filter domain
 		},
 		Limit: filter.Limit, Offset: filter.Offset,
 	}, nil
+}
+
+// DailyPnL 在模拟执行模式下返回空报告，不把纸交易伪装成真实收益。
+func (*TradeHistoryRepository) DailyPnL(_ context.Context, filter domain.DailyPnLFilter) (domain.DailyPnLReport, error) {
+	filter = filter.Normalize()
+	toDay := utcDay(filter.AsOf)
+	fromDay := toDay.AddDate(0, 0, 1-filter.Days)
+	return domain.DailyPnLReport{
+		Items: []domain.DailyPnLPoint{}, Days: filter.Days,
+		FromDay: fromDay.Format(time.DateOnly), ToDay: toDay.Format(time.DateOnly),
+		Timezone: "UTC", GeneratedAt: filter.AsOf,
+	}, nil
+}
+
+func utcDay(value time.Time) time.Time {
+	value = value.UTC()
+	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, time.UTC)
 }

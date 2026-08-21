@@ -117,6 +117,7 @@ type FillLedger interface {
 // TradeHistoryRepository 提供已确认且已入账成交的只读视图，并保证明细、总数和汇总使用同一筛选条件。
 type TradeHistoryRepository interface {
 	ListTradeHistory(ctx context.Context, filter domain.TradeHistoryFilter) (domain.TradeHistoryPage, error)
+	DailyPnL(ctx context.Context, filter domain.DailyPnLFilter) (domain.DailyPnLReport, error)
 }
 
 // LiveOperationsRepository 在同一个 PostgreSQL 可重复读事务中构建实盘监控所需的本地权威视图。

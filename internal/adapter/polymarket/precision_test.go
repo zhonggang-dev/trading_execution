@@ -34,14 +34,30 @@ func TestBuildRawAmountsRejectsInsteadOfRoundingStrategySize(t *testing.T) {
 	}
 }
 
-// TestBuildRawAmountsProtectsFAKPrecision 验证 Build Raw Amounts Protects FAK Precision 场景下的行为。
-func TestBuildRawAmountsProtectsFAKPrecision(t *testing.T) {
+// TestBuildRawAmountsAllowsFourDecimalFAKBuyNotional 验证 FAK BUY 允许四位小数的 maker notional。
+func TestBuildRawAmountsAllowsFourDecimalFAKBuyNotional(t *testing.T) {
 	intent := adapterIntent()
 	intent.Price = "0.17"
 	intent.WorstPrice = "0.17"
 	intent.Size = "5.89"
 	intent.TimeInForce = domain.TimeInForceFAK
-	_, err := buildRawAmounts(intent, "0.01", "5", "1")
+	amounts, err := buildRawAmounts(intent, "0.01", "5", "1")
+	if err != nil {
+		t.Fatalf("buildRawAmounts() error = %v", err)
+	}
+	if amounts.MakerAmount != "1001300" || amounts.TakerAmount != "5890000" {
+		t.Fatalf("amounts = %#v, want exact 1.0013 pUSD and 5.89 shares", amounts)
+	}
+}
+
+// TestBuildRawAmountsRejectsFAKBuyNotionalBeyondFourDecimals 验证 FAK BUY 仍拒绝超过四位小数的 maker notional。
+func TestBuildRawAmountsRejectsFAKBuyNotionalBeyondFourDecimals(t *testing.T) {
+	intent := adapterIntent()
+	intent.Price = "0.501"
+	intent.WorstPrice = "0.501"
+	intent.Size = "19.97"
+	intent.TimeInForce = domain.TimeInForceFAK
+	_, err := buildRawAmounts(intent, "0.001", "5", "1")
 	var venueError *port.VenueError
 	if !errors.As(err, &venueError) || venueError.Code != "INVALID_FAK_FOK_PRECISION" {
 		t.Fatalf("buildRawAmounts() error = %v", err)

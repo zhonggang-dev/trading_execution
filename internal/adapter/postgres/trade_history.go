@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
@@ -186,4 +187,89 @@ func buildTradeHistoryWhere(filter domain.TradeHistoryFilter) (string, []any) {
 			order_row.intent->>'strategy_id', fill.execution_account_id)) LIKE LOWER($%d)`, "%"+filter.Search+"%")
 	}
 	return "\n\tWHERE " + strings.Join(clauses, " AND "), args
+}
+
+const dailyPnLStatement = `
+	WITH bounds AS (
+		SELECT $1::date AS from_day, $2::date AS to_day
+	), days AS (
+		SELECT generate_series(bounds.from_day, bounds.to_day, INTERVAL '1 day')::date AS day
+		FROM bounds
+	), closed AS (
+		SELECT (fill.matched_at AT TIME ZONE 'UTC')::date AS day,
+		       fill.execution_account_id, lot.model_id, lot.strategy_id,
+		       SUM(closure.realized_pnl) AS realized_pnl,
+		       COUNT(DISTINCT fill.fill_key)::bigint AS closed_trade_count,
+		       SUM(closure.closed_shares) AS closed_shares
+		FROM position_lot_closures AS closure
+		JOIN execution_fills AS fill ON fill.fill_key = closure.closing_fill_key
+		JOIN position_lots AS lot ON lot.lot_id = closure.lot_id
+		CROSS JOIN bounds
+		WHERE fill.status = 'CONFIRMED'
+		  AND fill.applied_at IS NOT NULL
+		  AND fill.confirmed_at IS NOT NULL
+		  AND fill.matched_at >= (bounds.from_day::timestamp AT TIME ZONE 'UTC')
+		  AND fill.matched_at < ((bounds.to_day + 1)::timestamp AT TIME ZONE 'UTC')
+		GROUP BY day, fill.execution_account_id, lot.model_id, lot.strategy_id
+	), identities AS (
+		SELECT model_id, strategy_id, execution_account_id
+		FROM execution_strategy_bindings
+		WHERE enabled
+		UNION
+		SELECT model_id, strategy_id, execution_account_id FROM closed
+	)
+	SELECT days.day::text, identities.execution_account_id,
+	       identities.model_id, identities.strategy_id,
+	       COALESCE(closed.realized_pnl, 0)::text,
+	       COALESCE(closed.closed_trade_count, 0)::bigint,
+	       COALESCE(closed.closed_shares, 0)::text
+	FROM days CROSS JOIN identities
+	LEFT JOIN closed
+	  ON closed.day = days.day
+	 AND closed.execution_account_id = identities.execution_account_id
+	 AND closed.model_id = identities.model_id
+	 AND closed.strategy_id = identities.strategy_id
+	ORDER BY days.day, identities.execution_account_id, identities.strategy_id, identities.model_id`
+
+// DailyPnL 查询连续 UTC 日，并按来源批次的 model/strategy 归因每一笔平仓收益。
+// 启用的绑定通过 days × identities 补齐零值点，前端无需把“无成交”误判为“数据缺失”。
+func (repository *TradeHistoryRepository) DailyPnL(
+	ctx context.Context,
+	filter domain.DailyPnLFilter,
+) (domain.DailyPnLReport, error) {
+	filter = filter.Normalize()
+	if err := filter.Validate(); err != nil {
+		return domain.DailyPnLReport{}, err
+	}
+	toDay := postgresUTCDay(filter.AsOf)
+	fromDay := toDay.AddDate(0, 0, 1-filter.Days)
+	rows, err := repository.db.QueryContext(ctx, dailyPnLStatement, fromDay, toDay)
+	if err != nil {
+		return domain.DailyPnLReport{}, fmt.Errorf("query daily pnl: %w", err)
+	}
+	defer rows.Close()
+	items := make([]domain.DailyPnLPoint, 0)
+	for rows.Next() {
+		var item domain.DailyPnLPoint
+		if err := rows.Scan(
+			&item.Day, &item.ExecutionAccountID, &item.ModelID, &item.StrategyID,
+			&item.RealizedPnL, &item.ClosedTradeCount, &item.ClosedShares,
+		); err != nil {
+			return domain.DailyPnLReport{}, fmt.Errorf("scan daily pnl row: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.DailyPnLReport{}, fmt.Errorf("iterate daily pnl rows: %w", err)
+	}
+	return domain.DailyPnLReport{
+		Items: items, Days: filter.Days,
+		FromDay: fromDay.Format(time.DateOnly), ToDay: toDay.Format(time.DateOnly),
+		Timezone: "UTC", GeneratedAt: filter.AsOf,
+	}, nil
+}
+
+func postgresUTCDay(value time.Time) time.Time {
+	value = value.UTC()
+	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, time.UTC)
 }

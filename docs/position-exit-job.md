@@ -1,5 +1,10 @@
 # Position Exit Job
 
+> Runtime status: this service and endpoint contract are implemented but are not currently wired by
+> `cmd/server`. Production OPEN-lot exits continue through the ten-minute `decisioncycle` strategy call.
+> Do not schedule `/internal/jobs/position-exit-evaluation/run` until server wiring and an atomic cutover
+> have disabled decision-cycle exits; running both paths would create duplicate exit decisions.
+
 This is the independent ten-minute exit cycle. It freezes the point-in-time
 prediction snapshot, every open position lot, current Market status, top-15
 book and raw 48-hour Polymarket `p` history, then requires exactly one `HOLD`
@@ -39,7 +44,14 @@ exitJob, _ := positionexit.New(positionexit.Params{
     Strategy: positionExitPythonClient,
     Recorder: positionExitRecorder,      // PostgreSQL position_exit_runs
     Executor: executionService,
-    Bindings: bindings,
+    Bindings: []domain.StrategyExecutionBinding{
+        {
+            PredictionModelID: "gemini-3.6-flash", // name in the PIT snapshot
+            ModelID: "model-a",                    // stable Python/order identity
+            StrategyID: "multfactor_v1",
+            ExecutionAccountID: "wallet-model-a-v1",
+        },
+    },
     Venue: "polymarket",
 })
 
@@ -68,13 +80,21 @@ Authorization: Bearer <STRATEGY_TOKEN>
 
 One request belongs to one `(model_id, strategy_id,
 execution_account_id)`. Adding a model or strategy adds another binding and
-wallet, without changing the protocol.
+wallet, without changing the protocol. A binding also carries the internal
+`prediction_model_id` route: Position Exit selects PIT rows whose original
+`model.name` equals that value, then projects their `model.name` to the stable
+`model_id` before calling Python. The producer name therefore never leaks into
+the strategy/order identity. When `prediction_model_id` is omitted it defaults
+to `model_id` for backward-compatible configurations.
 
 ### Backtest parity invariants
 
 | Field | Enforced meaning |
 | --- | --- |
-| `predictions[].prediction_as_of` | Producer forecast time; it, `completed_at`, and `available_at` must all be no later than `decision_at` |
+| binding `prediction_model_id` | Exact upstream `predictions[].model.name` used only for snapshot selection |
+| request `context.model_id` | Stable logical model used by Python, positions, orders, and risk bindings |
+| `predictions[].sandbox_id` | Must be empty in production; Sandbox rows are discarded before PIT selection and cannot replace a Direct result |
+| `predictions[].prediction_as_of` | Producer forecast time; it must be within the configured lookback, and it, `completed_at`, and `available_at` must all be no later than `decision_at` |
 | `orderbook.best_ask` | Exactly `asks[0].price`; never weighted or midpoint |
 | `orderbook.bids/asks` | Real nearest levels, sorted, up to 15 per side; no synthetic padding |
 | `mid_prices[].p` | Exact decimal value returned as Polymarket `/prices-history` `p` |
@@ -102,7 +122,7 @@ wallet, without changing the protocol.
     {
       "prediction_id": "prediction-01",
       "source_job_id": "predict-job-01",
-      "sandbox_id": "sandbox-01",
+      "sandbox_id": "",
       "market_id": "market-01",
       "condition_id": "condition-01",
       "question": "Will the event occur?",

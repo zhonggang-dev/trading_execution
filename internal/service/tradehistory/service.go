@@ -29,3 +29,12 @@ func (service *Service) List(ctx context.Context, filter domain.TradeHistoryFilt
 	}
 	return service.repository.ListTradeHistory(ctx, filter)
 }
+
+// DailyPnL 返回按 UTC 自然日、执行账户与开仓策略归因的净已实现盈亏。
+func (service *Service) DailyPnL(ctx context.Context, filter domain.DailyPnLFilter) (domain.DailyPnLReport, error) {
+	filter = filter.Normalize()
+	if err := filter.Validate(); err != nil {
+		return domain.DailyPnLReport{}, err
+	}
+	return service.repository.DailyPnL(ctx, filter)
+}

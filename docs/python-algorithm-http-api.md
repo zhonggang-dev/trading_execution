@@ -205,9 +205,10 @@ type StrategyOrder = {
 POST /api/v4/decisions
 ```
 
-Trading Execution 通常每10分钟为每个模型、策略、钱包绑定调用一次。该接口主要负责预测入场。
-当前协议仍保留 `exits` 兼容字段；启用独立持仓退出任务后，算法应在本接口返回 `exits: []`，避免
-同一持仓在两个接口中重复产生卖出决策。
+Trading Execution 通常每10分钟为每个模型、策略、钱包绑定调用一次。当前生产装配同时通过本接口处理
+预测入场和该 binding 的 OPEN lot 退出；策略必须按实际 `positions` 返回所需 `exits`。仓库中的独立
+Position Exit endpoint/service 目前未在 `cmd/server` 注册，不能把它视为已启用的生产退出 runner。未来若
+显式装配独立退出任务，才应让本接口返回 `exits: []`，并用切换门禁避免同一持仓双重卖出。
 
 ### 3.2 Request 类型
 
@@ -228,7 +229,7 @@ type StrategyPositionLot = {
 type StrategyExecutionConstraints = {
   size_unit: "SHARES";
   size_decimal_places: 2;
-  buy_notional_decimal_places: 2;
+  buy_notional_decimal_places: 4;
   minimum_buy_notional: "1";
   allowed_time_in_force: ["FOK"];
   price_protection_policy: "EXACT_TOP_OF_BOOK";
@@ -308,6 +309,12 @@ type StrategyDecisionResponse = {
   exits: StrategyExit[];
 };
 
+// 仅为解释 Trading 持久化输出；Python 响应不得发送该字段。
+type GoOwnedEntryPolicy = {
+  enabled: false;
+  block_reason: "INCOMPLETE_MODEL_COVERAGE";
+};
+
 type StrategyDecisionSuccess = {
   data: StrategyDecisionResponse;
 };
@@ -321,13 +328,20 @@ type StrategyDecisionSuccess = {
 - `SKIP` 不能带 `order`；
 - `SUBMIT` 必须是 `BUY + LIMIT + FOK`，`reason_code` 必须为 `ENTRY_SIGNAL`；
 - BUY `worst_price` 必须严格等于输入订单簿的 `best_ask`，不允许加价格垫；
-- `size` 单位为shares，最多2位小数；`worst_price * size` 最多2位小数且不少于1美元；
+- `size` 单位为 shares，输入最多 2 位小数；Trading 会在 BUY 下单前四舍五入为整数 shares，再校验不超过保护价的可见卖盘数量、`worst_price * size` 最多 4 位小数且不少于 1 美元；
 - `multfactor_v1` SUBMIT 的 `evidence.metrics` 必须包含
   `best_ask/near_logdiff_usd/rel_spread`，MOM/MACD 可选；`multfactor_v2` 必须完整包含五项；
 - `metrics.best_ask` 必须等于输入 `best_ask`，metrics value 全部为十进制字符串；
 - 订单簿不可用必须 `SKIP + INVALID_BOOK`；只有 `multfactor_v2` 在 mid price 不可用时必须
   `SKIP + STALE_DATA`；策略范围外预测使用 `SKIP + OUTSIDE_STRATEGY_UNIVERSE`；
 - 任何漏评、重复评价、非法字段都会导致整个响应被拒绝，不会部分执行。
+
+`entry_policy` 不是 Python 响应契约的一部分。Trading 在 model task manifest 不完整时，会在 HTTP
+响应通过身份/基础结构校验后由 Go 覆盖并追加
+`entry_policy={"enabled":false,"block_reason":"INCOMPLETE_MODEL_COVERAGE"}`，然后把它作为
+`trading.strategy_output.v4` 的 additive、Go-owned 审计字段持久化。Python 不应设置它；正常健康周期不持久化
+该字段。阻断周期中的 SUBMIT evaluations 只供审计，不会形成 BUY OrderIntent，但同一响应中独立合法的
+`exits` 仍会形成 SELL OrderIntent。该门禁独立于 Python 策略，所以 Python 仍应始终按正常 Response 规则返回。
 
 ### 3.5 最小示例
 
@@ -354,7 +368,7 @@ type StrategyDecisionSuccess = {
   "execution_constraints": {
     "size_unit": "SHARES",
     "size_decimal_places": 2,
-    "buy_notional_decimal_places": 2,
+    "buy_notional_decimal_places": 4,
     "minimum_buy_notional": "1",
     "allowed_time_in_force": ["FOK"],
     "price_protection_policy": "EXACT_TOP_OF_BOOK"

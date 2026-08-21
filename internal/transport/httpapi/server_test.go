@@ -257,8 +257,10 @@ type fakeReconciliationJob struct {
 
 // fakeTradeHistoryService 表示后端使用的 fakeTradeHistoryService 类型。
 type fakeTradeHistoryService struct {
-	filter domain.TradeHistoryFilter
-	calls  int
+	filter         domain.TradeHistoryFilter
+	dailyPnLFilter domain.DailyPnLFilter
+	calls          int
+	dailyPnLCalls  int
 }
 
 // List 记录交易历史筛选条件并返回模拟成交页面。
@@ -279,6 +281,20 @@ func (service *fakeTradeHistoryService) List(_ context.Context, filter domain.Tr
 			TradeCount: 1, BuyNotional: "0", SellNotional: "6.2", NetCashFlow: "6.19", TotalFee: "0.01", RealizedPnL: "1.19",
 		},
 		Total: 1, Limit: filter.Limit, Offset: filter.Offset,
+	}, nil
+}
+
+// DailyPnL 记录每日盈亏窗口并返回包含零值与正收益的模拟账户策略序列。
+func (service *fakeTradeHistoryService) DailyPnL(_ context.Context, filter domain.DailyPnLFilter) (domain.DailyPnLReport, error) {
+	service.dailyPnLFilter = filter
+	service.dailyPnLCalls++
+	return domain.DailyPnLReport{
+		Items: []domain.DailyPnLPoint{{
+			Day: "2026-08-21", ExecutionAccountID: "account-1", ModelID: "model-v2",
+			StrategyID: "multfactor_v2", RealizedPnL: "1.19", ClosedTradeCount: 1, ClosedShares: "10",
+		}},
+		Days: filter.Days, FromDay: "2026-08-08", ToDay: "2026-08-21",
+		Timezone: "UTC", GeneratedAt: time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC),
 	}, nil
 }
 
@@ -308,6 +324,33 @@ func TestTradeHistoryEndpointAuthenticatesAndValidatesFilters(t *testing.T) {
 	}
 	if history.calls != 1 || history.filter.Side != domain.SideSell || history.filter.Limit != 25 || history.filter.Offset != 5 || history.filter.From == nil {
 		t.Fatalf("captured filter = %#v, calls=%d", history.filter, history.calls)
+	}
+}
+
+// TestDailyPnLEndpointAuthenticatesAndValidatesWindow 验证每日盈亏只接受安全天数并复用账本读取权限。
+func TestDailyPnLEndpointAuthenticatesAndValidatesWindow(t *testing.T) {
+	history := &fakeTradeHistoryService{}
+	server, err := New(Params{
+		Service: baseExecutionService(t), TradeHistory: history,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), APIToken: "console-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized := performRequest(t, server, http.MethodGet, "/api/v1/daily-pnl?days=14", "", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthorized.Code)
+	}
+	invalid := performRequest(t, server, http.MethodGet, "/api/v1/daily-pnl?days=91", "", "console-secret")
+	if invalid.Code != http.StatusBadRequest || history.dailyPnLCalls != 0 {
+		t.Fatalf("invalid status=%d calls=%d body=%s", invalid.Code, history.dailyPnLCalls, invalid.Body.String())
+	}
+	response := performRequest(t, server, http.MethodGet, "/api/v1/daily-pnl?days=14", "", "console-secret")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"realized_pnl":"1.19"`) {
+		t.Fatalf("daily pnl response status=%d body=%s", response.Code, response.Body.String())
+	}
+	if history.dailyPnLCalls != 1 || history.dailyPnLFilter.Days != 14 || history.dailyPnLFilter.AsOf.IsZero() {
+		t.Fatalf("captured filter=%#v calls=%d", history.dailyPnLFilter, history.dailyPnLCalls)
 	}
 }
 

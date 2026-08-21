@@ -299,6 +299,104 @@ func TestLegacyThreeFieldBindingDefaultsPredictionSource(t *testing.T) {
 	}
 }
 
+func TestRunSelectsLatestPITPredictionForExitBinding(t *testing.T) {
+	fixture := newFixture(t)
+	old := fixture.predictionSource.snapshot.Predictions[0]
+	newest := old
+	newest.Outcomes = append([]domain.PredictionOutcome(nil), old.Outcomes...)
+	newest.PredictionID = "prediction-new"
+	newest.SourceJobID = "job-new"
+	newest.PredictionAsOf = fixture.decisionAt.Add(-30 * time.Second)
+	newest.CompletedAt = fixture.decisionAt.Add(-20 * time.Second)
+	newest.AvailableAt = fixture.decisionAt.Add(-10 * time.Second)
+	newest.Outcomes[0].Probability = 0.6
+	newest.Outcomes[1].Probability = 0.4
+	fixture.predictionSource.snapshot.Predictions = []domain.Prediction{old, newest}
+
+	service, err := New(fixture.params())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Run(context.Background(), fixture.decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	predictions := result.Runs[0].Request.Predictions
+	if len(predictions) != 1 || predictions[0].PredictionID != "prediction-new" ||
+		predictions[0].Outcomes[0].Probability != 0.6 {
+		t.Fatalf("effective exit predictions = %#v", predictions)
+	}
+}
+
+func TestRunDoesNotLetNewerSandboxPredictionReplaceDirectPrediction(t *testing.T) {
+	fixture := newFixture(t)
+	direct := fixture.predictionSource.snapshot.Predictions[0]
+	sandbox := direct
+	sandbox.Outcomes = append([]domain.PredictionOutcome(nil), direct.Outcomes...)
+	sandbox.PredictionID = "prediction-sandbox-new"
+	sandbox.SourceJobID = "job-sandbox-new"
+	sandbox.SandboxID = "sandbox-new"
+	sandbox.PredictionAsOf = fixture.decisionAt.Add(-30 * time.Second)
+	sandbox.CompletedAt = fixture.decisionAt.Add(-20 * time.Second)
+	sandbox.AvailableAt = fixture.decisionAt.Add(-10 * time.Second)
+	sandbox.Outcomes[0].Probability = 0.99
+	sandbox.Outcomes[1].Probability = 0.01
+	fixture.predictionSource.snapshot.Predictions = []domain.Prediction{direct, sandbox}
+
+	service, err := New(fixture.params())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Run(context.Background(), fixture.decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	predictions := result.Runs[0].Request.Predictions
+	if len(predictions) != 1 || predictions[0].PredictionID != direct.PredictionID ||
+		predictions[0].Outcomes[0].Probability != direct.Outcomes[0].Probability {
+		t.Fatalf("live exit predictions = %#v, want Direct row only", predictions)
+	}
+}
+
+func TestRunOmitsStalePredictionButStillEvaluatesExit(t *testing.T) {
+	fixture := newFixture(t)
+	stale := &fixture.predictionSource.snapshot.Predictions[0]
+	stale.PredictionAsOf = fixture.decisionAt.Add(-defaultPredictionLookback - time.Second)
+	stale.CompletedAt = stale.PredictionAsOf.Add(10 * time.Second)
+	stale.AvailableAt = stale.CompletedAt.Add(10 * time.Second)
+
+	service, err := New(fixture.params())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Run(context.Background(), fixture.decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(result.Runs) != 1 {
+		t.Fatalf("runs = %#v", result.Runs)
+	}
+	if got := result.Runs[0].Request.Predictions; len(got) != 0 {
+		t.Fatalf("stale predictions must not reach exit strategy: %#v", got)
+	}
+	if got := fixture.executor.intents; len(got) != 1 || got[0].Side != domain.SideSell {
+		t.Fatalf("exit must remain live without a fresh prediction: %#v", got)
+	}
+}
+
+// TestNewRejectsAmbiguousExitModelRouting 验证一个上游模型不能被投影为多个逻辑模型。
+func TestNewRejectsAmbiguousExitModelRouting(t *testing.T) {
+	fixture := newFixture(t)
+	params := fixture.params()
+	params.Bindings = []domain.StrategyExecutionBinding{
+		{PredictionModelID: "gemini-3.6-flash", ModelID: "model-a", StrategyID: "multfactor_v1", ExecutionAccountID: "wallet-a"},
+		{PredictionModelID: "gemini-3.6-flash", ModelID: "model-b", StrategyID: "multfactor_v1", ExecutionAccountID: "wallet-b"},
+	}
+	if _, err := New(params); err == nil {
+		t.Fatal("New() error = nil, want ambiguous prediction-model routing rejection")
+	}
+}
+
 // TestRunRejectsSellForResolvedMarket 验证 Run Rejects Sell For Resolved Market 场景下的行为。
 func TestRunRejectsSellForResolvedMarket(t *testing.T) {
 	fixture := newFixture(t)
@@ -388,7 +486,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	strategy := &fakeStrategy{build: sellResponse}
 	prediction := domain.Prediction{
-		PredictionID: "prediction-1", SourceJobID: "job-1", SandboxID: "sandbox-1",
+		PredictionID: "prediction-1", SourceJobID: "job-1",
 		MarketID: trade.MarketID, ConditionID: trade.ConditionID, Question: "Will it happen?",
 		Domains: []string{"example.com"}, NegRisk: false,
 		Outcomes: []domain.PredictionOutcome{

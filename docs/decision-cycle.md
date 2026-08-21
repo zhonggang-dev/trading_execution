@@ -33,7 +33,8 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 ```text
 10-minute UTC boundary T
   -> GET prediction_infra snapshot(as_of=T)
-  -> select each Market by configured prediction_model_id
+  -> reduce expected_predictions to the current Market/model task generation
+  -> match only the exact completed result named by each current task
   -> load every binding's OPEN position lots
   -> capture CLOB books and [T-48h,T] midpoint histories once for the prediction/position token union
   -> normalize bids DESC / asks ASC / top 15 each side
@@ -75,7 +76,7 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
   "execution_constraints": {
     "size_unit": "SHARES",
     "size_decimal_places": 2,
-    "buy_notional_decimal_places": 2,
+    "buy_notional_decimal_places": 4,
     "minimum_buy_notional": "1",
     "allowed_time_in_force": ["FOK"],
     "price_protection_policy": "EXACT_TOP_OF_BOOK"
@@ -83,15 +84,36 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 }
 ```
 
-`predictions` 每个周期发送当前 binding 所属模型的全部当前有效 Market，不要求
-同一 Market 同时具有所有模型的概率。一条 Market/Model 预测仍包含两个按原始
+策略返回的 BUY `size` 可保留最多 2 位小数；Trading 在构建订单意图前按四舍五入
+转为整数 shares，然后使用转换后的数量执行最小下单量、保护价卖盘流动性、BUY notional 精度和风控校验。
+如果数量发生变化，原始值会记录在 intent metadata 的 `strategy_requested_size`。
+
+`predictions` 每个周期发送当前 binding 所属模型的全部当前有效 Market。一条 Market/Model 预测仍包含两个按原始
 Outcome 顺序对齐且和为 1 的概率和 token，而不是只传一个脱离 Outcome 的 `prob`。
-同一 Market 可以有不同模型的独立预测，但同一 `(market_id, prediction_model_id)`
-在一个冻结快照中必须恰好只有一条；重复时 Trading 会 fail closed，避免同一概率维度触发两次买入。
+Prediction snapshot 保留 lookback 内的 immutable 结果，同时携带由持久化 Direct Prediction task
+生成的 `expected_predictions[]`。这个 manifest 即使模型尚未回调也会保留 `PENDING` 行，所以 Trading
+不再从“成功 prob 行的并集”猜测本轮应有哪些 Market。严格覆盖模式会为每个
+`(market_id, prediction_model_id)` 选择最新 task，要求同一 Market 的所有模型具有相同
+`selection_id + selection_run_id + prediction_as_of`、状态均为 `COMPLETED`，再按
+`prediction_id + source_job_id + model + Market + prediction_as_of + outcome/token identity`
+精确匹配结果，同时要求 `prediction_as_of >= decision_at - DECISION_CYCLE_PREDICTION_LOOKBACK`。
+只有这些 manifest 命名且满足 freshness SLA 的结果会被路由；延迟完成的过期 task、旧概率、Sandbox 行和其他
+非 manifest 行都不能补齐当前轮。
+非严格兼容模式才会按 `prediction_as_of`、`available_at`、`completed_at` 选择最新结果；三类时间戳完全相同但
+概率不同的 revision 会因歧义直接失败，不按随机 ID 猜“更新”。不同模型对同一 Market 的 Condition、Outcome
+顺序和 token 必须完全一致。
+`DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true` 时，每个当前 task Market 必须同时具有
+全部配置上游模型的概率。任一 task `PENDING`、缺失或精确结果不匹配都会使周期返回错误，并由 Go 硬门禁
+阻止本轮所有 BUY evaluation 生成 OrderIntent；冻结请求仍保留真实 PIT predictions 和
+`ALL_EFFECTIVE_AT_DECISION_AT` 语义，同时继续处理 OPEN lots 的合法 SELL exit，避免上游数据故障阻断退出。
+降级请求只保留当前 manifest 中同代、fresh、已完成且精确匹配的结果；若同一 Market 的模型 task 混用不同
+selection generation，该 Market 的全部 probabilities 都会从降级请求移除，旧代概率不能影响 SELL/HOLD 判断。
+Order submission 打开时该覆盖开关是强制项；四钱包生产拓扑必须开启它，dry-run 也建议开启以便先观察完整矩阵。
 发往 Python 前已确保 `prediction.model.name == context.model_id`。不同策略处理同一模型时复用完全相同的冻结
 prob 和盘口，但使用不同 `strategy_id`、`execution_account_id`、`cycle_id` 和 `input_id`。
-某个模型当轮没有 Market 时仍调用对应 binding，因为该钱包可能还有需要退出的
-OPEN lots；运行日志会逐 binding 记录上游模型和 prediction count，空预测不再与“未调用”混淆。
+某个模型当轮没有 Market 时仍调用对应 binding，因为该钱包可能还有需要退出的 OPEN lots；
+严格覆盖模式会关闭整个周期的 entry intent 构建并把该轮标记为失败，不会把这种不完整矩阵视为健康。
+运行日志会逐 binding 记录上游模型和 prediction count，空预测不再与“未调用”混淆。
 `positions` 按开仓批次发送当前 binding 的全部 OPEN lot，不按 token 聚合。`orderbooks` 覆盖
 prediction 和 position 的 token 并固定请求 top 15，每侧返回实际存在的最多 15 档；价格和数量必须使用 JSON string decimal。
 `mid_price_histories` 也按 token 一一对应，`mid_prices[].p` 直接来自 Polymarket
@@ -110,6 +132,11 @@ evaluation；按手卖出通过 `exits[].lot_id` 返回。entry 和 exit 都只�
 [`python-algorithm-http-api.md`](python-algorithm-http-api.md)。Trading Execution 根据 `SUBMIT` 的订单
 参数生成内部 `OrderIntent`；venue 和 `client_order_id` 不由策略服务指定。
 Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风控执行信号时效检查。
+当 model coverage 不完整时，Go 会在收到 Python 响应后追加持久化专用字段
+`entry_policy={"enabled":false,"block_reason":"INCOMPLETE_MODEL_COVERAGE"}`。Python 不得发送或决定
+该字段；正常周期不写该字段，以兼容升级前的幂等输出。被阻断的 SUBMIT evaluation 仍留在审计输出中，但不会
+生成 BUY intent；同一响应里的合法 SELL exit 继续生成、持久化和提交。Runner 的每个 binding 摘要也会记录
+`entry_submission_enabled=false` 和同一 block reason，避免把 4/4 Python 调用误判为 4/4 入场健康。
 
 ## 审计和失败语义
 
@@ -135,6 +162,8 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
 - `DECISION_CYCLE_ENABLED=true` 只打开快照、行情、算法调用及 PostgreSQL 输入/输出审计。
   `DECISION_CYCLE_ORDER_SUBMISSION_ENABLED` 默认 `false`，关闭时仍构建并记录合法 OrderIntent，
   但明确标记 `submission_disabled` 且绝不调用 `execution.Submit`；
+- `DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=true` 还要求
+  `DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true`，否则配置校验和服务装配都会拒绝启动；
 - Go 绑定表保证一个 `(model_id, strategy_id)` 只对应一个唯一 `execution_account_id`，同一
   execution account 不能重复绑定；同一逻辑 `model_id` 不能来自多个 `prediction_model_id`，
   同一 `prediction_model_id` 也不能路由到多个逻辑模型。

@@ -127,9 +127,11 @@ func TestBindingRunSummariesExposePredictionRoutingAndCounts(t *testing.T) {
 		Context: domain.StrategyExecutionContext{
 			ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-3",
 		},
-		PredictionModelID: "gemini-3.6-flash",
-		PredictionCount:   2,
-		PositionCount:     1,
+		PredictionModelID:      "gemini-3.6-flash",
+		PredictionCount:        2,
+		PositionCount:          1,
+		EntrySubmissionEnabled: false,
+		EntryBlockReason:       domain.StrategyEntryBlockIncompleteModelCoverage,
 		Request: domain.StrategyDecisionRequest{
 			Predictions: []domain.Prediction{{}, {}},
 			Positions:   []domain.StrategyPositionLot{{}},
@@ -139,7 +141,9 @@ func TestBindingRunSummariesExposePredictionRoutingAndCounts(t *testing.T) {
 	}}})
 	if len(summaries) != 1 || summaries[0].PredictionModelID != "gemini-3.6-flash" ||
 		summaries[0].ModelID != "gemini_masked" || summaries[0].ExecutionAccountID != "wallet-3" ||
-		summaries[0].Predictions != 2 || summaries[0].Positions != 1 || summaries[0].Intents != 1 || !summaries[0].Failed {
+		summaries[0].Predictions != 2 || summaries[0].Positions != 1 || summaries[0].Intents != 1 ||
+		summaries[0].EntrySubmissionEnabled || summaries[0].EntryBlockReason != domain.StrategyEntryBlockIncompleteModelCoverage ||
+		!summaries[0].Failed {
 		t.Fatalf("binding summaries = %#v", summaries)
 	}
 }
