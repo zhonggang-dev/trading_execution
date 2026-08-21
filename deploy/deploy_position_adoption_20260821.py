@@ -6494,7 +6494,7 @@ def database_open_lots(database: DatabaseSession) -> dict[str, list[dict[str, ob
     value = db_json(
         database,
         r"""
-SELECT COALESCE(json_agg(row_to_json(x) ORDER BY execution_account_id,opened_at,lot_id),'[]'::json)
+SELECT COALESCE(json_agg(row_to_json(x) ORDER BY execution_account_id,entered_at,lot_id),'[]'::json)
 FROM (
   SELECT lot.lot_id,lot.execution_account_id,lot.market_id,lot.condition_id,
          lot.outcome_index,lot.outcome_name,lot.token_id,lot.neg_risk,
@@ -8118,6 +8118,16 @@ def self_test() -> None:
         )
     ):
         raise CutoverError("terminal reconciliation wait self-test failed")
+    open_lots_source = source[
+        source.index("def database_open_lots(") : source.index(
+            "def normalize_python_positions("
+        )
+    ]
+    if (
+        "ORDER BY execution_account_id,entered_at,lot_id" not in open_lots_source
+        or "ORDER BY execution_account_id,opened_at,lot_id" in open_lots_source
+    ):
+        raise CutoverError("open-lot verification alias self-test failed")
     apply_migration_source = source[
         source.index("def apply_migration_0016(") : source.index(
             "def stop_service()"
