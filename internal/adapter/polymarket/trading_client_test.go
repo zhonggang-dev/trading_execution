@@ -131,7 +131,8 @@ func TestCancelRaceReturnsFillObservedAfterCancel(t *testing.T) {
 		case request.Method == http.MethodGet && request.URL.Path == "/data/trades":
 			writeTestJSON(writer, []map[string]any{{
 				"id": "trade-filled", "taker_order_id": "0xvenue", "size": "10", "price": "0.5",
-				"status": "CONFIRMED",
+				"status": "CONFIRMED", "trader_side": "TAKER",
+				"maker_address": request.URL.Query().Get("maker_address"),
 			}})
 		default:
 			http.NotFound(writer, request)
@@ -185,7 +186,8 @@ func TestMatchedPlacementReadsAuthoritativePartialFill(t *testing.T) {
 			writeTestJSON(writer, map[string]any{
 				"data": []map[string]any{{
 					"id": tradeID, "taker_order_id": placedOrderID, "size": "2", "price": price,
-					"status": "CONFIRMED",
+					"status": "CONFIRMED", "trader_side": "TAKER",
+					"maker_address": request.URL.Query().Get("maker_address"),
 				}},
 				"next_cursor": "LTE=",
 			})
@@ -277,8 +279,9 @@ func TestListTradesAcceptsBareWireArray(t *testing.T) {
 		writeTestJSON(writer, []map[string]any{{
 			"id": "trade-1", "taker_order_id": "0xvenue", "market": "condition-1",
 			"asset_id": "token-1", "side": "BUY", "size": "100", "price": "0.5",
-			"status": "MATCHED", "transaction_hash": "0xtx",
-			"maker_orders": []map[string]any{{"order_id": "0xmaker", "matched_amount": "2.5", "price": "0.5"}},
+			"status": "MATCHED", "transaction_hash": "0xtx", "trader_side": "TAKER",
+			"maker_address": request.URL.Query().Get("maker_address"),
+			"maker_orders":  []map[string]any{{"order_id": "0xmaker", "matched_amount": "2.5", "price": "0.5"}},
 		}})
 	}))
 	defer server.Close()
@@ -290,8 +293,181 @@ func TestListTradesAcceptsBareWireArray(t *testing.T) {
 	}
 	if len(trades) != 1 || trades[0].ID != "trade-1" || !trades[0].Size.Equal("100") ||
 		len(trades[0].MakerOrders) != 1 || !trades[0].MakerOrders[0].MatchedAmount.Equal("2.5") ||
-		trades[0].TransactionHash != "0xtx" {
+		trades[0].TransactionHash != "0xtx" || trades[0].MakerAddress == "" {
 		t.Fatalf("trades = %#v", trades)
+	}
+}
+
+func TestListTradesBindsProxyFunderAndRejectsSignerFilter(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	const funderAddress = "0x1111111111111111111111111111111111111111"
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestCount++
+		if got := request.URL.Query().Get("maker_address"); got != funderAddress {
+			t.Fatalf("maker_address = %q, want proxy funder %q", got, funderAddress)
+		}
+		writeTestJSON(writer, map[string]any{"data": []map[string]any{{
+			"id": "trade-1", "taker_order_id": "order-1", "size": "1", "price": "0.5",
+			"trader_side": "TAKER", "maker_address": funderAddress,
+		}}, "next_cursor": "LTE="})
+	}))
+	defer server.Close()
+
+	signer, err := NewEOASigner("0000000000000000000000000000000000000000000000000000000000000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := NewStaticCredentialProvider([]TradingAccount{{
+		ExecutionAccountID: "proxy-account", FunderAddress: funderAddress,
+		SignatureType: SignatureTypePolyProxy, Signer: signer,
+		API: APICredentials{Key: "api-key", Secret: base64.URLEncoding.EncodeToString([]byte("test-secret")), Passphrase: "passphrase"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewTradingClient(TradingClientParams{
+		BaseURL: server.URL, Credentials: provider, RequestTimeout: 2 * time.Second,
+		RequestsPerSecond: 100, Burst: 20, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListTrades(context.Background(), "proxy-account", TradeFilter{}); err != nil {
+		t.Fatalf("ListTrades() error = %v", err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want 1", requestCount)
+	}
+
+	_, err = client.ListTrades(context.Background(), "proxy-account", TradeFilter{MakerAddress: signer.Address()})
+	var venueError *port.VenueError
+	if !errors.As(err, &venueError) || venueError.Kind != port.VenueErrorInvalid ||
+		venueError.Code != "CLOB_TRADE_ACCOUNT_FILTER_MISMATCH" {
+		t.Fatalf("cross-account ListTrades() error = %#v", err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("rejected filter emitted %d request(s), want 1 total", requestCount)
+	}
+}
+
+func TestListTradesRejectsForeignTradeComponent(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writeTestJSON(writer, map[string]any{"data": []map[string]any{{
+			"id": "foreign-trade", "taker_order_id": "foreign-order", "size": "1", "price": "0.5",
+			"trader_side": "TAKER", "maker_address": "0x2222222222222222222222222222222222222222",
+		}}, "next_cursor": "LTE="})
+	}))
+	defer server.Close()
+	client := newTestTradingClient(t, server.URL, now)
+	_, err := client.ListTrades(context.Background(), "account-1", TradeFilter{})
+	var venueError *port.VenueError
+	if !errors.As(err, &venueError) || venueError.Kind != port.VenueErrorUnavailable ||
+		venueError.Code != "CLOB_TRADE_OWNERSHIP_MISMATCH" {
+		t.Fatalf("ListTrades() error = %#v, want ownership mismatch", err)
+	}
+}
+
+func TestAccountTradeOrderIDsHonorsTakerMakerAndLegacyOwnership(t *testing.T) {
+	const funderAddress = "0x1111111111111111111111111111111111111111"
+	tests := []struct {
+		name    string
+		trade   Trade
+		wantIDs []string
+		wantErr bool
+	}{
+		{name: "taker", trade: Trade{ID: "t1", TraderSide: "TAKER", MakerAddress: funderAddress, TakerOrderID: "take-1"}, wantIDs: []string{"take-1"}},
+		{name: "maker", trade: Trade{ID: "t2", TraderSide: "MAKER", MakerOrders: []MakerOrder{{OrderID: "make-1", TokenID: "maker-token", MakerAddress: funderAddress}}}, wantIDs: []string{"make-1"}},
+		{name: "legacy taker", trade: Trade{ID: "t3", MakerAddress: funderAddress, TakerOrderID: "take-legacy"}, wantIDs: []string{"take-legacy"}},
+		{name: "legacy maker", trade: Trade{ID: "t4", MakerOrders: []MakerOrder{{OrderID: "make-legacy", TokenID: "maker-token", MakerAddress: funderAddress}}}, wantIDs: []string{"make-legacy"}},
+		{name: "taker remains top level", trade: Trade{ID: "t5", TraderSide: "TAKER", MakerAddress: funderAddress, TakerOrderID: "take-self", MakerOrders: []MakerOrder{{OrderID: "make-self", TokenID: "maker-token", MakerAddress: funderAddress}}}, wantIDs: []string{"take-self"}},
+		{name: "foreign taker", trade: Trade{ID: "t6", TraderSide: "TAKER", MakerAddress: "0x2222222222222222222222222222222222222222", TakerOrderID: "foreign"}, wantErr: true},
+		{name: "foreign maker", trade: Trade{ID: "t7", TraderSide: "MAKER", MakerOrders: []MakerOrder{{OrderID: "foreign", MakerAddress: "0x2222222222222222222222222222222222222222"}}}, wantErr: true},
+		{name: "unknown side", trade: Trade{ID: "t8", TraderSide: "BROKER", MakerAddress: funderAddress, TakerOrderID: "unknown"}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := accountTradeOrderIDs(test.trade, funderAddress)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("accountTradeOrderIDs() = %#v, want error", got)
+				}
+				return
+			}
+			if err != nil || strings.Join(got, ",") != strings.Join(test.wantIDs, ",") {
+				t.Fatalf("accountTradeOrderIDs() = %#v, %v; want %#v", got, err, test.wantIDs)
+			}
+		})
+	}
+}
+
+func TestListReconciliationTradesPreservesOwnedMakerComponentTokens(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	const funderAddress = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/data/trades" {
+			http.NotFound(writer, request)
+			return
+		}
+		if got := request.URL.Query().Get("maker_address"); got != funderAddress {
+			t.Fatalf("maker_address = %q, want %q", got, funderAddress)
+		}
+		writeTestJSON(writer, map[string]any{
+			"data": []map[string]any{{
+				"id": "trade-maker-components", "taker_order_id": "foreign-taker",
+				"market": "condition-1", "asset_id": "top-level-taker-token",
+				"size": "4", "price": "0.5", "status": "CONFIRMED",
+				"last_update": "2026-08-18T07:59:59Z", "trader_side": "MAKER",
+				"maker_address": "0x2222222222222222222222222222222222222222",
+				"maker_orders": []map[string]any{
+					{"order_id": "owned-maker-a", "asset_id": "owned-token-a", "maker_address": funderAddress, "matched_amount": "1", "price": "0.4"},
+					{"order_id": "foreign-maker", "asset_id": "foreign-token", "maker_address": "0x3333333333333333333333333333333333333333", "matched_amount": "1", "price": "0.5"},
+					{"order_id": "owned-maker-b", "asset_id": "owned-token-b", "maker_address": funderAddress, "matched_amount": "2", "price": "0.6"},
+				},
+			}},
+			"next_cursor": "LTE=",
+		})
+	}))
+	defer server.Close()
+
+	client := newTestTradingClient(t, server.URL, now)
+	trades, err := client.ListReconciliationTrades(context.Background(), "account-1", time.Time{})
+	if err != nil {
+		t.Fatalf("ListReconciliationTrades() error = %v", err)
+	}
+	if len(trades) != 2 {
+		t.Fatalf("reconciliation trades = %#v, want two owned maker components", trades)
+	}
+	for index, expected := range []struct {
+		orderID string
+		tokenID string
+	}{{"owned-maker-a", "owned-token-a"}, {"owned-maker-b", "owned-token-b"}} {
+		trade := trades[index]
+		if trade.VenueTradeID != "trade-maker-components" || trade.ConditionID != "condition-1" ||
+			trade.TokenID != expected.tokenID || len(trade.OrderIDs) != 1 || trade.OrderIDs[0] != expected.orderID {
+			t.Fatalf("component %d = %#v, want order/token %s/%s", index, trade, expected.orderID, expected.tokenID)
+		}
+		if trade.TokenID == "top-level-taker-token" {
+			t.Fatalf("maker component %d inherited the top-level taker token", index)
+		}
+	}
+}
+
+func TestAccountTradeComponentsUsesTopLevelIdentityForTaker(t *testing.T) {
+	const funderAddress = "0x1111111111111111111111111111111111111111"
+	components, err := accountTradeComponents(Trade{
+		ID: "taker-trade", TraderSide: "TAKER", MakerAddress: funderAddress,
+		TakerOrderID: "owned-taker", TokenID: "top-level-taker-token",
+		MakerOrders: []MakerOrder{{
+			OrderID: "owned-self-maker", TokenID: "nested-maker-token", MakerAddress: funderAddress,
+		}},
+	}, funderAddress)
+	if err != nil {
+		t.Fatalf("accountTradeComponents() error = %v", err)
+	}
+	if len(components) != 1 || components[0].OrderID != "owned-taker" || components[0].TokenID != "top-level-taker-token" {
+		t.Fatalf("taker components = %#v, want only exact top-level taker identity", components)
 	}
 }
 
@@ -307,6 +483,26 @@ func TestTradeWireDefaultsEmptyDeprecatedFeeRateMetadataToZero(t *testing.T) {
 	if !trade.Size.Equal("1.25") || !trade.FeeRateBPS.Equal("0") || len(trade.MakerOrders) != 1 ||
 		!trade.MakerOrders[0].MatchedAmount.Equal("0.75") || !trade.MakerOrders[0].FeeRateBPS.Equal("0") {
 		t.Fatalf("trade = %#v", trade)
+	}
+}
+
+func TestTradeOwnershipFieldKeepsLegacyFillDigestShape(t *testing.T) {
+	var trade Trade
+	if err := json.Unmarshal([]byte(`{
+		"id":"trade-1","taker_order_id":"order-1","size":"1","price":"0.5",
+		"maker_address":"0x1111111111111111111111111111111111111111","trader_side":"TAKER"
+	}`), &trade); err != nil {
+		t.Fatal(err)
+	}
+	if trade.MakerAddress == "" {
+		t.Fatal("maker_address was not decoded for ownership validation")
+	}
+	raw, err := json.Marshal(trade)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "maker_address") {
+		t.Fatalf("digest payload unexpectedly changed shape: %s", raw)
 	}
 }
 
@@ -333,6 +529,7 @@ func TestListOrderFillsFailsClosedWithoutFinalizedFeeEvidence(t *testing.T) {
 				"asset_id": tokenID, "side": "BUY", "size": "10", "price": "0.5",
 				"status": "CONFIRMED", "fee_rate_bps": "0", "transaction_hash": "0xtx",
 				"match_time": "2026-08-18T07:59:58Z", "last_update": "2026-08-18T07:59:59Z",
+				"trader_side": "TAKER", "maker_address": request.URL.Query().Get("maker_address"),
 			}}, "next_cursor": "LTE="})
 		case "/clob-markets/condition-1":
 			writeTestJSON(writer, map[string]any{

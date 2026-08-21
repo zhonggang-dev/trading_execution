@@ -22,7 +22,7 @@ func TestRunAccountRepairsOnlyProvableFacts(t *testing.T) {
 		balance: testBalance("100"),
 		positions: []domain.Position{{
 			ExecutionAccountID: "account-1", MarketID: "market-1", ConditionID: "condition-1",
-			TokenID: "token-1", TotalShares: "5", AvailableShares: "5", ReservedShares: "0",
+			TokenID: "token-1", OutcomeName: "YES", TotalShares: "5", AvailableShares: "5", ReservedShares: "0",
 			CostBasis: "2.5", AverageCostPrice: "0.5", LifecycleStatus: domain.PositionLifecycleOpen,
 		}},
 	}
@@ -174,6 +174,188 @@ func TestStartupWithoutAccountBaselineStillScansFullVenueHistory(t *testing.T) {
 	}
 	if !venue.tradesAfter.IsZero() {
 		t.Fatalf("venue trades after = %s, want full-history zero time", venue.tradesAfter)
+	}
+}
+
+func TestExternalTradeDispositionRequiresExactTradeAndPositionIdentity(t *testing.T) {
+	baseDisposition := domain.ExternalPositionDispositionTrade{
+		ExecutionAccountID: "account-1",
+		VenueTradeID:       "trade-1",
+		VenueOrderID:       "external-order-1",
+		ConditionID:        "condition-1",
+		TokenID:            "token-1",
+	}
+	tests := []struct {
+		name        string
+		disposition domain.ExternalPositionDispositionTrade
+		wantOpen    bool
+	}{
+		{name: "exact", disposition: baseDisposition},
+		{name: "different trade", disposition: withDispositionTradeID(baseDisposition, "trade-other"), wantOpen: true},
+		{name: "different order", disposition: withDispositionOrderID(baseDisposition, "external-order-other"), wantOpen: true},
+		{name: "different condition", disposition: withDispositionConditionID(baseDisposition, "condition-other"), wantOpen: true},
+		{name: "different token", disposition: withDispositionTokenID(baseDisposition, "token-other"), wantOpen: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := newTestService(t, Params{
+				Orders: &fakeOrders{},
+				Venue: &fakeVenue{trades: []domain.VenueTradeSnapshot{{
+					VenueTradeID: "trade-1", OrderIDs: []string{"external-order-1"},
+					ConditionID: "condition-1", TokenID: "token-1",
+				}}},
+				Ledger:         &fakeLedger{balance: testBalance("100")},
+				Fills:          &fakeFills{},
+				OrderRefresher: &fakeRefresher{},
+				PositionDispositionTrades: positionDispositionTradeSourceFunc(func(context.Context, string) ([]domain.ExternalPositionDispositionTrade, error) {
+					return []domain.ExternalPositionDispositionTrade{test.disposition}, nil
+				}),
+				PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+					return nil, nil
+				})},
+				BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+					return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+				})},
+			})
+
+			result, err := service.RunAccount(context.Background(), RunAccountParams{
+				ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerStartup,
+			})
+			if err != nil {
+				t.Fatalf("RunAccount() error = %v", err)
+			}
+			if test.wantOpen {
+				assertIssue(t, result.Issues, domain.ReconciliationIssueExternalTrade, domain.ReconciliationIssueOpen)
+				if result.Run.Summary["external_trades_accounted"] != 0 {
+					t.Fatalf("accounted external trades = %d, want 0", result.Run.Summary["external_trades_accounted"])
+				}
+				return
+			}
+			for _, issue := range result.Issues {
+				if issue.Type == domain.ReconciliationIssueExternalTrade {
+					t.Fatalf("exact disposition manufactured reconciliation issue %#v", issue)
+				}
+			}
+			if result.Run.Summary["external_trades_accounted"] != 1 {
+				t.Fatalf("accounted external trades = %d, want 1", result.Run.Summary["external_trades_accounted"])
+			}
+		})
+	}
+}
+
+func TestExternalTradeDispositionSuppressesOnlyOneOwnedOrderComponent(t *testing.T) {
+	disposition := domain.ExternalPositionDispositionTrade{
+		ExecutionAccountID: "account-1", VenueTradeID: "trade-1",
+		VenueOrderID: "external-order-1", ConditionID: "condition-1", TokenID: "token-1",
+	}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{},
+		Venue: &fakeVenue{trades: []domain.VenueTradeSnapshot{{
+			VenueTradeID: "trade-1", OrderIDs: []string{"external-order-1", "external-order-2"},
+			ConditionID: "condition-1", TokenID: "token-1",
+		}}},
+		Ledger:         &fakeLedger{balance: testBalance("100")},
+		Fills:          &fakeFills{},
+		OrderRefresher: &fakeRefresher{},
+		PositionDispositionTrades: positionDispositionTradeSourceFunc(func(context.Context, string) ([]domain.ExternalPositionDispositionTrade, error) {
+			return []domain.ExternalPositionDispositionTrade{disposition}, nil
+		}),
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerStartup,
+	})
+	if err != nil {
+		t.Fatalf("RunAccount() error = %v", err)
+	}
+	if result.Run.Summary["external_trades_accounted"] != 1 {
+		t.Fatalf("accounted external trades = %d, want 1", result.Run.Summary["external_trades_accounted"])
+	}
+	openOrders := make([]string, 0)
+	for _, issue := range result.Issues {
+		if issue.Type == domain.ReconciliationIssueExternalTrade && issue.Status == domain.ReconciliationIssueOpen {
+			openOrders = append(openOrders, issue.VenueOrderID)
+		}
+	}
+	if len(openOrders) != 1 || openOrders[0] != "external-order-2" {
+		t.Fatalf("open external trade orders = %#v, want only external-order-2", openOrders)
+	}
+}
+
+func TestExternalTradeDispositionReadFailureFailsClosed(t *testing.T) {
+	unavailable := errors.New("disposition ledger unavailable")
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{},
+		Venue: &fakeVenue{trades: []domain.VenueTradeSnapshot{{
+			VenueTradeID: "trade-1", OrderIDs: []string{"external-order-1"},
+			ConditionID: "condition-1", TokenID: "token-1",
+		}}},
+		Ledger:         &fakeLedger{balance: testBalance("100")},
+		Fills:          &fakeFills{},
+		OrderRefresher: &fakeRefresher{},
+		PositionDispositionTrades: positionDispositionTradeSourceFunc(func(context.Context, string) ([]domain.ExternalPositionDispositionTrade, error) {
+			return nil, unavailable
+		}),
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerStartup,
+	})
+	if !errors.Is(err, unavailable) {
+		t.Fatalf("RunAccount() error = %v, want disposition source failure", err)
+	}
+	assertIssue(t, result.Issues, domain.ReconciliationIssueExternalTrade, domain.ReconciliationIssueOpen)
+	assertIssue(t, result.Issues, domain.ReconciliationIssueSourceUnavailable, domain.ReconciliationIssueOpen)
+}
+
+func TestManagedPositionIdentityMismatchFailsClosed(t *testing.T) {
+	basePosition := domain.Position{
+		ExecutionAccountID: "account-1", MarketID: "market-1", ConditionID: "condition-1",
+		TokenID: "token-1", OutcomeIndex: intPointer(0), OutcomeName: "YES",
+		TotalShares: "2", AvailableShares: "2", ReservedShares: "0",
+		LifecycleStatus: domain.PositionLifecycleOpen,
+	}
+	baseExternal := domain.ExternalPosition{
+		ConditionID: "condition-1", TokenID: "token-1", OutcomeIndex: intPointer(0), OutcomeName: "YES",
+		Shares: "2", Redeemable: true, Source: "DATA_API", ObservedAt: testNow,
+	}
+	tests := []struct {
+		name     string
+		position domain.Position
+		external domain.ExternalPosition
+	}{
+		{name: "account", position: withPositionAccountID(basePosition, "account-other"), external: baseExternal},
+		{name: "condition", position: basePosition, external: withExternalConditionID(baseExternal, "condition-other")},
+		{name: "outcome index", position: basePosition, external: withExternalOutcomeIndex(baseExternal, intPointer(1))},
+		{name: "outcome name", position: basePosition, external: withExternalOutcomeName(baseExternal, "NO")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ledger := &fakeLedger{balance: testBalance("100"), positions: []domain.Position{test.position}}
+			service := newPositionBaselineTestService(t, ledger, nil, []domain.ExternalPosition{test.external})
+
+			result, err := service.RunAccount(context.Background(), RunAccountParams{
+				ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+			})
+			if err != nil {
+				t.Fatalf("RunAccount() error = %v", err)
+			}
+			assertIssue(t, result.Issues, domain.ReconciliationIssuePositionDrift, domain.ReconciliationIssueOpen)
+			if len(ledger.settled) != 0 {
+				t.Fatalf("identity mismatch settled a managed position: %#v", ledger.settled)
+			}
+		})
 	}
 }
 
@@ -473,6 +655,15 @@ func (function positionBaselineSourceFunc) ListExternalPositionBaselines(
 	return function(ctx, executionAccountID)
 }
 
+type positionDispositionTradeSourceFunc func(context.Context, string) ([]domain.ExternalPositionDispositionTrade, error)
+
+func (function positionDispositionTradeSourceFunc) ListExternalPositionDispositionTrades(
+	ctx context.Context,
+	executionAccountID string,
+) ([]domain.ExternalPositionDispositionTrade, error) {
+	return function(ctx, executionAccountID)
+}
+
 // balanceSourceFunc 表示后端使用的 balanceSourceFunc 类型。
 type balanceSourceFunc func(context.Context, string, string) (domain.ExternalBalance, error)
 
@@ -606,6 +797,11 @@ func newTestService(t *testing.T, params Params) *Service {
 			return nil, nil
 		})
 	}
+	if params.PositionDispositionTrades == nil {
+		params.PositionDispositionTrades = positionDispositionTradeSourceFunc(func(context.Context, string) ([]domain.ExternalPositionDispositionTrade, error) {
+			return nil, nil
+		})
+	}
 	params.Now = func() time.Time { return testNow }
 	sequence := 0
 	params.NewID = func() string {
@@ -634,6 +830,55 @@ func testOrder(id, venueID string, status domain.OrderStatus) domain.Order {
 func withStatus(order domain.Order, status domain.OrderStatus) domain.Order {
 	order.Status = status
 	return order
+}
+
+func withDispositionTradeID(value domain.ExternalPositionDispositionTrade, venueTradeID string) domain.ExternalPositionDispositionTrade {
+	value.VenueTradeID = venueTradeID
+	return value
+}
+
+func withDispositionOrderID(value domain.ExternalPositionDispositionTrade, venueOrderID string) domain.ExternalPositionDispositionTrade {
+	value.VenueOrderID = venueOrderID
+	return value
+}
+
+func withDispositionConditionID(value domain.ExternalPositionDispositionTrade, conditionID string) domain.ExternalPositionDispositionTrade {
+	value.ConditionID = conditionID
+	return value
+}
+
+func withDispositionTokenID(value domain.ExternalPositionDispositionTrade, tokenID string) domain.ExternalPositionDispositionTrade {
+	value.TokenID = tokenID
+	return value
+}
+
+func withExternalConditionID(value domain.ExternalPosition, conditionID string) domain.ExternalPosition {
+	value.ConditionID = conditionID
+	return value
+}
+
+func withExternalOutcomeIndex(value domain.ExternalPosition, outcomeIndex *int) domain.ExternalPosition {
+	value.OutcomeIndex = outcomeIndex
+	return value
+}
+
+func withExternalOutcomeName(value domain.ExternalPosition, outcomeName string) domain.ExternalPosition {
+	value.OutcomeName = outcomeName
+	return value
+}
+
+func withPositionAccountID(value domain.Position, executionAccountID string) domain.Position {
+	value.ExecutionAccountID = executionAccountID
+	return value
+}
+
+func hasIssue(issues []domain.ReconciliationIssue, issueType domain.ReconciliationIssueType) bool {
+	for _, issue := range issues {
+		if issue.Type == issueType {
+			return true
+		}
+	}
+	return false
 }
 
 // testBalance 实现当前测试场景所需的辅助行为。

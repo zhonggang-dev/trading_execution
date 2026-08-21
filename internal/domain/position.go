@@ -65,6 +65,7 @@ type PositionEventType string
 
 const (
 	PositionEventBought  PositionEventType = "BOUGHT"
+	PositionEventAdopted PositionEventType = "ADOPTED"
 	PositionEventSold    PositionEventType = "SOLD"
 	PositionEventMarked  PositionEventType = "MARKED"
 	PositionEventSettled PositionEventType = "SETTLED"

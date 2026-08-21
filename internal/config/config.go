@@ -58,8 +58,11 @@ type LiveOperations struct {
 // workflow. OrderSubmissionEnabled is deliberately independent from Enabled so
 // production can run the complete decision path without creating orders.
 type DecisionCycle struct {
-	Enabled                      bool
-	OrderSubmissionEnabled       bool
+	Enabled                bool
+	OrderSubmissionEnabled bool
+	// EntrySubmissionDisabled is an operator-owned sell-only gate. It blocks
+	// BUY intents without blocking validated exits from managed position lots.
+	EntrySubmissionDisabled      bool
 	RequireCompleteModelCoverage bool
 	PredictionInfraBaseURL       string
 	PredictionInfraToken         string
@@ -476,6 +479,10 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	entrySubmissionDisabled, err := boolean("DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED", false)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	requireCompleteModelCoverage, err := boolean("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", false)
 	if err != nil {
 		return DecisionCycle{}, err
@@ -510,6 +517,7 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	}
 	return DecisionCycle{
 		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
+		EntrySubmissionDisabled:      entrySubmissionDisabled,
 		RequireCompleteModelCoverage: requireCompleteModelCoverage,
 		PredictionInfraBaseURL:       strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_URL")),
 		PredictionInfraToken:         strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_TOKEN")),

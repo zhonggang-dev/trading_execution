@@ -112,8 +112,12 @@ type Trade struct {
 	MatchTime       string         `json:"match_time"`
 	LastUpdate      string         `json:"last_update"`
 	TransactionHash string         `json:"transaction_hash"`
-	TraderSide      string         `json:"trader_side"`
-	MakerOrders     []MakerOrder   `json:"maker_orders"`
+	// MakerAddress is decoded explicitly for account-ownership checks but is
+	// excluded from re-marshalling so existing FillLedger raw-payload digests
+	// remain stable across this adapter upgrade.
+	MakerAddress string       `json:"-"`
+	TraderSide   string       `json:"trader_side"`
+	MakerOrders  []MakerOrder `json:"maker_orders"`
 }
 
 // MakerOrder 表示后端使用的 MakerOrder 类型。
@@ -171,6 +175,12 @@ func (raw *rawOrder) UnmarshalJSON(data []byte) error {
 func (trade *Trade) UnmarshalJSON(data []byte) error {
 	type tradeAlias Trade
 	var decoded tradeAlias
+	var ownership struct {
+		MakerAddress string `json:"maker_address"`
+	}
+	if err := json.Unmarshal(data, &ownership); err != nil {
+		return fmt.Errorf("decode trade ownership: %w", err)
+	}
 	normalized, err := defaultEmptyDecimalField(data, "fee_rate_bps")
 	if err != nil {
 		return fmt.Errorf("normalize trade fee-rate metadata: %w", err)
@@ -184,6 +194,7 @@ func (trade *Trade) UnmarshalJSON(data []byte) error {
 	if sign, err := decoded.Size.Sign(); err != nil || sign < 0 {
 		return fmt.Errorf("decode trade size: size must be a non-negative decimal")
 	}
+	decoded.MakerAddress = ownership.MakerAddress
 	*trade = Trade(decoded)
 	return nil
 }
@@ -937,6 +948,18 @@ func (client *TradingClient) ListTrades(ctx context.Context, executionAccountID 
 	if err != nil {
 		return nil, err
 	}
+	requestedMaker := strings.TrimSpace(filter.MakerAddress)
+	if requestedMaker != "" && !strings.EqualFold(requestedMaker, account.FunderAddress) {
+		return nil, newInvalidError(
+			"CLOB_TRADE_ACCOUNT_FILTER_MISMATCH",
+			"trade maker_address must match the configured execution account funder",
+		)
+	}
+	// The CLOB contract marks maker_address as required. More importantly, L2
+	// credentials identify the signer, which may be shared by several proxy or
+	// Safe funders. Always bind the query to the execution account's actual
+	// asset-owning wallet; callers cannot widen or redirect that boundary.
+	filter.MakerAddress = account.FunderAddress
 	query := url.Values{}
 	setQuery(query, "id", filter.ID)
 	setQuery(query, "maker_address", filter.MakerAddress)
@@ -967,11 +990,17 @@ func (client *TradingClient) ListTrades(ctx context.Context, executionAccountID 
 			if arrayErr := json.Unmarshal(body, &bare); arrayErr != nil {
 				return nil, fmt.Errorf("decode CLOB trades: %w", err)
 			}
+			if ownershipErr := validateAccountTrades(bare, account.FunderAddress); ownershipErr != nil {
+				return nil, tradeOwnershipVenueError(ownershipErr)
+			}
 			return append(trades, bare...), nil
 		}
 		page := envelope.Data
 		if page == nil {
 			page = envelope.Items
+		}
+		if ownershipErr := validateAccountTrades(page, account.FunderAddress); ownershipErr != nil {
+			return nil, tradeOwnershipVenueError(ownershipErr)
 		}
 		trades = append(trades, page...)
 		nextCursor := firstNonEmpty(envelope.NextCursor, envelope.NextCursorAlt)
@@ -981,6 +1010,126 @@ func (client *TradingClient) ListTrades(ctx context.Context, executionAccountID 
 		cursor = nextCursor
 	}
 	return nil, fmt.Errorf("CLOB trades pagination exceeded 100 pages")
+}
+
+// validateAccountTrades rejects an authenticated response that contains a
+// trade component not attributable to the requested funder. Query filtering is
+// necessary but is not sufficient authority for reconciliation or FillLedger.
+func validateAccountTrades(trades []Trade, funderAddress string) error {
+	for _, trade := range trades {
+		if _, err := accountTradeComponents(trade, funderAddress); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type accountTradeComponent struct {
+	OrderID string
+	TokenID string
+}
+
+// accountTradeComponents applies the CLOB wire semantics to select only order
+// components owned by one funder while retaining each component's asset. The
+// top-level asset belongs to the taker order; a maker component's asset must
+// come from that exact maker_orders entry and may differ from the taker asset.
+// Legacy rows without trader_side are accepted only when an address-bearing
+// shape proves ownership.
+func accountTradeComponents(trade Trade, funderAddress string) ([]accountTradeComponent, error) {
+	funderAddress = strings.TrimSpace(funderAddress)
+	tradeID := strings.TrimSpace(trade.ID)
+	if tradeID == "" {
+		tradeID = "<missing>"
+	}
+	traderSide := strings.ToUpper(strings.TrimSpace(trade.TraderSide))
+	topLevelOwned := strings.EqualFold(strings.TrimSpace(trade.MakerAddress), funderAddress)
+
+	ownedMakerComponents := make([]accountTradeComponent, 0, len(trade.MakerOrders))
+	for _, maker := range trade.MakerOrders {
+		if !strings.EqualFold(strings.TrimSpace(maker.MakerAddress), funderAddress) {
+			continue
+		}
+		orderID := strings.TrimSpace(maker.OrderID)
+		if orderID == "" {
+			return nil, fmt.Errorf("CLOB trade %s has an owned maker component without order_id", tradeID)
+		}
+		ownedMakerComponents = appendDistinctTradeComponent(ownedMakerComponents, accountTradeComponent{
+			OrderID: orderID,
+			TokenID: strings.TrimSpace(maker.TokenID),
+		})
+	}
+
+	var components []accountTradeComponent
+	switch traderSide {
+	case "TAKER":
+		if !topLevelOwned {
+			return nil, fmt.Errorf("CLOB trade %s taker component is not owned by the configured funder", tradeID)
+		}
+		takerOrderID := strings.TrimSpace(trade.TakerOrderID)
+		if takerOrderID == "" {
+			return nil, fmt.Errorf("CLOB trade %s has an owned taker component without taker_order_id", tradeID)
+		}
+		components = appendDistinctTradeComponent(components, accountTradeComponent{
+			OrderID: takerOrderID,
+			TokenID: strings.TrimSpace(trade.TokenID),
+		})
+	case "MAKER":
+		if len(ownedMakerComponents) == 0 {
+			return nil, fmt.Errorf("CLOB trade %s has no maker component owned by the configured funder", tradeID)
+		}
+		components = append(components, ownedMakerComponents...)
+	case "":
+		// Historical observations can omit trader_side. Do not guess from IDs:
+		// accept only address-proven top-level or maker-order components.
+		if topLevelOwned {
+			takerOrderID := strings.TrimSpace(trade.TakerOrderID)
+			if takerOrderID != "" {
+				components = appendDistinctTradeComponent(components, accountTradeComponent{
+					OrderID: takerOrderID,
+					TokenID: strings.TrimSpace(trade.TokenID),
+				})
+			}
+		}
+		for _, component := range ownedMakerComponents {
+			components = appendDistinctTradeComponent(components, component)
+		}
+		if len(components) == 0 {
+			return nil, fmt.Errorf("CLOB trade %s has no address-proven component owned by the configured funder", tradeID)
+		}
+	default:
+		return nil, fmt.Errorf("CLOB trade %s has unsupported trader_side %q", tradeID, trade.TraderSide)
+	}
+	return components, nil
+}
+
+func appendDistinctTradeComponent(existing []accountTradeComponent, candidate accountTradeComponent) []accountTradeComponent {
+	for _, component := range existing {
+		if component.OrderID == candidate.OrderID && component.TokenID == candidate.TokenID {
+			return existing
+		}
+	}
+	return append(existing, candidate)
+}
+
+func accountTradeOrderIDs(trade Trade, funderAddress string) ([]string, error) {
+	components, err := accountTradeComponents(trade, funderAddress)
+	if err != nil {
+		return nil, err
+	}
+	orderIDs := make([]string, 0, len(components))
+	for _, component := range components {
+		orderIDs = appendDistinct(orderIDs, component.OrderID)
+	}
+	return orderIDs, nil
+}
+
+func tradeOwnershipVenueError(cause error) error {
+	return &port.VenueError{
+		Kind:    port.VenueErrorUnavailable,
+		Code:    "CLOB_TRADE_OWNERSHIP_MISMATCH",
+		Message: "CLOB trade response crossed the configured execution-account ownership boundary",
+		Cause:   cause,
+	}
 }
 
 // ListReconciliationTrades 查询并映射账户对账所需的交易所成交。
@@ -1003,18 +1152,9 @@ func (client *TradingClient) ListReconciliationTrades(
 	}
 	result := make([]domain.VenueTradeSnapshot, 0, len(trades))
 	for _, trade := range trades {
-		var orderIDs []string
-		traderSide := strings.ToUpper(strings.TrimSpace(trade.TraderSide))
-		if traderSide == "TAKER" {
-			orderIDs = appendDistinct(orderIDs, trade.TakerOrderID)
-		}
-		if traderSide == "MAKER" || traderSide == "" {
-			for _, maker := range trade.MakerOrders {
-				address := strings.ToLower(strings.TrimSpace(maker.MakerAddress))
-				if address == strings.ToLower(account.FunderAddress) || address == strings.ToLower(account.Signer.Address()) {
-					orderIDs = appendDistinct(orderIDs, maker.OrderID)
-				}
-			}
+		components, ownershipErr := accountTradeComponents(trade, account.FunderAddress)
+		if ownershipErr != nil {
+			return nil, tradeOwnershipVenueError(ownershipErr)
 		}
 		observedAt, ok := parseTradeTime(trade.LastUpdate)
 		if !ok {
@@ -1023,11 +1163,19 @@ func (client *TradingClient) ListReconciliationTrades(
 		if !ok {
 			observedAt = client.now().UTC()
 		}
-		result = append(result, domain.VenueTradeSnapshot{
-			VenueTradeID: strings.TrimSpace(trade.ID), OrderIDs: orderIDs,
-			ConditionID: strings.TrimSpace(trade.Market), TokenID: strings.TrimSpace(trade.TokenID),
-			Status: domain.NormalizeFillStatus(domain.FillStatus(trade.Status)), ObservedAt: observedAt,
-		})
+		for _, component := range components {
+			if component.TokenID == "" {
+				return nil, &port.VenueError{
+					Kind: port.VenueErrorUnavailable, Code: "CLOB_TRADE_COMPONENT_IDENTITY_INVALID",
+					Message: "CLOB trade response omitted the owned order component asset id",
+				}
+			}
+			result = append(result, domain.VenueTradeSnapshot{
+				VenueTradeID: strings.TrimSpace(trade.ID), OrderIDs: []string{component.OrderID},
+				ConditionID: strings.TrimSpace(trade.Market), TokenID: component.TokenID,
+				Status: domain.NormalizeFillStatus(domain.FillStatus(trade.Status)), ObservedAt: observedAt,
+			})
+		}
 	}
 	return result, nil
 }

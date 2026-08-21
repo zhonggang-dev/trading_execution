@@ -41,6 +41,9 @@ type Params struct {
 	// SubmitEnabled is an independent, fail-closed gate. A disabled cycle still
 	// records the validated strategy output but never invokes execution.Submit.
 	SubmitEnabled bool
+	// EntrySubmissionDisabled keeps validated exits executable while
+	// suppressing every BUY intent.
+	EntrySubmissionDisabled bool
 	// RequireCompleteModelCoverage rejects a cycle unless every effective
 	// Market has one PIT-selected probability from every configured prediction
 	// model. This is the production guard for same-Market model comparisons.
@@ -63,6 +66,7 @@ type Service struct {
 	recorder                     port.DecisionRecorder
 	executor                     port.OrderExecutor
 	submitEnabled                bool
+	entrySubmissionDisabled      bool
 	requireCompleteModelCoverage bool
 	bindings                     []domain.StrategyExecutionBinding
 	venue                        string
@@ -153,6 +157,7 @@ func New(params Params) (*Service, error) {
 		recorder:                     params.Recorder,
 		executor:                     params.Executor,
 		submitEnabled:                params.SubmitEnabled,
+		entrySubmissionDisabled:      params.EntrySubmissionDisabled,
 		requireCompleteModelCoverage: params.RequireCompleteModelCoverage,
 		bindings:                     bindings,
 		venue:                        params.Venue,
@@ -305,8 +310,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		run, runErr := service.runBinding(ctx, runBindingParams{
 			decisionAt: decisionAt, predictionSnapshotID: snapshot.SnapshotID, binding: executionContext,
 			predictions: predictions, positions: positions, books: bindingBooks, histories: bindingHistories,
-			allowEntries:     coverageErr == nil,
-			entryBlockReason: entryBlockReason(coverageErr),
+			allowEntries:     coverageErr == nil && !service.entrySubmissionDisabled,
+			entryBlockReason: entryBlockReason(coverageErr, service.entrySubmissionDisabled),
 		})
 		run.PredictionModelID = binding.PredictionModelID
 		run.Error = runErr
@@ -446,7 +451,10 @@ func wrapError(operation string, err error) error {
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
-func entryBlockReason(coverageErr error) string {
+func entryBlockReason(coverageErr error, entrySubmissionDisabled bool) string {
+	if entrySubmissionDisabled {
+		return domain.StrategyEntryBlockSubmissionDisabled
+	}
 	if coverageErr == nil {
 		return ""
 	}
@@ -513,7 +521,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if response.DecidedAt.After(service.now().UTC()) {
 		return run, fmt.Errorf("%w: decided_at must not be in the future", ErrInvalidStrategy)
 	}
-	intents, err := validateResponseWithEntryPolicy(request, response, service.venue, params.allowEntries)
+	intents, err := validateResponseWithEntryPolicy(request, response, service.venue, params.allowEntries, params.entryBlockReason)
 	if err != nil {
 		return run, err
 	}
@@ -522,7 +530,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, fmt.Errorf("record strategy output: %w", err)
 	}
-	intents, err = validateResponseWithEntryPolicy(request, response, service.venue, params.allowEntries)
+	intents, err = validateResponseWithEntryPolicy(request, response, service.venue, params.allowEntries, params.entryBlockReason)
 	if err != nil {
 		return run, fmt.Errorf("validate recorded strategy output: %w", err)
 	}
@@ -579,8 +587,12 @@ func (service *Service) RecoverStartup(ctx context.Context) error {
 }
 
 func (service *Service) recoverDeliveries(ctx context.Context, cutoff time.Time) error {
+	side := domain.Side("")
+	if service.entrySubmissionDisabled {
+		side = domain.SideSell
+	}
 	for {
-		requeued, err := service.recorder.RequeueStaleSubmitting(ctx, cutoff, defaultDeliveryBatch)
+		requeued, err := service.recorder.RequeueStaleSubmitting(ctx, cutoff, side, defaultDeliveryBatch)
 		if err != nil {
 			return fmt.Errorf("requeue stale strategy intents: %w", err)
 		}
@@ -593,10 +605,14 @@ func (service *Service) recoverDeliveries(ctx context.Context, cutoff time.Time)
 }
 
 func (service *Service) deliverPending(ctx context.Context, cycleID string) ([]IntentResult, error) {
+	side := domain.Side("")
+	if service.entrySubmissionDisabled {
+		side = domain.SideSell
+	}
 	results := make([]IntentResult, 0)
 	deliveryErrors := make([]error, 0)
 	for {
-		deliveries, err := service.recorder.ClaimPendingIntents(ctx, cycleID, defaultDeliveryBatch)
+		deliveries, err := service.recorder.ClaimPendingIntents(ctx, cycleID, side, defaultDeliveryBatch)
 		if err != nil {
 			return results, errors.Join(errors.Join(deliveryErrors...), fmt.Errorf("claim strategy intents: %w", err))
 		}
@@ -1200,7 +1216,7 @@ type expectedEvaluation struct {
 
 // validateResponse 校验 Response 的字段和业务约束。
 func validateResponse(request domain.StrategyDecisionRequest, response domain.StrategyDecisionResponse, venue string) ([]domain.OrderIntent, error) {
-	return validateResponseWithEntryPolicy(request, response, venue, true)
+	return validateResponseWithEntryPolicy(request, response, venue, true, "")
 }
 
 // validateResponseWithEntryPolicy keeps the frozen input truthful during a
@@ -1212,16 +1228,17 @@ func validateResponseWithEntryPolicy(
 	response domain.StrategyDecisionResponse,
 	venue string,
 	allowEntries bool,
+	expectedBlockReason string,
 ) ([]domain.OrderIntent, error) {
 	if err := request.Context.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: request execution context: %v", ErrInvalidStrategy, err)
 	}
 	if allowEntries {
-		if response.EntryPolicy != nil {
+		if expectedBlockReason != "" || response.EntryPolicy != nil {
 			return nil, fmt.Errorf("%w: healthy Trading entry policy must be absent", ErrInvalidStrategy)
 		}
-	} else if response.EntryPolicy == nil || response.EntryPolicy.Enabled ||
-		response.EntryPolicy.BlockReason != domain.StrategyEntryBlockIncompleteModelCoverage {
+	} else if expectedBlockReason == "" || response.EntryPolicy == nil || response.EntryPolicy.Enabled ||
+		response.EntryPolicy.BlockReason != expectedBlockReason {
 		return nil, fmt.Errorf("%w: blocked Trading entry policy mismatch", ErrInvalidStrategy)
 	}
 	if response.SchemaVersion != domain.StrategyOutputSchemaVersion || response.CycleID != request.CycleID ||

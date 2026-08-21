@@ -718,7 +718,10 @@ type StrategyExit struct {
 	Order      *StrategyOrderParams `json:"order"`
 }
 
-const StrategyEntryBlockIncompleteModelCoverage = "INCOMPLETE_MODEL_COVERAGE"
+const (
+	StrategyEntryBlockIncompleteModelCoverage = "INCOMPLETE_MODEL_COVERAGE"
+	StrategyEntryBlockSubmissionDisabled      = "ENTRY_SUBMISSION_DISABLED"
+)
 
 // StrategyEntryPolicy is appended by Trading only when entries are blocked so
 // the durable output explains why BUY intents were suppressed. It is absent on

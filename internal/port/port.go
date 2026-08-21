@@ -178,6 +178,13 @@ type ExternalPositionBaselineSource interface {
 	ListExternalPositionBaselines(ctx context.Context, executionAccountID string) ([]domain.ExternalPositionBaseline, error)
 }
 
+// ExternalPositionDispositionTradeSource reads exact venue-trade identities
+// whose effects on unmanaged baseline shares have already been accounted for.
+// The evidence is read-only and does not imply ownership of the venue order.
+type ExternalPositionDispositionTradeSource interface {
+	ListExternalPositionDispositionTrades(ctx context.Context, executionAccountID string) ([]domain.ExternalPositionDispositionTrade, error)
+}
+
 // ExternalBalanceSource 表示后端使用的 ExternalBalanceSource 类型。
 type ExternalBalanceSource interface {
 	GetExternalBalance(ctx context.Context, walletAddress, asset string) (domain.ExternalBalance, error)
@@ -370,12 +377,14 @@ type DecisionRecorder interface {
 	// intent set. Replays must use the same mode and exact intent set.
 	ClaimOutput(ctx context.Context, response domain.StrategyDecisionResponse, intents []domain.OrderIntent, submissionEnabled bool) (stored domain.StrategyDecisionResponse, created bool, err error)
 	// ClaimPendingIntents exclusively moves PENDING rows to SUBMITTING. An empty
-	// cycleID claims across cycles for crash recovery.
-	ClaimPendingIntents(ctx context.Context, cycleID string, limit int) ([]domain.DecisionIntentDelivery, error)
+	// cycleID claims across cycles for crash recovery; an empty side permits both
+	// BUY and SELL. A side filter is the durable boundary used by sell-only mode,
+	// including startup recovery of intents frozen by an older process.
+	ClaimPendingIntents(ctx context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error)
 	// RequeueStaleSubmitting makes abandoned claims retryable. The stable
 	// client_order_id and execution service's durable lookup make this safe;
 	// an execution result already recorded as UNKNOWN is never requeued.
-	RequeueStaleSubmitting(ctx context.Context, before time.Time, limit int) (int, error)
+	RequeueStaleSubmitting(ctx context.Context, before time.Time, side domain.Side, limit int) (int, error)
 	// CompleteIntent uses Attempt as a fencing token and accepts only terminal
 	// SUBMITTED, FAILED, or UNKNOWN states.
 	CompleteIntent(ctx context.Context, clientOrderID string, attempt int, completion domain.DecisionIntentCompletion) error

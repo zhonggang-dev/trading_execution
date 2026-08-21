@@ -57,6 +57,70 @@ func TestSubmitRejectsClientOrderIDConflict(t *testing.T) {
 	}
 }
 
+func TestSellOnlyGateBlocksDirectBuyButAllowsSell(t *testing.T) {
+	venue := &fakeVenue{}
+	service, err := execution.New(execution.Params{
+		Repository: memory.NewOrderRepository(), Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		EntrySubmissionDisabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var rejection *port.Rejection
+	if _, submitErr := service.Submit(context.Background(), validIntent("blocked-direct-buy")); !errors.As(submitErr, &rejection) || rejection.Code != domain.StrategyEntryBlockSubmissionDisabled {
+		t.Fatalf("blocked BUY error = %v, rejection = %#v", submitErr, rejection)
+	}
+	if venue.placeCalls.Load() != 0 {
+		t.Fatalf("blocked BUY reached venue %d times", venue.placeCalls.Load())
+	}
+
+	sell := validIntent("allowed-direct-sell")
+	sell.Side = domain.SideSell
+	sell.TargetLotID = "lot-1"
+	sell.WorstPrice = sell.Price
+	sell.TimeInForce = domain.TimeInForceFOK
+	if _, submitErr := service.Submit(context.Background(), sell); submitErr != nil {
+		t.Fatalf("SELL Submit() error = %v", submitErr)
+	}
+	if venue.placeCalls.Load() != 1 {
+		t.Fatalf("SELL venue calls = %d, want 1", venue.placeCalls.Load())
+	}
+}
+
+func TestSellOnlyGatePreservesIdempotentReplayOfExistingBuy(t *testing.T) {
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	baseParams := execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		NewID: func() string { return "existing-buy" },
+	}
+	initialService, err := execution.New(baseParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validIntent("existing-buy-client-id")
+	created, err := initialService.Submit(context.Background(), intent)
+	if err != nil || !created.Created {
+		t.Fatalf("initial Submit() = %#v, %v", created, err)
+	}
+
+	baseParams.EntrySubmissionDisabled = true
+	sellOnlyService, err := execution.New(baseParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := sellOnlyService.Submit(context.Background(), intent)
+	if err != nil || replayed.Created || replayed.Order.ID != created.Order.ID {
+		t.Fatalf("sell-only replay = %#v, %v; want existing order", replayed, err)
+	}
+	if venue.placeCalls.Load() != 1 {
+		t.Fatalf("idempotent replay venue calls = %d, want 1", venue.placeCalls.Load())
+	}
+}
+
 // TestSubmitPersistsAmbiguousVenueFailureWithoutRetry 验证 Submit Persists Ambiguous Venue Failure Without Retry 场景下的行为。
 func TestSubmitPersistsAmbiguousVenueFailureWithoutRetry(t *testing.T) {
 	venue := &fakeVenue{placeErr: errors.New("venue timeout")}
@@ -402,6 +466,46 @@ func TestResumeRevalidatesReservedOrderWithoutDuplicateSubmit(t *testing.T) {
 	resumed, err := service.Resume(context.Background(), result.Order.ID)
 	if err != nil || resumed.Status != domain.OrderStatusLive || venue.placeCalls.Load() != 1 {
 		t.Fatalf("Resume() = %#v, %v, calls=%d", resumed, err, venue.placeCalls.Load())
+	}
+}
+
+func TestSellOnlyGateRejectsReservedBuyDuringResumeWithoutVenueCall(t *testing.T) {
+	baseRepository := memory.NewOrderRepository()
+	repository := &failFirstStartRepository{OrderRepository: baseRepository}
+	venue := &fakeVenue{}
+	reservations := paper.NewReservationManager()
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	initialService, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		Now: func() time.Time { return now }, NewID: func() string { return "ord-resume-blocked-buy" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, submitErr := initialService.Submit(context.Background(), validIntent("client-resume-blocked-buy"))
+	if submitErr == nil || result.Order.Status != domain.OrderStatusReserved || venue.placeCalls.Load() != 0 {
+		t.Fatalf("initial Submit() = %#v, %v, calls=%d", result, submitErr, venue.placeCalls.Load())
+	}
+
+	sellOnlyService, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		EntrySubmissionDisabled: true,
+		Now:                     func() time.Time { return now.Add(time.Second) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, resumeErr := sellOnlyService.Resume(context.Background(), result.Order.ID)
+	var rejection *port.Rejection
+	if !errors.As(resumeErr, &rejection) || rejection.Code != domain.StrategyEntryBlockSubmissionDisabled ||
+		resumed.Status != domain.OrderStatusRejected || venue.placeCalls.Load() != 0 {
+		t.Fatalf("Resume() = %#v, %v, rejection=%#v, calls=%d", resumed, resumeErr, rejection, venue.placeCalls.Load())
+	}
+	reservation, ok := reservations.Get(result.Order.ID)
+	if !ok || reservation.Status != domain.ReservationStatusReleased {
+		t.Fatalf("reservation = %#v, found=%v; want RELEASED", reservation, ok)
 	}
 }
 

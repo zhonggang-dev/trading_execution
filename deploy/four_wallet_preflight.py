@@ -40,6 +40,7 @@ TRADING_RUNTIME_KEYS = frozenset(
         "POLYMARKET_LIVE_TRADING_ENABLED",
         "DECISION_CYCLE_ENABLED",
         "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED",
+        "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
         "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",
         "DECISION_CYCLE_BINDINGS_JSON",
         "POLYMARKET_ACCOUNTS_FILE",
@@ -180,7 +181,31 @@ SELECT json_build_object(
            WHERE status IN ('UNKNOWN','MANUAL_REVIEW')
            ORDER BY order_id
            LIMIT 20
-        ) AS risky_order
+      ) AS risky_order
+    )
+  ),
+  'nonterminal_buy_state',json_build_object(
+    'count',(
+      SELECT count(*) FROM execution_orders
+       WHERE intent->>'side'='BUY'
+         AND status NOT IN ('FILLED','CANCELLED','REJECTED','MANUAL_REVIEW')
+    ),
+    'orders',(
+      SELECT COALESCE(json_agg(json_build_object(
+        'order_id',order_id,
+        'client_order_id',client_order_id,
+        'execution_account_id',execution_account_id,
+        'status',status,
+        'updated_at',updated_at
+      ) ORDER BY order_id),'[]'::json)
+        FROM (
+          SELECT order_id,client_order_id,execution_account_id,status,updated_at
+            FROM execution_orders
+           WHERE intent->>'side'='BUY'
+             AND status NOT IN ('FILLED','CANCELLED','REJECTED','MANUAL_REVIEW')
+           ORDER BY order_id
+           LIMIT 20
+        ) AS nonterminal_buy
     )
   )
 )::text;
@@ -385,11 +410,23 @@ def _required_boolean(environment: dict[str, str], key: str, expected: bool) -> 
         raise PreflightError(f"{key} must be {str(expected).lower()}")
 
 
+def _explicit_boolean(environment: dict[str, str], key: str) -> None:
+    if environment.get(key, "").strip().lower() not in {"true", "false"}:
+        raise PreflightError(f"{key} must be explicitly true or false")
+
+
 def validate_environment(
-    environment: dict[str, str], *, submission_state: str
+    environment: dict[str, str], *, submission_state: str, entry_submission_state: str = "allowed"
 ) -> tuple[Binding, ...]:
     _required_boolean(environment, "DECISION_CYCLE_ENABLED", True)
     _required_boolean(environment, "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", True)
+    if entry_submission_state not in {"allowed", "blocked"}:
+        raise PreflightError("entry submission state must be allowed or blocked")
+    _required_boolean(
+        environment,
+        "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
+        entry_submission_state == "blocked",
+    )
     if submission_state != "either":
         _required_boolean(
             environment,
@@ -608,9 +645,13 @@ def validate_database_observation(
     )
 
 
-def validate_delivery_state(state: object) -> dict[str, object]:
+def validate_delivery_state(
+    state: object, *, entry_submission_state: str = "allowed"
+) -> dict[str, object]:
     if not isinstance(state, dict):
         raise PreflightError("database delivery state must be a JSON object")
+    if entry_submission_state not in {"allowed", "blocked"}:
+        raise PreflightError("entry submission state must be allowed or blocked")
     status_names = ("PENDING", "SUBMITTING", "SUBMITTED", "FAILED", "UNKNOWN")
     delivery_summary = state.get("decision_delivery_state")
     risky_samples: list[object]
@@ -705,6 +746,24 @@ def validate_delivery_state(state: object) -> dict[str, object]:
             raise PreflightError("database preflight did not return manual-review order state")
         manual_review_count = len(review_orders)
 
+    buy_summary = state.get("nonterminal_buy_state")
+    if isinstance(buy_summary, dict):
+        nonterminal_buy_count = buy_summary.get("count")
+        nonterminal_buy_orders = buy_summary.get("orders")
+        if (
+            not isinstance(nonterminal_buy_count, int)
+            or nonterminal_buy_count < 0
+            or not isinstance(nonterminal_buy_orders, list)
+            or len(nonterminal_buy_orders) > 20
+            or len(nonterminal_buy_orders) > nonterminal_buy_count
+        ):
+            raise PreflightError("database returned an invalid nonterminal BUY summary")
+    else:
+        nonterminal_buy_orders = state.get("nonterminal_buy_orders")
+        if not isinstance(nonterminal_buy_orders, list):
+            raise PreflightError("database preflight did not return nonterminal BUY state")
+        nonterminal_buy_count = len(nonterminal_buy_orders)
+
     risky_total = (
         status_counts["PENDING"]
         + status_counts["SUBMITTING"]
@@ -732,6 +791,15 @@ def validate_delivery_state(state: object) -> dict[str, object]:
             "execution orders require explicit UNKNOWN/MANUAL_REVIEW resolution before "
             "cutover: " + ", ".join(identities or [f"unsafe_count={manual_review_count}"])
         )
+    if entry_submission_state == "blocked" and nonterminal_buy_count:
+        identities = []
+        for row in nonterminal_buy_orders[:20]:
+            if isinstance(row, dict):
+                identities.append(f"{row.get('order_id')}:{row.get('status')}")
+        raise PreflightError(
+            "sell-only cutover requires zero nonterminal BUY execution orders: "
+            + ", ".join(identities or [f"unsafe_count={nonterminal_buy_count}"])
+        )
 
     watermark: dict[str, object] = {
         "count": delivery_count,
@@ -742,6 +810,7 @@ def validate_delivery_state(state: object) -> dict[str, object]:
             "UNKNOWN": status_counts["UNKNOWN"],
             "DELIVERY_ORDER_UNKNOWN_OR_MANUAL_REVIEW": unsafe_order_status_count,
             "EXECUTION_ORDER_UNKNOWN_OR_MANUAL_REVIEW": manual_review_count,
+            "NONTERMINAL_BUY_EXECUTION_ORDER": nonterminal_buy_count,
         },
         "max_updated_at": (
             max_updated_at.isoformat().replace("+00:00", "Z")
@@ -872,7 +941,10 @@ def validate_dry_run_state(
     now: dt.datetime,
     max_age: dt.timedelta,
     required: dict[str, object] | None = None,
+    entry_submission_state: str = "allowed",
 ) -> dict[str, object]:
+    if entry_submission_state not in {"allowed", "blocked"}:
+        raise PreflightError("entry submission state must be allowed or blocked")
     if not isinstance(state, dict) or not isinstance(state.get("dry_runs"), list):
         raise PreflightError("database preflight did not return dry-run evidence")
     candidates: list[tuple[dt.datetime, dict[str, object]]] = []
@@ -934,8 +1006,16 @@ def validate_dry_run_state(
             raise PreflightError(f"latest binding run {authorization} did not complete")
         if not isinstance(row.get("prediction_count"), int) or row["prediction_count"] < 1:
             raise PreflightError(f"latest binding run {authorization} received no predictions")
-        if row.get("entry_policy_enabled") is False or row.get("entry_block_reason") not in {"", None}:
-            raise PreflightError(f"latest binding run {authorization} has a model-coverage block")
+        policy_enabled = row.get("entry_policy_enabled")
+        block_reason = row.get("entry_block_reason")
+        if entry_submission_state == "blocked":
+            if policy_enabled is not False or block_reason != "ENTRY_SUBMISSION_DISABLED":
+                raise PreflightError(
+                    f"latest binding run {authorization} does not carry the exact "
+                    "sell-only entry policy"
+                )
+        elif (policy_enabled is not None and policy_enabled is not True) or block_reason not in {"", None}:
+            raise PreflightError(f"latest binding run {authorization} has an entry block")
     if actual != expected:
         raise PreflightError(
             f"latest dry-run bindings differ from the atomic configuration; "
@@ -1830,6 +1910,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="expected order-submission flag; use enabled after staging the second gate",
     )
     parser.add_argument(
+        "--entry-submission-state",
+        choices=("allowed", "blocked"),
+        default="allowed",
+        help="expected process-wide BUY gate; use blocked for an audited sell-only window",
+    )
+    parser.add_argument(
         "--write-disabled-evidence",
         type=pathlib.Path,
         help="new mode-0600 evidence artifact; required for the disabled phase",
@@ -1978,7 +2064,11 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
         prediction_environment = read_environment_file(args.prediction_env_file)
-        bindings = validate_environment(environment, submission_state=args.submission_state)
+        bindings = validate_environment(
+            environment,
+            submission_state=args.submission_state,
+            entry_submission_state=args.entry_submission_state,
+        )
         wallet_path = pathlib.Path(environment["POLYMARKET_ACCOUNTS_FILE"])
         wallet_file_sha = hashlib.sha256(
             _read_bounded_regular_file(wallet_path, "wallet")
@@ -2030,7 +2120,9 @@ def main(argv: list[str] | None = None) -> int:
         database_now = dt.datetime.now(dt.timezone.utc)
         validate_database_observation(state, now=database_now, max_age=evidence_age)
         database_account_identity_sha = validate_database_state(state, bindings)
-        delivery_watermark = validate_delivery_state(state)
+        delivery_watermark = validate_delivery_state(
+            state, entry_submission_state=args.entry_submission_state
+        )
         disabled_dry_run: dict[str, object] | None = None
         if args.submission_state == "enabled":
             disabled_evidence = read_disabled_evidence(args.disabled_evidence_json)
@@ -2058,6 +2150,7 @@ def main(argv: list[str] | None = None) -> int:
             now=dry_run_now,
             max_age=dry_run_age,
             required=disabled_dry_run,
+            entry_submission_state=args.entry_submission_state,
         )
 
         if args.prediction_snapshot_json is None:
@@ -2181,7 +2274,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise PreflightError(
                     "four-wallet database address identity changed during enabled preflight"
                 )
-            final_watermark = validate_delivery_state(final_state)
+            final_watermark = validate_delivery_state(
+                final_state, entry_submission_state=args.entry_submission_state
+            )
             if final_watermark != delivery_watermark:
                 raise PreflightError(
                     "decision delivery state changed during the enabled preflight"
@@ -2196,6 +2291,7 @@ def main(argv: list[str] | None = None) -> int:
                 now=final_dry_run_now,
                 max_age=dry_run_age,
                 required=disabled_dry_run,
+                entry_submission_state=args.entry_submission_state,
             )
             if final_dry_run != dry_run:
                 raise PreflightError(

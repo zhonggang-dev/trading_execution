@@ -65,14 +65,15 @@ func (recorder *replayDecisionRecorder) ClaimOutput(_ context.Context, response 
 	return response, true, nil
 }
 
-func (recorder *replayDecisionRecorder) ClaimPendingIntents(_ context.Context, cycleID string, limit int) ([]domain.DecisionIntentDelivery, error) {
+func (recorder *replayDecisionRecorder) ClaimPendingIntents(_ context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
 	result := make([]domain.DecisionIntentDelivery, 0)
 	for key, deliveries := range recorder.deliveries {
 		if cycleID != "" && key != cycleID {
 			continue
 		}
 		for index := range deliveries {
-			if deliveries[index].Status != domain.DecisionIntentPending || len(result) >= limit {
+			if deliveries[index].Status != domain.DecisionIntentPending ||
+				(side != "" && deliveries[index].Intent.Side != side) || len(result) >= limit {
 				continue
 			}
 			deliveries[index].Status = domain.DecisionIntentSubmitting
@@ -84,7 +85,7 @@ func (recorder *replayDecisionRecorder) ClaimPendingIntents(_ context.Context, c
 	return result, nil
 }
 
-func (recorder *replayDecisionRecorder) RequeueStaleSubmitting(_ context.Context, _ time.Time, _ int) (int, error) {
+func (recorder *replayDecisionRecorder) RequeueStaleSubmitting(_ context.Context, _ time.Time, _ domain.Side, _ int) (int, error) {
 	return 0, nil
 }
 

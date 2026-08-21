@@ -164,6 +164,8 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
   但明确标记 `submission_disabled` 且绝不调用 `execution.Submit`；
 - `DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=true` 还要求
   `DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true`，否则配置校验和服务装配都会拒绝启动；
+- `DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=true` 是独立的 sell-only 闸门：即使订单提交已开启，
+  Trading 仍会在 Go 侧拒绝所有 BUY，只允许当前 managed lot 的合法 SELL exit；
 - Go 绑定表保证一个 `(model_id, strategy_id)` 只对应一个唯一 `execution_account_id`，同一
   execution account 不能重复绑定；同一逻辑 `model_id` 不能来自多个 `prediction_model_id`，
   同一 `prediction_model_id` 也不能路由到多个逻辑模型。

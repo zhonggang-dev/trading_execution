@@ -291,6 +291,16 @@ func (state *runState) compareExternalPosition(ctx context.Context, params compa
 	}
 	delete(params.localByToken, params.tokenID)
 
+	if !managedPositionMatchesExternal(state.run.ExecutionAccountID, position, params.external) {
+		state.issue(ctx, domain.ReconciliationIssueParams{
+			Type: domain.ReconciliationIssuePositionDrift, Resolution: domain.ReconciliationResolutionManual,
+			Status: domain.ReconciliationIssueOpen, MarketID: position.MarketID,
+			ConditionID: position.ConditionID, TokenID: params.tokenID,
+			LocalValue: position.TotalShares, RemoteValue: params.external.Shares, Source: params.external.Source,
+			Details: "managed ledger and remote position identities do not match exactly; do not merge, relabel, or settle the token",
+		})
+		return
+	}
 	sharesMatch := within(position.TotalShares, params.external.Shares, state.service.positionEpsilon)
 	state.settlePositionIfNeeded(ctx, settlePositionParams{tokenID: params.tokenID, position: position, external: params.external, sharesMatch: sharesMatch})
 	if sharesMatch {
@@ -303,6 +313,14 @@ func (state *runState) compareExternalPosition(ctx context.Context, params compa
 		LocalValue: position.TotalShares, RemoteValue: params.external.Shares, Source: params.external.Source,
 		Details: "position quantity still differs after confirmed-fill recovery; do not guess an accounting event",
 	})
+}
+
+func managedPositionMatchesExternal(executionAccountID string, position domain.Position, external domain.ExternalPosition) bool {
+	return position.ExecutionAccountID == executionAccountID &&
+		position.ConditionID != "" && position.ConditionID == external.ConditionID &&
+		position.TokenID != "" && position.TokenID == external.TokenID &&
+		position.OutcomeName != "" && position.OutcomeName == external.OutcomeName &&
+		outcomeIndexesEqual(position.OutcomeIndex, external.OutcomeIndex)
 }
 
 // recordPhantomPosition 记录外部存在但本地没有可归因账本事件的持仓。

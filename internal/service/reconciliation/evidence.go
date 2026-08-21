@@ -15,6 +15,16 @@ type venueEvidence struct {
 	ordersWithTrades map[string]struct{}
 }
 
+// dispositionTradeIdentity is deliberately an exact component identity. One
+// venue trade may contain more than one owned maker order, including multiple
+// components for the same token, so order identity cannot be discarded.
+type dispositionTradeIdentity struct {
+	venueTradeID string
+	venueOrderID string
+	conditionID  string
+	tokenID      string
+}
+
 // accountRunScope 保存一次账户对账中各阶段共享且已规范化的查询范围。
 type accountRunScope struct {
 	executionAccountID string
@@ -67,8 +77,10 @@ func (state *runState) loadLocalAuthority(ctx context.Context, scope accountRunS
 func (state *runState) collectVenueEvidence(ctx context.Context, scope accountRunScope, orders []domain.Order) (venueEvidence, error) {
 	openOrders, openErr := state.service.venue.ListReconciliationOpenOrders(ctx, scope.executionAccountID)
 	trades, tradesErr := state.service.venue.ListReconciliationTrades(ctx, scope.executionAccountID, scope.scanAfter)
+	dispositionTrades, dispositionErr := state.service.positionDispositionTrades.ListExternalPositionDispositionTrades(ctx, scope.executionAccountID)
 	state.recordVenueReadError(ctx, "CLOB_OPEN_ORDERS", "read CLOB open orders", openErr)
 	state.recordVenueReadError(ctx, "CLOB_TRADES", "read Polymarket trades", tradesErr)
+	state.recordVenueReadError(ctx, "POSTGRES_EXTERNAL_POSITION_DISPOSITIONS", "read accounted external disposition trades", dispositionErr)
 	state.run.Summary["venue_open_orders"] = len(openOrders)
 	state.run.Summary["venue_trades"] = len(trades)
 
@@ -78,12 +90,22 @@ func (state *runState) collectVenueEvidence(ctx context.Context, scope accountRu
 	}
 	ordersWithTrades := make(map[string]struct{})
 	if tradesErr == nil {
-		ordersWithTrades = state.recordExternalTrades(ctx, trades, localOrders)
+		dispositionIndex := make(map[dispositionTradeIdentity]struct{})
+		if dispositionErr == nil {
+			var indexErr error
+			dispositionIndex, indexErr = makeDispositionTradeIndex(scope.executionAccountID, dispositionTrades)
+			if indexErr != nil {
+				state.addInfrastructureIssue(ctx, "POSTGRES_EXTERNAL_POSITION_DISPOSITIONS", "validate accounted external disposition trades", indexErr)
+				dispositionErr = indexErr
+				dispositionIndex = make(map[dispositionTradeIdentity]struct{})
+			}
+		}
+		ordersWithTrades = state.recordExternalTrades(ctx, trades, localOrders, dispositionIndex)
 	}
 	return venueEvidence{
 		tradesAvailable:  tradesErr == nil,
 		ordersWithTrades: ordersWithTrades,
-	}, errors.Join(openErr, tradesErr)
+	}, errors.Join(openErr, tradesErr, dispositionErr)
 }
 
 // recordVenueReadError 把非空的外部读取错误转换为可追踪的基础设施问题。
@@ -122,19 +144,28 @@ func (state *runState) recordExternalOrders(ctx context.Context, openOrders []do
 }
 
 // recordExternalTrades 建立有成交的订单索引，并记录无法归属到本系统的成交。
-func (state *runState) recordExternalTrades(ctx context.Context, trades []domain.VenueTradeSnapshot, localOrders map[string]struct{}) map[string]struct{} {
+func (state *runState) recordExternalTrades(
+	ctx context.Context,
+	trades []domain.VenueTradeSnapshot,
+	localOrders map[string]struct{},
+	dispositionTrades map[dispositionTradeIdentity]struct{},
+) map[string]struct{} {
 	result := make(map[string]struct{})
 	for _, trade := range trades {
-		state.recordExternalTradeOrders(ctx, externalTradeOrdersParams{trade: trade, localOrders: localOrders, ordersWithTrades: result})
+		state.recordExternalTradeOrders(ctx, externalTradeOrdersParams{
+			trade: trade, localOrders: localOrders, ordersWithTrades: result,
+			dispositionTrades: dispositionTrades,
+		})
 	}
 	return result
 }
 
 // externalTradeOrdersParams 收拢处理一笔外部成交时需要共享的索引。
 type externalTradeOrdersParams struct {
-	trade            domain.VenueTradeSnapshot
-	localOrders      map[string]struct{}
-	ordersWithTrades map[string]struct{}
+	trade             domain.VenueTradeSnapshot
+	localOrders       map[string]struct{}
+	ordersWithTrades  map[string]struct{}
+	dispositionTrades map[dispositionTradeIdentity]struct{}
 }
 
 // recordExternalTradeOrders 处理一笔交易所成交关联的全部订单标识。
@@ -145,8 +176,50 @@ func (state *runState) recordExternalTradeOrders(ctx context.Context, params ext
 		if _, owned := params.localOrders[normalizedOrderID]; owned {
 			continue
 		}
+		_, accountedByDisposition := params.dispositionTrades[dispositionTradeIdentity{
+			venueTradeID: params.trade.VenueTradeID,
+			venueOrderID: normalizedOrderID,
+			conditionID:  params.trade.ConditionID,
+			tokenID:      params.trade.TokenID,
+		}]
+		if accountedByDisposition {
+			// The append-only disposition is already the durable audit record.
+			// Reconciliation suppresses the exact external component without
+			// manufacturing a fresh RESOLVED issue on every lookback sweep.
+			state.run.Summary["external_trades_accounted"]++
+			continue
+		}
 		state.recordExternalTrade(ctx, params.trade, venueOrderID)
 	}
+}
+
+func makeDispositionTradeIndex(
+	executionAccountID string,
+	values []domain.ExternalPositionDispositionTrade,
+) (map[dispositionTradeIdentity]struct{}, error) {
+	result := make(map[dispositionTradeIdentity]struct{}, len(values))
+	for _, value := range values {
+		if value.ExecutionAccountID != executionAccountID || value.VenueTradeID == "" || value.VenueOrderID == "" ||
+			value.ConditionID == "" || value.TokenID == "" ||
+			value.ExecutionAccountID != strings.TrimSpace(value.ExecutionAccountID) ||
+			value.VenueTradeID != strings.TrimSpace(value.VenueTradeID) ||
+			value.VenueOrderID != strings.TrimSpace(value.VenueOrderID) ||
+			value.ConditionID != strings.TrimSpace(value.ConditionID) ||
+			value.TokenID != strings.TrimSpace(value.TokenID) {
+			return nil, errors.New("external position disposition trade has incomplete or mismatched exact identity")
+		}
+		identity := dispositionTradeIdentity{
+			venueTradeID: value.VenueTradeID,
+			venueOrderID: normalizedID(value.VenueOrderID),
+			conditionID:  value.ConditionID,
+			tokenID:      value.TokenID,
+		}
+		if _, duplicate := result[identity]; duplicate {
+			return nil, errors.New("external position disposition contains a duplicate exact trade identity")
+		}
+		result[identity] = struct{}{}
+	}
+	return result, nil
 }
 
 // recordExternalTrade 记录一笔无法归属到本系统策略订单的交易所成交。

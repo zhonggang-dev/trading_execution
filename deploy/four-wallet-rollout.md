@@ -13,9 +13,17 @@ both durable gates closed:
 
 ```text
 DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false
+DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false
 DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true
 execution_risk_global_control.kill_switch=true
 ```
+
+For an explicitly approved exit-only maintenance window, set
+`DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=true` before enabling order
+submission. Run the preflight with `--entry-submission-state blocked`; it also
+requires zero non-terminal BUY orders. The execution service enforces this
+gate for HTTP submissions, decision delivery, and crash recovery, not only in
+the Python decision-cycle path.
 
 The `DECISION_CYCLE_BINDINGS_JSON` array must be replaced atomically as one
 environment-file value. Each logical model must have both `multfactor_v1` and

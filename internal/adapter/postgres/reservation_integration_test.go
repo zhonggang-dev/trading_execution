@@ -1060,6 +1060,608 @@ func TestExternalPositionBaselinePostgresIntegration(t *testing.T) {
 	}
 }
 
+// TestExternalPositionAdoptionPostgresIntegration proves that an immutable
+// unmanaged baseline can become one managed Python-visible lot without a fake
+// execution order or fill, while its effective unmanaged remainder becomes
+// zero.
+func TestExternalPositionAdoptionPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	const (
+		accountID     = "account-external-position-adoption"
+		baselineID    = "baseline-external-position-adoption"
+		batchID       = "batch-external-position-adoption"
+		adoptionID    = "external-adoption-1"
+		dispositionID = "external-adoption-disposition-1"
+		lotID         = "lot-external-adoption-1"
+		eventID       = "position-event-external-adoption-1"
+		tokenID       = "token-external-adoption-1"
+		conditionID   = "condition-external-adoption-1"
+	)
+	observedAt := time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC)
+	openedAt := observedAt.Add(-72 * time.Hour)
+	adoptedAt := observedAt.Add(time.Minute)
+	insertAccount(t, db, accountID, "0xexternalpositionadoption", "20", "20", "0")
+	if _, err := db.Exec(`
+		INSERT INTO execution_strategy_bindings (
+			model_id,strategy_id,execution_account_id,enabled
+		) VALUES ('echo','multfactor_v1',$1,TRUE)`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	baselineTx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := baselineTx.Exec(`
+		INSERT INTO execution_external_position_baseline_items (
+			baseline_id,execution_account_id,token_id,condition_id,
+			outcome_index,outcome_name,neg_risk,shares
+		) VALUES ($1,$2,$3,$4,1,'No',TRUE,1.5)`, baselineID, accountID, tokenID, conditionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := baselineTx.Exec(`
+		INSERT INTO execution_external_position_baselines (
+			baseline_id,execution_account_id,source,observed_at,evidence,actor,reason
+		) VALUES ($1,$2,'POLYMARKET_DATA_API',$3,'{"snapshot_sha256":"adoption"}',
+		          'integration-test','initial ownership capture')`, baselineID, accountID, observedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := baselineTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		INSERT INTO execution_external_position_dispositions (
+			disposition_id,adjustment_batch_id,baseline_id,execution_account_id,
+			condition_id,token_id,disposition_kind,transition_sequence,
+			shares_before,shares_delta,shares_after,occurred_at,evidence,actor,reason
+		) VALUES ($1,$2,$3,$4,$5,$6,'ADOPTION',1,1.5,1.5,0,$7,
+		          '{"remote_shares":"1.5"}','integration-test','authorized ownership transfer')`,
+		dispositionID, batchID, baselineID, accountID, conditionID, tokenID, adoptedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO execution_external_position_adoptions (
+			external_adoption_id,adjustment_batch_id,disposition_id,baseline_id,
+			execution_account_id,lot_id,position_event_id,market_id,condition_id,token_id,
+			outcome_index,outcome_name,neg_risk,model_id,strategy_id,shares,remaining_cost,
+			average_entry_price,opened_at,adopted_at,evidence,actor,reason
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,'market-adoption',$8,$9,1,'No',TRUE,
+		          'echo','multfactor_v1',1.5,0.615,0.4,$10,$11,
+		          '{"fifo":"proven"}','integration-test','authorized ownership transfer')`,
+		adoptionID, batchID, dispositionID, baselineID, accountID, lotID, eventID,
+		conditionID, tokenID, openedAt, adoptedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO execution_positions (
+			execution_account_id,market_id,condition_id,token_id,outcome_index,outcome_name,
+			total_shares,available_shares,reserved_shares,cost_basis,average_cost_price,
+			realized_pnl,market_value,unrealized_pnl,is_dust,lifecycle_status,created_at,updated_at
+		) VALUES ($1,'market-adoption',$2,$3,1,'No',1.5,1.5,0,0.615,0.41,
+		          0,0,0,FALSE,'OPEN',$4,$4)`, accountID, conditionID, tokenID, adoptedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO position_lots (
+			lot_id,execution_account_id,market_id,condition_id,token_id,outcome_index,
+			outcome_name,neg_risk,model_id,strategy_id,opening_order_id,opening_fill_key,
+			external_adoption_id,original_shares,remaining_shares,original_cost,
+			remaining_cost,average_entry_price,status,opened_at
+		) VALUES ($1,$2,'market-adoption',$3,$4,1,'No',TRUE,'echo','multfactor_v1',
+		          NULL,NULL,$5,1.5,1.5,0.615,0.615,0.4,'OPEN',$6)`,
+		lotID, accountID, conditionID, tokenID, adoptionID, openedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO position_events (
+			position_event_id,event_type,execution_account_id,market_id,token_id,
+			order_id,fill_key,external_adoption_id,model_id,strategy_id,shares_delta,
+			cash_delta,cost_basis_delta,realized_pnl_delta,shares_after,cost_basis_after,
+			average_cost_after,realized_pnl_after,unrealized_pnl_after,occurred_at
+		) VALUES ($1,'ADOPTED',$2,'market-adoption',$3,'','',$4,'echo','multfactor_v1',
+		          1.5,0,0.615,0,1.5,0.615,0.41,0,0,$5)`,
+		eventID, accountID, tokenID, adoptionID, adoptedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO execution_external_position_adjustment_batches (
+			adjustment_batch_id,schema_version,observed_at,evidence,evidence_sha256,actor,reason
+		) VALUES ($1,'trading.external-position-adjustment.v1',$2,
+		          '{"cutover":"integration"}',$3,'integration-test','authorized ownership transfer')`,
+		batchID, adoptedAt, strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit external position adoption: %v", err)
+	}
+
+	baselineRepository, err := NewExternalPositionBaselineRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselines, err := baselineRepository.ListExternalPositionBaselines(context.Background(), accountID)
+	if err != nil || len(baselines) != 0 {
+		t.Fatalf("effective unmanaged baselines = %#v err=%v, want empty", baselines, err)
+	}
+	ledger, err := NewFillLedger(FillLedgerParams{DB: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lots, err := ledger.ListOpenLots(context.Background(), accountID)
+	if err != nil || len(lots) != 1 || lots[0].OpeningOrderID != "external-adoption:"+adoptionID ||
+		lots[0].OpeningFillKey != "external-adoption:"+adoptionID || !lots[0].RemainingShares.Equal("1.5") {
+		t.Fatalf("adopted open lots = %#v err=%v", lots, err)
+	}
+	exits, err := ledger.ListOpenPositionExitTrades(context.Background(), accountID)
+	if err != nil || len(exits) != 1 || exits[0].VenueTradeID != "external-adoption:"+adoptionID ||
+		exits[0].OpeningOrderID != "external-adoption:"+adoptionID {
+		t.Fatalf("adopted exit trades = %#v err=%v", exits, err)
+	}
+	if _, err := db.Exec(`UPDATE position_lots SET external_adoption_id=NULL WHERE lot_id=$1`, lotID); err == nil {
+		t.Fatal("adopted lot origin mutation succeeded")
+	}
+	if _, err := db.Exec(`UPDATE position_lots SET original_cost=0.5 WHERE lot_id=$1`, lotID); err == nil {
+		t.Fatal("adopted lot original economics mutation succeeded")
+	}
+	if _, err := db.Exec(`UPDATE position_events SET shares_after=1 WHERE position_event_id=$1`, eventID); err == nil {
+		t.Fatal("adopted position event mutation succeeded")
+	}
+
+	orderRepository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations, err := NewReservationManager(ReservationManagerParams{DB: db, MaxBuyFeeRateBPS: "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor, err := fillprocessor.New(fillprocessor.Params{
+		Orders: orderRepository, Source: noFillsSource{}, Ledger: ledger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sellAt := adoptedAt.Add(time.Hour)
+	sell := integrationOrder("external-adoption-sell", accountID, tokenID, domain.SideSell, "1.5", "0.3")
+	sell.Intent.Venue = "paper"
+	sell.Intent.ModelID = "echo"
+	sell.Intent.StrategyID = "multfactor_v1"
+	sell.Intent.MarketID = "market-adoption"
+	sell.Intent.ConditionID = conditionID
+	sell.Intent.TargetLotID = lotID
+	sellOutcomeIndex := 1
+	sellNegRisk := true
+	sell.Intent.OutcomeIndex = &sellOutcomeIndex
+	sell.Intent.OutcomeName = "No"
+	sell.Intent.ExpectedNegRisk = &sellNegRisk
+	sell.Intent.TimeInForce = domain.TimeInForceFOK
+	sell = createAcknowledgedIntegrationOrder(
+		t, context.Background(), orderRepository, reservations, sell,
+		"0xexternal-adoption-sell", sellAt,
+	)
+	confirmedAt := sellAt.Add(10 * time.Second)
+	sold, err := processor.Process(context.Background(), sell, domain.Fill{
+		VenueFillID: "trade-external-adoption-sell", LiquidityRole: domain.LiquidityRoleMaker,
+		Status: domain.FillStatusConfirmed, Shares: "1.5", Price: "0.5",
+		GrossNotional: "0.75", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
+		FeeSource: "TEST_AUTHORITATIVE_SETTLEMENT",
+		MatchedAt: sellAt.Add(9 * time.Second), VenueUpdatedAt: confirmedAt,
+		ObservedAt: confirmedAt, ConfirmedAt: &confirmedAt,
+	})
+	if err != nil {
+		t.Fatalf("sell adopted lot: %v", err)
+	}
+	if sold.Position == nil || sold.Order.Status != domain.OrderStatusFilled ||
+		!sold.Position.TotalShares.Equal("0") || !sold.Position.CostBasis.Equal("0") ||
+		!sold.Position.RealizedPnL.Equal("0.135") {
+		t.Fatalf("sold adopted position = %#v", sold)
+	}
+	assertAccount(t, db, accountID, "20.75", "20.75", "0")
+	lots, err = ledger.ListLots(context.Background(), accountID, tokenID)
+	if err != nil || len(lots) != 1 || lots[0].Status != domain.PositionLotClosed ||
+		!lots[0].RemainingShares.Equal("0") || !lots[0].RemainingCost.Equal("0") ||
+		lots[0].OpeningOrderID != "external-adoption:"+adoptionID {
+		t.Fatalf("closed adopted lot = %#v err=%v", lots, err)
+	}
+}
+
+// TestExternalCashAdjustmentChainPostgresIntegration proves that an external
+// sell batch starts from the account's pre-adjustment balance and that every
+// later transaction is appended in one strict, gap-free cash chain.
+func TestExternalCashAdjustmentChainPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	baselineObservedAt := time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC)
+
+	type fixture struct {
+		accountID  string
+		baselineID string
+		batchID    string
+		tokenID    string
+		condition  string
+	}
+	setup := func(t *testing.T, suffix string) fixture {
+		t.Helper()
+		value := fixture{
+			accountID:  "account-external-cash-" + suffix,
+			baselineID: "baseline-external-cash-" + suffix,
+			batchID:    "batch-external-cash-" + suffix,
+			tokenID:    "token-external-cash-" + suffix,
+			condition:  "condition-external-cash-" + suffix,
+		}
+		insertAccount(t, db, value.accountID, "0xexternalcash"+suffix, "20", "20", "0")
+		tx, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`
+			INSERT INTO execution_external_position_baseline_items (
+				baseline_id,execution_account_id,token_id,condition_id,
+				outcome_index,outcome_name,neg_risk,shares
+			) VALUES ($1,$2,$3,$4,0,'Yes',FALSE,10)`,
+			value.baselineID, value.accountID, value.tokenID, value.condition); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO execution_external_position_baselines (
+				baseline_id,execution_account_id,source,observed_at,evidence,actor,reason
+			) VALUES ($1,$2,'POLYMARKET_DATA_API',$3,'{"snapshot_sha256":"cash-chain"}',
+			          'integration-test','initial ownership capture')`,
+			value.baselineID, value.accountID, baselineObservedAt); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	insertDisposition := func(
+		t *testing.T,
+		tx *sql.Tx,
+		value fixture,
+		sequence int,
+		before, delta, after string,
+		occurredAt time.Time,
+		transactionHash string,
+	) {
+		t.Helper()
+		_, err := tx.Exec(`
+			INSERT INTO execution_external_position_dispositions (
+				disposition_id,adjustment_batch_id,baseline_id,execution_account_id,
+				condition_id,token_id,disposition_kind,transition_sequence,
+				shares_before,shares_delta,shares_after,venue_trade_id,venue_order_id,
+				transaction_hash,occurred_at,evidence,actor,reason
+			) VALUES ($1,$2,$3,$4,$5,$6,'EXTERNAL_SELL',$7,$8::numeric,$9::numeric,$10::numeric,
+			          $11,$12,$13,$14,'{"receipt":"finalized"}',
+			          'integration-test','account for external sell')`,
+			fmt.Sprintf("disposition-%s-%d", value.accountID, sequence), value.batchID,
+			value.baselineID, value.accountID, value.condition, value.tokenID, sequence,
+			before, delta, after, fmt.Sprintf("venue-trade-%s-%d", value.accountID, sequence),
+			fmt.Sprintf("venue-order-%s-%d", value.accountID, sequence), transactionHash, occurredAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertCash := func(
+		tx *sql.Tx,
+		value fixture,
+		cashID, eventID, before, delta, after string,
+		occurredAt time.Time,
+		transactionHash string,
+	) error {
+		_, err := tx.Exec(`
+			INSERT INTO execution_external_cash_adjustments (
+				cash_adjustment_id,adjustment_batch_id,execution_account_id,transaction_hash,
+				asset,total_delta,available_delta,reserved_delta,balance_before,balance_after,
+				account_event_id,occurred_at,evidence,actor,reason
+			) VALUES ($1,$2,$3,$4,'pUSD',$5::numeric,$5::numeric,0,$6::numeric,$7::numeric,
+			          $8,$9,'{"receipt":"finalized"}',
+			          'integration-test','account for external sell')`,
+			cashID, value.batchID, value.accountID, transactionHash, delta, before, after,
+			eventID, occurredAt)
+		return err
+	}
+
+	t.Run("forged opening balance is rejected", func(t *testing.T) {
+		value := setup(t, "forged-opening")
+		occurredAt := baselineObservedAt.Add(time.Minute)
+		transactionHash := "0x" + strings.Repeat("11", 32)
+		tx, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		insertDisposition(t, tx, value, 1, "10", "1", "9", occurredAt, transactionHash)
+		err = insertCash(tx, value, "cash-forged-opening", "event-forged-opening", "19", "2", "21", occurredAt, transactionHash)
+		if err == nil || !strings.Contains(err.Error(), "must start at the current available account balance") {
+			t.Fatalf("forged opening cash balance error = %v", err)
+		}
+	})
+
+	t.Run("broken chain is rejected", func(t *testing.T) {
+		value := setup(t, "broken-chain")
+		firstAt := baselineObservedAt.Add(time.Minute)
+		secondAt := firstAt.Add(time.Minute)
+		firstHash := "0x" + strings.Repeat("22", 32)
+		secondHash := "0x" + strings.Repeat("33", 32)
+		tx, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		insertDisposition(t, tx, value, 1, "10", "1", "9", firstAt, firstHash)
+		insertDisposition(t, tx, value, 2, "9", "1", "8", secondAt, secondHash)
+		if err := insertCash(tx, value, "cash-broken-1", "event-broken-1", "20", "2", "22", firstAt, firstHash); err != nil {
+			t.Fatal(err)
+		}
+		err = insertCash(tx, value, "cash-broken-2", "event-broken-2", "21", "3", "24", secondAt, secondHash)
+		if err == nil || !strings.Contains(err.Error(), "does not continue the batch balance chain") {
+			t.Fatalf("broken cash chain error = %v", err)
+		}
+	})
+
+	t.Run("out of order insert is rejected", func(t *testing.T) {
+		value := setup(t, "out-of-order")
+		firstAt := baselineObservedAt.Add(time.Minute)
+		secondAt := firstAt.Add(time.Minute)
+		firstHash := "0x" + strings.Repeat("44", 32)
+		secondHash := "0x" + strings.Repeat("55", 32)
+		tx, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		insertDisposition(t, tx, value, 1, "10", "1", "9", firstAt, firstHash)
+		insertDisposition(t, tx, value, 2, "9", "1", "8", secondAt, secondHash)
+		if err := insertCash(tx, value, "cash-order-later", "event-order-later", "20", "2", "22", secondAt, secondHash); err != nil {
+			t.Fatal(err)
+		}
+		err = insertCash(tx, value, "cash-order-earlier", "event-order-earlier", "22", "3", "25", firstAt, firstHash)
+		if err == nil || !strings.Contains(err.Error(), "strict occurred_at/id order") {
+			t.Fatalf("out-of-order cash insert error = %v", err)
+		}
+	})
+
+	t.Run("multiple transactions commit one exact chain", func(t *testing.T) {
+		value := setup(t, "valid-chain")
+		firstAt := baselineObservedAt.Add(time.Minute)
+		secondAt := firstAt.Add(time.Minute)
+		firstHash := "0x" + strings.Repeat("66", 32)
+		secondHash := "0x" + strings.Repeat("77", 32)
+		tx, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		insertDisposition(t, tx, value, 1, "10", "2", "8", firstAt, firstHash)
+		insertDisposition(t, tx, value, 2, "8", "3", "5", secondAt, secondHash)
+		if err := insertCash(tx, value, "cash-valid-1", "event-valid-1", "20", "2", "22", firstAt, firstHash); err != nil {
+			t.Fatal(err)
+		}
+		if err := insertCash(tx, value, "cash-valid-2", "event-valid-2", "22", "3", "25", secondAt, secondHash); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO execution_account_events (
+				account_event_id,execution_account_id,event_type,order_id,fill_key,
+				total_balance_delta,available_balance_delta,reserved_balance_delta,
+				total_balance_after,available_balance_after,reserved_balance_after,occurred_at
+			) VALUES
+				('event-valid-1',$1,'EXTERNAL_POSITION_DISPOSITION','','',2,2,0,22,22,0,$2),
+				('event-valid-2',$1,'EXTERNAL_POSITION_DISPOSITION','','',3,3,0,25,25,0,$3)`,
+			value.accountID, firstAt, secondAt); err != nil {
+			t.Fatal(err)
+		}
+		accountResult, err := tx.Exec(`
+			UPDATE execution_accounts
+			SET total_balance=25,available_balance=25,reserved_balance=0,
+			    version=version+1,updated_at=$2
+			WHERE execution_account_id=$1 AND total_balance=20
+			  AND available_balance=20 AND reserved_balance=0`, value.accountID, secondAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !oneRow(accountResult) {
+			t.Fatal("external cash chain account compare-and-swap did not update exactly one row")
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO execution_external_position_adjustment_batches (
+				adjustment_batch_id,schema_version,observed_at,evidence,evidence_sha256,actor,reason
+			) VALUES ($1,'trading.external-position-adjustment.v1',$2,
+			          '{"cutover":"cash-chain"}',$3,'integration-test','account for external sells')`,
+			value.batchID, secondAt, strings.Repeat("b", 64)); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit valid external cash chain: %v", err)
+		}
+
+		assertAccount(t, db, value.accountID, "25", "25", "0")
+		repository, err := NewExternalPositionBaselineRepository(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		baselines, err := repository.ListExternalPositionBaselines(context.Background(), value.accountID)
+		if err != nil || len(baselines) != 1 || !baselines[0].Shares.Equal("5") {
+			t.Fatalf("effective baseline after external sells = %#v err=%v", baselines, err)
+		}
+		dispositions, err := repository.ListExternalPositionDispositionTrades(context.Background(), value.accountID)
+		if err != nil || len(dispositions) != 2 {
+			t.Fatalf("external sell disposition identities = %#v err=%v", dispositions, err)
+		}
+	})
+}
+
+// TestExternalPositionAdjustmentBatchSealPostgresIntegration proves that the
+// child-first/header-last protocol cannot be extended by a concurrent late
+// child after the immutable batch header starts sealing.
+func TestExternalPositionAdjustmentBatchSealPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	const (
+		accountID = "account-external-batch-seal"
+		batchID   = "batch-external-batch-seal"
+	)
+	observedAt := time.Date(2026, 8, 18, 11, 0, 0, 0, time.UTC)
+	insertAccount(t, db, accountID, "0xexternalbatchseal", "20", "20", "0")
+
+	sealing, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sealing.Rollback()
+	if _, err := sealing.Exec(`
+		INSERT INTO execution_external_position_dispositions (
+			disposition_id,adjustment_batch_id,baseline_id,execution_account_id,
+			condition_id,token_id,disposition_kind,transition_sequence,
+			shares_before,shares_delta,shares_after,venue_trade_id,venue_order_id,
+			transaction_hash,occurred_at,evidence,actor,reason
+		) VALUES (
+			'seed-false-attribution',$1,NULL,$2,'condition-seal','token-seal',
+			'FALSE_ATTRIBUTION',NULL,0,0,0,'trade-seed','order-seed','',$3,
+			'{"account_scope":"absent"}','integration-test','seed immutable audit'
+		)`, batchID, accountID, observedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sealing.Exec(`
+		INSERT INTO execution_external_position_adjustment_batches (
+			adjustment_batch_id,schema_version,observed_at,evidence,evidence_sha256,actor,reason
+		) VALUES ($1,'trading.external-position-adjustment.v1',$2,
+		          '{"cutover":"seal-race"}',$3,'integration-test','seal immutable audit')`,
+		batchID, observedAt, strings.Repeat("c", 64)); err != nil {
+		t.Fatal(err)
+	}
+
+	lateResult := make(chan error, 1)
+	go func() {
+		_, lateErr := db.Exec(`
+			INSERT INTO execution_external_position_dispositions (
+				disposition_id,adjustment_batch_id,baseline_id,execution_account_id,
+				condition_id,token_id,disposition_kind,transition_sequence,
+				shares_before,shares_delta,shares_after,venue_trade_id,venue_order_id,
+				transaction_hash,occurred_at,evidence,actor,reason
+			) VALUES (
+				'late-false-attribution',$1,NULL,$2,'condition-late','token-late',
+				'FALSE_ATTRIBUTION',NULL,0,0,0,'trade-late','order-late','',$3,
+				'{"account_scope":"absent"}','integration-test','late immutable audit'
+			)`, batchID, accountID, observedAt)
+		lateResult <- lateErr
+	}()
+
+	// The late insert must be waiting on the shared advisory seal lock while
+	// the header transaction remains uncommitted.
+	select {
+	case lateErr := <-lateResult:
+		t.Fatalf("late child returned before batch seal committed: %v", lateErr)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := sealing.Commit(); err != nil {
+		t.Fatalf("commit external adjustment batch seal: %v", err)
+	}
+	select {
+	case lateErr := <-lateResult:
+		if lateErr == nil || !strings.Contains(lateErr.Error(), "already sealed") {
+			t.Fatalf("late child error = %v, want already sealed", lateErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("late child did not fail after immutable batch seal committed")
+	}
+	var childCount int
+	if err := db.QueryRow(`
+		SELECT count(*) FROM execution_external_position_dispositions
+		WHERE adjustment_batch_id=$1`, batchID).Scan(&childCount); err != nil {
+		t.Fatal(err)
+	}
+	if childCount != 1 {
+		t.Fatalf("sealed batch child count = %d, want exactly 1", childCount)
+	}
+
+	// A historical false-attribution audit must not permanently block a later
+	// stronger account-scoped proof for the same trade identity.
+	const (
+		baselineID     = "baseline-external-batch-correction"
+		accountedBatch = "batch-external-batch-correction"
+	)
+	baselineTx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer baselineTx.Rollback()
+	if _, err := baselineTx.Exec(`
+		INSERT INTO execution_external_position_baseline_items (
+			baseline_id,execution_account_id,token_id,condition_id,
+			outcome_index,outcome_name,neg_risk,shares
+		) VALUES ($1,$2,'token-positive','condition-positive',0,'Yes',FALSE,1)`,
+		baselineID, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := baselineTx.Exec(`
+		INSERT INTO execution_external_position_baselines (
+			baseline_id,execution_account_id,source,observed_at,evidence,actor,reason
+		) VALUES ($1,$2,'POLYMARKET_DATA_API',$3,
+		          '{"snapshot_sha256":"correction"}','integration-test','seal ownership boundary')`,
+		baselineID, accountID, observedAt.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := baselineTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	correction, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer correction.Rollback()
+	if _, err := correction.Exec(`
+		INSERT INTO execution_external_position_dispositions (
+			disposition_id,adjustment_batch_id,baseline_id,execution_account_id,
+			condition_id,token_id,disposition_kind,transition_sequence,
+			shares_before,shares_delta,shares_after,venue_trade_id,venue_order_id,
+			transaction_hash,occurred_at,evidence,actor,reason
+		) VALUES (
+			'accounted-after-false',$1,$2,$3,'condition-seal','token-seal',
+			'BASELINE_ACCOUNTED',NULL,0,0,0,'trade-seed','order-seed','',$4,
+			'{"account_scope":"proven"}','integration-test','correct prior attribution'
+		)`, accountedBatch, baselineID, accountID, observedAt); err != nil {
+		t.Fatalf("insert stronger accounting proof after false attribution: %v", err)
+	}
+	if _, err := correction.Exec(`
+		INSERT INTO execution_external_position_adjustment_batches (
+			adjustment_batch_id,schema_version,observed_at,evidence,evidence_sha256,actor,reason
+		) VALUES ($1,'trading.external-position-adjustment.v1',$2,
+		          '{"cutover":"correction"}',$3,'integration-test','seal corrected audit')`,
+		accountedBatch, observedAt.Add(time.Hour), strings.Repeat("d", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := correction.Commit(); err != nil {
+		t.Fatalf("commit stronger accounting proof after false attribution: %v", err)
+	}
+	repository, err := NewExternalPositionBaselineRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounted, err := repository.ListExternalPositionDispositionTrades(context.Background(), accountID)
+	if err != nil || len(accounted) != 1 || accounted[0].VenueTradeID != "trade-seed" {
+		t.Fatalf("corrected accounted trade identities = %#v err=%v", accounted, err)
+	}
+}
+
 // TestPositionLotModelRoutePostgresIntegration proves that a logical model can
 // close one explicitly routed legacy lot without rewriting its opening BUY.
 func TestPositionLotModelRoutePostgresIntegration(t *testing.T) {
@@ -1587,7 +2189,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 	db := stdlib.OpenDB(*testConfig)
 	db.SetMaxOpenConns(8)
 	t.Cleanup(func() { _ = db.Close() })
-	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql", "0014_external_position_ownership_baselines.sql", "0015_position_lot_model_routes.sql"} {
+	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql", "0014_external_position_ownership_baselines.sql", "0015_position_lot_model_routes.sql", "0016_external_position_dispositions.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", name, err)

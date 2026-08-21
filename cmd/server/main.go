@@ -213,11 +213,12 @@ func buildPaperRuntime(cfg config.Config, database *sql.DB, guard port.Guard) (p
 	}
 	venue := paper.NewVenue(cfg.Execution.Venue)
 	service, err := execution.New(execution.Params{
-		Repository:      repository,
-		Venue:           venue,
-		Guard:           guard,
-		MarketValidator: paper.NewMarketValidator(),
-		Reservations:    reservations,
+		Repository:              repository,
+		Venue:                   venue,
+		Guard:                   guard,
+		MarketValidator:         paper.NewMarketValidator(),
+		Reservations:            reservations,
+		EntrySubmissionDisabled: cfg.DecisionCycle.EntrySubmissionDisabled,
 		// 模拟交易所同步返回结果，不会产生延迟出现的外部成交。
 		ImmediateCancelFinality: true,
 	})

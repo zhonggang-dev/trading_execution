@@ -156,6 +156,18 @@ type ExternalPositionBaseline struct {
 	Reason             string          `json:"reason"`
 }
 
+// ExternalPositionDispositionTrade identifies a venue trade whose effect on
+// an immutable external-position baseline has already been recorded by an
+// append-only disposition. It is evidence only: reconciliation must never use
+// it to manufacture an execution order or fill.
+type ExternalPositionDispositionTrade struct {
+	ExecutionAccountID string `json:"execution_account_id"`
+	VenueTradeID       string `json:"venue_trade_id"`
+	VenueOrderID       string `json:"venue_order_id"`
+	ConditionID        string `json:"condition_id"`
+	TokenID            string `json:"token_id"`
+}
+
 // ExternalBalance 表示后端使用的 ExternalBalance 类型。
 type ExternalBalance struct {
 	Asset      string    `json:"asset"`

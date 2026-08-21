@@ -215,11 +215,12 @@ func (strategy *coverageBuyExitStrategy) Decide(_ context.Context, request domai
 	}, nil
 }
 
-func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, cycleID string, limit int) ([]domain.DecisionIntentDelivery, error) {
+func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
 	result := make([]domain.DecisionIntentDelivery, 0)
 	for index := range recorder.deliveries {
 		delivery := &recorder.deliveries[index]
-		if delivery.Status != domain.DecisionIntentPending || (cycleID != "" && delivery.CycleID != cycleID) || len(result) >= limit {
+		if delivery.Status != domain.DecisionIntentPending || (cycleID != "" && delivery.CycleID != cycleID) ||
+			(side != "" && delivery.Intent.Side != side) || len(result) >= limit {
 			continue
 		}
 		delivery.Status = domain.DecisionIntentSubmitting
@@ -229,7 +230,7 @@ func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, cycleID str
 	return result, nil
 }
 
-func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, _ time.Time, limit int) (int, error) {
+func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, _ time.Time, side domain.Side, limit int) (int, error) {
 	recorder.requeueCalls++
 	requeued := 0
 	for index := range recorder.deliveries {
@@ -237,7 +238,7 @@ func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, _ time.T
 			break
 		}
 		delivery := &recorder.deliveries[index]
-		if delivery.Status != domain.DecisionIntentSubmitting {
+		if delivery.Status != domain.DecisionIntentSubmitting || (side != "" && delivery.Intent.Side != side) {
 			continue
 		}
 		delivery.Status = domain.DecisionIntentPending
@@ -678,6 +679,78 @@ func TestCoverageGateSubmitsExitButNeverBuyOnPendingModelTask(t *testing.T) {
 			output.EntryPolicy.BlockReason != domain.StrategyEntryBlockIncompleteModelCoverage {
 			t.Fatalf("output %d entry policy = %#v", index, output.EntryPolicy)
 		}
+	}
+}
+
+func TestOperatorSellOnlyGateSubmitsExitButNeverBuy(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	prediction.Model.Name = "echo-producer-v7"
+	outcomeIndex := 0
+	negRisk := false
+	positions := accountPositionSource{
+		"main": {{
+			LotID: "lot-main-1", ExecutionAccountID: "main", MarketID: prediction.MarketID,
+			ConditionID: prediction.ConditionID, TokenID: prediction.Outcomes[0].TokenID,
+			OutcomeIndex: &outcomeIndex, OutcomeName: prediction.Outcomes[0].Name, NegRisk: &negRisk,
+			ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1,
+			RemainingShares: "12.50", AverageEntryPrice: "0.40", Status: domain.PositionLotOpen,
+			OpenedAt: decisionAt.Add(-49 * time.Hour),
+		}},
+	}
+	books := make([]domain.OrderBookSnapshot, 0, 2)
+	for _, outcome := range prediction.Outcomes {
+		books = append(books, domain.OrderBookSnapshot{
+			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, Status: domain.OrderBookStatusOK,
+			SourceAt: decisionAt, ObservedAt: decisionAt.Add(time.Second),
+			DepthLimit: domain.StrategyOrderBookDepth, MinOrderSize: "1",
+			Bids: []domain.PriceLevel{{Price: "0.49", Size: "20"}},
+			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
+		})
+	}
+	recorder := &fakeRecorder{}
+	executor := &fakeExecutor{}
+	strategy := &coverageBuyExitStrategy{}
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-sell-only",
+			DecisionAt: decisionAt, Predictions: []domain.Prediction{prediction},
+			ExpectedPredictions: []domain.PredictionExpectation{
+				completedPredictionExpectation(prediction, 1, 1),
+			},
+		}},
+		PositionSource: positions, OrderBookSource: &fakeOrderBookSource{books: books},
+		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: recorder,
+		Executor: executor, SubmitEnabled: true, EntrySubmissionDisabled: true,
+		RequireCompleteModelCoverage: true,
+		Bindings: []domain.StrategyExecutionBinding{{
+			PredictionModelID: "echo-producer-v7", ModelID: "echo",
+			StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main",
+		}},
+		Venue: "polymarket-paper", Now: func() time.Time { return decisionAt.Add(2 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, runErr := service.Run(context.Background(), decisionAt)
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
+	}
+	if len(executor.intents) != 1 || executor.intents[0].Side != domain.SideSell ||
+		executor.intents[0].TargetLotID != "lot-main-1" {
+		t.Fatalf("executed intents = %#v, want only SELL", executor.intents)
+	}
+	if len(recorder.claimedIntents) != 1 || recorder.claimedIntents[0].Side != domain.SideSell {
+		t.Fatalf("durable intents = %#v, want no BUY", recorder.claimedIntents)
+	}
+	if len(result.Runs) != 1 || result.Runs[0].EntrySubmissionEnabled ||
+		result.Runs[0].EntryBlockReason != domain.StrategyEntryBlockSubmissionDisabled {
+		t.Fatalf("binding run = %#v, want operator sell-only gate", result.Runs)
+	}
+	if len(recorder.claimedOutputs) != 1 || recorder.claimedOutputs[0].EntryPolicy == nil ||
+		recorder.claimedOutputs[0].EntryPolicy.BlockReason != domain.StrategyEntryBlockSubmissionDisabled {
+		t.Fatalf("recorded output policy = %#v", recorder.claimedOutputs)
 	}
 }
 
@@ -1471,6 +1544,43 @@ func TestRecoverStartupDrainsMoreThanOneClaimBatchBeforeNewSchedule(t *testing.T
 	}
 }
 
+func TestSellOnlyRecoveryNeverClaimsOrRequeuesBuy(t *testing.T) {
+	recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{
+		{
+			CycleID: "old-cycle", ClientOrderID: "old-buy-submitting",
+			Intent: domain.OrderIntent{ClientOrderID: "old-buy-submitting", Side: domain.SideBuy},
+			Status: domain.DecisionIntentSubmitting, Attempt: 1,
+		},
+		{
+			CycleID: "old-cycle", ClientOrderID: "old-buy-pending",
+			Intent: domain.OrderIntent{ClientOrderID: "old-buy-pending", Side: domain.SideBuy},
+			Status: domain.DecisionIntentPending,
+		},
+		{
+			CycleID: "old-cycle", ClientOrderID: "old-sell-submitting",
+			Intent: domain.OrderIntent{ClientOrderID: "old-sell-submitting", Side: domain.SideSell},
+			Status: domain.DecisionIntentSubmitting, Attempt: 1,
+		},
+	}}
+	executor := &fakeExecutor{}
+	service := &Service{
+		recorder: recorder, executor: executor, submitEnabled: true, entrySubmissionDisabled: true,
+		now: func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
+	}
+
+	if err := service.RecoverStartup(context.Background()); err != nil {
+		t.Fatalf("RecoverStartup() error = %v", err)
+	}
+	if len(executor.intents) != 1 || executor.intents[0].Side != domain.SideSell {
+		t.Fatalf("submitted intents = %#v, want exactly one SELL", executor.intents)
+	}
+	if recorder.deliveries[0].Status != domain.DecisionIntentSubmitting ||
+		recorder.deliveries[1].Status != domain.DecisionIntentPending ||
+		recorder.deliveries[2].Status != domain.DecisionIntentSubmitted {
+		t.Fatalf("stored delivery statuses = %s/%s/%s", recorder.deliveries[0].Status, recorder.deliveries[1].Status, recorder.deliveries[2].Status)
+	}
+}
+
 // TestValidateResponseBuildsLotAddressedFOKExit 验证 Validate Response Builds Lot Addressed FOK Exit 场景下的行为。
 func TestValidateResponseBuildsLotAddressedFOKExit(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
@@ -1576,12 +1686,20 @@ func TestCoverageEntryGateBlocksMalformedBuyButPreservesValidExit(t *testing.T) 
 			},
 		}},
 	}
-	intents, err := validateResponseWithEntryPolicy(request, response, "polymarket", false)
+	intents, err := validateResponseWithEntryPolicy(
+		request, response, "polymarket", false, domain.StrategyEntryBlockIncompleteModelCoverage,
+	)
 	if err != nil {
 		t.Fatalf("validateResponseWithEntryPolicy() error = %v", err)
 	}
 	if len(intents) != 1 || intents[0].Side != domain.SideSell || intents[0].TargetLotID != "lot-1" {
 		t.Fatalf("coverage-gated intents = %#v, want only SELL exit", intents)
+	}
+	response.EntryPolicy.BlockReason = domain.StrategyEntryBlockSubmissionDisabled
+	if _, err := validateResponseWithEntryPolicy(
+		request, response, "polymarket", false, domain.StrategyEntryBlockIncompleteModelCoverage,
+	); err == nil {
+		t.Fatal("coverage-gated validation accepted a mismatched operator block reason")
 	}
 	response.EntryPolicy = nil
 	if _, err := validateResponse(request, response, "polymarket"); err == nil {

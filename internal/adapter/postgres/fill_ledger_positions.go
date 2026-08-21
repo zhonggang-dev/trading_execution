@@ -573,7 +573,9 @@ func (ledger *FillLedger) ListLots(ctx context.Context, accountID, tokenID strin
 		SELECT lot.lot_id, lot.execution_account_id, lot.market_id, lot.condition_id, lot.token_id,
 		       lot.outcome_index, lot.outcome_name, lot.neg_risk,
 		       lot.model_id, COALESCE(route.logical_model_id, lot.model_id), lot.strategy_id,
-		       lot.opening_order_id, lot.opening_fill_key, lot.original_shares::text, lot.remaining_shares::text,
+		       COALESCE(lot.opening_order_id,'external-adoption:'||lot.external_adoption_id),
+		       COALESCE(lot.opening_fill_key,'external-adoption:'||lot.external_adoption_id),
+		       lot.original_shares::text, lot.remaining_shares::text,
 		       lot.original_cost::text, lot.remaining_cost::text, lot.average_entry_price::text,
 		       lot.status, lot.opened_at, lot.closed_at
 		FROM position_lots AS lot
@@ -622,7 +624,9 @@ func (ledger *FillLedger) ListOpenLots(ctx context.Context, accountID string) ([
 		SELECT lot.lot_id, lot.execution_account_id, lot.market_id, lot.condition_id, lot.token_id,
 		       lot.outcome_index, lot.outcome_name, lot.neg_risk,
 		       lot.model_id, COALESCE(route.logical_model_id, lot.model_id), lot.strategy_id,
-		       lot.opening_order_id, lot.opening_fill_key, lot.original_shares::text, lot.remaining_shares::text,
+		       COALESCE(lot.opening_order_id,'external-adoption:'||lot.external_adoption_id),
+		       COALESCE(lot.opening_fill_key,'external-adoption:'||lot.external_adoption_id),
+		       lot.original_shares::text, lot.remaining_shares::text,
 		       lot.original_cost::text, lot.remaining_cost::text, lot.average_entry_price::text,
 		       lot.status, lot.opened_at, lot.closed_at
 		FROM position_lots AS lot
@@ -647,7 +651,9 @@ func (ledger *FillLedger) ListOpenLots(ctx context.Context, accountID string) ([
 // ListOpenPositionExitTrades 查询可供退出策略评估的开放持仓批次和预占。
 func (ledger *FillLedger) ListOpenPositionExitTrades(ctx context.Context, accountID string) ([]domain.PositionExitTrade, error) {
 	rows, err := ledger.db.QueryContext(ctx, `
-		SELECT lot.lot_id, fill.venue_fill_id, lot.opening_order_id,
+		SELECT lot.lot_id,
+		       COALESCE(fill.venue_fill_id,'external-adoption:'||lot.external_adoption_id),
+		       COALESCE(lot.opening_order_id,'external-adoption:'||lot.external_adoption_id),
 		       lot.market_id, lot.condition_id, lot.outcome_index, lot.outcome_name,
 		       lot.token_id, lot.neg_risk, lot.opened_at,
 		       lot.original_shares::text, lot.remaining_shares::text,
@@ -659,7 +665,7 @@ func (ledger *FillLedger) ListOpenPositionExitTrades(ctx context.Context, accoun
 		       lot.model_id, COALESCE(route.logical_model_id, lot.model_id),
 		       lot.strategy_id, lot.execution_account_id
 		FROM position_lots AS lot
-		JOIN execution_fills AS fill ON fill.fill_key = lot.opening_fill_key
+		LEFT JOIN execution_fills AS fill ON fill.fill_key = lot.opening_fill_key
 		LEFT JOIN position_lot_model_routes AS route ON route.lot_id=lot.lot_id
 		LEFT JOIN (
 			SELECT execution_account_id, target_lot_id,

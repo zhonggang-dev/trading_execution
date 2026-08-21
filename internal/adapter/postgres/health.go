@@ -45,6 +45,10 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_outbox'),
 			('execution_external_position_baselines'),
 			('execution_external_position_baseline_items'),
+			('execution_external_position_adjustment_batches'),
+			('execution_external_position_dispositions'),
+			('execution_external_cash_adjustments'),
+			('execution_external_position_adoptions'),
 			('position_exit_runs'),
 			('strategy_decision_runs'),
 			('strategy_order_intent_deliveries'),
@@ -95,7 +99,19 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_external_position_baseline_items', 'outcome_index'),
 			('execution_external_position_baseline_items', 'outcome_name'),
 			('execution_external_position_baseline_items', 'neg_risk'),
-			('execution_external_position_baseline_items', 'shares')
+			('execution_external_position_baseline_items', 'shares'),
+			('execution_external_position_dispositions', 'disposition_kind'),
+			('execution_external_position_dispositions', 'transition_sequence'),
+			('execution_external_position_dispositions', 'shares_delta'),
+			('execution_external_position_dispositions', 'venue_trade_id'),
+			('execution_external_position_dispositions', 'transaction_hash'),
+			('execution_external_cash_adjustments', 'transaction_hash'),
+			('execution_external_cash_adjustments', 'account_event_id'),
+			('execution_external_position_adoptions', 'external_adoption_id'),
+			('execution_external_position_adoptions', 'lot_id'),
+			('execution_external_position_adoptions', 'position_event_id'),
+			('position_lots', 'external_adoption_id'),
+			('position_events', 'external_adoption_id')
 		) AS required(table_name, column_name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -149,7 +165,23 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_external_position_baseline_items_account_token_unique'),
 			('execution_external_position_baseline_items_identity_nonempty'),
 			('execution_external_position_baseline_items_outcome_index'),
-			('execution_external_position_baseline_items_positive_shares')
+			('execution_external_position_baseline_items_positive_shares'),
+			('execution_external_position_adjustment_batches_pkey'),
+			('execution_external_position_adjustment_batches_evidence_object'),
+			('execution_external_position_dispositions_pkey'),
+			('execution_external_position_dispositions_batch_fk'),
+			('execution_external_position_dispositions_shape'),
+			('execution_external_position_dispositions_venue_shape'),
+			('execution_external_cash_adjustments_pkey'),
+			('execution_external_cash_adjustments_batch_fk'),
+			('execution_external_cash_adjustments_amount_shape'),
+			('execution_external_position_adoptions_pkey'),
+			('execution_external_position_adoptions_disposition_fk'),
+			('execution_external_position_adoptions_amount_shape'),
+			('position_lots_origin_xor'),
+			('position_lots_external_adoption_fk'),
+			('position_events_external_adoption_shape'),
+			('position_events_external_adoption_fk')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -173,7 +205,10 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 		FROM (VALUES
 			('execution_fills_polygon_settlement_event_uidx'),
 			('strategy_decision_runs_account_time_idx'),
-			('strategy_order_intent_deliveries_cycle_sequence_unique')
+			('strategy_order_intent_deliveries_cycle_sequence_unique'),
+			('execution_external_position_dispositions_accounted_trade_uidx'),
+			('execution_external_position_dispositions_false_attribution_uidx'),
+			('execution_external_position_dispositions_adoption_uidx')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -200,7 +235,8 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 		FROM (VALUES
 			('strategy_order_intent_deliveries_pending_idx'),
 			('strategy_order_intent_deliveries_stale_idx'),
-			('execution_external_position_baseline_items_account_idx')
+			('execution_external_position_baseline_items_account_idx'),
+			('execution_external_position_dispositions_baseline_idx')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -236,7 +272,21 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('position_lot_model_routes_insert_guard_trigger'),
 			('position_lot_model_routes_append_only_trigger'),
 			('position_lot_model_routes_truncate_guard_trigger'),
-			('position_lots_model_immutable_trigger')
+			('position_lots_model_immutable_trigger'),
+			('execution_external_position_batches_items_required_trigger'),
+			('execution_external_position_batches_append_only_trigger'),
+			('execution_external_position_dispositions_insert_guard_trigger'),
+			('execution_external_position_dispositions_validate_trigger'),
+			('execution_external_position_dispositions_append_only_trigger'),
+			('execution_external_cash_adjustments_insert_guard_trigger'),
+			('execution_external_cash_adjustments_validate_trigger'),
+			('execution_external_cash_adjustments_append_only_trigger'),
+			('execution_external_position_adoptions_insert_guard_trigger'),
+			('execution_external_position_adoptions_validate_trigger'),
+			('execution_external_position_adoptions_append_only_trigger'),
+			('position_lots_origin_immutable_trigger'),
+			('position_events_external_adoption_immutable_trigger'),
+			('execution_account_events_external_adjustment_immutable_trigger')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1

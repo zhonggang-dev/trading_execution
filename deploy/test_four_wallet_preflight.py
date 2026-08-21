@@ -122,6 +122,7 @@ def database_state(bindings: list[dict[str, object]] | None = None) -> dict[str,
         "bindings": rows,
         "decision_deliveries": [],
         "manual_review_orders": [],
+        "nonterminal_buy_orders": [],
     }
 
 
@@ -271,6 +272,7 @@ class EnvironmentTests(unittest.TestCase):
             "DECISION_CYCLE_ENABLED": "true",
             "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE": "true",
             "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED": "false",
+            "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "false",
             "DECISION_CYCLE_BINDINGS_JSON": json.dumps(VALID_BINDINGS),
             "POLYMARKET_ACCOUNTS_FILE": str(wallet_path),
             "TRADING_EXECUTION_DATABASE_URL": "postgres://user:secret@db/trading",
@@ -284,6 +286,26 @@ class EnvironmentTests(unittest.TestCase):
             )
             bindings = preflight.validate_environment(
                 self.environment(wallet_path), submission_state="disabled"
+            )
+        self.assertEqual(len(bindings), 4)
+
+    def test_sell_only_preflight_requires_entry_submission_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
+            )
+            environment = self.environment(wallet_path)
+            with self.assertRaisesRegex(preflight.PreflightError, "ENTRY_SUBMISSION_DISABLED"):
+                preflight.validate_environment(
+                    environment,
+                    submission_state="disabled",
+                    entry_submission_state="blocked",
+                )
+            environment["DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED"] = "true"
+            bindings = preflight.validate_environment(
+                environment,
+                submission_state="disabled",
+                entry_submission_state="blocked",
             )
         self.assertEqual(len(bindings), 4)
 
@@ -496,6 +518,16 @@ class DryRunEvidenceTests(unittest.TestCase):
             max_age=dt.timedelta(minutes=30),
         )
 
+    def validate_sell_only(self) -> dict[str, object]:
+        return preflight.validate_dry_run_state(
+            self.state,
+            self.bindings,
+            not_before=self.now - dt.timedelta(minutes=20),
+            now=self.now,
+            max_age=dt.timedelta(minutes=30),
+            entry_submission_state="blocked",
+        )
+
     def test_accepts_legacy_healthy_output_without_entry_policy(self) -> None:
         self.assertEqual(self.validate()["prediction_snapshot_id"], "snapshot-1")
 
@@ -505,14 +537,38 @@ class DryRunEvidenceTests(unittest.TestCase):
 
     def test_rejects_explicit_disabled_policy_even_without_reason(self) -> None:
         self.state["dry_runs"][0]["bindings"] = dry_run_rows(False, "")
-        with self.assertRaisesRegex(preflight.PreflightError, "coverage block"):
+        with self.assertRaisesRegex(preflight.PreflightError, "entry block"):
             self.validate()
 
     def test_rejects_coverage_block_reason(self) -> None:
         self.state["dry_runs"][0]["bindings"] = dry_run_rows(
             False, "INCOMPLETE_MODEL_COVERAGE"
         )
-        with self.assertRaisesRegex(preflight.PreflightError, "coverage block"):
+        with self.assertRaisesRegex(preflight.PreflightError, "entry block"):
+            self.validate()
+
+    def test_accepts_exact_operator_policy_in_sell_only_mode(self) -> None:
+        self.state["dry_runs"][0]["bindings"] = dry_run_rows(
+            False, "ENTRY_SUBMISSION_DISABLED"
+        )
+        self.assertEqual(
+            self.validate_sell_only()["prediction_snapshot_id"], "snapshot-1"
+        )
+
+    def test_rejects_missing_operator_policy_in_sell_only_mode(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "exact sell-only"):
+            self.validate_sell_only()
+
+    def test_rejects_wrong_operator_reason_in_sell_only_mode(self) -> None:
+        self.state["dry_runs"][0]["bindings"] = dry_run_rows(
+            False, "INCOMPLETE_MODEL_COVERAGE"
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "exact sell-only"):
+            self.validate_sell_only()
+
+    def test_rejects_invalid_entry_policy_type_in_allowed_mode(self) -> None:
+        self.state["dry_runs"][0]["bindings"] = dry_run_rows("true", "")
+        with self.assertRaisesRegex(preflight.PreflightError, "entry block"):
             self.validate()
 
 
@@ -616,6 +672,7 @@ class DeliveryStateTests(unittest.TestCase):
             "risky_samples": [],
         }
         state["manual_review_state"] = {"count": 0, "orders": []}
+        state["nonterminal_buy_state"] = {"count": 0, "orders": []}
         return state
 
     def test_accepts_bounded_terminal_summary_without_loading_history(self) -> None:
@@ -644,6 +701,28 @@ class DeliveryStateTests(unittest.TestCase):
         state["manual_review_state"] = {"count": 1, "orders": []}
         with self.assertRaisesRegex(preflight.PreflightError, "explicit"):
             preflight.validate_delivery_state(state)
+
+    def test_rejects_nonterminal_buy_execution_order(self) -> None:
+        state = self.aggregate_state()
+        state["nonterminal_buy_state"] = {
+            "count": 1,
+            "orders": [{"order_id": "buy-1", "status": "RESERVED"}],
+        }
+        with self.assertRaisesRegex(preflight.PreflightError, "zero nonterminal BUY"):
+            preflight.validate_delivery_state(state, entry_submission_state="blocked")
+
+    def test_allows_nonterminal_buy_execution_order_outside_sell_only_mode(self) -> None:
+        state = self.aggregate_state()
+        state["nonterminal_buy_state"] = {
+            "count": 1,
+            "orders": [{"order_id": "buy-1", "status": "LIVE"}],
+        }
+        watermark = preflight.validate_delivery_state(
+            state, entry_submission_state="allowed"
+        )
+        self.assertEqual(
+            watermark["non_terminal_counts"]["NONTERMINAL_BUY_EXECUTION_ORDER"], 1
+        )
 
     def test_rejects_inconsistent_count_or_missing_nonempty_watermark(self) -> None:
         state = self.aggregate_state()
@@ -884,6 +963,7 @@ class MainWiringTests(unittest.TestCase):
             trading_environment = {
                 "DECISION_CYCLE_ENABLED": "true",
                 "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED": "false",
+                "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "false",
                 "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE": "true",
                 "DECISION_CYCLE_BINDINGS_JSON": compact_bindings,
                 "POLYMARKET_ACCOUNTS_FILE": str(wallet_path),

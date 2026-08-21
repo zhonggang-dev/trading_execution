@@ -38,6 +38,25 @@ func (repository *ExternalPositionBaselineRepository) ListExternalPositionBaseli
 		return nil, fmt.Errorf("execution account id is required")
 	}
 	rows, err := repository.db.QueryContext(ctx, `
+		WITH effective_items AS (
+			SELECT item.baseline_id,
+			       item.execution_account_id,
+			       item.token_id,
+			       item.condition_id,
+			       item.outcome_index,
+			       item.outcome_name,
+			       item.neg_risk,
+			       item.shares - COALESCE(sum(disposition.shares_delta),0) AS shares
+			FROM execution_external_position_baseline_items AS item
+			LEFT JOIN execution_external_position_dispositions AS disposition
+			  ON disposition.baseline_id=item.baseline_id
+			 AND disposition.execution_account_id=item.execution_account_id
+			 AND disposition.token_id=item.token_id
+			 AND disposition.disposition_kind IN ('EXTERNAL_SELL','ADOPTION')
+			WHERE item.execution_account_id=$1
+			GROUP BY item.baseline_id,item.execution_account_id,item.token_id,
+			         item.condition_id,item.outcome_index,item.outcome_name,item.neg_risk,item.shares
+		)
 		SELECT baseline.baseline_id,
 		       baseline.execution_account_id,
 		       item.condition_id,
@@ -52,10 +71,10 @@ func (repository *ExternalPositionBaselineRepository) ListExternalPositionBaseli
 		       baseline.actor,
 		       baseline.reason
 		FROM execution_external_position_baselines baseline
-		JOIN execution_external_position_baseline_items item
+		JOIN effective_items item
 		  ON item.baseline_id=baseline.baseline_id
 		 AND item.execution_account_id=baseline.execution_account_id
-		WHERE baseline.execution_account_id=$1
+		WHERE baseline.execution_account_id=$1 AND item.shares>0
 		ORDER BY item.condition_id, item.outcome_index NULLS LAST, item.token_id`, executionAccountID)
 	if err != nil {
 		return nil, fmt.Errorf("query external position ownership baseline: %w", err)

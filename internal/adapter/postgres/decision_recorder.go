@@ -277,8 +277,11 @@ func verifyStoredDecisionIntents(ctx context.Context, tx *sql.Tx, cycleID string
 
 // ClaimPendingIntents atomically claims a bounded batch with SKIP LOCKED so
 // concurrent workers cannot submit the same row.
-func (recorder *DecisionRecorder) ClaimPendingIntents(ctx context.Context, cycleID string, limit int) ([]domain.DecisionIntentDelivery, error) {
+func (recorder *DecisionRecorder) ClaimPendingIntents(ctx context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
 	cycleID = strings.TrimSpace(cycleID)
+	if side != "" && side != domain.SideBuy && side != domain.SideSell {
+		return nil, fmt.Errorf("decision intent claim side must be BUY, SELL, or empty")
+	}
 	if limit <= 0 || limit > 1000 {
 		return nil, fmt.Errorf("decision intent claim limit must be between 1 and 1000")
 	}
@@ -288,20 +291,21 @@ func (recorder *DecisionRecorder) ClaimPendingIntents(ctx context.Context, cycle
 			SELECT client_order_id
 			FROM strategy_order_intent_deliveries
 			WHERE status='PENDING' AND ($1='' OR cycle_id=$1)
+				AND ($2='' OR intent_payload->>'side'=$2)
 			ORDER BY created_at, cycle_id, sequence_no
 			FOR UPDATE SKIP LOCKED
-			LIMIT $2
+			LIMIT $3
 		)
 		UPDATE strategy_order_intent_deliveries delivery
 		SET status='SUBMITTING', attempt_count=delivery.attempt_count+1,
-			claimed_at=$3, completed_at=NULL, last_error=NULL, updated_at=$3
+			claimed_at=$4, completed_at=NULL, last_error=NULL, updated_at=$4
 		FROM candidates
 		WHERE delivery.client_order_id=candidates.client_order_id
 		RETURNING delivery.cycle_id, delivery.client_order_id,
 			delivery.sequence_no, delivery.intent_payload, delivery.status,
 			delivery.attempt_count, delivery.claimed_at, delivery.completed_at,
 			delivery.order_id, delivery.order_status, delivery.last_error,
-			delivery.created_at, delivery.updated_at`, cycleID, limit, now)
+			delivery.created_at, delivery.updated_at`, cycleID, side, limit, now)
 	if err != nil {
 		return nil, fmt.Errorf("claim pending strategy decision intents: %w", err)
 	}
@@ -338,7 +342,10 @@ func (recorder *DecisionRecorder) ClaimPendingIntents(ctx context.Context, cycle
 // RequeueStaleSubmitting recovers a crashed worker claim. Retrying through
 // OrderExecutor is safe because it first resolves the stable client_order_id;
 // it never sends a second venue Place for an already-created order.
-func (recorder *DecisionRecorder) RequeueStaleSubmitting(ctx context.Context, before time.Time, limit int) (int, error) {
+func (recorder *DecisionRecorder) RequeueStaleSubmitting(ctx context.Context, before time.Time, side domain.Side, limit int) (int, error) {
+	if side != "" && side != domain.SideBuy && side != domain.SideSell {
+		return 0, fmt.Errorf("stale decision intent side must be BUY, SELL, or empty")
+	}
 	if before.IsZero() || limit <= 0 || limit > 1000 {
 		return 0, fmt.Errorf("stale decision intent cutoff and limit are required")
 	}
@@ -347,15 +354,16 @@ func (recorder *DecisionRecorder) RequeueStaleSubmitting(ctx context.Context, be
 			SELECT client_order_id
 			FROM strategy_order_intent_deliveries
 			WHERE status='SUBMITTING' AND claimed_at <= $1
+				AND ($2='' OR intent_payload->>'side'=$2)
 			ORDER BY claimed_at, cycle_id, sequence_no
 			FOR UPDATE SKIP LOCKED
-			LIMIT $2
+			LIMIT $3
 		)
 		UPDATE strategy_order_intent_deliveries delivery
 		SET status='PENDING', claimed_at=NULL, completed_at=NULL,
-			last_error='worker claim expired before durable completion', updated_at=$3
+			last_error='worker claim expired before durable completion', updated_at=$4
 		FROM candidates
-		WHERE delivery.client_order_id=candidates.client_order_id`, before.UTC(), limit, recorder.now().UTC())
+		WHERE delivery.client_order_id=candidates.client_order_id`, before.UTC(), side, limit, recorder.now().UTC())
 	if err != nil {
 		return 0, fmt.Errorf("requeue stale strategy decision intents: %w", err)
 	}

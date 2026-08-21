@@ -270,6 +270,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		ImmediateCancelFinality:  false,
 		MaxReconcileAttempts:     cfg.Polymarket.MaxReconcileAttempts,
 		RequirePreparedPlacement: true,
+		EntrySubmissionDisabled:  cfg.DecisionCycle.EntrySubmissionDisabled,
 	})
 	if err != nil {
 		return nil, err
@@ -301,18 +302,19 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, err
 	}
 	reconciliationService, err := reconciliation.New(reconciliation.Params{
-		Orders:            repository,
-		Venue:             tradingClient,
-		PositionSources:   []port.ExternalPositionSource{positionSource},
-		PositionBaselines: positionBaselines,
-		BalanceSources:    []port.ExternalBalanceSource{balanceSource},
-		Ledger:            fillLedger,
-		Fills:             fillProcessor,
-		OrderRefresher:    executionService,
-		Recorder:          recorder,
-		TradeLookback:     cfg.Polymarket.ReconciliationLookback,
-		PositionEpsilon:   cfg.Polymarket.PositionEpsilon,
-		BalanceEpsilon:    cfg.Polymarket.BalanceEpsilon,
+		Orders:                    repository,
+		Venue:                     tradingClient,
+		PositionSources:           []port.ExternalPositionSource{positionSource},
+		PositionBaselines:         positionBaselines,
+		PositionDispositionTrades: positionBaselines,
+		BalanceSources:            []port.ExternalBalanceSource{balanceSource},
+		Ledger:                    fillLedger,
+		Fills:                     fillProcessor,
+		OrderRefresher:            executionService,
+		Recorder:                  recorder,
+		TradeLookback:             cfg.Polymarket.ReconciliationLookback,
+		PositionEpsilon:           cfg.Polymarket.PositionEpsilon,
+		BalanceEpsilon:            cfg.Polymarket.BalanceEpsilon,
 	})
 	if err != nil {
 		return nil, err

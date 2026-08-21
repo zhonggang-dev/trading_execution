@@ -37,6 +37,10 @@ type Params struct {
 	CancelFillFinalityGrace time.Duration
 	ImmediateCancelFinality bool
 	MaxReconcileAttempts    int
+	// EntrySubmissionDisabled is a process-wide sell-only gate. It is enforced
+	// here, below every caller (HTTP, decision cycle, and crash recovery), so a
+	// BUY can never reach Venue.Place while the operator is exiting positions.
+	EntrySubmissionDisabled bool
 	// RequirePreparedPlacement is mandatory for live composition. Paper and
 	// legacy in-memory tests may keep the one-step Venue contract.
 	RequirePreparedPlacement bool
@@ -57,6 +61,7 @@ type Service struct {
 	cancelFillFinalityGrace  time.Duration
 	immediateCancelFinality  bool
 	maxReconcileAttempts     int
+	entrySubmissionDisabled  bool
 	requirePreparedPlacement bool
 	now                      func() time.Time
 	newID                    func() string
@@ -114,6 +119,7 @@ func New(params Params) (*Service, error) {
 		cancelFillFinalityGrace:  params.CancelFillFinalityGrace,
 		immediateCancelFinality:  params.ImmediateCancelFinality,
 		maxReconcileAttempts:     params.MaxReconcileAttempts,
+		entrySubmissionDisabled:  params.EntrySubmissionDisabled,
 		requirePreparedPlacement: params.RequirePreparedPlacement,
 		now:                      params.Now,
 		newID:                    params.NewID,
@@ -136,6 +142,9 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 		return SubmitResult{Order: existing, Created: false}, nil
 	} else if !errors.Is(err, port.ErrOrderNotFound) {
 		return SubmitResult{}, fmt.Errorf("look up order intent: %w", err)
+	}
+	if service.entrySubmissionDisabled && intent.Side == domain.SideBuy {
+		return SubmitResult{}, entrySubmissionDisabledError()
 	}
 
 	now := service.now().UTC()
@@ -186,6 +195,15 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 
 // submitReserved 为已预占订单记录提交尝试并处理交易所结果。
 func (service *Service) submitReserved(ctx context.Context, stored domain.Order, created bool) (SubmitResult, error) {
+	if service.entrySubmissionDisabled && stored.Intent.Side == domain.SideBuy {
+		cause := entrySubmissionDisabledError()
+		if err := service.reject(ctx, &stored, cause.Code, cause); err != nil {
+			uncertainErr := service.reservations.MarkUncertain(ctx, stored, "ENTRY_SUBMISSION_DISABLED_REJECTION_PERSIST_FAILED: "+err.Error())
+			return SubmitResult{Order: stored, Created: created}, errors.Join(cause, err, uncertainErr)
+		}
+		_, releaseErr := service.reservations.Reconcile(ctx, stored)
+		return SubmitResult{Order: stored, Created: created}, errors.Join(cause, releaseErr)
+	}
 	var prepared port.PreparedPlacement
 	preparedVenue, supportsPrepared := service.venue.(port.PreparedVenue)
 	if service.requirePreparedPlacement && !supportsPrepared {
@@ -306,6 +324,13 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 		}
 	}
 	return SubmitResult{Order: stored, Created: created}, nil
+}
+
+func entrySubmissionDisabledError() *port.Rejection {
+	return &port.Rejection{
+		Code:   domain.StrategyEntryBlockSubmissionDisabled,
+		Reason: "BUY submission is disabled while the operator-owned sell-only gate is active",
+	}
 }
 
 // finishPrepareError handles only failures that occur before a venue POST is

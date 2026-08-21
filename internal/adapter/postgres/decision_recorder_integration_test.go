@@ -138,6 +138,8 @@ func TestDecisionRecorderDurableIntentDeliveryPostgresIntegration(t *testing.T) 
 	}
 	firstIntent := integrationDecisionIntentWithID(t, request, decisionAt, "decision-z", "z-client-order")
 	secondIntent := integrationDecisionIntentWithID(t, request, decisionAt, "decision-a", "a-client-order")
+	secondIntent.Side = domain.SideSell
+	secondIntent.TargetLotID = "external-lot-delivery"
 	if _, created, err := recorder.ClaimOutput(context.Background(), response, []domain.OrderIntent{firstIntent, secondIntent}, true); err != nil || !created {
 		t.Fatalf("ClaimOutput() = created %v, error %v", created, err)
 	}
@@ -145,11 +147,26 @@ func TestDecisionRecorderDurableIntentDeliveryPostgresIntegration(t *testing.T) 
 		t.Fatalf("submission-mode replay error = %v", err)
 	}
 
-	claimed, err := recorder.ClaimPendingIntents(context.Background(), request.CycleID, 10)
-	if err != nil || len(claimed) != 2 || claimed[0].ClientOrderID != firstIntent.ClientOrderID ||
-		claimed[1].ClientOrderID != secondIntent.ClientOrderID || claimed[0].Attempt != 1 ||
-		claimed[0].Status != domain.DecisionIntentSubmitting {
-		t.Fatalf("claimed deliveries = %#v, error %v", claimed, err)
+	claimedSell, err := recorder.ClaimPendingIntents(context.Background(), request.CycleID, domain.SideSell, 10)
+	if err != nil || len(claimedSell) != 1 || claimedSell[0].ClientOrderID != secondIntent.ClientOrderID ||
+		claimedSell[0].Attempt != 1 || claimedSell[0].Status != domain.DecisionIntentSubmitting {
+		t.Fatalf("claimed SELL deliveries = %#v, error %v", claimedSell, err)
+	}
+	claimedBuy, err := recorder.ClaimPendingIntents(context.Background(), request.CycleID, domain.SideBuy, 10)
+	if err != nil || len(claimedBuy) != 1 || claimedBuy[0].ClientOrderID != firstIntent.ClientOrderID ||
+		claimedBuy[0].Attempt != 1 || claimedBuy[0].Status != domain.DecisionIntentSubmitting {
+		t.Fatalf("claimed BUY deliveries = %#v, error %v", claimedBuy, err)
+	}
+	requeued, err := recorder.RequeueStaleSubmitting(
+		context.Background(), now.Add(time.Second), domain.SideSell, 10,
+	)
+	if err != nil || requeued != 1 {
+		t.Fatalf("requeued SELL deliveries = %d, error %v", requeued, err)
+	}
+	reclaimedSell, err := recorder.ClaimPendingIntents(context.Background(), request.CycleID, domain.SideSell, 10)
+	if err != nil || len(reclaimedSell) != 1 || reclaimedSell[0].ClientOrderID != secondIntent.ClientOrderID ||
+		reclaimedSell[0].Attempt != 2 {
+		t.Fatalf("reclaimed SELL deliveries = %#v, error %v", reclaimedSell, err)
 	}
 	if err := recorder.CompleteIntent(context.Background(), firstIntent.ClientOrderID, 2, domain.DecisionIntentCompletion{
 		Status: domain.DecisionIntentSubmitted, OrderID: "order-delivery", OrderStatus: domain.OrderStatusAcknowledged,
@@ -161,7 +178,7 @@ func TestDecisionRecorderDurableIntentDeliveryPostgresIntegration(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := recorder.CompleteIntent(context.Background(), secondIntent.ClientOrderID, 1, domain.DecisionIntentCompletion{
+	if err := recorder.CompleteIntent(context.Background(), secondIntent.ClientOrderID, 2, domain.DecisionIntentCompletion{
 		Status: domain.DecisionIntentFailed, OrderID: "order-rejected", OrderStatus: domain.OrderStatusRejected,
 	}); err != nil {
 		t.Fatal(err)
@@ -171,7 +188,7 @@ func TestDecisionRecorderDurableIntentDeliveryPostgresIntegration(t *testing.T) 
 		deliveries[0].OrderID != "order-delivery" || deliveries[0].Attempt != 1 {
 		t.Fatalf("stored deliveries = %#v, error %v", deliveries, err)
 	}
-	if claimed, err := recorder.ClaimPendingIntents(context.Background(), "", 10); err != nil || len(claimed) != 0 {
+	if claimed, err := recorder.ClaimPendingIntents(context.Background(), "", "", 10); err != nil || len(claimed) != 0 {
 		t.Fatalf("terminal delivery reclaimed = %#v, error %v", claimed, err)
 	}
 }
