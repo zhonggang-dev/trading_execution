@@ -125,9 +125,6 @@ func (service *Service) collectExternalAccount(ctx context.Context, account doma
 	}
 	result.trades, result.tradesErr = service.venue.ListReconciliationTrades(ctx, account.ExecutionAccountID, tradesAfter)
 	result.tradesAt = service.now().UTC()
-	if result.tradesErr == nil && len(result.trades) > 0 {
-		result.tradesAt = oldestVenueTradeTime(result.trades, result.tradesAt)
-	}
 	return result
 }
 
@@ -270,15 +267,6 @@ func oldestExternalPositionTime(values []domain.ExternalPosition, fallback time.
 
 // oldestVenueOrderTime 返回外部订单中最早的观察时间。
 func oldestVenueOrderTime(values []domain.VenueOrderSnapshot, fallback time.Time) time.Time {
-	result := fallback
-	for _, value := range values {
-		result = earlierTime(result, value.ObservedAt)
-	}
-	return result
-}
-
-// oldestVenueTradeTime 返回外部成交中最早的观察时间。
-func oldestVenueTradeTime(values []domain.VenueTradeSnapshot, fallback time.Time) time.Time {
 	result := fallback
 	for _, value := range values {
 		result = earlierTime(result, value.ObservedAt)

@@ -129,6 +129,30 @@ func TestRefreshKeepsLastGoodSnapshotAndEventuallyFailsClosed(t *testing.T) {
 	}
 }
 
+// TestHistoricalTradeTimestampDoesNotMakeFreshSnapshotStale verifies that a
+// venue trade's event timestamp is not mistaken for the observation time of
+// the current /trades response.
+func TestHistoricalTradeTimestampDoesNotMakeFreshSnapshotStale(t *testing.T) {
+	now := time.Date(2026, 8, 19, 8, 0, 10, 0, time.UTC)
+	service, _, _ := newTestService(t, &now)
+	service.venue.(*fakeVenue).trades = []domain.VenueTradeSnapshot{{
+		VenueTradeID: "trade-1", OrderIDs: []string{"venue-order-1"},
+		ConditionID: "condition-1", TokenID: "token-yes",
+		Status: domain.FillStatusConfirmed, ObservedAt: now.Add(-6 * time.Hour),
+	}}
+
+	if err := service.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	snapshot, err := service.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if snapshot.DataFreshnessSeconds != 2 {
+		t.Fatalf("freshness=%d, want current fetch bounded by the two-second-old orderbook", snapshot.DataFreshnessSeconds)
+	}
+}
+
 // TestPositionDriftAndMissingWorkerCannotAppearHealthy 验证数量漂移和缺失 heartbeat 会传播到引擎健康状态。
 func TestPositionDriftAndMissingWorkerCannotAppearHealthy(t *testing.T) {
 	now := time.Date(2026, 8, 19, 8, 0, 10, 0, time.UTC)
