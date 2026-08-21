@@ -24,36 +24,38 @@ type OrderRefresher interface {
 
 // Params 表示后端使用的 Params 类型。
 type Params struct {
-	Orders          port.ReconciliationOrderRepository
-	Venue           port.VenueReconciliationSource
-	PositionSources []port.ExternalPositionSource
-	BalanceSources  []port.ExternalBalanceSource
-	Ledger          port.ReconciliationLedger
-	Fills           port.FillSynchronizer
-	OrderRefresher  OrderRefresher
-	Recorder        port.ReconciliationRecorder
-	TradeLookback   time.Duration
-	PositionEpsilon domain.Decimal
-	BalanceEpsilon  domain.Decimal
-	Now             func() time.Time
-	NewID           func() string
+	Orders            port.ReconciliationOrderRepository
+	Venue             port.VenueReconciliationSource
+	PositionSources   []port.ExternalPositionSource
+	PositionBaselines port.ExternalPositionBaselineSource
+	BalanceSources    []port.ExternalBalanceSource
+	Ledger            port.ReconciliationLedger
+	Fills             port.FillSynchronizer
+	OrderRefresher    OrderRefresher
+	Recorder          port.ReconciliationRecorder
+	TradeLookback     time.Duration
+	PositionEpsilon   domain.Decimal
+	BalanceEpsilon    domain.Decimal
+	Now               func() time.Time
+	NewID             func() string
 }
 
 // Service 表示后端使用的 Service 类型。
 type Service struct {
-	orders          port.ReconciliationOrderRepository
-	venue           port.VenueReconciliationSource
-	positionSources []port.ExternalPositionSource
-	balanceSources  []port.ExternalBalanceSource
-	ledger          port.ReconciliationLedger
-	fills           port.FillSynchronizer
-	orderRefresher  OrderRefresher
-	recorder        port.ReconciliationRecorder
-	tradeLookback   time.Duration
-	positionEpsilon domain.Decimal
-	balanceEpsilon  domain.Decimal
-	now             func() time.Time
-	newID           func() string
+	orders            port.ReconciliationOrderRepository
+	venue             port.VenueReconciliationSource
+	positionSources   []port.ExternalPositionSource
+	positionBaselines port.ExternalPositionBaselineSource
+	balanceSources    []port.ExternalBalanceSource
+	ledger            port.ReconciliationLedger
+	fills             port.FillSynchronizer
+	orderRefresher    OrderRefresher
+	recorder          port.ReconciliationRecorder
+	tradeLookback     time.Duration
+	positionEpsilon   domain.Decimal
+	balanceEpsilon    domain.Decimal
+	now               func() time.Time
+	newID             func() string
 }
 
 // Result 表示后端使用的 Result 类型。
@@ -71,9 +73,9 @@ type RunAccountParams struct {
 
 // New 校验依赖和配置后创建当前服务实例。
 func New(params Params) (*Service, error) {
-	if params.Orders == nil || params.Venue == nil || params.Ledger == nil || params.Fills == nil ||
+	if params.Orders == nil || params.Venue == nil || params.PositionBaselines == nil || params.Ledger == nil || params.Fills == nil ||
 		params.OrderRefresher == nil || params.Recorder == nil {
-		return nil, fmt.Errorf("orders, venue, ledger, fills, order refresher, and recorder are required")
+		return nil, fmt.Errorf("orders, venue, position baselines, ledger, fills, order refresher, and recorder are required")
 	}
 	if len(params.PositionSources) == 0 || len(params.BalanceSources) == 0 {
 		return nil, fmt.Errorf("at least one external position source and balance source are required")
@@ -116,9 +118,10 @@ func New(params Params) (*Service, error) {
 	}
 	return &Service{
 		orders: params.Orders, venue: params.Venue,
-		positionSources: append([]port.ExternalPositionSource(nil), params.PositionSources...),
-		balanceSources:  append([]port.ExternalBalanceSource(nil), params.BalanceSources...),
-		ledger:          params.Ledger, fills: params.Fills, orderRefresher: params.OrderRefresher,
+		positionSources:   append([]port.ExternalPositionSource(nil), params.PositionSources...),
+		positionBaselines: params.PositionBaselines,
+		balanceSources:    append([]port.ExternalBalanceSource(nil), params.BalanceSources...),
+		ledger:            params.Ledger, fills: params.Fills, orderRefresher: params.OrderRefresher,
 		recorder: params.Recorder, tradeLookback: params.TradeLookback,
 		positionEpsilon: params.PositionEpsilon, balanceEpsilon: params.BalanceEpsilon,
 		now: params.Now, newID: params.NewID,

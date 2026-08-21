@@ -17,6 +17,7 @@ type accountObservation struct {
 	account       domain.LiveAccountState
 	balance       domain.ExternalBalance
 	positions     []domain.ExternalPosition
+	baselines     []domain.ExternalPositionBaseline
 	openOrders    []domain.VenueOrderSnapshot
 	trades        []domain.VenueTradeSnapshot
 	positionAt    time.Time
@@ -110,6 +111,12 @@ func (service *Service) collectExternalAccount(ctx context.Context, account doma
 		if len(positions) > 0 {
 			result.positionAt = oldestExternalPositionTime(positions, result.positionAt)
 		}
+	}
+	baselines, baselineErr := service.positionBaselines.ListExternalPositionBaselines(ctx, account.ExecutionAccountID)
+	if baselineErr != nil {
+		result.coreErr = errors.Join(result.coreErr, fmt.Errorf("read external position ownership baseline: %w", baselineErr))
+	} else {
+		result.baselines = baselines
 	}
 	result.openOrders, result.openOrdersErr = service.venue.ListReconciliationOpenOrders(ctx, account.ExecutionAccountID)
 	result.openOrdersAt = service.now().UTC()

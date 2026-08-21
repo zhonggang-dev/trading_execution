@@ -42,7 +42,37 @@ func buildPositions(params buildPositionsParams) ([]domain.LivePosition, positio
 		params.quality.add("clob", "CLOB 订单与成交", domain.LiveHealthDegraded, "当前盘口批量读取失败，仓位标记价已回退到 Data API")
 	}
 	for _, observation := range params.observations {
+		baselines, err := makeLivePositionBaselineSet(observation.account.ExecutionAccountID, observation.baselines)
+		if err != nil {
+			return nil, totals, fmt.Errorf("validate account %s external position baselines: %w", observation.account.ExecutionAccountID, err)
+		}
+		unseenBaselines := make(map[string]domain.ExternalPositionBaseline, len(baselines.byToken))
+		for tokenID, baseline := range baselines.byToken {
+			unseenBaselines[tokenID] = baseline
+		}
+		seenExternal := make(map[string]struct{}, len(observation.positions))
 		for _, external := range observation.positions {
+			tokenID := strings.TrimSpace(external.TokenID)
+			if tokenID == "" {
+				return nil, totals, fmt.Errorf("external position token is empty for account %q", observation.account.ExecutionAccountID)
+			}
+			if _, duplicate := seenExternal[tokenID]; duplicate {
+				return nil, totals, fmt.Errorf("external position token %q is duplicated for account %q", tokenID, observation.account.ExecutionAccountID)
+			}
+			seenExternal[tokenID] = struct{}{}
+			if baseline, exists := baselines.byToken[tokenID]; exists {
+				delete(unseenBaselines, tokenID)
+				managed, include, baselineErr := managedExternalPosition(
+					observation.account.ExecutionAccountID, external, baseline, localByKey,
+				)
+				if baselineErr != nil {
+					return nil, totals, baselineErr
+				}
+				if !include {
+					continue
+				}
+				external = managed
+			}
 			position, cost, marketValue, err := buildExternalPosition(buildExternalPositionParams{
 				observedAt: params.observedAt, accountID: observation.account.ExecutionAccountID,
 				external: external, localByKey: localByKey, books: params.books,
@@ -71,6 +101,12 @@ func buildPositions(params buildPositionsParams) ([]domain.LivePosition, positio
 			if book, found := params.books[external.TokenID]; found && book.Status == domain.OrderBookStatusOK {
 				totals.oldestBookAt = earlierTime(totals.oldestBookAt, book.ObservedAt)
 			}
+		}
+		for tokenID := range unseenBaselines {
+			return nil, totals, fmt.Errorf(
+				"external position baseline token %q is absent for account %q",
+				tokenID, observation.account.ExecutionAccountID,
+			)
 		}
 	}
 	checkMissingExternalPositions(params.local, externalKeys, params.quality)

@@ -45,6 +45,7 @@ type PositionLot struct {
 	OutcomeIndex       *int              `json:"outcome_index,omitempty"`
 	OutcomeName        string            `json:"outcome_name"`
 	NegRisk            *bool             `json:"neg_risk,omitempty"`
+	OriginModelID      string            `json:"-"`
 	ModelID            string            `json:"model_id"`
 	StrategyID         string            `json:"strategy_id"`
 	OpeningOrderID     string            `json:"opening_order_id"`

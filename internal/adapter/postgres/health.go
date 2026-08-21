@@ -38,10 +38,13 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_fills'),
 			('execution_fill_events'),
 			('position_lots'),
+			('position_lot_model_routes'),
 			('position_lot_closures'),
 			('position_events'),
 			('execution_account_events'),
 			('execution_outbox'),
+			('execution_external_position_baselines'),
+			('execution_external_position_baseline_items'),
 			('position_exit_runs'),
 			('strategy_decision_runs'),
 			('strategy_order_intent_deliveries'),
@@ -77,7 +80,22 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('strategy_decision_runs', 'order_submission_enabled'),
 			('strategy_order_intent_deliveries', 'intent_payload'),
 			('strategy_order_intent_deliveries', 'status'),
-			('strategy_order_intent_deliveries', 'attempt_count')
+			('strategy_order_intent_deliveries', 'attempt_count'),
+			('execution_external_position_baselines', 'baseline_id'),
+			('execution_external_position_baselines', 'execution_account_id'),
+			('execution_external_position_baselines', 'source'),
+			('execution_external_position_baselines', 'observed_at'),
+			('execution_external_position_baselines', 'evidence'),
+			('execution_external_position_baselines', 'actor'),
+			('execution_external_position_baselines', 'reason'),
+			('execution_external_position_baseline_items', 'baseline_id'),
+			('execution_external_position_baseline_items', 'execution_account_id'),
+			('execution_external_position_baseline_items', 'token_id'),
+			('execution_external_position_baseline_items', 'condition_id'),
+			('execution_external_position_baseline_items', 'outcome_index'),
+			('execution_external_position_baseline_items', 'outcome_name'),
+			('execution_external_position_baseline_items', 'neg_risk'),
+			('execution_external_position_baseline_items', 'shares')
 		) AS required(table_name, column_name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -104,6 +122,10 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('asset_reservations_risk_metadata_shape'),
 			('execution_strategy_bindings_canonical_strategy'),
 			('execution_risk_controls_canonical_strategy'),
+			('position_lots_lot_origin_model_unique'),
+			('position_lot_model_routes_origin_fk'),
+			('position_lot_model_routes_identity_nonempty'),
+			('position_lot_model_routes_audit_nonempty'),
 			('execution_fills_platform_fee_rate_nonnegative'),
 			('execution_fills_fee_exponent_shape'),
 			('execution_fills_settlement_evidence_object'),
@@ -115,7 +137,19 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('strategy_order_intent_deliveries_status'),
 			('strategy_order_intent_deliveries_attempt_nonnegative'),
 			('strategy_order_intent_deliveries_state_shape'),
-			('strategy_order_intent_deliveries_result_shape')
+			('strategy_order_intent_deliveries_result_shape'),
+			('execution_external_position_baselines_pkey'),
+			('execution_external_position_baselines_execution_account_fk'),
+			('execution_external_position_baselines_account_unique'),
+			('execution_external_position_baselines_identity_nonempty'),
+			('execution_external_position_baselines_evidence_object'),
+			('execution_external_position_baselines_account_identity_unique'),
+			('execution_external_position_baseline_items_pkey'),
+			('execution_external_position_baseline_items_header_fk'),
+			('execution_external_position_baseline_items_account_token_unique'),
+			('execution_external_position_baseline_items_identity_nonempty'),
+			('execution_external_position_baseline_items_outcome_index'),
+			('execution_external_position_baseline_items_positive_shares')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -165,7 +199,8 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 		SELECT count(*)
 		FROM (VALUES
 			('strategy_order_intent_deliveries_pending_idx'),
-			('strategy_order_intent_deliveries_stale_idx')
+			('strategy_order_intent_deliveries_stale_idx'),
+			('execution_external_position_baseline_items_account_idx')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -193,7 +228,15 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_risk_global_control_version_trigger'),
 			('execution_risk_policies_version_trigger'),
 			('execution_risk_controls_version_trigger'),
-			('execution_strategy_bindings_version_trigger')
+			('execution_strategy_bindings_version_trigger'),
+			('execution_external_position_baselines_append_only_trigger'),
+			('execution_external_position_baseline_items_append_only_trigger'),
+			('execution_external_position_baseline_items_sealed_trigger'),
+			('execution_external_position_baselines_items_required_trigger'),
+			('position_lot_model_routes_insert_guard_trigger'),
+			('position_lot_model_routes_append_only_trigger'),
+			('position_lot_model_routes_truncate_guard_trigger'),
+			('position_lots_model_immutable_trigger')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1

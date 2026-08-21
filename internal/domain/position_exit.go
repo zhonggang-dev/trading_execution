@@ -44,6 +44,7 @@ type PositionExitTrade struct {
 	ReservedShares     Decimal   `json:"reserved_shares"`
 	EntryPrice         Decimal   `json:"entry_price"`
 	RemainingCost      Decimal   `json:"remaining_cost"`
+	OriginModelID      string    `json:"-"`
 	ModelID            string    `json:"-"`
 	StrategyID         string    `json:"-"`
 	ExecutionAccountID string    `json:"-"`

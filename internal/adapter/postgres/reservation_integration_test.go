@@ -989,6 +989,318 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	}
 }
 
+func TestExternalPositionBaselinePostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	const (
+		accountID  = "account-external-position-baseline"
+		baselineID = "baseline-external-position"
+	)
+	insertAccount(t, db, accountID, "0xexternalpositionbaseline", "20", "20", "0")
+
+	if _, err := db.Exec(`
+		INSERT INTO execution_external_position_baselines (
+			baseline_id, execution_account_id, source, observed_at, evidence, actor, reason
+		) VALUES ($1,$2,'POLYMARKET_DATA_API',clock_timestamp(),'{"snapshot_sha256":"empty"}'::jsonb,
+		          'integration-test','empty seal must fail')`, baselineID, accountID); err == nil {
+		t.Fatal("empty external position baseline header succeeded")
+	}
+
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		INSERT INTO execution_external_position_baseline_items (
+			baseline_id, execution_account_id, token_id, condition_id,
+			outcome_index, outcome_name, neg_risk, shares
+		) VALUES
+			($1,$2,'baseline-token-yes','baseline-condition',0,'YES',FALSE,5),
+			($1,$2,'baseline-token-no','baseline-condition',1,'NO',FALSE,3)`, baselineID, accountID); err != nil {
+		t.Fatalf("insert items before deferred header: %v", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO execution_external_position_baselines (
+			baseline_id, execution_account_id, source, observed_at, evidence, actor, reason
+		) VALUES ($1,$2,'POLYMARKET_DATA_API',clock_timestamp(),
+		          '{"snapshot_sha256":"two-items"}'::jsonb,'integration-test','initial account cutover')`, baselineID, accountID); err != nil {
+		t.Fatalf("seal populated external position baseline: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit deferred external position baseline FK: %v", err)
+	}
+
+	repository, err := NewExternalPositionBaselineRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselines, err := repository.ListExternalPositionBaselines(context.Background(), accountID)
+	if err != nil || len(baselines) != 2 || baselines[0].BaselineID != baselineID || baselines[1].BaselineID != baselineID {
+		t.Fatalf("external position baselines = %#v err=%v", baselines, err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_external_position_baseline_items (
+			baseline_id, execution_account_id, token_id, condition_id,
+			outcome_index, outcome_name, neg_risk, shares
+		) VALUES ($1,$2,'baseline-token-late','baseline-condition',2,'LATE',FALSE,1)`, baselineID, accountID); err == nil {
+		t.Fatal("late item extended a sealed external position baseline")
+	}
+	if _, err := db.Exec(`UPDATE execution_external_position_baselines SET reason='mutated' WHERE baseline_id=$1`, baselineID); err == nil {
+		t.Fatal("append-only external position baseline UPDATE succeeded")
+	}
+	if _, err := db.Exec(`DELETE FROM execution_external_position_baseline_items WHERE baseline_id=$1`, baselineID); err == nil {
+		t.Fatal("append-only external position baseline item DELETE succeeded")
+	}
+	if _, err := db.Exec(`TRUNCATE execution_external_position_baselines`); err == nil {
+		t.Fatal("append-only external position baseline TRUNCATE succeeded")
+	}
+}
+
+// TestPositionLotModelRoutePostgresIntegration proves that a logical model can
+// close one explicitly routed legacy lot without rewriting its opening BUY.
+func TestPositionLotModelRoutePostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	const (
+		accountID    = "account-model-route"
+		tokenID      = "token-model-route"
+		lotID        = "lot-model-route"
+		originModel  = "gemini-3.6-flash"
+		logicalModel = "gemini_masked"
+	)
+	insertAccount(t, db, accountID, "0xmodelroute", "20", "20", "0")
+	if _, err := db.Exec(`
+		INSERT INTO execution_positions (
+			execution_account_id, market_id, condition_id, token_id, outcome_index, outcome_name,
+			total_shares, available_shares, reserved_shares, cost_basis, average_cost_price
+		) VALUES ($1,'market-1','condition-1',$2,0,'Yes',5,5,0,2.5,0.5)`, accountID, tokenID); err != nil {
+		t.Fatal(err)
+	}
+	insertOpenLotFixtureNamedWithModel(t, db, accountID, tokenID, lotID, "5", originModel)
+
+	reservations, err := NewReservationManager(ReservationManagerParams{DB: db, MaxBuyFeeRateBPS: "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrouted := integrationOrder("unrouted-model-sell", accountID, tokenID, domain.SideSell, "1", "0.4")
+	unrouted.Intent.ModelID = logicalModel
+	unrouted.Intent.TargetLotID = lotID
+	if _, err := reservations.Reserve(context.Background(), unrouted); err == nil {
+		t.Fatal("unrouted logical SELL reserve error = nil, want fail-closed identity rejection")
+	} else {
+		assertRejectionCode(t, err, "TARGET_LOT_IDENTITY_MISMATCH")
+	}
+
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_routes (
+			lot_id, origin_model_id, logical_model_id, reason, actor
+		) VALUES ($1,'wrong-origin',$2,'test cutover','integration-test')`, lotID, logicalModel); err == nil {
+		t.Fatal("route with a mismatched origin model succeeded")
+	}
+	if _, err := db.Exec(`
+		UPDATE execution_risk_global_control
+		SET kill_switch=FALSE, reason='route guard test', version=version+1
+		WHERE singleton=TRUE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_routes (
+			lot_id, origin_model_id, logical_model_id, reason, actor
+		) VALUES ($1,$2,$3,'test cutover','integration-test')`, lotID, originModel, logicalModel); err == nil {
+		t.Fatal("route INSERT succeeded with the global kill switch disabled")
+	}
+	if _, err := db.Exec(`
+		UPDATE execution_risk_global_control
+		SET kill_switch=TRUE, reason='route guard test complete', version=version+1
+		WHERE singleton=TRUE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO asset_reservations (
+			order_id, client_order_id, intent_fingerprint,
+			execution_account_id, strategy_id, market_id, token_id, target_lot_id, side,
+			requested_shares, reserve_unit_price,
+			initial_reserved_balance, remaining_reserved_balance,
+			initial_reserved_shares, remaining_reserved_shares,
+			settled_shares, settled_notional, status
+		) VALUES (
+			'route-blocking-reservation','route-blocking-client','route-blocking-fingerprint',
+			$1,'strategy-v1','market-1',$2,$3,'SELL',
+			1,0,0,0,1,1,0,0,'ACTIVE'
+		)`, accountID, tokenID, lotID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_routes (
+			lot_id, origin_model_id, logical_model_id, reason, actor
+		) VALUES ($1,$2,$3,'test cutover','integration-test')`, lotID, originModel, logicalModel); err == nil {
+		t.Fatal("route INSERT succeeded with an active lot reservation")
+	}
+	if _, err := db.Exec(`DELETE FROM asset_reservations WHERE order_id='route-blocking-reservation'`); err != nil {
+		t.Fatal(err)
+	}
+
+	blockingOrder := integrationOrder("route-blocking-order", accountID, tokenID, domain.SideBuy, "1", "0.4")
+	blockingPayload, err := json.Marshal(blockingOrder.Intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_orders (
+			order_id, client_order_id, execution_account_id, venue, market_id, token_id,
+			intent, status, filled_size, revision, created_at, updated_at
+		) VALUES (
+			'route-blocking-order','route-blocking-order-client',$1,'paper','market-1',$2,
+			$3::jsonb,'RECEIVED',0,1,clock_timestamp(),clock_timestamp()
+		)`, accountID, tokenID, blockingPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_routes (
+			lot_id, origin_model_id, logical_model_id, reason, actor
+		) VALUES ($1,$2,$3,'test cutover','integration-test')`, lotID, originModel, logicalModel); err == nil {
+		t.Fatal("route INSERT succeeded with a non-terminal account order")
+	}
+	if _, err := db.Exec(`UPDATE execution_orders SET status='REJECTED' WHERE order_id='route-blocking-order'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`
+		INSERT INTO strategy_decision_runs (
+			cycle_id, input_id, decision_at, model_id, strategy_id, execution_account_id,
+			input_payload, output_payload, order_submission_enabled, decided_at
+		) VALUES (
+			'route-blocking-cycle','route-blocking-input',clock_timestamp(),$1,'strategy-v1',$2,
+			'{}'::jsonb,'{}'::jsonb,TRUE,clock_timestamp()
+		)`, logicalModel, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO strategy_order_intent_deliveries (
+			client_order_id, cycle_id, sequence_no, intent_payload, status
+		) VALUES ('route-blocking-delivery','route-blocking-cycle',0,$1::jsonb,'PENDING')`, blockingPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_routes (
+			lot_id, origin_model_id, logical_model_id, reason, actor
+		) VALUES ($1,$2,$3,'test cutover','integration-test')`, lotID, originModel, logicalModel); err == nil {
+		t.Fatal("route INSERT succeeded with a pending account intent")
+	}
+	if _, err := db.Exec(`DELETE FROM strategy_order_intent_deliveries WHERE client_order_id='route-blocking-delivery'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM strategy_decision_runs WHERE cycle_id='route-blocking-cycle'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_routes (
+			lot_id, origin_model_id, logical_model_id, reason, actor
+		) VALUES ($1,$2,$3,'test cutover','integration-test')`, lotID, originModel, logicalModel); err != nil {
+		t.Fatal(err)
+	}
+
+	ledger, err := NewFillLedger(FillLedgerParams{DB: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	openLots, err := ledger.ListOpenLots(context.Background(), accountID)
+	if err != nil || len(openLots) != 1 || openLots[0].OriginModelID != originModel || openLots[0].ModelID != logicalModel {
+		t.Fatalf("routed open lots = %#v err=%v", openLots, err)
+	}
+	exitTrades, err := ledger.ListOpenPositionExitTrades(context.Background(), accountID)
+	if err != nil || len(exitTrades) != 1 || exitTrades[0].OriginModelID != originModel || exitTrades[0].ModelID != logicalModel {
+		t.Fatalf("routed exit trades = %#v err=%v", exitTrades, err)
+	}
+
+	repository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor, err := fillprocessor.New(fillprocessor.Params{
+		Orders: repository, Source: noFillsSource{}, Ledger: ledger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	sell := integrationOrder("routed-model-sell", accountID, tokenID, domain.SideSell, "5", "0.4")
+	sell.Intent.ModelID = logicalModel
+	sell.Intent.Venue = "paper"
+	sell.Intent.TargetLotID = lotID
+	sell = createAcknowledgedIntegrationOrder(t, ctx, repository, reservations, sell, "0xrouted-model-sell", now)
+	if _, err := db.Exec(`
+		UPDATE asset_reservations
+		SET risk_policy_id='route-test-policy', risk_policy_version=1,
+		    risk_day=CURRENT_DATE, daily_risk_notional=2
+		WHERE order_id=$1`, sell.ID); err != nil {
+		t.Fatal(err)
+	}
+	account := ExpectedExecutionAccount{ExecutionAccountID: accountID, WalletAddress: "0xmodelroute"}
+	if err := CheckLiveLedgerBootstrap(ctx, db, []ExpectedExecutionAccount{account}); err != nil {
+		t.Fatalf("routed active SELL bootstrap: %v", err)
+	}
+
+	confirmedAt := now.Add(10 * time.Second)
+	sold, err := processor.Process(ctx, sell, domain.Fill{
+		VenueFillID: "trade-routed-model-sell", LiquidityRole: domain.LiquidityRoleMaker,
+		Status: domain.FillStatusConfirmed, Shares: "5", Price: "0.6",
+		GrossNotional: "3", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
+		FeeSource: "TEST_AUTHORITATIVE_SETTLEMENT",
+		MatchedAt: confirmedAt, VenueUpdatedAt: confirmedAt,
+		ObservedAt: confirmedAt, ConfirmedAt: &confirmedAt,
+	})
+	if err != nil || !sold.Applied || sold.Order.Status != domain.OrderStatusFilled {
+		t.Fatalf("routed SELL fill = %#v err=%v", sold, err)
+	}
+	lots, err := ledger.ListLots(ctx, accountID, tokenID)
+	if err != nil || len(lots) != 1 || lots[0].Status != domain.PositionLotClosed ||
+		lots[0].OriginModelID != originModel || lots[0].ModelID != logicalModel {
+		t.Fatalf("closed routed lot = %#v err=%v", lots, err)
+	}
+	var storedOrigin string
+	if err := db.QueryRow(`SELECT model_id FROM position_lots WHERE lot_id=$1`, lotID).Scan(&storedOrigin); err != nil || storedOrigin != originModel {
+		t.Fatalf("stored origin model=%q err=%v", storedOrigin, err)
+	}
+
+	history, err := NewTradeHistoryRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := history.ListTradeHistory(ctx, domain.TradeHistoryFilter{ExecutionAccountID: accountID})
+	if err != nil || len(page.Items) != 2 {
+		t.Fatalf("routed trade history = %#v err=%v", page, err)
+	}
+	modelsBySide := make(map[domain.Side]string, len(page.Items))
+	for _, item := range page.Items {
+		modelsBySide[item.Side] = item.ModelID
+	}
+	if modelsBySide[domain.SideBuy] != originModel || modelsBySide[domain.SideSell] != logicalModel {
+		t.Fatalf("historical models by side = %#v", modelsBySide)
+	}
+	if _, err := db.Exec(`UPDATE position_lot_model_routes SET reason='mutated' WHERE lot_id=$1`, lotID); err == nil {
+		t.Fatal("append-only route UPDATE succeeded")
+	}
+	if _, err := db.Exec(`DELETE FROM position_lot_model_routes WHERE lot_id=$1`, lotID); err == nil {
+		t.Fatal("append-only route DELETE succeeded")
+	}
+	if _, err := db.Exec(`TRUNCATE position_lot_model_routes`); err == nil {
+		t.Fatal("append-only route TRUNCATE succeeded")
+	}
+	if _, err := db.Exec(`UPDATE position_lots SET model_id='mutated' WHERE lot_id=$1`, lotID); err == nil {
+		t.Fatal("immutable origin model UPDATE succeeded")
+	}
+}
+
 // TestBuyFeeReservationPostgresIntegration 验证手续费上限被预占，且超上限 Fill 不会消费未预占资金。
 func TestBuyFeeReservationPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
@@ -1275,7 +1587,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 	db := stdlib.OpenDB(*testConfig)
 	db.SetMaxOpenConns(8)
 	t.Cleanup(func() { _ = db.Close() })
-	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql"} {
+	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql", "0014_external_position_ownership_baselines.sql", "0015_position_lot_model_routes.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", name, err)
@@ -1329,11 +1641,18 @@ func insertOpenLotFixture(t *testing.T, db *sql.DB, accountID, tokenID, shares s
 
 // insertOpenLotFixtureNamed 实现当前测试场景所需的辅助行为。
 func insertOpenLotFixtureNamed(t *testing.T, db *sql.DB, accountID, tokenID, lotID, shares string) {
+	insertOpenLotFixtureNamedWithModel(t, db, accountID, tokenID, lotID, shares, "model-a")
+}
+
+// insertOpenLotFixtureNamedWithModel inserts an opening BUY and immutable lot
+// with the requested historical model identity.
+func insertOpenLotFixtureNamedWithModel(t *testing.T, db *sql.DB, accountID, tokenID, lotID, shares, modelID string) {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	orderID := "opening-order-" + accountID + "-" + lotID
 	fillKey := "opening-fill-" + accountID + "-" + lotID
 	intent := integrationOrder("opening-"+accountID+"-"+lotID, accountID, tokenID, domain.SideBuy, shares, "0.5").Intent
+	intent.ModelID = modelID
 	payload, err := json.Marshal(intent)
 	if err != nil {
 		t.Fatal(err)
@@ -1366,9 +1685,9 @@ func insertOpenLotFixtureNamed(t *testing.T, db *sql.DB, accountID, tokenID, lot
 			outcome_name, neg_risk, model_id, strategy_id, opening_order_id, opening_fill_key,
 			original_shares, remaining_shares, original_cost, remaining_cost,
 			average_entry_price, status, opened_at
-		) VALUES ($1,$2,'market-1','condition-1',$3,0,'Yes',false,'model-a','strategy-v1',$4,$5,
+		) VALUES ($1,$2,'market-1','condition-1',$3,0,'Yes',false,$8,'strategy-v1',$4,$5,
 			$6::numeric,$6::numeric,$6::numeric*0.5,$6::numeric*0.5,0.5,'OPEN',$7)`,
-		lotID, accountID, tokenID, orderID, fillKey, shares, now)
+		lotID, accountID, tokenID, orderID, fillKey, shares, now, modelID)
 	if err != nil {
 		t.Fatal(err)
 	}

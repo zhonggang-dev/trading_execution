@@ -2,6 +2,7 @@ package reconciliation
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
@@ -16,11 +17,28 @@ type positionSnapshot struct {
 	Positions map[string]domain.ExternalPosition
 }
 
+// positionBaselineSnapshot contains immutable shares outside this service's
+// ownership. These values remain separate from the managed position ledger.
+type positionBaselineSnapshot struct {
+	BaselineID string
+	Positions  map[string]domain.ExternalPositionBaseline
+}
+
 // compareExternalPositionParams 收拢一个外部持仓与本地持仓索引的比较参数。
 type compareExternalPositionParams struct {
 	tokenID      string
 	external     domain.ExternalPosition
 	localByToken map[string]domain.Position
+}
+
+// compareBaselinedPositionParams collects the three independently owned views
+// required to compare a token that existed before account cutover.
+type compareBaselinedPositionParams struct {
+	tokenID  string
+	external domain.ExternalPosition
+	baseline domain.ExternalPositionBaseline
+	local    domain.Position
+	hasLocal bool
 }
 
 // settlePositionParams 收拢推进持仓结算生命周期所需的证据。
@@ -38,6 +56,16 @@ type missingExternalPositionParams struct {
 	externalSource string
 }
 
+// baselineDriftParams preserves both the immutable expected total and the
+// externally observed total for manual review.
+type baselineDriftParams struct {
+	baseline      domain.ExternalPositionBaseline
+	localExpected domain.Decimal
+	remoteValue   domain.Decimal
+	source        string
+	details       string
+}
+
 // reconcilePositions 在成交补录后重新读取并核对本地与外部持仓。
 func (state *runState) reconcilePositions(ctx context.Context, executionAccountID, walletAddress string) error {
 	positions, err := state.service.ledger.ListPositions(ctx, executionAccountID)
@@ -46,11 +74,22 @@ func (state *runState) reconcilePositions(ctx context.Context, executionAccountI
 		return err
 	}
 	state.run.Summary["local_positions"] = len(positions)
+	baselineValues, err := state.service.positionBaselines.ListExternalPositionBaselines(ctx, executionAccountID)
+	if err != nil {
+		state.addInfrastructureIssue(ctx, "POSTGRES_EXTERNAL_POSITION_BASELINES", "read external position ownership baseline", err)
+		return err
+	}
+	baselines, err := makePositionBaselineSnapshot(executionAccountID, baselineValues)
+	if err != nil {
+		state.addInfrastructureIssue(ctx, "POSTGRES_EXTERNAL_POSITION_BASELINES", "validate external position ownership baseline", err)
+		return err
+	}
+	state.run.Summary["unmanaged_position_baselines"] = len(baselines.Positions)
 	external, conflict := state.readPositionConsensus(ctx, walletAddress)
 	if conflict {
 		return nil
 	}
-	state.comparePositions(ctx, positions, external)
+	state.comparePositions(ctx, positions, baselines, external)
 	return nil
 }
 
@@ -155,17 +194,92 @@ func (state *runState) requireBalanceConsensus(ctx context.Context, snapshots []
 }
 
 // comparePositions 比较本地权威持仓与已经达成共识的外部快照。
-func (state *runState) comparePositions(ctx context.Context, local []domain.Position, remote positionSnapshot) {
+func (state *runState) comparePositions(
+	ctx context.Context,
+	local []domain.Position,
+	baselines positionBaselineSnapshot,
+	remote positionSnapshot,
+) {
 	localByToken := make(map[string]domain.Position, len(local))
 	for _, position := range local {
 		localByToken[position.TokenID] = position
 	}
+	baselineByToken := make(map[string]domain.ExternalPositionBaseline, len(baselines.Positions))
+	for tokenID, baseline := range baselines.Positions {
+		baselineByToken[tokenID] = baseline
+	}
 	for tokenID, external := range remote.Positions {
+		if baseline, exists := baselineByToken[tokenID]; exists {
+			position, hasLocal := localByToken[tokenID]
+			delete(baselineByToken, tokenID)
+			delete(localByToken, tokenID)
+			state.compareBaselinedPosition(ctx, compareBaselinedPositionParams{
+				tokenID: tokenID, external: external, baseline: baseline,
+				local: position, hasLocal: hasLocal,
+			})
+			continue
+		}
 		state.compareExternalPosition(ctx, compareExternalPositionParams{tokenID: tokenID, external: external, localByToken: localByToken})
+	}
+	for tokenID, baseline := range baselineByToken {
+		position, hasLocal := localByToken[tokenID]
+		delete(localByToken, tokenID)
+		expected := baseline.Shares
+		if hasLocal {
+			var err error
+			expected, err = addDecimals(expected, position.TotalShares)
+			if err != nil {
+				state.addInfrastructureIssue(ctx, "POSTGRES_POSITIONS", "sum managed and unmanaged position shares", err)
+				continue
+			}
+		}
+		state.recordBaselineDrift(ctx, baselineDriftParams{
+			baseline: baseline, localExpected: expected, remoteValue: "0", source: baseline.Source,
+			details: "the immutable unmanaged baseline token is absent from the external snapshot; the baseline is never reduced or imported into the managed ledger",
+		})
 	}
 	for tokenID, position := range localByToken {
 		state.recordMissingExternalPosition(ctx, missingExternalPositionParams{tokenID: tokenID, position: position, externalSource: remote.Source})
 	}
+}
+
+// compareBaselinedPosition verifies remote_total = immutable unmanaged shares
+// + managed local shares. It never materializes the unmanaged shares locally.
+func (state *runState) compareBaselinedPosition(ctx context.Context, params compareBaselinedPositionParams) {
+	expected := params.baseline.Shares
+	if params.hasLocal {
+		var err error
+		expected, err = addDecimals(expected, params.local.TotalShares)
+		if err != nil {
+			state.addInfrastructureIssue(ctx, "POSTGRES_POSITIONS", "sum managed and unmanaged position shares", err)
+			return
+		}
+	}
+	identityMatches := baselineMatchesExternal(params.baseline, params.external)
+	if params.hasLocal {
+		identityMatches = identityMatches && baselineMatchesLocal(params.baseline, params.local)
+	}
+	// Baseline evidence is exact and immutable. Unlike ordinary live-source
+	// comparison, no epsilon may absorb a change to an unmanaged cutover amount.
+	if !identityMatches || !expected.Equal(params.external.Shares) {
+		details := "remote position does not equal the immutable unmanaged baseline plus the managed ledger; do not adjust the baseline or invent a managed position"
+		if !identityMatches {
+			details = "remote, unmanaged baseline, and managed ledger position identities do not match exactly; do not merge or relabel the token"
+		}
+		state.recordBaselineDrift(ctx, baselineDriftParams{
+			baseline: params.baseline, localExpected: expected, remoteValue: params.external.Shares,
+			source: params.external.Source, details: details,
+		})
+		return
+	}
+	if !params.hasLocal {
+		return
+	}
+	managedExternal := params.external
+	managedExternal.Shares = params.local.TotalShares
+	state.settlePositionIfNeeded(ctx, settlePositionParams{
+		tokenID: params.tokenID, position: params.local, external: managedExternal, sharesMatch: true,
+	})
 }
 
 // compareExternalPosition 比较一个外部持仓与对应的本地权威快照。
@@ -198,6 +312,17 @@ func (state *runState) recordPhantomPosition(ctx context.Context, tokenID string
 		Status: domain.ReconciliationIssueOpen, ConditionID: external.ConditionID, TokenID: tokenID,
 		RemoteValue: external.Shares, Source: external.Source,
 		Details: "wallet has shares without a local position or attributable local fill; manual/external/phantom trade must be identified",
+	})
+}
+
+// recordBaselineDrift records immutable ownership evidence drift without
+// changing either the baseline or the managed position ledger.
+func (state *runState) recordBaselineDrift(ctx context.Context, params baselineDriftParams) {
+	state.issue(ctx, domain.ReconciliationIssueParams{
+		Type: domain.ReconciliationIssueExternalPositionBaselineDrift, Resolution: domain.ReconciliationResolutionManual,
+		Status: domain.ReconciliationIssueOpen, ConditionID: params.baseline.ConditionID,
+		TokenID: params.baseline.TokenID, LocalValue: params.localExpected,
+		RemoteValue: params.remoteValue, Source: params.source, Details: params.details,
 	})
 }
 
@@ -240,6 +365,98 @@ func (state *runState) recordMissingExternalPosition(ctx context.Context, params
 	})
 }
 
+// makePositionBaselineSnapshot validates the baseline again at the service
+// boundary so a corrupt or alternate adapter cannot silently weaken cutover
+// ownership. Every item in one account must belong to the same immutable set.
+func makePositionBaselineSnapshot(
+	executionAccountID string,
+	values []domain.ExternalPositionBaseline,
+) (positionBaselineSnapshot, error) {
+	result := positionBaselineSnapshot{Positions: make(map[string]domain.ExternalPositionBaseline)}
+	for _, baseline := range values {
+		baseline.BaselineID = strings.TrimSpace(baseline.BaselineID)
+		baseline.ExecutionAccountID = strings.TrimSpace(baseline.ExecutionAccountID)
+		baseline.ConditionID = strings.TrimSpace(baseline.ConditionID)
+		baseline.TokenID = strings.TrimSpace(baseline.TokenID)
+		baseline.OutcomeName = strings.TrimSpace(baseline.OutcomeName)
+		baseline.Source = strings.TrimSpace(baseline.Source)
+		baseline.Actor = strings.TrimSpace(baseline.Actor)
+		baseline.Reason = strings.TrimSpace(baseline.Reason)
+		if baseline.BaselineID == "" || baseline.ExecutionAccountID != executionAccountID ||
+			baseline.ConditionID == "" || baseline.TokenID == "" || baseline.OutcomeName == "" ||
+			baseline.Source == "" || baseline.Actor == "" || baseline.Reason == "" || baseline.ObservedAt.IsZero() {
+			return positionBaselineSnapshot{}, fmt.Errorf("external position baseline has incomplete or mismatched identity for token %q", baseline.TokenID)
+		}
+		if result.BaselineID == "" {
+			result.BaselineID = baseline.BaselineID
+		} else if result.BaselineID != baseline.BaselineID {
+			return positionBaselineSnapshot{}, fmt.Errorf("execution account has multiple external position baseline sets")
+		}
+		if baseline.OutcomeIndex != nil && *baseline.OutcomeIndex < 0 {
+			return positionBaselineSnapshot{}, fmt.Errorf("external position baseline token %q has invalid outcome index", baseline.TokenID)
+		}
+		if sign, err := baseline.Shares.Sign(); err != nil || sign <= 0 {
+			return positionBaselineSnapshot{}, fmt.Errorf("external position baseline token %q must have positive shares", baseline.TokenID)
+		}
+		var evidence map[string]any
+		if err := json.Unmarshal(baseline.Evidence, &evidence); err != nil || len(evidence) == 0 {
+			return positionBaselineSnapshot{}, fmt.Errorf("external position baseline token %q must have non-empty object evidence", baseline.TokenID)
+		}
+		if _, exists := result.Positions[baseline.TokenID]; exists {
+			return positionBaselineSnapshot{}, fmt.Errorf("external position baseline contains duplicate token %q", baseline.TokenID)
+		}
+		result.Positions[baseline.TokenID] = baseline
+	}
+	return result, nil
+}
+
+func baselineMatchesExternal(baseline domain.ExternalPositionBaseline, external domain.ExternalPosition) bool {
+	return baseline.ConditionID == strings.TrimSpace(external.ConditionID) &&
+		baseline.TokenID == strings.TrimSpace(external.TokenID) &&
+		baseline.OutcomeName == strings.TrimSpace(external.OutcomeName) &&
+		baseline.NegRisk == external.NegRisk &&
+		!external.ObservedAt.IsZero() && !external.ObservedAt.Before(baseline.ObservedAt) &&
+		outcomeIndexesEqual(baseline.OutcomeIndex, external.OutcomeIndex)
+}
+
+func baselineMatchesLocal(baseline domain.ExternalPositionBaseline, local domain.Position) bool {
+	return baseline.ConditionID == strings.TrimSpace(local.ConditionID) &&
+		baseline.TokenID == strings.TrimSpace(local.TokenID) &&
+		baseline.OutcomeName == strings.TrimSpace(local.OutcomeName) &&
+		outcomeIndexesEqual(baseline.OutcomeIndex, local.OutcomeIndex)
+}
+
+func outcomeIndexesEqual(left, right *int) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+// addDecimals performs exact base-10 addition and emits a Decimal rather than
+// a rational fraction. The maximum input scale is sufficient for an exact sum.
+func addDecimals(left, right domain.Decimal) (domain.Decimal, error) {
+	leftValue, leftOK := new(big.Rat).SetString(strings.TrimSpace(left.String()))
+	rightValue, rightOK := new(big.Rat).SetString(strings.TrimSpace(right.String()))
+	if !leftOK || !rightOK || strings.ContainsAny(left.String()+right.String(), "/eE") {
+		return "", fmt.Errorf("invalid decimal operands %q and %q", left, right)
+	}
+	scale := decimalScale(left.String())
+	if rightScale := decimalScale(right.String()); rightScale > scale {
+		scale = rightScale
+	}
+	return domain.ParseDecimal(new(big.Rat).Add(leftValue, rightValue).FloatString(scale))
+}
+
+func decimalScale(value string) int {
+	value = strings.TrimSpace(value)
+	point := strings.IndexByte(value, '.')
+	if point < 0 {
+		return 0
+	}
+	return len(value) - point - 1
+}
+
 // makePositionSnapshot 汇总并构建一个外部来源的持仓快照。
 func makePositionSnapshot(positions []domain.ExternalPosition) (positionSnapshot, error) {
 	result := positionSnapshot{Positions: make(map[string]domain.ExternalPosition)}
@@ -273,6 +490,9 @@ func positionsAgree(left, right positionSnapshot, epsilon domain.Decimal) bool {
 		rightPosition, found := right.Positions[tokenID]
 		if !found || leftPosition.Redeemable != rightPosition.Redeemable ||
 			leftPosition.ConditionID != rightPosition.ConditionID ||
+			leftPosition.OutcomeName != rightPosition.OutcomeName ||
+			leftPosition.NegRisk != rightPosition.NegRisk ||
+			!outcomeIndexesEqual(leftPosition.OutcomeIndex, rightPosition.OutcomeIndex) ||
 			!within(leftPosition.Shares, rightPosition.Shares, epsilon) {
 			return false
 		}

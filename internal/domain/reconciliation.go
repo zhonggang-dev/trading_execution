@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // ReconciliationTrigger 表示后端使用的 ReconciliationTrigger 类型。
 type ReconciliationTrigger string
@@ -27,18 +30,19 @@ const (
 type ReconciliationIssueType string
 
 const (
-	ReconciliationIssueMissedBuyFill       ReconciliationIssueType = "MISSED_BUY_FILL"
-	ReconciliationIssueMissedSellFill      ReconciliationIssueType = "MISSED_SELL_FILL"
-	ReconciliationIssueLocalOrderCancelled ReconciliationIssueType = "LOCAL_ORDER_CANCELLED"
-	ReconciliationIssueSubmitUnconfirmed   ReconciliationIssueType = "SUBMIT_UNCONFIRMED"
-	ReconciliationIssueExternalOrder       ReconciliationIssueType = "EXTERNAL_ORDER"
-	ReconciliationIssueExternalTrade       ReconciliationIssueType = "EXTERNAL_TRADE"
-	ReconciliationIssuePositionSettled     ReconciliationIssueType = "POSITION_SETTLED"
-	ReconciliationIssuePositionDrift       ReconciliationIssueType = "POSITION_DRIFT"
-	ReconciliationIssuePhantomPosition     ReconciliationIssueType = "PHANTOM_POSITION"
-	ReconciliationIssueBalanceDrift        ReconciliationIssueType = "BALANCE_DRIFT"
-	ReconciliationIssueSourceUnavailable   ReconciliationIssueType = "SOURCE_UNAVAILABLE"
-	ReconciliationIssueSourceConflict      ReconciliationIssueType = "SOURCE_CONFLICT"
+	ReconciliationIssueMissedBuyFill                 ReconciliationIssueType = "MISSED_BUY_FILL"
+	ReconciliationIssueMissedSellFill                ReconciliationIssueType = "MISSED_SELL_FILL"
+	ReconciliationIssueLocalOrderCancelled           ReconciliationIssueType = "LOCAL_ORDER_CANCELLED"
+	ReconciliationIssueSubmitUnconfirmed             ReconciliationIssueType = "SUBMIT_UNCONFIRMED"
+	ReconciliationIssueExternalOrder                 ReconciliationIssueType = "EXTERNAL_ORDER"
+	ReconciliationIssueExternalTrade                 ReconciliationIssueType = "EXTERNAL_TRADE"
+	ReconciliationIssuePositionSettled               ReconciliationIssueType = "POSITION_SETTLED"
+	ReconciliationIssuePositionDrift                 ReconciliationIssueType = "POSITION_DRIFT"
+	ReconciliationIssuePhantomPosition               ReconciliationIssueType = "PHANTOM_POSITION"
+	ReconciliationIssueExternalPositionBaselineDrift ReconciliationIssueType = "EXTERNAL_POSITION_BASELINE_DRIFT"
+	ReconciliationIssueBalanceDrift                  ReconciliationIssueType = "BALANCE_DRIFT"
+	ReconciliationIssueSourceUnavailable             ReconciliationIssueType = "SOURCE_UNAVAILABLE"
+	ReconciliationIssueSourceConflict                ReconciliationIssueType = "SOURCE_CONFLICT"
 )
 
 // ReconciliationResolution 表示后端使用的 ReconciliationResolution 类型。
@@ -131,6 +135,25 @@ type ExternalPosition struct {
 	Redeemable   bool      `json:"redeemable"`
 	Source       string    `json:"source"`
 	ObservedAt   time.Time `json:"observed_at"`
+}
+
+// ExternalPositionBaseline is immutable cutover evidence for shares that
+// predate trading_execution ownership. It is not a Position or PositionLot and
+// therefore cannot be routed to a strategy or reserved for an order.
+type ExternalPositionBaseline struct {
+	BaselineID         string          `json:"baseline_id"`
+	ExecutionAccountID string          `json:"execution_account_id"`
+	ConditionID        string          `json:"condition_id"`
+	TokenID            string          `json:"token_id"`
+	OutcomeIndex       *int            `json:"outcome_index,omitempty"`
+	OutcomeName        string          `json:"outcome_name"`
+	NegRisk            bool            `json:"neg_risk"`
+	Shares             Decimal         `json:"shares"`
+	Source             string          `json:"source"`
+	ObservedAt         time.Time       `json:"observed_at"`
+	Evidence           json.RawMessage `json:"evidence"`
+	Actor              string          `json:"actor"`
+	Reason             string          `json:"reason"`
 }
 
 // ExternalBalance 表示后端使用的 ExternalBalance 类型。

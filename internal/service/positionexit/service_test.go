@@ -2,7 +2,9 @@ package positionexit
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -216,6 +218,87 @@ func TestRunSendsPerLotDataAndExecutesPythonSellWithoutGoHoldGate(t *testing.T) 
 	}
 }
 
+// TestRunRoutesPredictionProducerToLogicalModelForRoutedLot proves the raw
+// producer identity never crosses the Python or execution boundary.
+func TestRunRoutesPredictionProducerToLogicalModelForRoutedLot(t *testing.T) {
+	fixture := newFixture(t)
+	const (
+		predictionModel = "gemini-3.6-flash"
+		logicalModel    = "gemini_masked"
+	)
+	fixture.predictionSource.snapshot.Predictions[0].Model.Name = predictionModel
+	fixture.tradeSource.trades[0].OriginModelID = predictionModel
+	fixture.tradeSource.trades[0].ModelID = logicalModel
+	fixture.strategy.build = func(request domain.PositionExitRequest) domain.PositionExitResponse {
+		if request.Context.ModelID != logicalModel || len(request.Predictions) != 1 ||
+			request.Predictions[0].Model.Name != logicalModel {
+			t.Fatalf("Python request did not receive logical model routing: %#v", request)
+		}
+		return sellResponse(request)
+	}
+	params := fixture.params()
+	params.Bindings = []domain.StrategyExecutionBinding{{
+		PredictionModelID:  predictionModel,
+		ModelID:            logicalModel,
+		StrategyID:         domain.StrategyIDMultfactorV1,
+		ExecutionAccountID: "wallet-model-a-v1",
+	}}
+	service, err := New(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Run(context.Background(), fixture.decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(result.Runs) != 1 || len(result.Runs[0].Intents) != 1 || len(fixture.executor.intents) != 1 {
+		t.Fatalf("routed lot was not exited: result=%#v intents=%#v", result, fixture.executor.intents)
+	}
+	request := result.Runs[0].Request
+	intent := fixture.executor.intents[0]
+	if request.Context.ModelID != logicalModel || request.Predictions[0].Model.Name != logicalModel ||
+		intent.ModelID != logicalModel || intent.TargetLotID != "lot-1" {
+		t.Fatalf("logical exit identity request=%#v intent=%#v", request, intent)
+	}
+	if fixture.predictionSource.snapshot.Predictions[0].Model.Name != predictionModel {
+		t.Fatalf("raw prediction snapshot was mutated: %#v", fixture.predictionSource.snapshot.Predictions[0])
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "prediction_model_id") || strings.Contains(string(payload), predictionModel) {
+		t.Fatalf("position-exit HTTP JSON leaked producer routing: %s", payload)
+	}
+}
+
+// TestLegacyThreeFieldBindingDefaultsPredictionSource keeps old configuration
+// valid when prediction_model_id is omitted.
+func TestLegacyThreeFieldBindingDefaultsPredictionSource(t *testing.T) {
+	fixture := newFixture(t)
+	var bindings []domain.StrategyExecutionBinding
+	if err := json.Unmarshal([]byte(`[{"model_id":"model-a","strategy_id":"multfactor_v1","execution_account_id":"wallet-model-a-v1"}]`), &bindings); err != nil {
+		t.Fatal(err)
+	}
+	params := fixture.params()
+	params.Bindings = bindings
+	service, err := New(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(service.bindings) != 1 || service.bindings[0].PredictionModelID != "model-a" {
+		t.Fatalf("legacy binding was not normalized: %#v", service.bindings)
+	}
+	result, err := service.Run(context.Background(), fixture.decisionAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Runs) != 1 || len(result.Runs[0].Request.Predictions) != 1 ||
+		result.Runs[0].Request.Predictions[0].Model.Name != "model-a" {
+		t.Fatalf("legacy binding prediction selection = %#v", result)
+	}
+}
+
 // TestRunRejectsSellForResolvedMarket 验证 Run Rejects Sell For Resolved Market 场景下的行为。
 func TestRunRejectsSellForResolvedMarket(t *testing.T) {
 	fixture := newFixture(t)
@@ -342,7 +425,7 @@ func (fixture *fixture) params() Params {
 		MarketUniverse: fixture.marketUniverse, OrderBookSource: fixture.bookSource,
 		MidPriceSource: fixture.historySource, Strategy: fixture.strategy,
 		Recorder: fixture.recorder, Executor: fixture.executor,
-		Bindings: []domain.StrategyExecutionContext{{
+		Bindings: []domain.StrategyExecutionBinding{{
 			ModelID: "model-a", StrategyID: "multfactor_v1", ExecutionAccountID: "wallet-model-a-v1",
 		}},
 		Venue: "polymarket", Now: func() time.Time { return fixture.decisionAt.Add(time.Second) },

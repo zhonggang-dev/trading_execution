@@ -19,40 +19,42 @@ var ErrSnapshotUnavailable = errors.New("live operations snapshot unavailable")
 
 // Params 表示实盘运维后台聚合器的依赖和刷新策略。
 type Params struct {
-	Repository     port.LiveOperationsRepository
-	Venue          port.VenueReconciliationSource
-	PositionSource port.ExternalPositionSource
-	BalanceSource  port.ExternalBalanceSource
-	OrderBooks     port.OrderBookSource
-	Accounts       []string
-	VenueName      string
-	StartedAt      time.Time
-	RunID          string
-	Interval       time.Duration
-	RefreshTimeout time.Duration
-	MaxSnapshotAge time.Duration
-	EventLimit     int
-	Now            func() time.Time
-	Logger         *slog.Logger
+	Repository        port.LiveOperationsRepository
+	Venue             port.VenueReconciliationSource
+	PositionSource    port.ExternalPositionSource
+	PositionBaselines port.ExternalPositionBaselineSource
+	BalanceSource     port.ExternalBalanceSource
+	OrderBooks        port.OrderBookSource
+	Accounts          []string
+	VenueName         string
+	StartedAt         time.Time
+	RunID             string
+	Interval          time.Duration
+	RefreshTimeout    time.Duration
+	MaxSnapshotAge    time.Duration
+	EventLimit        int
+	Now               func() time.Time
+	Logger            *slog.Logger
 }
 
 // Service 在后台聚合外部事实与本地账本，并为 HTTP 层提供原子只读快照。
 type Service struct {
-	repository     port.LiveOperationsRepository
-	venue          port.VenueReconciliationSource
-	positionSource port.ExternalPositionSource
-	balanceSource  port.ExternalBalanceSource
-	orderBooks     port.OrderBookSource
-	accounts       []string
-	venueName      string
-	startedAt      time.Time
-	runID          string
-	interval       time.Duration
-	refreshTimeout time.Duration
-	maxAge         time.Duration
-	eventLimit     int
-	now            func() time.Time
-	logger         *slog.Logger
+	repository        port.LiveOperationsRepository
+	venue             port.VenueReconciliationSource
+	positionSource    port.ExternalPositionSource
+	positionBaselines port.ExternalPositionBaselineSource
+	balanceSource     port.ExternalBalanceSource
+	orderBooks        port.OrderBookSource
+	accounts          []string
+	venueName         string
+	startedAt         time.Time
+	runID             string
+	interval          time.Duration
+	refreshTimeout    time.Duration
+	maxAge            time.Duration
+	eventLimit        int
+	now               func() time.Time
+	logger            *slog.Logger
 
 	cache            atomic.Pointer[cacheEntry]
 	errMu            sync.RWMutex
@@ -66,8 +68,9 @@ type cacheEntry struct {
 
 // New 校验依赖并创建后台实盘运维聚合器。
 func New(params Params) (*Service, error) {
-	if params.Repository == nil || params.Venue == nil || params.PositionSource == nil || params.BalanceSource == nil || params.OrderBooks == nil {
-		return nil, fmt.Errorf("live operations repository, venue, position, balance, and orderbook sources are required")
+	if params.Repository == nil || params.Venue == nil || params.PositionSource == nil || params.PositionBaselines == nil ||
+		params.BalanceSource == nil || params.OrderBooks == nil {
+		return nil, fmt.Errorf("live operations repository, venue, position, position baseline, balance, and orderbook sources are required")
 	}
 	accounts, err := normalizeAccounts(params.Accounts)
 	if err != nil {
@@ -110,8 +113,9 @@ func New(params Params) (*Service, error) {
 	}
 	return &Service{
 		repository: params.Repository, venue: params.Venue,
-		positionSource: params.PositionSource, balanceSource: params.BalanceSource,
-		orderBooks: params.OrderBooks, accounts: accounts, venueName: params.VenueName,
+		positionSource: params.PositionSource, positionBaselines: params.PositionBaselines,
+		balanceSource: params.BalanceSource,
+		orderBooks:    params.OrderBooks, accounts: accounts, venueName: params.VenueName,
 		startedAt: params.StartedAt.UTC(), runID: params.RunID,
 		interval: params.Interval, refreshTimeout: params.RefreshTimeout,
 		maxAge: params.MaxSnapshotAge, eventLimit: params.EventLimit, now: params.Now,

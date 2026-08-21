@@ -98,8 +98,9 @@ PostgreSQL 订单/预占/Fill/仓位账本、启动与持续 reconciliation、he
 
 1. 用进程外 secret 文件/HSM 安全配置钱包，并确认旧机器人已停机；同一账户不能由两个 heartbeat
    owner 并行控制。`POLY_1271`/Deposit Wallet 当前仍 fail closed；
-2. 执行并审计 migrations `0001..0013`，把钱包、账面 pUSD、已有仓位 cost basis/lots、
-   risk policy、strategy binding 和 reconciliation 基线对齐；
+2. 执行并审计 migrations `0001..0015`，把钱包、账面 pUSD、已有仓位 cost basis/lots、
+   外部持仓 ownership baseline、旧 lot 的逻辑模型路由、risk policy、strategy binding 和
+   reconciliation 基线对齐；
 3. 确认 CLOB V2 私有认证成功、`closed_only=false`、Polygon pUSD 及两个 V2 Exchange allowance
    正确，并让每个确认 Fill 都取得足够确认数的链上 `OrderFilled` 证据；
 4. 使用专用小额空钱包完成一次人工批准的 BUY/SELL/Cancel canary 后再逐步放量。
@@ -169,7 +170,7 @@ curl 'http://127.0.0.1:8090/api/v1/trades?from=2026-08-01T00:00:00Z&side=SELL&mo
 字符串小数；不返回钱包地址、CLOB 凭证、签名或原始响应。配置
 `TRADING_EXECUTION_DATABASE_URL` 后读取 PostgreSQL；未配置时 paper 模式返回空列表，
 不会把 paper 订单状态伪装成真实成交。生产库需按顺序执行至
-`migrations/0013_strategy_intent_deliveries.sql`。
+`migrations/0015_position_lot_model_routes.sql`。
 
 创建限价单：
 

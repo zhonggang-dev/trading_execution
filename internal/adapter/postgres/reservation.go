@@ -178,14 +178,17 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 			if err != nil {
 				return domain.AssetReservation{}, fmt.Errorf("lock sell position: %w", err)
 			}
-			var lotToken, lotMarket, lotModel, lotStrategy, lotStatus string
+			var lotToken, lotMarket, lotOriginModel, lotModel, lotStrategy, lotStatus string
 			var lotRemaining domain.Decimal
 			err = tx.QueryRowContext(ctx, `
-				SELECT token_id, market_id, model_id, strategy_id, status, remaining_shares::text
-				FROM position_lots
-				WHERE lot_id=$1 AND execution_account_id=$2
-				FOR UPDATE`, order.Intent.TargetLotID, order.Intent.ExecutionAccountID).Scan(
-				&lotToken, &lotMarket, &lotModel, &lotStrategy, &lotStatus, &lotRemaining)
+				SELECT lot.token_id, lot.market_id, lot.model_id,
+				       COALESCE(route.logical_model_id, lot.model_id),
+				       lot.strategy_id, lot.status, lot.remaining_shares::text
+				FROM position_lots AS lot
+				LEFT JOIN position_lot_model_routes AS route ON route.lot_id=lot.lot_id
+				WHERE lot.lot_id=$1 AND lot.execution_account_id=$2
+				FOR UPDATE OF lot`, order.Intent.TargetLotID, order.Intent.ExecutionAccountID).Scan(
+				&lotToken, &lotMarket, &lotOriginModel, &lotModel, &lotStrategy, &lotStatus, &lotRemaining)
 			if errors.Is(err, sql.ErrNoRows) {
 				return domain.AssetReservation{}, reject("TARGET_LOT_NOT_FOUND", "the selected position lot does not exist in this execution account")
 			}

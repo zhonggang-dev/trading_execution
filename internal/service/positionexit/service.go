@@ -36,7 +36,7 @@ type Params struct {
 	Strategy           port.PositionExitStrategyClient
 	Recorder           port.PositionExitRecorder
 	Executor           port.OrderExecutor
-	Bindings           []domain.StrategyExecutionContext
+	Bindings           []domain.StrategyExecutionBinding
 	Venue              string
 	Lookback           time.Duration
 	PredictionLookback time.Duration
@@ -53,7 +53,7 @@ type Service struct {
 	strategy           port.PositionExitStrategyClient
 	recorder           port.PositionExitRecorder
 	executor           port.OrderExecutor
-	bindings           []domain.StrategyExecutionContext
+	bindings           []domain.StrategyExecutionBinding
 	venue              string
 	lookback           time.Duration
 	predictionLookback time.Duration
@@ -85,7 +85,7 @@ type RunResult struct {
 
 // preparedBinding 表示后端使用的 preparedBinding 类型。
 type preparedBinding struct {
-	binding domain.StrategyExecutionContext
+	binding domain.StrategyExecutionBinding
 	request domain.PositionExitRequest
 	trades  []domain.PositionExitTrade
 	stored  bool
@@ -185,8 +185,9 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	result := RunResult{DecisionAt: decisionAt, Runs: make([]BindingRunResult, 0, len(prepared))}
 	var runErrors []error
 	for _, item := range prepared {
+		executionContext := item.binding.Context()
 		if item.err != nil {
-			run := failedRun(item.binding, item.err)
+			run := failedRun(executionContext, item.err)
 			result.Runs = append(result.Runs, run)
 			runErrors = append(runErrors, item.err)
 			continue
@@ -196,14 +197,14 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		if !item.stored {
 			if predictionErr != nil || marketErr != nil || captureErr != nil {
 				err := fmt.Errorf("capture exit decision data: %w", errors.Join(predictionErr, marketErr, captureErr))
-				result.Runs = append(result.Runs, failedRun(item.binding, err))
+				result.Runs = append(result.Runs, failedRun(executionContext, err))
 				runErrors = append(runErrors, err)
 				continue
 			}
 			request, err = buildRequest(buildRequestParams{
-				binding: item.binding, decisionAt: decisionAt, generatedAt: service.now().UTC(),
+				binding: executionContext, decisionAt: decisionAt, generatedAt: service.now().UTC(),
 				predictionSnapshotID: predictionSnapshot.SnapshotID,
-				predictions:          predictionsForExitModel(predictionSnapshot.Predictions, item.binding.ModelID),
+				predictions:          predictionsForExitBinding(predictionSnapshot.Predictions, item.binding),
 				trades:               item.trades, marketByCondition: marketByCondition,
 				bookByToken: bookByToken, historyByToken: historyByToken,
 			})
@@ -212,7 +213,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			}
 			if err != nil {
 				err = fmt.Errorf("record position exit input: %w", err)
-				result.Runs = append(result.Runs, failedRun(item.binding, err))
+				result.Runs = append(result.Runs, failedRun(executionContext, err))
 				runErrors = append(runErrors, err)
 				continue
 			}
@@ -229,11 +230,12 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 }
 
 // prepareBinding 补全并校验 Binding。
-func (service *Service) prepareBinding(ctx context.Context, binding domain.StrategyExecutionContext, decisionAt time.Time) preparedBinding {
-	cycle := cycleID(binding, decisionAt)
+func (service *Service) prepareBinding(ctx context.Context, binding domain.StrategyExecutionBinding, decisionAt time.Time) preparedBinding {
+	executionContext := binding.Context()
+	cycle := cycleID(executionContext, decisionAt)
 	stored, err := service.recorder.GetInput(ctx, cycle)
 	if err == nil {
-		params := validateInputParams{request: stored, expectedCycleID: cycle, expectedContext: binding, expectedDecisionAt: decisionAt}
+		params := validateInputParams{request: stored, expectedCycleID: cycle, expectedContext: executionContext, expectedDecisionAt: decisionAt}
 		if validateErr := validateInput(params); validateErr != nil {
 			return preparedBinding{binding: binding, err: validateErr}
 		}
@@ -454,12 +456,15 @@ type validateInputParams struct {
 	expectedDecisionAt time.Time
 }
 
-// predictionsForExitModel 筛选属于指定退出模型的预测记录。
-func predictionsForExitModel(predictions []domain.Prediction, modelID string) []domain.Prediction {
+// predictionsForExitBinding 选择上游预测模型的记录，再把副本投影为 Python
+// 和执行层使用的稳定逻辑模型。原始 PIT snapshot 始终保留 producer identity。
+func predictionsForExitBinding(predictions []domain.Prediction, binding domain.StrategyExecutionBinding) []domain.Prediction {
 	result := make([]domain.Prediction, 0)
 	for _, prediction := range predictions {
-		if strings.TrimSpace(prediction.Model.Name) == strings.TrimSpace(modelID) {
-			result = append(result, prediction)
+		if strings.TrimSpace(prediction.Model.Name) == binding.PredictionModelID {
+			cloned := prediction
+			cloned.Model.Name = binding.ModelID
+			result = append(result, cloned)
 		}
 	}
 	return result
@@ -840,13 +845,15 @@ func alignHistories(params alignHistoriesParams) ([]domain.MidPriceHistory, erro
 }
 
 // normalizeBindings 规范化 Bindings 的字段和表示。
-func normalizeBindings(bindings []domain.StrategyExecutionContext) ([]domain.StrategyExecutionContext, error) {
+func normalizeBindings(bindings []domain.StrategyExecutionBinding) ([]domain.StrategyExecutionBinding, error) {
 	if len(bindings) == 0 {
 		return nil, fmt.Errorf("at least one model/strategy/execution account binding is required")
 	}
-	result := make([]domain.StrategyExecutionContext, len(bindings))
+	result := make([]domain.StrategyExecutionBinding, len(bindings))
 	seenPairs := make(map[string]struct{}, len(bindings))
 	seenAccounts := make(map[string]struct{}, len(bindings))
+	logicalModelSources := make(map[string]string, len(bindings))
+	sourceModelTargets := make(map[string]string, len(bindings))
 	for index, binding := range bindings {
 		binding = binding.Normalize()
 		if err := binding.Validate(); err != nil {
@@ -859,8 +866,16 @@ func normalizeBindings(bindings []domain.StrategyExecutionContext) ([]domain.Str
 		if _, exists := seenAccounts[binding.ExecutionAccountID]; exists {
 			return nil, fmt.Errorf("execution account %q is bound more than once", binding.ExecutionAccountID)
 		}
+		if sourceModelID, exists := logicalModelSources[binding.ModelID]; exists && sourceModelID != binding.PredictionModelID {
+			return nil, fmt.Errorf("logical model %q is routed from multiple prediction models", binding.ModelID)
+		}
+		if logicalModelID, exists := sourceModelTargets[binding.PredictionModelID]; exists && logicalModelID != binding.ModelID {
+			return nil, fmt.Errorf("prediction model %q is routed to multiple logical models", binding.PredictionModelID)
+		}
 		seenPairs[pair] = struct{}{}
 		seenAccounts[binding.ExecutionAccountID] = struct{}{}
+		logicalModelSources[binding.ModelID] = binding.PredictionModelID
+		sourceModelTargets[binding.PredictionModelID] = binding.ModelID
 		result[index] = binding
 	}
 	sort.Slice(result, func(i, j int) bool {

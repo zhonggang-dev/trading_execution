@@ -174,11 +174,18 @@ func loadLivePositions(ctx context.Context, tx *sql.Tx, clause string, args []an
 		       COALESCE(label.market_label, ''), signal.signal_at
 		FROM execution_positions AS position
 		LEFT JOIN LATERAL (
-			SELECT string_agg(DISTINCT model_id, ',' ORDER BY model_id) AS model_id,
-			       string_agg(DISTINCT execution_canonical_strategy_id(strategy_id), ',' ORDER BY execution_canonical_strategy_id(strategy_id)) AS strategy_id
-			FROM position_lots
-			WHERE execution_account_id=position.execution_account_id AND token_id=position.token_id
-			  AND status IN ('OPEN','SETTLED_PENDING_REDEEM')
+			SELECT string_agg(
+			           DISTINCT COALESCE(route.logical_model_id, lot_row.model_id), ','
+			           ORDER BY COALESCE(route.logical_model_id, lot_row.model_id)
+			       ) AS model_id,
+			       string_agg(
+			           DISTINCT execution_canonical_strategy_id(lot_row.strategy_id), ','
+			           ORDER BY execution_canonical_strategy_id(lot_row.strategy_id)
+			       ) AS strategy_id
+			FROM position_lots AS lot_row
+			LEFT JOIN position_lot_model_routes AS route ON route.lot_id=lot_row.lot_id
+			WHERE lot_row.execution_account_id=position.execution_account_id AND lot_row.token_id=position.token_id
+			  AND lot_row.status IN ('OPEN','SETTLED_PENDING_REDEEM')
 		) AS lot ON TRUE
 		LEFT JOIN LATERAL (
 			SELECT intent->'metadata'->>'market_question' AS market_label

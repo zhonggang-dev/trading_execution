@@ -2,6 +2,7 @@ package reconciliation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -176,6 +177,122 @@ func TestStartupWithoutAccountBaselineStillScansFullVenueHistory(t *testing.T) {
 	}
 }
 
+func TestExternalPositionBaselineOnlyIsHealthyAndNeverBecomesManaged(t *testing.T) {
+	ledger := &fakeLedger{balance: testBalance("100")}
+	service := newPositionBaselineTestService(t, ledger, []domain.ExternalPositionBaseline{
+		testExternalPositionBaseline("5"),
+	}, []domain.ExternalPosition{
+		testExternalPosition("5"),
+	})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerStartup,
+	})
+	if err != nil || result.Run.Status != domain.ReconciliationRunCompleted {
+		t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+	}
+	if len(result.Issues) != 0 || len(ledger.positions) != 0 || len(ledger.settled) != 0 {
+		t.Fatalf("unmanaged baseline leaked into managed state: issues=%#v positions=%#v settled=%#v", result.Issues, ledger.positions, ledger.settled)
+	}
+}
+
+func TestExternalPositionBaselineAddsToManagedShares(t *testing.T) {
+	ledger := &fakeLedger{
+		balance: testBalance("100"),
+		positions: []domain.Position{{
+			ExecutionAccountID: "account-1", MarketID: "market-1", ConditionID: "condition-1",
+			TokenID: "token-1", OutcomeIndex: intPointer(0), OutcomeName: "YES",
+			TotalShares: "2", AvailableShares: "2", ReservedShares: "0",
+			LifecycleStatus: domain.PositionLifecycleOpen,
+		}},
+	}
+	service := newPositionBaselineTestService(t, ledger, []domain.ExternalPositionBaseline{
+		testExternalPositionBaseline("5"),
+	}, []domain.ExternalPosition{
+		testExternalPosition("7"),
+	})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil || result.Run.Status != domain.ReconciliationRunCompleted {
+		t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+	}
+	if len(result.Issues) != 0 || ledger.positions[0].TotalShares != "2" || len(ledger.settled) != 0 {
+		t.Fatalf("baseline changed managed state: issues=%#v positions=%#v settled=%#v", result.Issues, ledger.positions, ledger.settled)
+	}
+}
+
+func TestExternalPositionBaselineQuantityDriftFailsClosed(t *testing.T) {
+	for _, remoteShares := range []domain.Decimal{"6.9", "7.1", "7.0000001"} {
+		t.Run(remoteShares.String(), func(t *testing.T) {
+			ledger := &fakeLedger{
+				balance: testBalance("100"),
+				positions: []domain.Position{{
+					ExecutionAccountID: "account-1", MarketID: "market-1", ConditionID: "condition-1",
+					TokenID: "token-1", OutcomeIndex: intPointer(0), OutcomeName: "YES",
+					TotalShares: "2", AvailableShares: "2", ReservedShares: "0",
+					LifecycleStatus: domain.PositionLifecycleOpen,
+				}},
+			}
+			service := newPositionBaselineTestService(t, ledger, []domain.ExternalPositionBaseline{
+				testExternalPositionBaseline("5"),
+			}, []domain.ExternalPosition{
+				testExternalPosition(remoteShares),
+			})
+
+			result, err := service.RunAccount(context.Background(), RunAccountParams{
+				ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+			})
+			if err != nil || result.Run.Status != domain.ReconciliationRunAttentionRequired {
+				t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+			}
+			assertIssue(t, result.Issues, domain.ReconciliationIssueExternalPositionBaselineDrift, domain.ReconciliationIssueOpen)
+			if ledger.positions[0].TotalShares != "2" || len(ledger.settled) != 0 {
+				t.Fatalf("drift caused a managed mutation: positions=%#v settled=%#v", ledger.positions, ledger.settled)
+			}
+		})
+	}
+}
+
+func TestExternalPositionBaselineIdentityMismatchFailsClosed(t *testing.T) {
+	remote := testExternalPosition("5")
+	remote.ConditionID = "condition-other"
+	ledger := &fakeLedger{balance: testBalance("100")}
+	service := newPositionBaselineTestService(t, ledger, []domain.ExternalPositionBaseline{
+		testExternalPositionBaseline("5"),
+	}, []domain.ExternalPosition{remote})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil || result.Run.Status != domain.ReconciliationRunAttentionRequired {
+		t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+	}
+	assertIssue(t, result.Issues, domain.ReconciliationIssueExternalPositionBaselineDrift, domain.ReconciliationIssueOpen)
+	if len(ledger.positions) != 0 {
+		t.Fatalf("identity mismatch created a managed position: %#v", ledger.positions)
+	}
+}
+
+func TestUnbaselinedExternalPositionRemainsPhantom(t *testing.T) {
+	ledger := &fakeLedger{balance: testBalance("100")}
+	service := newPositionBaselineTestService(t, ledger, nil, []domain.ExternalPosition{
+		testExternalPosition("1"),
+	})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil || result.Run.Status != domain.ReconciliationRunAttentionRequired {
+		t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+	}
+	assertIssue(t, result.Issues, domain.ReconciliationIssuePhantomPosition, domain.ReconciliationIssueOpen)
+	if len(ledger.positions) != 0 {
+		t.Fatalf("phantom position was imported into managed state: %#v", ledger.positions)
+	}
+}
+
 // TestRunAccountLeavesUnattributableStateForManualReview 验证 Run Account Leaves Unattributable State For Manual Review 场景下的行为。
 func TestRunAccountLeavesUnattributableStateForManualReview(t *testing.T) {
 	unknown := testOrder("order-unknown", "", domain.OrderStatusUnknown)
@@ -347,6 +464,15 @@ func (function positionSourceFunc) ListExternalPositions(ctx context.Context, wa
 	return function(ctx, wallet)
 }
 
+type positionBaselineSourceFunc func(context.Context, string) ([]domain.ExternalPositionBaseline, error)
+
+func (function positionBaselineSourceFunc) ListExternalPositionBaselines(
+	ctx context.Context,
+	executionAccountID string,
+) ([]domain.ExternalPositionBaseline, error) {
+	return function(ctx, executionAccountID)
+}
+
 // balanceSourceFunc 表示后端使用的 balanceSourceFunc 类型。
 type balanceSourceFunc func(context.Context, string, string) (domain.ExternalBalance, error)
 
@@ -475,6 +601,11 @@ func (recorder *fakeRecorder) Complete(_ context.Context, run domain.Reconciliat
 func newTestService(t *testing.T, params Params) *Service {
 	t.Helper()
 	params.Recorder = &fakeRecorder{}
+	if params.PositionBaselines == nil {
+		params.PositionBaselines = positionBaselineSourceFunc(func(context.Context, string) ([]domain.ExternalPositionBaseline, error) {
+			return nil, nil
+		})
+	}
 	params.Now = func() time.Time { return testNow }
 	sequence := 0
 	params.NewID = func() string {
@@ -511,6 +642,48 @@ func testBalance(total domain.Decimal) domain.AccountBalance {
 		ExecutionAccountID: "account-1", WalletAddress: "0x1111111111111111111111111111111111111111",
 		CollateralAsset: "USDC", TotalBalance: total, AvailableBalance: total, ReservedBalance: "0",
 	}
+}
+
+func newPositionBaselineTestService(
+	t *testing.T,
+	ledger *fakeLedger,
+	baselines []domain.ExternalPositionBaseline,
+	remote []domain.ExternalPosition,
+) *Service {
+	t.Helper()
+	return newTestService(t, Params{
+		Orders: &fakeOrders{}, Venue: &fakeVenue{}, Ledger: ledger,
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{},
+		PositionBaselines: positionBaselineSourceFunc(func(context.Context, string) ([]domain.ExternalPositionBaseline, error) {
+			return append([]domain.ExternalPositionBaseline(nil), baselines...), nil
+		}),
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return append([]domain.ExternalPosition(nil), remote...), nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+}
+
+func testExternalPositionBaseline(shares domain.Decimal) domain.ExternalPositionBaseline {
+	return domain.ExternalPositionBaseline{
+		BaselineID: "baseline-1", ExecutionAccountID: "account-1",
+		ConditionID: "condition-1", TokenID: "token-1", OutcomeIndex: intPointer(0),
+		OutcomeName: "YES", Shares: shares, Source: "DATA_API", ObservedAt: testNow.Add(-time.Hour),
+		Evidence: json.RawMessage(`{"snapshot_sha256":"abc123"}`), Actor: "operator-1", Reason: "initial live account cutover",
+	}
+}
+
+func testExternalPosition(shares domain.Decimal) domain.ExternalPosition {
+	return domain.ExternalPosition{
+		ConditionID: "condition-1", TokenID: "token-1", OutcomeIndex: intPointer(0),
+		OutcomeName: "YES", Shares: shares, Source: "DATA_API", ObservedAt: testNow,
+	}
+}
+
+func intPointer(value int) *int {
+	return &value
 }
 
 // assertIssue 执行对应的测试断言。

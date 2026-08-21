@@ -2,6 +2,7 @@ package liveoperations
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -42,6 +43,17 @@ func (venue *fakeVenue) ListReconciliationTrades(context.Context, string, time.T
 type fakePositionSource struct {
 	positions []domain.ExternalPosition
 	err       error
+}
+
+// fakePositionBaselineSource returns sealed unmanaged position evidence.
+type fakePositionBaselineSource struct {
+	baselines []domain.ExternalPositionBaseline
+	err       error
+}
+
+// ListExternalPositionBaselines returns the configured account cutover items.
+func (source *fakePositionBaselineSource) ListExternalPositionBaselines(context.Context, string) ([]domain.ExternalPositionBaseline, error) {
+	return source.baselines, source.err
 }
 
 // ListExternalPositions 返回预设外部持仓。
@@ -135,6 +147,98 @@ func TestPositionDriftAndMissingWorkerCannotAppearHealthy(t *testing.T) {
 	}
 }
 
+func TestExternalPositionBaselineOnlyIsExcludedFromManagedOperations(t *testing.T) {
+	now := time.Date(2026, 8, 19, 8, 0, 10, 0, time.UTC)
+	service, _, repository := newTestService(t, &now)
+	repository.state.Positions = nil
+	service.positionSource.(*fakePositionSource).positions = []domain.ExternalPosition{
+		testLiveExternalPosition(&now, "5"),
+	}
+	service.positionBaselines.(*fakePositionBaselineSource).baselines = []domain.ExternalPositionBaseline{
+		testLivePositionBaseline(&now, "5"),
+	}
+
+	if err := service.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	snapshot, err := service.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Positions) != 0 || snapshot.Capital.GrossExposure != "0" || snapshot.Capital.Equity != "100" {
+		t.Fatalf("unmanaged baseline leaked into operations snapshot: positions=%#v capital=%#v", snapshot.Positions, snapshot.Capital)
+	}
+	if snapshot.Engine.Health != domain.LiveHealthHealthy || dataQualityStatus(snapshot.DataQuality, "positions") != domain.LiveHealthHealthy {
+		t.Fatalf("baseline-only position degraded operations health: engine=%s quality=%#v", snapshot.Engine.Health, snapshot.DataQuality)
+	}
+}
+
+func TestExternalPositionBaselineProjectsRemoteTotalToManagedShares(t *testing.T) {
+	now := time.Date(2026, 8, 19, 8, 0, 10, 0, time.UTC)
+	service, _, _ := newTestService(t, &now)
+	service.positionSource.(*fakePositionSource).positions[0].Shares = "15"
+	service.positionBaselines.(*fakePositionBaselineSource).baselines = []domain.ExternalPositionBaseline{
+		testLivePositionBaseline(&now, "5"),
+	}
+
+	if err := service.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	snapshot, err := service.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Positions) != 1 || snapshot.Positions[0].Shares != "10" ||
+		snapshot.Capital.GrossExposure != "4" || snapshot.Capital.Equity != "105.5" {
+		t.Fatalf("managed baseline projection = positions=%#v capital=%#v", snapshot.Positions, snapshot.Capital)
+	}
+	if dataQualityStatus(snapshot.DataQuality, "positions") != domain.LiveHealthHealthy {
+		t.Fatalf("matching managed+baseline total degraded quality: %#v", snapshot.DataQuality)
+	}
+}
+
+func TestExternalPositionBaselineDriftFailsClosed(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*Service)
+	}{
+		{
+			name: "quantity",
+			mutate: func(service *Service) {
+				service.positionSource.(*fakePositionSource).positions[0].Shares = "14.999999"
+			},
+		},
+		{
+			name: "identity",
+			mutate: func(service *Service) {
+				service.positionSource.(*fakePositionSource).positions[0].ConditionID = "condition-other"
+			},
+		},
+		{
+			name: "missing remote token",
+			mutate: func(service *Service) {
+				service.positionSource.(*fakePositionSource).positions = nil
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			now := time.Date(2026, 8, 19, 8, 0, 10, 0, time.UTC)
+			service, _, _ := newTestService(t, &now)
+			service.positionSource.(*fakePositionSource).positions[0].Shares = "15"
+			service.positionBaselines.(*fakePositionBaselineSource).baselines = []domain.ExternalPositionBaseline{
+				testLivePositionBaseline(&now, "5"),
+			}
+			testCase.mutate(service)
+			if err := service.Refresh(context.Background()); err == nil {
+				t.Fatal("Refresh() error = nil, want immutable baseline drift failure")
+			}
+			if _, err := service.Snapshot(context.Background()); !errors.Is(err, ErrSnapshotUnavailable) {
+				t.Fatalf("Snapshot() error = %v, want ErrSnapshotUnavailable", err)
+			}
+		})
+	}
+}
+
 // newTestService 创建包含一个账户、一个仓位和完整健康状态的聚合服务。
 func newTestService(t *testing.T, now *time.Time) (*Service, *fakeBalanceSource, *fakeRepository) {
 	t.Helper()
@@ -171,13 +275,15 @@ func newTestService(t *testing.T, now *time.Time) (*Service, *fakeBalanceSource,
 		ConditionID: "condition-1", TokenID: "token-yes", OutcomeIndex: intPointer(0), OutcomeName: "YES",
 		Shares: "10", AveragePrice: "0.4", CurrentPrice: "0.54", ObservedAt: now.Add(-time.Second),
 	}}}
+	baselines := &fakePositionBaselineSource{}
 	books := &fakeBookSource{books: []domain.OrderBookSnapshot{{
 		MarketID: "market-1", ConditionID: "condition-1", TokenID: "token-yes", OutcomeIndex: 0,
 		Status: domain.OrderBookStatusOK, BestBid: "0.5", BestAsk: "0.6", ObservedAt: bookAt,
 	}}}
 	service, err := New(Params{
 		Repository: repository, Venue: &fakeVenue{}, PositionSource: positions,
-		BalanceSource: balance, OrderBooks: books, Accounts: []string{"account-1"},
+		PositionBaselines: baselines, BalanceSource: balance, OrderBooks: books,
+		Accounts:  []string{"account-1"},
 		VenueName: "Polymarket CLOB", StartedAt: now.Add(-time.Hour), RunID: "run-1",
 		Interval: 5 * time.Second, RefreshTimeout: time.Second, MaxSnapshotAge: 15 * time.Second,
 		Now: func() time.Time { return *now },
@@ -186,6 +292,23 @@ func newTestService(t *testing.T, now *time.Time) (*Service, *fakeBalanceSource,
 		t.Fatalf("New() error = %v", err)
 	}
 	return service, balance, repository
+}
+
+func testLivePositionBaseline(now *time.Time, shares domain.Decimal) domain.ExternalPositionBaseline {
+	return domain.ExternalPositionBaseline{
+		BaselineID: "baseline-1", ExecutionAccountID: "account-1",
+		ConditionID: "condition-1", TokenID: "token-yes", OutcomeIndex: intPointer(0),
+		OutcomeName: "YES", Shares: shares, Source: "POLYMARKET_DATA_API",
+		ObservedAt: now.Add(-2 * time.Second), Evidence: json.RawMessage(`{"snapshot_sha256":"abc123"}`),
+		Actor: "integration-test", Reason: "initial account cutover",
+	}
+}
+
+func testLiveExternalPosition(now *time.Time, shares domain.Decimal) domain.ExternalPosition {
+	return domain.ExternalPosition{
+		ConditionID: "condition-1", TokenID: "token-yes", OutcomeIndex: intPointer(0), OutcomeName: "YES",
+		Shares: shares, AveragePrice: "0.4", CurrentPrice: "0.54", ObservedAt: now.Add(-time.Second),
+	}
 }
 
 // intPointer 返回测试需要的 outcome index 指针。

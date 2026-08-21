@@ -100,13 +100,15 @@ func CheckLiveLedgerBootstrap(ctx context.Context, db *sql.DB, accounts []Expect
 				(SELECT count(*)
 				 FROM asset_reservations reservation
 				 LEFT JOIN position_lots lot ON lot.lot_id=reservation.target_lot_id
+				 LEFT JOIN position_lot_model_routes route ON route.lot_id=lot.lot_id
 				 LEFT JOIN execution_orders order_row ON order_row.order_id=reservation.order_id
 				 WHERE reservation.execution_account_id=$1 AND reservation.side='SELL'
 				   AND reservation.status IN ('ACTIVE','RECONCILIATION_REQUIRED')
 				   AND (lot.lot_id IS NULL OR lot.status<>'OPEN'
 				     OR lot.execution_account_id<>reservation.execution_account_id
 				     OR lot.market_id<>reservation.market_id OR lot.token_id<>reservation.token_id
-				     OR lot.model_id<>COALESCE(order_row.intent->>'model_id','')
+				     OR COALESCE(route.logical_model_id,lot.model_id)
+				        <>COALESCE(order_row.intent->>'model_id','')
 				     OR execution_canonical_strategy_id(lot.strategy_id)
 				        <>execution_canonical_strategy_id(reservation.strategy_id)
 				     OR reservation.remaining_reserved_shares>lot.remaining_shares)),

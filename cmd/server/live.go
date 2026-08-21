@@ -296,18 +296,23 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	positionBaselines, err := postgresadapter.NewExternalPositionBaselineRepository(database)
+	if err != nil {
+		return nil, err
+	}
 	reconciliationService, err := reconciliation.New(reconciliation.Params{
-		Orders:          repository,
-		Venue:           tradingClient,
-		PositionSources: []port.ExternalPositionSource{positionSource},
-		BalanceSources:  []port.ExternalBalanceSource{balanceSource},
-		Ledger:          fillLedger,
-		Fills:           fillProcessor,
-		OrderRefresher:  executionService,
-		Recorder:        recorder,
-		TradeLookback:   cfg.Polymarket.ReconciliationLookback,
-		PositionEpsilon: cfg.Polymarket.PositionEpsilon,
-		BalanceEpsilon:  cfg.Polymarket.BalanceEpsilon,
+		Orders:            repository,
+		Venue:             tradingClient,
+		PositionSources:   []port.ExternalPositionSource{positionSource},
+		PositionBaselines: positionBaselines,
+		BalanceSources:    []port.ExternalBalanceSource{balanceSource},
+		Ledger:            fillLedger,
+		Fills:             fillProcessor,
+		OrderRefresher:    executionService,
+		Recorder:          recorder,
+		TradeLookback:     cfg.Polymarket.ReconciliationLookback,
+		PositionEpsilon:   cfg.Polymarket.PositionEpsilon,
+		BalanceEpsilon:    cfg.Polymarket.BalanceEpsilon,
 	})
 	if err != nil {
 		return nil, err
@@ -340,7 +345,8 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	}
 	operations, err := liveoperations.New(liveoperations.Params{
 		Repository: liveOperationsRepository, Venue: tradingClient,
-		PositionSource: positionSource, BalanceSource: balanceSource, OrderBooks: orderBooks,
+		PositionSource: positionSource, PositionBaselines: positionBaselines,
+		BalanceSource: balanceSource, OrderBooks: orderBooks,
 		Accounts: accountIDs, VenueName: "Polymarket CLOB", StartedAt: startedAt,
 		RunID:    "live-" + startedAt.Format("20060102T150405.000000000Z"),
 		Interval: cfg.LiveOperations.Interval, RefreshTimeout: cfg.LiveOperations.RefreshTimeout,

@@ -171,6 +171,12 @@ type ExternalPositionSource interface {
 	ListExternalPositions(ctx context.Context, walletAddress string) ([]domain.ExternalPosition, error)
 }
 
+// ExternalPositionBaselineSource reads immutable cutover evidence for shares
+// that are present in a wallet but are outside trading_execution ownership.
+type ExternalPositionBaselineSource interface {
+	ListExternalPositionBaselines(ctx context.Context, executionAccountID string) ([]domain.ExternalPositionBaseline, error)
+}
+
 // ExternalBalanceSource 表示后端使用的 ExternalBalanceSource 类型。
 type ExternalBalanceSource interface {
 	GetExternalBalance(ctx context.Context, walletAddress, asset string) (domain.ExternalBalance, error)
