@@ -432,6 +432,7 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 	maskedPrediction := validPrediction(decisionAt)
 	maskedPrediction.PredictionID = "pred-masked"
 	maskedPrediction.SourceJobID = "job-masked"
+	maskedPrediction.SandboxID = "sandbox-gemini"
 	maskedPrediction.Model.Name = "gemini-3.6-flash"
 	maskedPrediction.MarketID = "market-gemini"
 	maskedPrediction.ConditionID = "condition-gemini"
@@ -485,8 +486,10 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 		if request.Context.ModelID == "echo" && request.Predictions[0].MarketID != "market-echo" {
 			t.Fatalf("echo received another model's market: %#v", request.Predictions)
 		}
-		if request.Context.ModelID == "gemini_masked" && request.Predictions[0].MarketID != "market-gemini" {
-			t.Fatalf("gemini_masked received another model's market: %#v", request.Predictions)
+		if request.Context.ModelID == "gemini_masked" &&
+			(request.Predictions[0].MarketID != "market-gemini" ||
+				request.Predictions[0].SandboxID != "sandbox-gemini") {
+			t.Fatalf("gemini_masked did not receive the Sandbox result: %#v", request.Predictions)
 		}
 		if request.CycleID != request.Context.ExecutionAccountID+":"+decisionAt.Format("20060102T150405Z") {
 			t.Fatalf("cycle_id = %q", request.CycleID)
@@ -889,6 +892,51 @@ func TestRunNewerSandboxResultReplacesOlderDirectResult(t *testing.T) {
 	}
 }
 
+func TestRunNewerDirectResultReplacesOlderSandboxResult(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	sandbox := validPrediction(decisionAt)
+	sandbox.Model.Name = "echo-producer-v7"
+	sandbox.SandboxID = "sandbox-1"
+	direct := sandbox
+	direct.Outcomes = append([]domain.PredictionOutcome(nil), sandbox.Outcomes...)
+	direct.PredictionID = "pred-direct-newer"
+	direct.SourceJobID = "job-direct-newer"
+	direct.SandboxID = ""
+	direct.PredictionAsOf = decisionAt.Add(-5 * time.Minute)
+	direct.CompletedAt = decisionAt.Add(-4 * time.Minute)
+	direct.AvailableAt = decisionAt.Add(-3 * time.Minute)
+	direct.Outcomes[0].Probability = 0.85
+	direct.Outcomes[1].Probability = 0.15
+	strategy := &matrixStrategy{}
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-direct-newer",
+			DecisionAt: decisionAt, Predictions: []domain.Prediction{sandbox, direct},
+		}},
+		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
+		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		RequireCompleteModelCoverage: true,
+		Bindings: []domain.StrategyExecutionBinding{{
+			PredictionModelID: "echo-producer-v7", ModelID: "echo",
+			StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main",
+		}},
+		Venue: "polymarket-paper",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
+		strategy.requests[0].Predictions[0].PredictionID != direct.PredictionID ||
+		strategy.requests[0].Predictions[0].Outcomes[0].Probability != 0.85 ||
+		len(result.Runs) != 1 || !result.Runs[0].EntrySubmissionEnabled {
+		t.Fatalf("newest Direct result = %#v, requests = %#v", result, strategy.requests)
+	}
+}
+
 func TestRunSandboxOnlyResultIsRoutedAndAllowsBindingEntry(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	sandbox := validPrediction(decisionAt)
@@ -1077,6 +1125,7 @@ func TestRunCompletedTaskOlderThanPredictionLookbackCannotAuthorizeEntry(t *test
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	stale := validPrediction(decisionAt)
 	stale.Model.Name = "echo-producer-v7"
+	stale.SandboxID = "sandbox-stale"
 	stale.PredictionAsOf = decisionAt.Add(-4 * time.Hour)
 	strategy := &matrixStrategy{}
 	service, err := New(Params{
