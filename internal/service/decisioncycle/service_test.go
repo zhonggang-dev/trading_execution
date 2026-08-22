@@ -1569,8 +1569,23 @@ func TestStrategySpecificEvidenceMetricsAndUniverseReason(t *testing.T) {
 		t.Fatalf("v1 evidence error = %v", err)
 	}
 	evidence.Metrics["MOM"] = "-0.01"
+	evidence.Metrics["best_bid"] = "0.49"
+	evidence.Metrics["expected_avg_price"] = "0.501"
+	evidence.Metrics["target_shares"] = "19.96007984031936"
+	evidence.Metrics["depth_capped"] = "1"
 	if err := validateEvidenceMetrics(evidence, request, "token", true); err != nil {
-		t.Fatalf("optional v1 hourly evidence error = %v", err)
+		t.Fatalf("optional Python audit metrics error = %v", err)
+	}
+	evidence.Metrics[" "] = "1"
+	if err := validateEvidenceMetrics(evidence, request, "token", true); err == nil ||
+		!strings.Contains(err.Error(), "key must be non-empty") {
+		t.Fatalf("blank metrics key error = %v", err)
+	}
+	delete(evidence.Metrics, " ")
+	evidence.Metrics["expected_avg_price"] = "not-a-decimal"
+	if err := validateEvidenceMetrics(evidence, request, "token", true); err == nil ||
+		!strings.Contains(err.Error(), "must be a decimal string") {
+		t.Fatalf("invalid metrics value error = %v", err)
 	}
 	if !validSkipReason(domain.StrategyReasonOutsideUniverse) {
 		t.Fatal("OUTSIDE_STRATEGY_UNIVERSE is not accepted as an auditable SKIP reason")

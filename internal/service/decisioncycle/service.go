@@ -1468,12 +1468,9 @@ func rationalDecimalPlaces(value *big.Rat) int {
 // validateEvidenceMetrics 校验 Evidence Metrics 的字段和业务约束。
 func validateEvidenceMetrics(evidence domain.StrategyEvidence, request domain.StrategyDecisionRequest, tokenID string, requireAll bool) error {
 	strategyID := request.Context.Normalize().StrategyID
-	allowed := map[string]struct{}{
-		"best_ask": {}, "near_logdiff_usd": {}, "rel_spread": {}, "MOM": {}, "MACD_SIGNAL": {},
-	}
 	for key, value := range evidence.Metrics {
-		if _, ok := allowed[key]; !ok {
-			return fmt.Errorf("unsupported evidence.metrics key %q", key)
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("evidence.metrics key must be non-empty")
 		}
 		if _, err := domain.ParseDecimal(value); err != nil {
 			return fmt.Errorf("evidence.metrics.%s must be a decimal string", key)
