@@ -845,7 +845,7 @@ func TestRunRoutesLatestCompletedResultWithoutManifestDependency(t *testing.T) {
 	}
 }
 
-func TestRunNewerSandboxResultCannotReplaceDirectResult(t *testing.T) {
+func TestRunNewerSandboxResultReplacesOlderDirectResult(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	direct := validPrediction(decisionAt)
 	direct.Model.Name = "echo-producer-v7"
@@ -882,13 +882,14 @@ func TestRunNewerSandboxResultCannotReplaceDirectResult(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
-		strategy.requests[0].Predictions[0].PredictionID != direct.PredictionID ||
+		strategy.requests[0].Predictions[0].PredictionID != sandbox.PredictionID ||
+		strategy.requests[0].Predictions[0].Outcomes[0].Probability != 0.9 ||
 		len(result.Runs) != 1 || !result.Runs[0].EntrySubmissionEnabled {
-		t.Fatalf("direct-only routed result = %#v, requests = %#v", result, strategy.requests)
+		t.Fatalf("newest Sandbox result = %#v, requests = %#v", result, strategy.requests)
 	}
 }
 
-func TestRunSandboxOnlyResultLeavesBindingEmptyAndBuyBlocked(t *testing.T) {
+func TestRunSandboxOnlyResultIsRoutedAndAllowsBindingEntry(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	sandbox := validPrediction(decisionAt)
 	sandbox.Model.Name = "echo-producer-v7"
@@ -915,9 +916,10 @@ func TestRunSandboxOnlyResultLeavesBindingEmptyAndBuyBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 0 ||
-		len(result.Runs) != 1 || result.Runs[0].EntrySubmissionEnabled ||
-		result.Runs[0].EntryBlockReason != domain.StrategyEntryBlockIncompleteModelCoverage {
+	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
+		strategy.requests[0].Predictions[0].PredictionID != sandbox.PredictionID ||
+		len(result.Runs) != 1 || !result.Runs[0].EntrySubmissionEnabled ||
+		result.Runs[0].EntryBlockReason != "" {
 		t.Fatalf("sandbox-only result = %#v, requests = %#v", result, strategy.requests)
 	}
 }

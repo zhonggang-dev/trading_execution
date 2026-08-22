@@ -716,10 +716,11 @@ func configuredPredictionModels(bindings []domain.StrategyExecutionBinding) []st
 	return result
 }
 
-// selectAvailablePredictions routes the completed result table directly. Each
-// (Market, source model) is independent: a result for Echo never requires a
-// Gemini result for that Market, and vice versa. The newest fresh PIT row for
-// each configured pair wins deterministically.
+// selectAvailablePredictions routes the completed result table directly. Both
+// Sandbox and Direct rows are valid production algorithm results; SandboxID is
+// lineage for audit, not an exclusion flag. Each (Market, source model) is
+// independent, and the newest fresh PIT row for each configured pair wins
+// deterministically.
 func selectAvailablePredictions(
 	predictions []domain.Prediction,
 	modelIDs []string,
@@ -727,8 +728,7 @@ func selectAvailablePredictions(
 ) ([]domain.Prediction, error) {
 	fresh := make([]domain.Prediction, 0, len(predictions))
 	for _, prediction := range predictions {
-		if strings.TrimSpace(prediction.SandboxID) != "" ||
-			prediction.PredictionAsOf.Before(freshAfter) || prediction.CompletedAt.Before(freshAfter) {
+		if prediction.PredictionAsOf.Before(freshAfter) || prediction.CompletedAt.Before(freshAfter) {
 			continue
 		}
 		fresh = append(fresh, prediction)
