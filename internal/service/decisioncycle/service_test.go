@@ -417,24 +417,26 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 	}
 }
 
-// TestRunRoutesTwoModelsForSameMarketIntoFourWallets 验证同一 Market 的两个模型概率各自复用到 v1/v2 钱包。
-func TestRunRoutesTwoModelsForSameMarketIntoFourWallets(t *testing.T) {
+// TestRunRoutesIndependentModelMarketsIntoFourWallets verifies that each
+// available (Market, source model) result is routed only to that model's two
+// strategy wallets. No cross-model Market coverage is required.
+func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	echoPrediction := validPrediction(decisionAt)
 	echoPrediction.PredictionID = "pred-echo"
 	echoPrediction.Model.Name = "echo-producer-v7"
-	echoPrediction.MarketID = "market-shared"
-	echoPrediction.ConditionID = "condition-shared"
-	echoPrediction.Outcomes[0].TokenID = "shared-yes"
-	echoPrediction.Outcomes[1].TokenID = "shared-no"
+	echoPrediction.MarketID = "market-echo"
+	echoPrediction.ConditionID = "condition-echo"
+	echoPrediction.Outcomes[0].TokenID = "echo-yes"
+	echoPrediction.Outcomes[1].TokenID = "echo-no"
 	maskedPrediction := validPrediction(decisionAt)
 	maskedPrediction.PredictionID = "pred-masked"
 	maskedPrediction.SourceJobID = "job-masked"
 	maskedPrediction.Model.Name = "gemini-3.6-flash"
-	maskedPrediction.MarketID = "market-shared"
-	maskedPrediction.ConditionID = "condition-shared"
-	maskedPrediction.Outcomes[0].TokenID = "shared-yes"
-	maskedPrediction.Outcomes[1].TokenID = "shared-no"
+	maskedPrediction.MarketID = "market-gemini"
+	maskedPrediction.ConditionID = "condition-gemini"
+	maskedPrediction.Outcomes[0].TokenID = "gemini-yes"
+	maskedPrediction.Outcomes[1].TokenID = "gemini-no"
 	predictions := []domain.Prediction{echoPrediction, maskedPrediction}
 	bindings := fourWalletBindings()
 	bookSource := &fakeOrderBookSource{}
@@ -442,11 +444,10 @@ func TestRunRoutesTwoModelsForSameMarketIntoFourWallets(t *testing.T) {
 	strategy := &matrixStrategy{}
 	service, err := New(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
-			SchemaVersion:       domain.PredictionSnapshotSchemaVersion,
-			SnapshotID:          "predsnap-matrix",
-			DecisionAt:          decisionAt,
-			Predictions:         predictions,
-			ExpectedPredictions: completedPredictionExpectations(predictions, 1, 1),
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
+			SnapshotID:    "predsnap-matrix",
+			DecisionAt:    decisionAt,
+			Predictions:   predictions,
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              bookSource,
@@ -470,21 +471,21 @@ func TestRunRoutesTwoModelsForSameMarketIntoFourWallets(t *testing.T) {
 	if len(result.Runs) != 4 || len(strategy.requests) != 4 {
 		t.Fatalf("runs/requests = %d/%d, want 4/4", len(result.Runs), len(strategy.requests))
 	}
-	if len(bookSource.targets) != 2 {
-		t.Fatalf("shared orderbook targets = %d, want two de-duplicated outcome tokens", len(bookSource.targets))
+	if len(bookSource.targets) != 4 {
+		t.Fatalf("independent orderbook targets = %d, want four outcome tokens", len(bookSource.targets))
 	}
-	if len(midPriceSource.targets) != 2 {
-		t.Fatalf("shared mid-price targets = %d, want two de-duplicated outcome tokens", len(midPriceSource.targets))
+	if len(midPriceSource.targets) != 4 {
+		t.Fatalf("independent mid-price targets = %d, want four outcome tokens", len(midPriceSource.targets))
 	}
 	seenAccounts := make(map[string]struct{}, 4)
 	for _, request := range strategy.requests {
 		if len(request.Predictions) != 1 || request.Predictions[0].Model.Name != request.Context.ModelID {
 			t.Fatalf("request mixes model predictions: %#v", request)
 		}
-		if request.Context.ModelID == "echo" && request.Predictions[0].MarketID != "market-shared" {
+		if request.Context.ModelID == "echo" && request.Predictions[0].MarketID != "market-echo" {
 			t.Fatalf("echo received another model's market: %#v", request.Predictions)
 		}
-		if request.Context.ModelID == "gemini_masked" && request.Predictions[0].MarketID != "market-shared" {
+		if request.Context.ModelID == "gemini_masked" && request.Predictions[0].MarketID != "market-gemini" {
 			t.Fatalf("gemini_masked received another model's market: %#v", request.Predictions)
 		}
 		if request.CycleID != request.Context.ExecutionAccountID+":"+decisionAt.Format("20060102T150405Z") {
@@ -546,7 +547,7 @@ func TestRunStillCallsAllFourWalletsWhenOneModelHasNoMarket(t *testing.T) {
 	}
 }
 
-func TestRunBlocksEntriesButKeepsExitCallsOnIncompleteRequiredModelCoverage(t *testing.T) {
+func TestRunRoutesAvailableModelWithoutBlockingOnMissingOtherModel(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
 	prediction.Model.Name = "echo-producer-v7"
@@ -580,30 +581,30 @@ func TestRunBlocksEntriesButKeepsExitCallsOnIncompleteRequiredModelCoverage(t *t
 		t.Fatalf("New() error = %v", err)
 	}
 	result, err := service.Run(context.Background(), decisionAt)
-	if err == nil ||
-		!strings.Contains(err.Error(), "market-1/gemini-3.6-flash") {
-		t.Fatalf("Run() error = %v, want missing Market/Model pair", err)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 	if len(result.Runs) != 4 || len(strategy.requests) != 4 {
 		t.Fatalf("runs/strategy requests = %d/%d, want four position-exit-capable calls", len(result.Runs), len(strategy.requests))
 	}
-	echoRequests := 0
-	for _, request := range strategy.requests {
-		if request.Context.ModelID == "echo" {
-			echoRequests++
-			if len(request.Predictions) != 1 {
-				t.Fatalf("truthful echo PIT input = %#v, want one source prediction", request.Predictions)
+	for _, run := range result.Runs {
+		switch run.Context.ModelID {
+		case "echo":
+			if run.PredictionCount != 1 || !run.EntrySubmissionEnabled || run.EntryBlockReason != "" {
+				t.Fatalf("echo run = %#v, want one independently usable result", run)
 			}
-		} else if len(request.Predictions) != 0 {
-			t.Fatalf("missing model unexpectedly received predictions: %#v", request.Predictions)
+		case "gemini_masked":
+			if run.PredictionCount != 0 || run.EntrySubmissionEnabled ||
+				run.EntryBlockReason != domain.StrategyEntryBlockIncompleteModelCoverage {
+				t.Fatalf("Gemini run = %#v, want only its empty binding blocked", run)
+			}
+		default:
+			t.Fatalf("unexpected run context %#v", run.Context)
 		}
-	}
-	if echoRequests != 2 {
-		t.Fatalf("echo requests = %d, want two strategy bindings", echoRequests)
 	}
 }
 
-func TestCoverageGateSubmitsExitButNeverBuyOnPendingModelTask(t *testing.T) {
+func TestEmptyModelRouteSubmitsExitButNeverBuy(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
 	prediction.Model.Name = "echo-producer-v7"
@@ -612,23 +613,22 @@ func TestCoverageGateSubmitsExitButNeverBuyOnPendingModelTask(t *testing.T) {
 	missingModel.SourceJobID = "job-gemini-pending"
 	missingModel.Model.Name = "gemini-3.6-flash"
 	bindings := []domain.StrategyExecutionBinding{
-		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main"},
 		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2"},
 	}
 	outcomeIndex := 0
 	negRisk := false
 	positions := accountPositionSource{
-		"main": {{
-			LotID: "lot-main-1", ExecutionAccountID: "main", MarketID: prediction.MarketID,
+		"wallet-2": {{
+			LotID: "lot-wallet-2-1", ExecutionAccountID: "wallet-2", MarketID: prediction.MarketID,
 			ConditionID: prediction.ConditionID, TokenID: prediction.Outcomes[0].TokenID,
 			OutcomeIndex: &outcomeIndex, OutcomeName: prediction.Outcomes[0].Name, NegRisk: &negRisk,
-			ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1,
+			ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1,
 			RemainingShares: "12.50", AverageEntryPrice: "0.40", Status: domain.PositionLotOpen,
 			OpenedAt: decisionAt.Add(-49 * time.Hour),
 		}},
 	}
-	books := make([]domain.OrderBookSnapshot, 0, 2)
-	for _, outcome := range prediction.Outcomes {
+	books := make([]domain.OrderBookSnapshot, 0, 1)
+	for _, outcome := range prediction.Outcomes[:1] {
 		books = append(books, domain.OrderBookSnapshot{
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
 			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, Status: domain.OrderBookStatusOK,
@@ -659,20 +659,20 @@ func TestCoverageGateSubmitsExitButNeverBuyOnPendingModelTask(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	result, runErr := service.Run(context.Background(), decisionAt)
-	if runErr == nil || !strings.Contains(runErr.Error(), "market-1/gemini-3.6-flash") {
-		t.Fatalf("Run() error = %v, want incomplete coverage", runErr)
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
 	}
-	if len(result.Runs) != 2 || len(strategy.requests) != 2 {
-		t.Fatalf("runs/requests = %d/%d, want both bindings", len(result.Runs), len(strategy.requests))
+	if len(result.Runs) != 1 || len(strategy.requests) != 1 {
+		t.Fatalf("runs/requests = %d/%d, want one binding", len(result.Runs), len(strategy.requests))
 	}
-	if len(executor.intents) != 1 || executor.intents[0].Side != domain.SideSell || executor.intents[0].TargetLotID != "lot-main-1" {
+	if len(executor.intents) != 1 || executor.intents[0].Side != domain.SideSell || executor.intents[0].TargetLotID != "lot-wallet-2-1" {
 		t.Fatalf("executed intents = %#v, want only safe SELL exit", executor.intents)
 	}
 	if len(recorder.claimedIntents) != 1 || recorder.claimedIntents[0].Side != domain.SideSell {
 		t.Fatalf("durable intents = %#v, want no BUY", recorder.claimedIntents)
 	}
-	if len(recorder.claimedOutputs) != 2 {
-		t.Fatalf("recorded outputs = %d, want both blocked binding decisions", len(recorder.claimedOutputs))
+	if len(recorder.claimedOutputs) != 1 {
+		t.Fatalf("recorded outputs = %d, want one blocked binding decision", len(recorder.claimedOutputs))
 	}
 	for index, output := range recorder.claimedOutputs {
 		if output.EntryPolicy == nil || output.EntryPolicy.Enabled ||
@@ -804,25 +804,24 @@ func TestRunSelectsLatestPITProbabilityForSameMarketAndModel(t *testing.T) {
 	}
 }
 
-func TestRunStrictCoverageRoutesOnlyExactManifestResult(t *testing.T) {
+func TestRunRoutesLatestCompletedResultWithoutManifestDependency(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	expected := validPrediction(decisionAt)
 	expected.Model.Name = "echo-producer-v7"
-	rogue := expected
-	rogue.Outcomes = append([]domain.PredictionOutcome(nil), expected.Outcomes...)
-	rogue.PredictionID = "pred-unmanifested"
-	rogue.SourceJobID = "job-unmanifested"
-	rogue.SandboxID = "sandbox-untrusted"
-	rogue.PredictionAsOf = decisionAt.Add(-5 * time.Minute)
-	rogue.CompletedAt = decisionAt.Add(-4 * time.Minute)
-	rogue.AvailableAt = decisionAt.Add(-3 * time.Minute)
-	rogue.Outcomes[0].Probability = 0.9
-	rogue.Outcomes[1].Probability = 0.1
+	newerResult := expected
+	newerResult.Outcomes = append([]domain.PredictionOutcome(nil), expected.Outcomes...)
+	newerResult.PredictionID = "pred-newer-result"
+	newerResult.SourceJobID = "job-newer-result"
+	newerResult.PredictionAsOf = decisionAt.Add(-5 * time.Minute)
+	newerResult.CompletedAt = decisionAt.Add(-4 * time.Minute)
+	newerResult.AvailableAt = decisionAt.Add(-3 * time.Minute)
+	newerResult.Outcomes[0].Probability = 0.9
+	newerResult.Outcomes[1].Probability = 0.1
 	strategy := &matrixStrategy{}
 	service, err := New(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-manifest-authority",
-			DecisionAt: decisionAt, Predictions: []domain.Prediction{rogue, expected},
+			DecisionAt: decisionAt, Predictions: []domain.Prediction{newerResult, expected},
 			ExpectedPredictions: []domain.PredictionExpectation{completedPredictionExpectation(expected, 1, 1)},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
@@ -841,12 +840,89 @@ func TestRunStrictCoverageRoutesOnlyExactManifestResult(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
-		strategy.requests[0].Predictions[0].PredictionID != expected.PredictionID {
-		t.Fatalf("strict routed predictions = %#v, want exact manifest result only", strategy.requests)
+		strategy.requests[0].Predictions[0].PredictionID != newerResult.PredictionID {
+		t.Fatalf("routed predictions = %#v, want latest completed result row", strategy.requests)
 	}
 }
 
-func TestRunMissingCurrentTaskCannotRouteOldUnmanifestedOtherModel(t *testing.T) {
+func TestRunNewerSandboxResultCannotReplaceDirectResult(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	direct := validPrediction(decisionAt)
+	direct.Model.Name = "echo-producer-v7"
+	sandbox := direct
+	sandbox.Outcomes = append([]domain.PredictionOutcome(nil), direct.Outcomes...)
+	sandbox.PredictionID = "pred-sandbox-newer"
+	sandbox.SourceJobID = "job-sandbox-newer"
+	sandbox.SandboxID = "sandbox-1"
+	sandbox.PredictionAsOf = decisionAt.Add(-5 * time.Minute)
+	sandbox.CompletedAt = decisionAt.Add(-4 * time.Minute)
+	sandbox.AvailableAt = decisionAt.Add(-3 * time.Minute)
+	sandbox.Outcomes[0].Probability = 0.9
+	sandbox.Outcomes[1].Probability = 0.1
+	strategy := &matrixStrategy{}
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-ignore-sandbox",
+			DecisionAt: decisionAt, Predictions: []domain.Prediction{direct, sandbox},
+		}},
+		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
+		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		RequireCompleteModelCoverage: true,
+		Bindings: []domain.StrategyExecutionBinding{{
+			PredictionModelID: "echo-producer-v7", ModelID: "echo",
+			StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main",
+		}},
+		Venue: "polymarket-paper",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
+		strategy.requests[0].Predictions[0].PredictionID != direct.PredictionID ||
+		len(result.Runs) != 1 || !result.Runs[0].EntrySubmissionEnabled {
+		t.Fatalf("direct-only routed result = %#v, requests = %#v", result, strategy.requests)
+	}
+}
+
+func TestRunSandboxOnlyResultLeavesBindingEmptyAndBuyBlocked(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	sandbox := validPrediction(decisionAt)
+	sandbox.Model.Name = "echo-producer-v7"
+	sandbox.SandboxID = "sandbox-1"
+	strategy := &matrixStrategy{}
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-sandbox-only",
+			DecisionAt: decisionAt, Predictions: []domain.Prediction{sandbox},
+		}},
+		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
+		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		RequireCompleteModelCoverage: true,
+		Bindings: []domain.StrategyExecutionBinding{{
+			PredictionModelID: "echo-producer-v7", ModelID: "echo",
+			StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main",
+		}},
+		Venue: "polymarket-paper",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 0 ||
+		len(result.Runs) != 1 || result.Runs[0].EntrySubmissionEnabled ||
+		result.Runs[0].EntryBlockReason != domain.StrategyEntryBlockIncompleteModelCoverage {
+		t.Fatalf("sandbox-only result = %#v, requests = %#v", result, strategy.requests)
+	}
+}
+
+func TestRunRoutesCompletedResultsForDifferentModelsWithoutSyntheticPairs(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	current := validPrediction(decisionAt)
 	current.Model.Name = "echo-producer-v7"
@@ -880,8 +956,8 @@ func TestRunMissingCurrentTaskCannotRouteOldUnmanifestedOtherModel(t *testing.T)
 		t.Fatalf("New() error = %v", err)
 	}
 	result, runErr := service.Run(context.Background(), decisionAt)
-	if runErr == nil || !strings.Contains(runErr.Error(), "market-1/gemini-3.6-flash") {
-		t.Fatalf("Run() error = %v, want missing current Market/Model task", runErr)
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
 	}
 	if len(strategy.requests) != 2 || len(result.Runs) != 2 {
 		t.Fatalf("requests/runs = %d/%d, want both exit-capable bindings", len(strategy.requests), len(result.Runs))
@@ -893,21 +969,21 @@ func TestRunMissingCurrentTaskCannotRouteOldUnmanifestedOtherModel(t *testing.T)
 				t.Fatalf("current manifest route = %#v, want only exact echo result", request.Predictions)
 			}
 		case "gemini_masked":
-			if len(request.Predictions) != 0 {
-				t.Fatalf("missing current Gemini task routed old result: %#v", request.Predictions)
+			if len(request.Predictions) != 1 || request.Predictions[0].PredictionID != oldUnmanifested.PredictionID {
+				t.Fatalf("independent Gemini result route = %#v", request.Predictions)
 			}
 		default:
 			t.Fatalf("unexpected strategy context %#v", request.Context)
 		}
 	}
 	for _, run := range result.Runs {
-		if run.EntrySubmissionEnabled || run.EntryBlockReason != domain.StrategyEntryBlockIncompleteModelCoverage {
-			t.Fatalf("binding run = %#v, want global audited entry suppression", run)
+		if !run.EntrySubmissionEnabled || run.EntryBlockReason != "" {
+			t.Fatalf("binding run = %#v, want independent available-model entry state", run)
 		}
 	}
 }
 
-func TestRunNewPendingTaskCannotBeMaskedByOldCompletedProbability(t *testing.T) {
+func TestRunUsesCompletedResultWhileNewerTaskIsPending(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	old := validPrediction(decisionAt)
 	old.Model.Name = "echo-producer-v7"
@@ -938,19 +1014,19 @@ func TestRunNewPendingTaskCannotBeMaskedByOldCompletedProbability(t *testing.T) 
 		t.Fatalf("New() error = %v", err)
 	}
 	result, runErr := service.Run(context.Background(), decisionAt)
-	if runErr == nil || !strings.Contains(runErr.Error(), "market-1/echo-producer-v7") {
-		t.Fatalf("Run() error = %v, want current PENDING task to block entries", runErr)
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
 	}
-	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 0 {
-		t.Fatalf("degraded input = %#v, old probability must not mask current PENDING task", strategy.requests)
+	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
+		strategy.requests[0].Predictions[0].PredictionID != old.PredictionID {
+		t.Fatalf("completed result input = %#v", strategy.requests)
 	}
-	if len(result.Runs) != 1 || result.Runs[0].EntrySubmissionEnabled ||
-		result.Runs[0].EntryBlockReason != domain.StrategyEntryBlockIncompleteModelCoverage {
-		t.Fatalf("binding run = %#v, want audited entry suppression", result.Runs)
+	if len(result.Runs) != 1 || !result.Runs[0].EntrySubmissionEnabled || result.Runs[0].EntryBlockReason != "" {
+		t.Fatalf("binding run = %#v, want available completed result", result.Runs)
 	}
 }
 
-func TestRunMixedCompletedGenerationsAreOmittedFromDegradedStrategyInput(t *testing.T) {
+func TestRunRoutesIndependentCompletedGenerations(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	current := validPrediction(decisionAt)
 	current.Model.Name = "echo-producer-v7"
@@ -982,15 +1058,15 @@ func TestRunMixedCompletedGenerationsAreOmittedFromDegradedStrategyInput(t *test
 		t.Fatalf("New() error = %v", err)
 	}
 	result, runErr := service.Run(context.Background(), decisionAt)
-	if runErr == nil || !strings.Contains(runErr.Error(), "mixes model generations") {
-		t.Fatalf("Run() error = %v, want mixed-generation coverage failure", runErr)
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
 	}
 	if len(strategy.requests) != 2 || len(result.Runs) != 2 {
 		t.Fatalf("requests/runs = %d/%d, want both exit-capable bindings", len(strategy.requests), len(result.Runs))
 	}
 	for _, request := range strategy.requests {
-		if len(request.Predictions) != 0 {
-			t.Fatalf("mixed-generation degraded input = %#v, want no stale probabilities", request.Predictions)
+		if len(request.Predictions) != 1 {
+			t.Fatalf("independent result input = %#v, want one result per model", request.Predictions)
 		}
 	}
 }
@@ -1020,8 +1096,8 @@ func TestRunCompletedTaskOlderThanPredictionLookbackCannotAuthorizeEntry(t *test
 		t.Fatalf("New() error = %v", err)
 	}
 	result, runErr := service.Run(context.Background(), decisionAt)
-	if runErr == nil || !strings.Contains(runErr.Error(), "stale market/model pairs: market-1/echo-producer-v7") {
-		t.Fatalf("Run() error = %v, want freshness coverage failure", runErr)
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
 	}
 	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 0 ||
 		len(result.Runs) != 1 || result.Runs[0].EntrySubmissionEnabled {

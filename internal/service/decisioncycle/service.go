@@ -44,9 +44,10 @@ type Params struct {
 	// EntrySubmissionDisabled keeps validated exits executable while
 	// suppressing every BUY intent.
 	EntrySubmissionDisabled bool
-	// RequireCompleteModelCoverage rejects a cycle unless every effective
-	// Market has one PIT-selected probability from every configured prediction
-	// model. This is the production guard for same-Market model comparisons.
+	// RequireCompleteModelCoverage keeps live BUY submission fail closed for a
+	// binding that has no fresh probability. Coverage is evaluated independently
+	// per configured source model; a Market is never required to have results
+	// from any other model.
 	RequireCompleteModelCoverage bool
 	Bindings                     []domain.StrategyExecutionBinding
 	Venue                        string
@@ -185,35 +186,11 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		return RunResult{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}
 	modelIDs := configuredPredictionModels(service.bindings)
-	selectedPredictions := make([]domain.Prediction, 0)
-	var coverageErr error
-	if service.requireCompleteModelCoverage {
-		expectations, expectationErr := domain.SelectEffectivePredictionExpectations(snapshot.ExpectedPredictions, modelIDs)
-		if expectationErr == nil {
-			freshAfter := decisionAt.Add(-service.predictionLookback)
-			selectedPredictions, coverageErr = selectCompleteModelCoverage(
-				snapshot.Predictions, expectations, service.bindings, freshAfter,
-			)
-			if coverageErr != nil {
-				// Keep only exact current manifest results in degraded requests.
-				// A previous generation must not influence either BUY or SELL
-				// decisions when the current task for that pair is PENDING.
-				selectedPredictions, err = selectCompletedManifestResults(
-					snapshot.Predictions, expectations, modelIDs, freshAfter,
-				)
-				if err != nil {
-					coverageErr = errors.Join(coverageErr, err)
-					selectedPredictions = nil
-				}
-			}
-		} else {
-			coverageErr = expectationErr
-		}
-	} else {
-		selectedPredictions, err = domain.SelectEffectivePredictions(snapshot.Predictions, modelIDs)
-		if err != nil {
-			return RunResult{}, err
-		}
+	selectedPredictions, err := selectAvailablePredictions(
+		snapshot.Predictions, modelIDs, decisionAt.Add(-service.predictionLookback),
+	)
+	if err != nil {
+		return RunResult{}, err
 	}
 	positionLots, err := service.loadPositionLots(ctx, decisionAt)
 	if err != nil {
@@ -250,12 +227,15 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		Runs:                 make([]BindingRunResult, 0, len(service.bindings)),
 	}
 	runErrors := make([]error, 0)
-	if coverageErr != nil {
-		runErrors = append(runErrors, coverageErr)
-	}
 	for _, binding := range service.bindings {
 		executionContext := binding.Context()
 		predictions := predictionsForBinding(selectedPredictions, binding)
+		var bindingCoverageErr error
+		if service.requireCompleteModelCoverage && len(predictions) == 0 {
+			bindingCoverageErr = fmt.Errorf(
+				"prediction snapshot has no fresh result for configured model %q", binding.PredictionModelID,
+			)
+		}
 		positions := positionLots[binding.ExecutionAccountID]
 		bindingTargets, selectErr := buildInputTargets(predictions, positions)
 		if selectErr != nil {
@@ -310,8 +290,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		run, runErr := service.runBinding(ctx, runBindingParams{
 			decisionAt: decisionAt, predictionSnapshotID: snapshot.SnapshotID, binding: executionContext,
 			predictions: predictions, positions: positions, books: bindingBooks, histories: bindingHistories,
-			allowEntries:     coverageErr == nil && !service.entrySubmissionDisabled,
-			entryBlockReason: entryBlockReason(coverageErr, service.entrySubmissionDisabled),
+			allowEntries:     bindingCoverageErr == nil && !service.entrySubmissionDisabled,
+			entryBlockReason: entryBlockReason(bindingCoverageErr, service.entrySubmissionDisabled),
 		})
 		run.PredictionModelID = binding.PredictionModelID
 		run.Error = runErr
@@ -736,163 +716,24 @@ func configuredPredictionModels(bindings []domain.StrategyExecutionBinding) []st
 	return result
 }
 
-// selectCompleteModelCoverage makes the producer task manifest authoritative
-// for a strict cycle. It requires one current COMPLETED task for every
-// Market/model pair, verifies the models belong to the same selection
-// generation, and returns only the exact result rows named by those tasks.
-// Older lookback rows and non-manifest rows can never make coverage pass.
-func selectCompleteModelCoverage(
+// selectAvailablePredictions routes the completed result table directly. Each
+// (Market, source model) is independent: a result for Echo never requires a
+// Gemini result for that Market, and vice versa. The newest fresh PIT row for
+// each configured pair wins deterministically.
+func selectAvailablePredictions(
 	predictions []domain.Prediction,
-	expectations []domain.PredictionExpectation,
-	bindings []domain.StrategyExecutionBinding,
-	freshAfter time.Time,
-) ([]domain.Prediction, error) {
-	models := configuredPredictionModels(bindings)
-	if len(expectations) == 0 {
-		return nil, fmt.Errorf("prediction snapshot has no expected prediction task manifest for configured models %q", models)
-	}
-	type generation struct {
-		selectionID    int64
-		selectionRunID int64
-		predictionAsOf time.Time
-	}
-	expectedByPair := make(map[string]domain.PredictionExpectation, len(expectations))
-	marketsSet := make(map[string]struct{})
-	generationByMarket := make(map[string]generation)
-	for _, expectation := range expectations {
-		marketID := strings.TrimSpace(expectation.MarketID)
-		modelID := strings.TrimSpace(expectation.PredictionModelID)
-		key := coveragePairKey(marketID, modelID)
-		expectedByPair[key] = expectation
-		marketsSet[marketID] = struct{}{}
-		candidate := generation{
-			selectionID: expectation.SelectionID, selectionRunID: expectation.SelectionRunID,
-			predictionAsOf: expectation.PredictionAsOf,
-		}
-		current, exists := generationByMarket[marketID]
-		if !exists {
-			generationByMarket[marketID] = candidate
-			continue
-		}
-		if current.selectionID != candidate.selectionID || current.selectionRunID != candidate.selectionRunID ||
-			!current.predictionAsOf.Equal(candidate.predictionAsOf) {
-			return nil, fmt.Errorf(
-				"prediction task manifest mixes model generations for market %q", marketID,
-			)
-		}
-	}
-	markets := make([]string, 0, len(marketsSet))
-	for marketID := range marketsSet {
-		markets = append(markets, marketID)
-	}
-	sort.Strings(markets)
-	missing := make([]string, 0)
-	for _, marketID := range markets {
-		for _, modelID := range models {
-			expectation, exists := expectedByPair[coveragePairKey(marketID, modelID)]
-			if !exists || expectation.Status != domain.PredictionExpectationCompleted ||
-				expectation.PredictionAsOf.Before(freshAfter) {
-				missing = append(missing, marketID+"/"+modelID)
-			}
-		}
-	}
-	if len(missing) != 0 {
-		return nil, fmt.Errorf("prediction snapshot has incomplete configured model coverage; pending, missing, or stale market/model pairs: %s", strings.Join(missing, ", "))
-	}
-
-	selected, err := selectCompletedManifestResults(predictions, expectations, models, freshAfter)
-	if err != nil {
-		return nil, err
-	}
-	if len(selected) != len(expectedByPair) {
-		return nil, fmt.Errorf("prediction snapshot is missing one or more exact completed manifest results")
-	}
-	return selected, nil
-}
-
-func selectCompletedManifestResults(
-	predictions []domain.Prediction,
-	expectations []domain.PredictionExpectation,
 	modelIDs []string,
 	freshAfter time.Time,
 ) ([]domain.Prediction, error) {
-	type generation struct {
-		selectionID    int64
-		selectionRunID int64
-		predictionAsOf time.Time
-	}
-	generationByMarket := make(map[string]generation)
-	inconsistentMarkets := make(map[string]struct{})
-	for _, expectation := range expectations {
-		marketID := strings.TrimSpace(expectation.MarketID)
-		candidate := generation{
-			selectionID: expectation.SelectionID, selectionRunID: expectation.SelectionRunID,
-			predictionAsOf: expectation.PredictionAsOf,
-		}
-		current, exists := generationByMarket[marketID]
-		if !exists {
-			generationByMarket[marketID] = candidate
-			continue
-		}
-		if current.selectionID != candidate.selectionID || current.selectionRunID != candidate.selectionRunID ||
-			!current.predictionAsOf.Equal(candidate.predictionAsOf) {
-			inconsistentMarkets[marketID] = struct{}{}
-		}
-	}
-	resultsByPredictionID := make(map[string]domain.Prediction, len(predictions))
+	fresh := make([]domain.Prediction, 0, len(predictions))
 	for _, prediction := range predictions {
-		resultsByPredictionID[prediction.PredictionID] = prediction
-	}
-	matched := make([]domain.Prediction, 0, len(expectations))
-	for _, expectation := range expectations {
-		if _, inconsistent := inconsistentMarkets[strings.TrimSpace(expectation.MarketID)]; inconsistent {
+		if strings.TrimSpace(prediction.SandboxID) != "" ||
+			prediction.PredictionAsOf.Before(freshAfter) || prediction.CompletedAt.Before(freshAfter) {
 			continue
 		}
-		if expectation.Status != domain.PredictionExpectationCompleted || expectation.PredictionAsOf.Before(freshAfter) {
-			continue
-		}
-		prediction, exists := resultsByPredictionID[expectation.PredictionID]
-		if !exists || !predictionMatchesExpectation(prediction, expectation) {
-			return nil, fmt.Errorf(
-				"prediction snapshot is missing the exact completed result for market/model pair %s/%s",
-				expectation.MarketID, expectation.PredictionModelID,
-			)
-		}
-		matched = append(matched, prediction)
+		fresh = append(fresh, prediction)
 	}
-	selected, err := domain.SelectEffectivePredictions(matched, modelIDs)
-	if err != nil {
-		return nil, err
-	}
-	if len(selected) != len(matched) {
-		return nil, fmt.Errorf("prediction task manifest resolves to duplicate Market/model results")
-	}
-	return selected, nil
-}
-
-func coveragePairKey(marketID, modelID string) string {
-	return strings.TrimSpace(marketID) + "\x00" + strings.TrimSpace(modelID)
-}
-
-func predictionMatchesExpectation(prediction domain.Prediction, expectation domain.PredictionExpectation) bool {
-	if prediction.PredictionID != expectation.PredictionID || prediction.SourceJobID != expectation.SourceJobID ||
-		strings.TrimSpace(prediction.SandboxID) != "" ||
-		strings.TrimSpace(prediction.Model.Name) != strings.TrimSpace(expectation.PredictionModelID) ||
-		strings.TrimSpace(prediction.MarketID) != strings.TrimSpace(expectation.MarketID) ||
-		strings.TrimSpace(prediction.ConditionID) != strings.TrimSpace(expectation.ConditionID) ||
-		!prediction.PredictionAsOf.Equal(expectation.PredictionAsOf) || expectation.ResultAvailableAt == nil ||
-		!prediction.AvailableAt.Equal(*expectation.ResultAvailableAt) || len(prediction.Outcomes) != len(expectation.Outcomes) {
-		return false
-	}
-	for index := range prediction.Outcomes {
-		resultOutcome := prediction.Outcomes[index]
-		expectedOutcome := expectation.Outcomes[index]
-		if resultOutcome.Index != expectedOutcome.Index || strings.TrimSpace(resultOutcome.Name) != strings.TrimSpace(expectedOutcome.Name) ||
-			strings.TrimSpace(resultOutcome.TokenID) != strings.TrimSpace(expectedOutcome.TokenID) {
-			return false
-		}
-	}
-	return true
+	return domain.SelectEffectivePredictions(fresh, modelIDs)
 }
 
 // predictionsForBinding 选择一个上游预测模型的 Market，再投影为 Python 和执行层使用的稳定业务模型。
