@@ -27,6 +27,45 @@ func TestApplyFillFeeEvidenceUsesActualEventFeeAndExponent(t *testing.T) {
 	}
 }
 
+func TestApplyFillFeeEvidenceAcceptsProductionV2SellFeeQuantum(t *testing.T) {
+	fill := feeEvidenceFill(domain.LiquidityRoleTaker)
+	fill.Side = domain.SideSell
+	fill.Shares = "5"
+	fill.Price = "0.216"
+	evidence := feeEvidence()
+	evidence.Side = domain.SideSell
+	evidence.MakerAmountBaseUnits = "5000000"
+	evidence.TakerAmountBaseUnits = "1080000"
+	evidence.TotalFeeBaseUnits = "33860"
+	result, err := applyFillFeeEvidence(
+		fill,
+		marketFeeSchedule{Rate: "0.04", Exponent: "1", TakerOnly: true},
+		evidence,
+		evidence.ExchangeAddress,
+		evidence.MakerAddress,
+		zeroBytes32,
+	)
+	if err != nil {
+		t.Fatalf("production V2 sell fee was rejected: %v", err)
+	}
+	if !result.GrossNotional.Equal("1.08") || !result.PlatformFee.Equal("0.03386") ||
+		!result.TotalFee.Equal("0.03386") {
+		t.Fatalf("event accounting = %#v", result)
+	}
+
+	evidence.TotalFeeBaseUnits = "33870"
+	if _, err := applyFillFeeEvidence(
+		fill,
+		marketFeeSchedule{Rate: "0.04", Exponent: "1", TakerOnly: true},
+		evidence,
+		evidence.ExchangeAddress,
+		evidence.MakerAddress,
+		zeroBytes32,
+	); err == nil {
+		t.Fatal("half-up fee quantum was accepted instead of the protocol-truncated fee")
+	}
+}
+
 func TestApplyFillFeeEvidenceDigestIgnoresGrowingConfirmations(t *testing.T) {
 	fill := feeEvidenceFill(domain.LiquidityRoleTaker)
 	schedule := marketFeeSchedule{Rate: "0.25", Exponent: "2", TakerOnly: true}

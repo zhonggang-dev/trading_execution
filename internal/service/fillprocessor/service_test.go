@@ -96,7 +96,7 @@ func TestCalculateMoneyValidatesFeeExponent(t *testing.T) {
 	}
 }
 
-func TestCalculateMoneyValidatesOfficialFiveDecimalFeePrecision(t *testing.T) {
+func TestCalculateMoneyValidatesOfficialFiveDecimalFeeTruncation(t *testing.T) {
 	raw := authoritativeMoneyFill(domain.SideBuy, domain.LiquidityRoleTaker)
 	raw.Shares = "1"
 	raw.Price = "0.333333"
@@ -104,10 +104,10 @@ func TestCalculateMoneyValidatesOfficialFiveDecimalFeePrecision(t *testing.T) {
 	raw.FeeRateBPS = "17"
 	raw.PlatformFeeRate = "0.0017"
 	raw.FeeExponent = "1"
-	raw.PlatformFee = "0.00038"
-	raw.TotalFee = "0.00038"
+	raw.PlatformFee = "0.00037"
+	raw.TotalFee = "0.00037"
 	if _, err := calculateMoney(raw); err != nil {
-		t.Fatalf("official five-decimal fee was rejected: %v", err)
+		t.Fatalf("official five-decimal truncated fee was rejected: %v", err)
 	}
 
 	raw.Shares = "0.000001"
@@ -117,6 +117,31 @@ func TestCalculateMoneyValidatesOfficialFiveDecimalFeePrecision(t *testing.T) {
 	raw.TotalFee = "0"
 	if _, err := calculateMoney(raw); err != nil {
 		t.Fatalf("verified sub-minimum zero fee was rejected: %v", err)
+	}
+}
+
+func TestCalculateMoneyAcceptsProductionV2SellFeeQuantum(t *testing.T) {
+	raw := authoritativeMoneyFill(domain.SideSell, domain.LiquidityRoleTaker)
+	raw.Shares = "5"
+	raw.Price = "0.216"
+	raw.GrossNotional = "1.08"
+	raw.FeeRateBPS = "0"
+	raw.PlatformFeeRate = "0.04"
+	raw.FeeExponent = "1"
+	raw.PlatformFee = "0.03386"
+	raw.TotalFee = "0.03386"
+	fill, err := calculateMoney(raw)
+	if err != nil {
+		t.Fatalf("production V2 fee quantum was rejected: %v", err)
+	}
+	if !fill.NetCashDelta.Equal("1.04614") {
+		t.Fatalf("net cash delta = %s, want 1.04614", fill.NetCashDelta)
+	}
+
+	raw.PlatformFee = "0.03387"
+	raw.TotalFee = "0.03387"
+	if _, err := calculateMoney(raw); err == nil {
+		t.Fatal("half-up fee quantum was accepted instead of the protocol-truncated fee")
 	}
 }
 

@@ -285,7 +285,7 @@ func expectedV2PlatformFee(
 	}
 	fee := new(big.Rat).Mul(shares, rate)
 	fee.Mul(fee, powered)
-	return roundedDecimal(fee, feeScale), nil
+	return truncatedDecimal(fee, feeScale), nil
 }
 
 // decimalRat 将十进制值转换为精确有理数。
@@ -310,18 +310,11 @@ func exactDecimal(value *big.Rat, maxScale int) (domain.Decimal, error) {
 	return "", fmt.Errorf("value cannot be represented exactly within %d decimals", maxScale)
 }
 
-// roundedDecimal 按指定位数对有理数进行半远离零舍入。
-func roundedDecimal(value *big.Rat, scale int) domain.Decimal {
+// truncatedDecimal 按协议的手续费精度向零截断。
+func truncatedDecimal(value *big.Rat, scale int) domain.Decimal {
 	multiplier := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
 	scaledNumerator := new(big.Int).Mul(value.Num(), multiplier)
-	quotient, remainder := new(big.Int).QuoRem(scaledNumerator, value.Denom(), new(big.Int))
-	if new(big.Int).Mul(new(big.Int).Abs(remainder), big.NewInt(2)).Cmp(value.Denom()) >= 0 {
-		if value.Sign() >= 0 {
-			quotient.Add(quotient, big.NewInt(1))
-		} else {
-			quotient.Sub(quotient, big.NewInt(1))
-		}
-	}
+	quotient := new(big.Int).Quo(scaledNumerator, value.Denom())
 	negative := quotient.Sign() < 0
 	digits := new(big.Int).Abs(quotient).String()
 	for len(digits) <= scale {

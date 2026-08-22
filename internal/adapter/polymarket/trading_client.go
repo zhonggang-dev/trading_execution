@@ -1732,7 +1732,7 @@ func calculateV2PlatformFee(
 	}
 	fee := new(big.Rat).Mul(sharesRat, rateRat)
 	fee.Mul(fee, powered)
-	return roundedRatDecimal(fee, 5), nil
+	return truncatedRatDecimal(fee, 5), nil
 }
 
 func exactRatDecimal(value *big.Rat, maxScale int) (domain.Decimal, error) {
@@ -1753,21 +1753,13 @@ func exactRatDecimal(value *big.Rat, maxScale int) (domain.Decimal, error) {
 	return "", fmt.Errorf("decimal requires more than %d fractional digits", maxScale)
 }
 
-// roundedRatDecimal uses half-away-from-zero rounding, matching the V2 fee
-// clients' documented five-decimal settlement precision.
-func roundedRatDecimal(value *big.Rat, scale int) domain.Decimal {
+// truncatedRatDecimal truncates to the protocol's five-decimal fee quantum.
+// Polymarket documents fees below that quantum as zero, and the authoritative
+// V2 OrderFilled event reports the same downward precision rule.
+func truncatedRatDecimal(value *big.Rat, scale int) domain.Decimal {
 	factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
 	scaled := new(big.Rat).Mul(value, new(big.Rat).SetInt(factor))
-	quotient, remainder := new(big.Int).QuoRem(scaled.Num(), scaled.Denom(), new(big.Int))
-	doubleRemainder := new(big.Int).Abs(remainder)
-	doubleRemainder.Mul(doubleRemainder, big.NewInt(2))
-	if doubleRemainder.Cmp(scaled.Denom()) >= 0 {
-		if scaled.Sign() >= 0 {
-			quotient.Add(quotient, big.NewInt(1))
-		} else {
-			quotient.Sub(quotient, big.NewInt(1))
-		}
-	}
+	quotient := new(big.Int).Quo(scaled.Num(), scaled.Denom())
 	text := new(big.Rat).SetFrac(quotient, factor).FloatString(scale)
 	parsed, _ := domain.ParseDecimal(canonicalDecimalText(text))
 	return parsed
