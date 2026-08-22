@@ -193,7 +193,7 @@ func (repository *OrderRepository) ListPending(_ context.Context, before time.Ti
 	defer repository.mu.RUnlock()
 	orders := make([]domain.Order, 0)
 	for _, order := range repository.byID {
-		if coordinatorEligible(order.Status) && !order.UpdatedAt.After(before) {
+		if coordinatorEligible(order) && !order.UpdatedAt.After(before) {
 			orders = append(orders, domain.CloneOrder(order))
 		}
 	}
@@ -209,9 +209,16 @@ func (repository *OrderRepository) ListPending(_ context.Context, before time.Ti
 	return orders, nil
 }
 
-// coordinatorEligible 判断当前业务条件是否成立。
-func coordinatorEligible(status domain.OrderStatus) bool {
-	switch status {
+// coordinatorEligible 判断当前业务条件是否成立。等待权威成交明细的 UNKNOWN
+// 由低频 scheduled reconciliation 持续处理，避免快速协调器每轮重复刷新同一状态。
+func coordinatorEligible(order domain.Order) bool {
+	if order.Status == domain.OrderStatusUnknown {
+		switch order.FailureCode {
+		case "CLOB_FILL_DETAILS_UNAVAILABLE", "VENUE_FILL_EVIDENCE_PENDING":
+			return false
+		}
+	}
+	switch order.Status {
 	case domain.OrderStatusReceived, domain.OrderStatusValidating, domain.OrderStatusReserved,
 		domain.OrderStatusSubmitting, domain.OrderStatusAcknowledged,
 		domain.OrderStatusLive, domain.OrderStatusPartiallyFilled,

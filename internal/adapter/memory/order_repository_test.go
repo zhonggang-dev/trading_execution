@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
@@ -41,5 +42,33 @@ func TestOrderRepositoryUsesClientOrderIDAndRevision(t *testing.T) {
 	loaded, err := repository.GetByClientOrderID(context.Background(), "client-1")
 	if err != nil || loaded.Status != domain.OrderStatusOpen || loaded.Revision != 2 {
 		t.Fatalf("GetByClientOrderID() = %#v, %v", loaded, err)
+	}
+}
+
+func TestListPendingDefersDurableFillEvidenceStatesToReconciliation(t *testing.T) {
+	repository := NewOrderRepository()
+	now := time.Now().UTC()
+	for index, failureCode := range []string{
+		"CLOB_FILL_DETAILS_UNAVAILABLE",
+		"VENUE_FILL_EVIDENCE_PENDING",
+		"CLOB_ORDER_NOT_FOUND",
+	} {
+		order := domain.Order{
+			ID:     "order-" + failureCode,
+			Intent: domain.OrderIntent{ClientOrderID: "client-" + failureCode},
+			Status: domain.OrderStatusUnknown, FailureCode: failureCode,
+			Revision: 1, CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(time.Duration(index) * time.Second),
+		}
+		if _, _, err := repository.Create(context.Background(), order); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	orders, err := repository.ListPending(context.Background(), now.Add(time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0].FailureCode != "CLOB_ORDER_NOT_FOUND" {
+		t.Fatalf("ListPending() = %#v, want only ordinary UNKNOWN", orders)
 	}
 }

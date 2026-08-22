@@ -501,16 +501,23 @@ func (client *TradingClient) PlacePrepared(ctx context.Context, order domain.Ord
 	tradeIDs := append(append([]string(nil), response.TradeIDs...), response.TradeIDsAlt...)
 	// A placement status of matched can represent a full or partial immediate
 	// match. The POST response does not carry authoritative size_matched, so a
-	// follow-up GET must determine the actual cumulative fill. If that read is
-	// unavailable, acceptance is still known and remains ACKNOWLEDGED.
+	// follow-up GET enriches the match with its actual cumulative fill. Missing
+	// trade details must not erase the match already observed in the POST.
 	if state == port.VenueOrderFilled {
 		observedOrder := order
 		observedOrder.VenueOrderID = orderID
-		if observed, getErr := client.Get(ctx, observedOrder); getErr == nil {
-			observed.TradeIDs = appendDistinct(observed.TradeIDs, tradeIDs...)
+		observed, getErr := client.Get(ctx, observedOrder)
+		observed.TradeIDs = appendDistinct(observed.TradeIDs, tradeIDs...)
+		if getErr == nil {
 			return observed, nil
 		}
-		state = port.VenueOrderAcknowledged
+		var venueError *port.VenueError
+		if errors.As(getErr, &venueError) && venueError.Code == "CLOB_FILL_DETAILS_UNAVAILABLE" {
+			// Get returns the normalized order together with this enrichment
+			// error. Preserve its observed size/state and let fill reconciliation
+			// retry the still-pending exact trade details.
+			return observed, nil
+		}
 	}
 	return port.VenueOrder{
 		ID:         orderID,
@@ -603,8 +610,8 @@ func (client *TradingClient) Get(ctx context.Context, order domain.Order) (port.
 	if sign, _ := normalized.FilledSize.Sign(); sign > 0 {
 		averagePrice, tradeIDs, err := client.fillAveragePrice(ctx, order.Intent.ExecutionAccountID, raw)
 		if err != nil {
-			return port.VenueOrder{}, &port.VenueError{
-				Kind: port.VenueErrorUnavailable, Code: "CLOB_FILL_DETAILS_UNAVAILABLE",
+			return normalized, &port.VenueError{
+				Kind: port.VenueErrorUnavailable, Code: "CLOB_FILL_DETAILS_UNAVAILABLE", VenueOrderID: normalized.ID,
 				Message: "order fill was observed but exact trade details are not complete", Cause: err,
 			}
 		}
@@ -1192,7 +1199,7 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 	if err != nil {
 		return nil, err
 	}
-	fills := make([]domain.Fill, 0)
+	observations := make([]domain.Fill, 0)
 	seen := make(map[string]int)
 	for _, trade := range trades {
 		fill, matched, err := mapTradeToOrderFill(trade, order, client.now().UTC())
@@ -1202,22 +1209,34 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 		if !matched {
 			continue
 		}
-		// CLOB's matched/mined observations do not yet carry finalized receipt
-		// evidence. They must not enter the money ledger with provisional fees.
-		if fill.Status != domain.FillStatusConfirmed {
-			continue
-		}
 		identity := fill.VenueFillID + "\x00" + fill.OrderID
 		if existingIndex, exists := seen[identity]; exists {
-			merged, err := preferTradeObservation(fills[existingIndex], fill)
+			merged, err := preferTradeObservation(observations[existingIndex], fill)
 			if err != nil {
 				return nil, err
 			}
-			fills[existingIndex] = merged
+			observations[existingIndex] = merged
 			continue
 		}
-		seen[identity] = len(fills)
-		fills = append(fills, fill)
+		seen[identity] = len(observations)
+		observations = append(observations, fill)
+	}
+	fills := make([]domain.Fill, 0, len(observations))
+	for _, fill := range observations {
+		// CLOB's matched/mined/retrying observations do not yet carry finalized
+		// receipt evidence. Returning an empty successful scan here would let
+		// cancellation finality release assets while a known fill is still
+		// propagating, so surface an explicit retryable evidence gap instead.
+		if !fill.Status.Terminal() {
+			return nil, &port.VenueError{
+				Kind: port.VenueErrorUnavailable, Code: "CLOB_FILL_DETAILS_UNAVAILABLE",
+				Message:      "CLOB order fill is observed but has not reached a terminal status",
+				VenueOrderID: order.VenueOrderID,
+			}
+		}
+		if fill.Status == domain.FillStatusConfirmed {
+			fills = append(fills, fill)
+		}
 	}
 	if len(fills) == 0 {
 		return fills, nil

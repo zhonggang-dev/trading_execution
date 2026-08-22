@@ -51,9 +51,15 @@ func (state *runState) reconcileOrder(ctx context.Context, params reconcileOrder
 	}
 
 	_, tradeReferenced := params.evidence.ordersWithTrades[normalizedID(params.order.VenueOrderID)]
+	_, pendingTrade := params.evidence.ordersWithPendingTrades[normalizedID(params.order.VenueOrderID)]
 	fillEvidenceComplete := params.evidence.tradesAvailable && !tradeReferenced
 	if shouldSyncOrderFills(params.order, params.focusOrderID, tradeReferenced) {
-		fillEvidenceComplete = state.syncOrderFills(ctx, params.order)
+		// A successful order-level read can recover delayed fills, but it must
+		// not turn an unavailable account-level trade scan into proof that a
+		// cancelled order had no fills. Cancellation finality requires both
+		// sources to have completed successfully in this run.
+		orderFillEvidenceComplete := state.syncOrderFills(ctx, params.order)
+		fillEvidenceComplete = params.evidence.tradesAvailable && !pendingTrade && orderFillEvidenceComplete
 	}
 	if params.order.Status == domain.OrderStatusCancelled {
 		state.finalizeCancellationWhenSafe(ctx, params.order, fillEvidenceComplete)
@@ -94,15 +100,25 @@ func hasAmbiguousSubmission(status domain.OrderStatus) bool {
 	}
 }
 
-// shouldSyncOrderFills 判断本次是否必须执行订单级成交读取。
+// shouldSyncOrderFills 判断本次是否必须执行订单级成交读取。MANUAL_REVIEW
+// 可能在多次异构错误后覆盖最初的成交延迟错误码；只要仓储仍将它选入恢复集，
+// 就继续允许迟到的权威成交修正账本。
 func shouldSyncOrderFills(order domain.Order, focusOrderID string, tradeReferenced bool) bool {
-	return !order.Terminal() || tradeReferenced || order.ID == focusOrderID
+	return !order.Terminal() || tradeReferenced || order.ID == focusOrderID ||
+		order.Status == domain.OrderStatusCancelled || order.Status == domain.OrderStatusManualReview
 }
 
 // syncOrderFills 同步一张订单的真实成交并记录自动补录结果。
 func (state *runState) syncOrderFills(ctx context.Context, order domain.Order) bool {
 	result, err := state.service.fills.SyncOrder(ctx, order.ID)
 	if err != nil {
+		if isFillEvidencePendingError(err) {
+			// A known non-terminal trade is a durable wait state, not source
+			// failure. It still makes cancellation evidence incomplete, while the
+			// next scheduled sweep can retry without poisoning runner readiness.
+			state.run.Summary["fill_evidence_pending"]++
+			return false
+		}
 		state.addOrderSourceIssue(ctx, orderSourceIssueParams{order: order, source: "CLOB_ORDER_TRADES", operation: "read/apply order fills", err: err})
 		return false
 	}
@@ -112,6 +128,12 @@ func (state *runState) syncOrderFills(ctx context.Context, order domain.Order) b
 		state.recordRecoveredFill(ctx, order, application)
 	}
 	return true
+}
+
+func isFillEvidencePendingError(err error) bool {
+	var venueError *port.VenueError
+	return errors.As(err, &venueError) &&
+		strings.EqualFold(strings.TrimSpace(venueError.Code), "CLOB_FILL_DETAILS_UNAVAILABLE")
 }
 
 // recordRecoveredFill 记录一条通过交易所证据自动补录的真实成交。

@@ -24,6 +24,11 @@ var (
 	ErrCancelFinalityPending = port.ErrCancelFinalityPending
 )
 
+const (
+	clobFillDetailsUnavailableCode = "CLOB_FILL_DETAILS_UNAVAILABLE"
+	venueFillEvidencePendingCode   = "VENUE_FILL_EVIDENCE_PENDING"
+)
+
 // Params 表示后端使用的 Params 类型。
 type Params struct {
 	Repository              port.OrderRepository
@@ -299,22 +304,23 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &stored, venueOrder)
 	if syncErr != nil {
 		if stored.Status == domain.OrderStatusCancelled {
-			return SubmitResult{Order: stored, Created: created}, errors.Join(syncErr, service.holdCancellationFinality(ctx, stored))
+			return SubmitResult{Order: stored, Created: created}, errors.Join(syncErr, service.holdCancellationFinality(ctx, stored, true))
 		}
 		uncertainErr := service.reservations.MarkUncertain(ctx, stored, "AUTHORITATIVE_FILL_SYNC_FAILED: "+syncErr.Error())
 		service.triggerReconciliation(stored, domain.ReconciliationTriggerOrderUnknown)
 		return SubmitResult{Order: stored, Created: created}, errors.Join(syncErr, uncertainErr)
 	}
-	if pendingFillEvidence && stored.Status != domain.OrderStatusUnknown && stored.Status != domain.OrderStatusCancelled {
-		if err := service.markFillEvidencePending(ctx, stored, domain.ReconciliationTriggerOrderUnknown); err != nil {
+	if pendingFillEvidence && stored.Status != domain.OrderStatusCancelled {
+		if err := service.markFillEvidencePending(ctx, &stored, domain.ReconciliationTriggerOrderUnknown, true); err != nil {
 			return SubmitResult{Order: stored, Created: created}, err
 		}
+		return SubmitResult{Order: stored, Created: created}, nil
 	}
 	if stored.Status == domain.OrderStatusUnknown {
 		_ = service.reservations.MarkUncertain(ctx, stored, "VENUE_RESPONSE_UNKNOWN")
 		service.triggerReconciliation(stored, domain.ReconciliationTriggerOrderUnknown)
 	} else if stored.Status == domain.OrderStatusCancelled {
-		if err := service.holdCancellationFinality(ctx, stored); err != nil {
+		if err := service.holdCancellationFinality(ctx, stored, true); err != nil {
 			return SubmitResult{Order: stored, Created: created}, err
 		}
 	} else if stored.Status != domain.OrderStatusAcknowledged && !service.authoritativeFills {
@@ -463,17 +469,61 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 	}
 	venueOrder, getErr := service.venue.Get(ctx, order)
 	if getErr != nil {
+		code := errorCode(getErr, "RECONCILE_FAILED")
+		fillEvidencePending := strings.EqualFold(strings.TrimSpace(code), clobFillDetailsUnavailableCode)
 		target := domain.OrderStatusUnknown
 		outcome := domain.AttemptOutcomeUnknown
-		if service.reconcileAttemptCount(ctx, order.ID) >= service.maxReconcileAttempts {
+		if !fillEvidencePending && service.reconcileAttemptCount(ctx, order.ID) >= service.maxReconcileAttempts {
 			target = domain.OrderStatusManualReview
 			outcome = domain.AttemptOutcomeFailed
 		}
-		placeholder := port.VenueOrder{ID: order.VenueOrderID, State: port.VenueOrderUnknown, RawStatus: errorCode(getErr, "RECONCILE_FAILED"), FilledSize: order.FilledSize, ObservedAt: service.now().UTC()}
-		if err := service.finishAttemptWithOutcome(ctx, &order, &attempt, target, domain.TransitionTriggerReconciliation, placeholder, errorCode(getErr, "RECONCILE_FAILED"), getErr, outcome); err != nil {
+		placeholder := port.VenueOrder{ID: order.VenueOrderID, State: port.VenueOrderUnknown, RawStatus: code, FilledSize: order.FilledSize, ObservedAt: service.now().UTC()}
+		if fillEvidencePending {
+			// The adapter deliberately returns normalized order evidence together
+			// with the enrichment error. Preserve its raw venue status/timestamp in
+			// the audit event while keeping execution amounts ledger-authoritative.
+			placeholder = venueOrder
+			placeholder.State = port.VenueOrderUnknown
+			placeholder.ID = firstNonEmpty(placeholder.ID, order.VenueOrderID)
+			placeholder.RawStatus = firstNonEmpty(placeholder.RawStatus, code)
+			if placeholder.FilledSize.IsEmpty() {
+				placeholder.FilledSize = order.FilledSize
+			}
+			if placeholder.ObservedAt.IsZero() {
+				placeholder.ObservedAt = service.now().UTC()
+			}
+		}
+		if err := service.finishAttemptWithOutcome(ctx, &order, &attempt, target, domain.TransitionTriggerReconciliation, placeholder, code, getErr, outcome); err != nil {
 			return order, errors.Join(fmt.Errorf("get venue order: %w", getErr), err)
 		}
 		if target == domain.OrderStatusUnknown {
+			if fillEvidencePending {
+				// A CLOB response may carry normalized size/trade-id evidence together
+				// with this error. Let the FillLedger try to recover confirmed trades;
+				// the aggregate venue size remains observation-only.
+				stillPending, syncErr := service.syncObservedFills(ctx, &order, venueOrder)
+				// Refresh may itself be running inside a focused reconciliation. Keep
+				// the order recoverable for the scheduled scan, but do not enqueue a
+				// new runner request from inside the same failing path.
+				var transitionErr error
+				if stillPending && order.Status != domain.OrderStatusUnknown {
+					transitionErr = service.transition(ctx, &order, domain.OrderStatusUnknown, domain.TransitionTriggerReconciliation, transitionDetails{
+						reasonCode: venueFillEvidencePendingCode,
+						reason:     "venue-reported execution is awaiting confirmation by the authoritative fill ledger",
+					})
+				}
+				var pendingErr error
+				if stillPending || syncErr != nil {
+					pendingErr = service.reservations.MarkUncertain(ctx, order, venueFillEvidencePendingCode)
+				}
+				if pendingErr != nil {
+					pendingErr = fmt.Errorf("retain reservation while confirmed fill evidence is pending: %w", pendingErr)
+				}
+				// Missing CLOB fill enrichment is an expected eventual-consistency
+				// state, not a failed reconciliation run. The attempt retains getErr
+				// for audit; only local synchronization/retention failures escape.
+				return order, errors.Join(syncErr, transitionErr, pendingErr)
+			}
 			_ = service.reservations.MarkUncertain(ctx, order, "RECONCILE_FAILED: "+getErr.Error())
 		}
 		return order, fmt.Errorf("get venue order: %w", getErr)
@@ -489,23 +539,23 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &order, venueOrder)
 	if syncErr != nil {
 		if order.Status == domain.OrderStatusCancelled {
-			return order, errors.Join(syncErr, service.holdCancellationFinality(ctx, order))
+			return order, errors.Join(syncErr, service.holdCancellationFinality(ctx, order, false))
 		}
-		uncertainErr := service.reservations.MarkUncertain(ctx, order, "AUTHORITATIVE_FILL_SYNC_FAILED: "+syncErr.Error())
-		service.triggerReconciliation(order, domain.ReconciliationTriggerOrderUnknown)
-		return order, errors.Join(syncErr, uncertainErr)
+		pendingErr := service.markFillEvidencePending(ctx, &order, domain.ReconciliationTriggerOrderUnknown, false)
+		return order, errors.Join(syncErr, pendingErr)
 	}
-	if pendingFillEvidence && order.Status != domain.OrderStatusUnknown && order.Status != domain.OrderStatusCancelled {
-		if err := service.markFillEvidencePending(ctx, order, domain.ReconciliationTriggerOrderUnknown); err != nil {
+	if pendingFillEvidence && order.Status != domain.OrderStatusCancelled {
+		if err := service.markFillEvidencePending(ctx, &order, domain.ReconciliationTriggerOrderUnknown, false); err != nil {
 			return order, err
 		}
+		return order, nil
 	}
 	if order.Status == domain.OrderStatusUnknown || order.Status == domain.OrderStatusAcknowledged {
 		_ = service.reservations.MarkUncertain(ctx, order, "RECONCILIATION_NOT_FINAL")
 		return order, nil
 	}
 	if order.Status == domain.OrderStatusCancelled {
-		return order, service.holdCancellationFinality(ctx, order)
+		return order, service.holdCancellationFinality(ctx, order, false)
 	}
 	if service.authoritativeFills && order.Status != domain.OrderStatusRejected {
 		return order, nil
@@ -551,16 +601,17 @@ func (service *Service) Cancel(ctx context.Context, orderID string) (domain.Orde
 	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &order, venueOrder)
 	if syncErr != nil {
 		if order.Status == domain.OrderStatusCancelled {
-			return order, errors.Join(syncErr, service.holdCancellationFinality(ctx, order))
+			return order, errors.Join(syncErr, service.holdCancellationFinality(ctx, order, true))
 		}
 		uncertainErr := service.reservations.MarkUncertain(ctx, order, "AUTHORITATIVE_FILL_SYNC_FAILED: "+syncErr.Error())
 		service.triggerReconciliation(order, domain.ReconciliationTriggerCancelUnknown)
 		return order, errors.Join(syncErr, uncertainErr)
 	}
-	if pendingFillEvidence && order.Status != domain.OrderStatusUnknown && order.Status != domain.OrderStatusCancelled {
-		if err := service.markFillEvidencePending(ctx, order, domain.ReconciliationTriggerCancelUnknown); err != nil {
+	if pendingFillEvidence && order.Status != domain.OrderStatusCancelled {
+		if err := service.markFillEvidencePending(ctx, &order, domain.ReconciliationTriggerCancelUnknown, true); err != nil {
 			return order, err
 		}
+		return order, nil
 	}
 	if order.Status == domain.OrderStatusUnknown {
 		_ = service.reservations.MarkUncertain(ctx, order, "CANCEL_RESULT_UNKNOWN")
@@ -568,7 +619,7 @@ func (service *Service) Cancel(ctx context.Context, orderID string) (domain.Orde
 		return order, nil
 	}
 	if order.Status == domain.OrderStatusCancelled {
-		return order, service.holdCancellationFinality(ctx, order)
+		return order, service.holdCancellationFinality(ctx, order, true)
 	}
 	if service.authoritativeFills {
 		return order, nil
@@ -603,7 +654,7 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 }
 
 // holdCancellationFinality 保留撤单后的资产预占并触发成交终局对账。
-func (service *Service) holdCancellationFinality(ctx context.Context, order domain.Order) error {
+func (service *Service) holdCancellationFinality(ctx context.Context, order domain.Order, enqueue bool) error {
 	if service.immediateCancelFinality {
 		if _, err := service.reservations.Reconcile(ctx, order); err != nil {
 			uncertainErr := service.reservations.MarkUncertain(ctx, order, "IMMEDIATE_CANCEL_RECONCILIATION_FAILED: "+err.Error())
@@ -612,7 +663,9 @@ func (service *Service) holdCancellationFinality(ctx context.Context, order doma
 		return nil
 	}
 	err := service.reservations.MarkUncertain(ctx, order, "CANCEL_FILL_FINALITY_PENDING")
-	service.triggerReconciliation(order, domain.ReconciliationTriggerCancelUnknown)
+	if enqueue {
+		service.triggerReconciliation(order, domain.ReconciliationTriggerCancelUnknown)
+	}
 	return err
 }
 
@@ -632,6 +685,13 @@ func (service *Service) syncObservedFills(ctx context.Context, order *domain.Ord
 		return false, nil
 	}
 	_, syncErr := service.fillSynchronizer.SyncOrder(ctx, order.ID)
+	fillEvidencePending := isFillEvidencePendingError(syncErr)
+	if fillEvidencePending {
+		// MATCHED/MINED/RETRYING is an expected propagation state. Keep the
+		// reservation and order durable, but do not turn the reconciliation
+		// runner unhealthy merely because final settlement evidence is not ready.
+		syncErr = nil
+	}
 	refreshed, reloadErr := service.repository.Get(ctx, order.ID)
 	if reloadErr == nil {
 		*order = refreshed
@@ -642,24 +702,47 @@ func (service *Service) syncObservedFills(ctx context.Context, order *domain.Ord
 	if reloadErr != nil {
 		reloadErr = fmt.Errorf("reload order %s after authoritative fill sync: %w", order.ID, reloadErr)
 	}
-	return authoritativeFillEvidencePending(observed, *order), errors.Join(syncErr, reloadErr)
+	return fillEvidencePending || authoritativeFillEvidencePending(observed, *order), errors.Join(syncErr, reloadErr)
+}
+
+func isFillEvidencePendingError(err error) bool {
+	var venueError *port.VenueError
+	return errors.As(err, &venueError) &&
+		strings.EqualFold(strings.TrimSpace(venueError.Code), clobFillDetailsUnavailableCode)
 }
 
 // markFillEvidencePending keeps collateral frozen until a later reconciliation
 // observes the corresponding confirmed trades.
-func (service *Service) markFillEvidencePending(ctx context.Context, order domain.Order, trigger domain.ReconciliationTrigger) error {
-	err := service.reservations.MarkUncertain(ctx, order, "VENUE_FILL_EVIDENCE_PENDING")
-	service.triggerReconciliation(order, trigger)
-	if err != nil {
-		return fmt.Errorf("retain reservation while confirmed fill evidence is pending: %w", err)
+func (service *Service) markFillEvidencePending(
+	ctx context.Context,
+	order *domain.Order,
+	trigger domain.ReconciliationTrigger,
+	enqueue bool,
+) error {
+	// Persist the reason even when the venue observation already mapped to
+	// UNKNOWN. Without this audited self-transition, the fast coordinator cannot
+	// distinguish durable fill enrichment from an ordinary retryable read error.
+	transitionErr := service.transition(ctx, order, domain.OrderStatusUnknown, domain.TransitionTriggerReconciliation, transitionDetails{
+		reasonCode: venueFillEvidencePendingCode,
+		reason:     "venue-reported execution is awaiting confirmation by the authoritative fill ledger",
+	})
+	uncertainErr := service.reservations.MarkUncertain(ctx, *order, venueFillEvidencePendingCode)
+	if enqueue {
+		service.triggerReconciliation(*order, trigger)
 	}
-	return nil
+	if uncertainErr != nil {
+		uncertainErr = fmt.Errorf("retain reservation while confirmed fill evidence is pending: %w", uncertainErr)
+	}
+	return errors.Join(transitionErr, uncertainErr)
 }
 
 // venueObservationNeedsFillSync identifies observations that may race with the
 // venue's confirmed trade feed. A successful cancel always requires one final
 // pre-finality scan, even when size_matched is zero.
 func venueObservationNeedsFillSync(observed port.VenueOrder) bool {
+	if len(observed.TradeIDs) > 0 {
+		return true
+	}
 	switch observed.State {
 	case port.VenueOrderPartiallyFilled, port.VenueOrderFilled, port.VenueOrderCancelled:
 		return true
@@ -689,6 +772,9 @@ func authoritativeFillEvidencePending(observed port.VenueOrder, order domain.Ord
 	}
 	confirmedSign, err := confirmedFilled.Sign()
 	if err != nil {
+		return true
+	}
+	if confirmedSign == 0 && len(observed.TradeIDs) > 0 {
 		return true
 	}
 	switch observed.State {
@@ -933,7 +1019,8 @@ func (service *Service) reconcileAttemptCount(ctx context.Context, orderID strin
 	}
 	count := 0
 	for _, attempt := range attempts {
-		if attempt.Kind == domain.OrderAttemptReconcile {
+		if attempt.Kind == domain.OrderAttemptReconcile &&
+			!strings.EqualFold(strings.TrimSpace(attempt.ErrorCode), clobFillDetailsUnavailableCode) {
 			count++
 		}
 	}

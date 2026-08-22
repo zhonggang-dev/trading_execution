@@ -11,8 +11,9 @@ import (
 
 // venueEvidence 保存本次账户级交易扫描对单订单处理有用的最小证据。
 type venueEvidence struct {
-	tradesAvailable  bool
-	ordersWithTrades map[string]struct{}
+	tradesAvailable         bool
+	ordersWithTrades        map[string]struct{}
+	ordersWithPendingTrades map[string]struct{}
 }
 
 // dispositionTradeIdentity is deliberately an exact component identity. One
@@ -89,6 +90,7 @@ func (state *runState) collectVenueEvidence(ctx context.Context, scope accountRu
 		state.recordExternalOrders(ctx, openOrders, localOrders)
 	}
 	ordersWithTrades := make(map[string]struct{})
+	ordersWithPendingTrades := make(map[string]struct{})
 	if tradesErr == nil {
 		dispositionIndex := make(map[dispositionTradeIdentity]struct{})
 		if dispositionErr == nil {
@@ -100,11 +102,12 @@ func (state *runState) collectVenueEvidence(ctx context.Context, scope accountRu
 				dispositionIndex = make(map[dispositionTradeIdentity]struct{})
 			}
 		}
-		ordersWithTrades = state.recordExternalTrades(ctx, trades, localOrders, dispositionIndex)
+		ordersWithTrades, ordersWithPendingTrades = state.recordExternalTrades(ctx, trades, localOrders, dispositionIndex)
 	}
 	return venueEvidence{
-		tradesAvailable:  tradesErr == nil,
-		ordersWithTrades: ordersWithTrades,
+		tradesAvailable:         tradesErr == nil,
+		ordersWithTrades:        ordersWithTrades,
+		ordersWithPendingTrades: ordersWithPendingTrades,
 	}, errors.Join(openErr, tradesErr, dispositionErr)
 }
 
@@ -149,23 +152,25 @@ func (state *runState) recordExternalTrades(
 	trades []domain.VenueTradeSnapshot,
 	localOrders map[string]struct{},
 	dispositionTrades map[dispositionTradeIdentity]struct{},
-) map[string]struct{} {
+) (map[string]struct{}, map[string]struct{}) {
 	result := make(map[string]struct{})
+	pending := make(map[string]struct{})
 	for _, trade := range trades {
 		state.recordExternalTradeOrders(ctx, externalTradeOrdersParams{
 			trade: trade, localOrders: localOrders, ordersWithTrades: result,
-			dispositionTrades: dispositionTrades,
+			ordersWithPendingTrades: pending, dispositionTrades: dispositionTrades,
 		})
 	}
-	return result
+	return result, pending
 }
 
 // externalTradeOrdersParams 收拢处理一笔外部成交时需要共享的索引。
 type externalTradeOrdersParams struct {
-	trade             domain.VenueTradeSnapshot
-	localOrders       map[string]struct{}
-	ordersWithTrades  map[string]struct{}
-	dispositionTrades map[dispositionTradeIdentity]struct{}
+	trade                   domain.VenueTradeSnapshot
+	localOrders             map[string]struct{}
+	ordersWithTrades        map[string]struct{}
+	ordersWithPendingTrades map[string]struct{}
+	dispositionTrades       map[dispositionTradeIdentity]struct{}
 }
 
 // recordExternalTradeOrders 处理一笔交易所成交关联的全部订单标识。
@@ -173,6 +178,9 @@ func (state *runState) recordExternalTradeOrders(ctx context.Context, params ext
 	for _, venueOrderID := range params.trade.OrderIDs {
 		normalizedOrderID := normalizedID(venueOrderID)
 		params.ordersWithTrades[normalizedOrderID] = struct{}{}
+		if !domain.NormalizeFillStatus(params.trade.Status).Terminal() {
+			params.ordersWithPendingTrades[normalizedOrderID] = struct{}{}
+		}
 		if _, owned := params.localOrders[normalizedOrderID]; owned {
 			continue
 		}

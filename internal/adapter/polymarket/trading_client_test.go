@@ -210,6 +210,63 @@ func TestMatchedPlacementReadsAuthoritativePartialFill(t *testing.T) {
 	}
 }
 
+func TestMatchedPlacementPreservesObservedFillWhileTradeDetailsArePending(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	var placedOrderID string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.URL.Path == "/version":
+			writeTestJSON(writer, map[string]any{"version": 2})
+		case request.URL.Path == "/tick-size":
+			writeTestJSON(writer, map[string]any{"minimum_tick_size": "0.01"})
+		case request.URL.Path == "/neg-risk":
+			writeTestJSON(writer, map[string]any{"neg_risk": false})
+		case request.URL.Path == "/order":
+			var posted postOrderPayload
+			if err := json.NewDecoder(request.Body).Decode(&posted); err != nil {
+				t.Fatal(err)
+			}
+			placedOrderID = signedOrderIDForTest(t, posted.Order, false)
+			writeTestJSON(writer, map[string]any{
+				"success": true, "orderID": placedOrderID, "status": "matched",
+				"tradeIDs": []string{"trade-post", "trade-shared"},
+				"tradeIds": []string{"trade-alt", "trade-shared"},
+			})
+		case placedOrderID != "" && request.URL.Path == "/data/order/"+placedOrderID:
+			writeTestJSON(writer, map[string]any{
+				"id": placedOrderID, "status": "MATCHED", "original_size": "10000000", "size_matched": "10000000",
+				"associate_trades": []string{"trade-shared", "trade-pending"},
+			})
+		case request.URL.Path == "/data/trades":
+			tradeID := request.URL.Query().Get("id")
+			writeTestJSON(writer, map[string]any{
+				"data": []map[string]any{{
+					"id": tradeID, "taker_order_id": placedOrderID, "size": "10", "price": "0.5",
+					"status": "MATCHED", "trader_side": "TAKER",
+					"maker_address": request.URL.Query().Get("maker_address"),
+				}},
+				"next_cursor": "LTE=",
+			})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestTradingClient(t, server.URL, now)
+	venueOrder, err := client.Place(context.Background(), adapterOrder())
+	if err != nil {
+		t.Fatalf("Place() error = %v", err)
+	}
+	if venueOrder.State != port.VenueOrderFilled || venueOrder.FilledSize != "10" || !venueOrder.AverageFillPrice.IsEmpty() {
+		t.Fatalf("Place() = %#v, want observed fill without a provisional average price", venueOrder)
+	}
+	wantTradeIDs := []string{"trade-shared", "trade-pending", "trade-post", "trade-alt"}
+	if strings.Join(venueOrder.TradeIDs, ",") != strings.Join(wantTradeIDs, ",") {
+		t.Fatalf("trade ids = %#v, want %#v", venueOrder.TradeIDs, wantTradeIDs)
+	}
+}
+
 func TestAcceptedPlacementWithMismatchedOrderIDIsAmbiguous(t *testing.T) {
 	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -550,6 +607,40 @@ func TestListOrderFillsFailsClosedWithoutFinalizedFeeEvidence(t *testing.T) {
 	schedule := client.feeSchedules[order.Intent.ConditionID+"\x00"+order.Intent.TokenID]
 	if !schedule.Rate.Equal("0.25") || !schedule.Exponent.Equal("2") {
 		t.Fatalf("official fee schedule = %#v", schedule)
+	}
+}
+
+func TestListOrderFillsFailsClosedWhileOwnedTradeIsPending(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	for _, status := range []string{"MATCHED", "MINED", "RETRYING"} {
+		t.Run(status, func(t *testing.T) {
+			order := adapterOrder()
+			order.VenueOrderID = "0xvenue"
+			order.Intent.ConditionID = "condition-1"
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path != "/data/trades" {
+					t.Fatalf("unexpected path %s", request.URL.Path)
+				}
+				writeTestJSON(writer, map[string]any{"data": []map[string]any{{
+					"id": "trade-pending", "taker_order_id": order.VenueOrderID, "market": order.Intent.ConditionID,
+					"asset_id": order.Intent.TokenID, "side": "BUY", "size": "10", "price": "0.5",
+					"status": status, "fee_rate_bps": "0", "match_time": "2026-08-18T07:59:58Z",
+					"last_update": "2026-08-18T07:59:59Z", "trader_side": "TAKER",
+					"maker_address": request.URL.Query().Get("maker_address"),
+				}}, "next_cursor": "LTE="})
+			}))
+			defer server.Close()
+
+			client := newTestTradingClient(t, server.URL, now)
+			fills, err := client.ListOrderFills(context.Background(), order)
+			var venueErr *port.VenueError
+			if !errors.As(err, &venueErr) || venueErr.Code != "CLOB_FILL_DETAILS_UNAVAILABLE" {
+				t.Fatalf("ListOrderFills() fills/error = %#v/%v, want explicit pending evidence error", fills, err)
+			}
+			if len(fills) != 0 {
+				t.Fatalf("ListOrderFills() fills = %#v, want no provisional ledger fills", fills)
+			}
+		})
 	}
 }
 

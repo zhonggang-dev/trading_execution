@@ -313,6 +313,10 @@ func (repository *OrderRepository) ListPending(ctx context.Context, before time.
 		WHERE status IN ('RECEIVED', 'VALIDATING', 'RESERVED',
 		                 'SUBMITTING', 'ACKNOWLEDGED', 'LIVE', 'PARTIALLY_FILLED',
 		                 'UNKNOWN', 'CANCEL_PENDING', 'RECONCILING')
+		  AND NOT (
+			status = 'UNKNOWN'
+			AND failure_code IN ('CLOB_FILL_DETAILS_UNAVAILABLE', 'VENUE_FILL_EVIDENCE_PENDING')
+		  )
 		  AND updated_at <= $1
 		ORDER BY updated_at, order_id
 		LIMIT $2`, before.UTC(), limit)
@@ -347,6 +351,19 @@ func (repository *OrderRepository) ListForReconciliation(
 			           'ACKNOWLEDGED', 'LIVE', 'PARTIALLY_FILLED', 'UNKNOWN',
 			           'CANCEL_PENDING', 'RECONCILING')
 			OR updated_at >= $2
+			OR EXISTS (
+				SELECT 1
+				FROM asset_reservations AS reservation
+				WHERE reservation.order_id = execution_orders.order_id
+				  AND reservation.execution_account_id = execution_orders.execution_account_id
+				  AND execution_orders.status IN ('MANUAL_REVIEW', 'CANCELLED')
+				  AND reservation.status IN ('ACTIVE', 'RECONCILIATION_REQUIRED')
+				  AND (
+					(reservation.side = 'BUY' AND reservation.remaining_reserved_balance > 0)
+					OR
+					(reservation.side = 'SELL' AND reservation.remaining_reserved_shares > 0)
+				  )
+			)
 		  )
 		ORDER BY created_at, order_id`, strings.TrimSpace(executionAccountID), updatedAfter.UTC())
 	if err != nil {

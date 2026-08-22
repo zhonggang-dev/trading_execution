@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,6 +151,65 @@ func TestScheduledReconciliationKeepsNewerLookbackThanAccountBaseline(t *testing
 	want := testNow.Add(-5 * time.Minute)
 	if !venue.tradesAfter.Equal(want) {
 		t.Fatalf("venue trades after = %s, want lookback %s", venue.tradesAfter, want)
+	}
+}
+
+func TestScheduledReconciliationSyncsPersistentTerminalRecoveryOrdersWithoutTradeReference(t *testing.T) {
+	manual := testOrder("order-manual", "venue-manual", domain.OrderStatusManualReview)
+	manual.FailureCode = "HTTP_TIMEOUT_AFTER_FILL_DELAY"
+	cancelled := testOrder("order-cancelled", "venue-cancelled", domain.OrderStatusCancelled)
+	ordinaryTerminalBuy := testOrder("order-terminal-buy", "venue-terminal-buy", domain.OrderStatusRejected)
+	fills := &fakeFills{}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{orders: []domain.Order{manual, cancelled, ordinaryTerminalBuy}},
+		Venue:  &fakeVenue{}, Ledger: &fakeLedger{balance: testBalance("100")},
+		Fills: fills, OrderRefresher: &fakeRefresher{},
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil || result.Run.Status != domain.ReconciliationRunCompleted {
+		t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+	}
+	if len(fills.calls) != 2 || fills.calls[0] != manual.ID || fills.calls[1] != cancelled.ID {
+		t.Fatalf("fill sync calls = %#v, want fill-evidence MANUAL_REVIEW and CANCELLED", fills.calls)
+	}
+}
+
+func TestScheduledReconciliationRetriesFillEvidencePendingAtLowFrequency(t *testing.T) {
+	order := testOrder("order-fill-evidence-pending", "venue-fill-evidence-pending", domain.OrderStatusUnknown)
+	order.FailureCode = "CLOB_FILL_DETAILS_UNAVAILABLE"
+	fills := &fakeFills{}
+	refresher := &fakeRefresher{}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{orders: []domain.Order{order}}, Venue: &fakeVenue{},
+		Ledger: &fakeLedger{balance: testBalance("100")}, Fills: fills, OrderRefresher: refresher,
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil || result.Run.Status != domain.ReconciliationRunCompleted {
+		t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+	}
+	if len(fills.calls) != 1 || fills.calls[0] != order.ID {
+		t.Fatalf("fill sync calls = %#v, want only %s", fills.calls, order.ID)
+	}
+	if refresher.calls != 1 {
+		t.Fatalf("venue refresh calls = %d, want one scheduled retry", refresher.calls)
 	}
 }
 
@@ -615,6 +675,83 @@ func TestRunAccountDoesNotFinalizeCancelledReservationWithoutCompleteFillEvidenc
 	}
 }
 
+func TestRunAccountDoesNotFinalizeCancelledReservationWhenOrderFillIsPending(t *testing.T) {
+	cancelled := testOrder("order-cancelled", "venue-cancelled", domain.OrderStatusCancelled)
+	pendingErr := &port.VenueError{
+		Kind: port.VenueErrorUnavailable, Code: "CLOB_FILL_DETAILS_UNAVAILABLE",
+		Message: "order fills are still propagating", VenueOrderID: cancelled.VenueOrderID,
+	}
+	fills := &fakeFills{errors: map[string]error{cancelled.ID: pendingErr}}
+	refresher := &fakeRefresher{orders: map[string]domain.Order{cancelled.ID: cancelled}}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{orders: []domain.Order{cancelled}}, Venue: &fakeVenue{},
+		Ledger: &fakeLedger{balance: testBalance("100")}, Fills: fills, OrderRefresher: refresher,
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil || result.Run.Status != domain.ReconciliationRunCompleted {
+		t.Fatalf("RunAccount() result/error = %#v/%v, want healthy durable pending state", result, err)
+	}
+	if refresher.finalizations != 0 {
+		t.Fatalf("cancel finalizations = %d, want 0 while order-level fills are unavailable", refresher.finalizations)
+	}
+	if len(fills.calls) != 1 || fills.calls[0] != cancelled.ID {
+		t.Fatalf("fill sync calls = %#v, want the cancelled order", fills.calls)
+	}
+	if result.Run.Summary["fill_evidence_pending"] != 1 {
+		t.Fatalf("fill_evidence_pending = %d, want 1", result.Run.Summary["fill_evidence_pending"])
+	}
+}
+
+func TestRunAccountDoesNotFinalizeCancelledReservationWhileTradeIsPending(t *testing.T) {
+	for _, status := range []domain.FillStatus{
+		domain.FillStatusMatched,
+		domain.FillStatusMined,
+		domain.FillStatusRetrying,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			cancelled := testOrder("order-cancelled-"+strings.ToLower(string(status)), "venue-cancelled", domain.OrderStatusCancelled)
+			refresher := &fakeRefresher{orders: map[string]domain.Order{cancelled.ID: cancelled}}
+			fills := &fakeFills{}
+			service := newTestService(t, Params{
+				Orders: &fakeOrders{orders: []domain.Order{cancelled}},
+				Venue: &fakeVenue{trades: []domain.VenueTradeSnapshot{{
+					VenueTradeID: "trade-pending", OrderIDs: []string{cancelled.VenueOrderID},
+					ConditionID: cancelled.Intent.ConditionID, TokenID: cancelled.Intent.TokenID,
+					Status: status, ObservedAt: testNow,
+				}}},
+				Ledger: &fakeLedger{balance: testBalance("100")}, Fills: fills, OrderRefresher: refresher,
+				PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+					return nil, nil
+				})},
+				BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+					return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+				})},
+			})
+
+			if _, err := service.RunAccount(context.Background(), RunAccountParams{
+				ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+			}); err != nil {
+				t.Fatalf("RunAccount() error = %v", err)
+			}
+			if refresher.finalizations != 0 {
+				t.Fatalf("cancel finalizations = %d, want 0 while trade is %s", refresher.finalizations, status)
+			}
+			if len(fills.calls) != 1 || fills.calls[0] != cancelled.ID {
+				t.Fatalf("fill sync calls = %#v, want the cancelled order", fills.calls)
+			}
+		})
+	}
+}
+
 // TestRunAccountFinalizesCancelledReservationAfterSuccessfulFillScan 验证 Run Account Finalizes Cancelled Reservation After Successful Fill Scan 场景下的行为。
 func TestRunAccountFinalizesCancelledReservationAfterSuccessfulFillScan(t *testing.T) {
 	cancelled := testOrder("order-cancelled", "venue-cancelled", domain.OrderStatusCancelled)
@@ -736,10 +873,12 @@ func (ledger *fakeLedger) MarkPositionSettled(_ context.Context, _ string, token
 type fakeFills struct {
 	results map[string]fillprocessor.SyncResult
 	errors  map[string]error
+	calls   []string
 }
 
 // SyncOrder 模拟真实成交同步。
 func (fills *fakeFills) SyncOrder(_ context.Context, orderID string) (fillprocessor.SyncResult, error) {
+	fills.calls = append(fills.calls, orderID)
 	return fills.results[orderID], fills.errors[orderID]
 }
 

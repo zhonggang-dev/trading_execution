@@ -657,8 +657,9 @@ func TestSubmitDoesNotBookVenueSizeMatchedWithoutConfirmedFill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
-	if result.Order.Status != domain.OrderStatusLive || !result.Order.FilledSize.Equal("0") || !result.Order.AverageFillPrice.IsEmpty() {
-		t.Fatalf("Submit() order = %#v, want LIVE with no ledger-confirmed fill", result.Order)
+	if result.Order.Status != domain.OrderStatusUnknown || result.Order.FailureCode != "VENUE_FILL_EVIDENCE_PENDING" ||
+		!result.Order.FilledSize.Equal("0") || !result.Order.AverageFillPrice.IsEmpty() {
+		t.Fatalf("Submit() order = %#v, want recoverable UNKNOWN with no ledger-confirmed fill", result.Order)
 	}
 	if synchronizer.calls.Load() != 1 || reservations.reconcileCalls.Load() != 0 || reservations.uncertainCalls.Load() != 1 {
 		t.Fatalf("sync/reconcile/uncertain calls = %d/%d/%d, want 1/0/1",
@@ -666,6 +667,80 @@ func TestSubmitDoesNotBookVenueSizeMatchedWithoutConfirmedFill(t *testing.T) {
 	}
 	if len(trigger.calls) != 1 || trigger.calls[0].trigger != domain.ReconciliationTriggerOrderUnknown {
 		t.Fatalf("reconciliation triggers = %#v", trigger.calls)
+	}
+}
+
+func TestSubmitTreatsNonTerminalTradeEvidenceAsDurablePending(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venueOrder := port.VenueOrder{
+		ID: "venue-nonterminal-fill", State: port.VenueOrderFilled, RawStatus: "matched",
+		FilledSize: "10", TradeIDs: []string{"trade-pending"}, ObservedAt: now,
+	}
+	synchronizer := &fakeFillSynchronizer{sync: func(context.Context, string) error {
+		return &port.VenueError{
+			Kind: port.VenueErrorUnavailable, Code: "CLOB_FILL_DETAILS_UNAVAILABLE",
+			Message: "owned trade is not terminal",
+		}
+	}}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	trigger := &reconciliationTrigger{}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: &fakeVenue{placeOrder: &venueOrder}, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations, Reconciliation: trigger,
+		FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		Now: func() time.Time { return now }, NewID: func() string { return "ord-nonterminal-fill" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(context.Background(), validIntent("client-nonterminal-fill"))
+	if err != nil {
+		t.Fatalf("Submit() error = %v, want asynchronous pending state", err)
+	}
+	if result.Order.Status != domain.OrderStatusUnknown || result.Order.FailureCode != "VENUE_FILL_EVIDENCE_PENDING" ||
+		!result.Order.FilledSize.Equal("0") {
+		t.Fatalf("Submit() order = %#v, want durable pending evidence without provisional fill", result.Order)
+	}
+	if reservations.uncertainCalls.Load() != 1 || len(trigger.calls) != 1 {
+		t.Fatalf("uncertain/triggers = %d/%d, want 1/1", reservations.uncertainCalls.Load(), len(trigger.calls))
+	}
+}
+
+func TestSubmitTradeIDsWithoutEnrichedSizeRemainPendingFillEvidence(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	for _, state := range []port.VenueOrderState{port.VenueOrderLive, port.VenueOrderUnknown} {
+		t.Run(string(state), func(t *testing.T) {
+			suffix := strings.ToLower(string(state))
+			venueOrder := port.VenueOrder{
+				ID: "venue-trade-id-pending-" + suffix, State: state, RawStatus: suffix,
+				FilledSize: "0", TradeIDs: []string{"trade-before-size-enrichment"}, ObservedAt: now,
+			}
+			synchronizer := &fakeFillSynchronizer{}
+			reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+			trigger := &reconciliationTrigger{}
+			service, err := execution.New(execution.Params{
+				Repository: memory.NewOrderRepository(), Venue: &fakeVenue{placeOrder: &venueOrder},
+				Guard: allowGuard{}, MarketValidator: allowMarketValidator{}, Reservations: reservations,
+				Reconciliation: trigger, FillSynchronizer: synchronizer, AuthoritativeFills: true,
+				Now: func() time.Time { return now }, NewID: func() string { return "ord-trade-id-pending-" + suffix },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := service.Submit(context.Background(), validIntent("client-trade-id-pending-"+suffix))
+			if err != nil {
+				t.Fatalf("Submit() error = %v", err)
+			}
+			if result.Order.Status != domain.OrderStatusUnknown || result.Order.FailureCode != "VENUE_FILL_EVIDENCE_PENDING" ||
+				!result.Order.FilledSize.Equal("0") {
+				t.Fatalf("Submit() order = %#v, want durable pending fill evidence", result.Order)
+			}
+			if synchronizer.calls.Load() != 1 || reservations.uncertainCalls.Load() != 1 || len(trigger.calls) != 1 {
+				t.Fatalf("sync/uncertain/triggers = %d/%d/%d, want 1/1/1",
+					synchronizer.calls.Load(), reservations.uncertainCalls.Load(), len(trigger.calls))
+			}
+		})
 	}
 }
 
@@ -739,6 +814,227 @@ func TestRefreshUsesConfirmedFillLedgerAsAuthority(t *testing.T) {
 	}
 	if synchronizer.calls.Load() != 1 || reservations.reconcileCalls.Load() != 0 {
 		t.Fatalf("sync/reconcile calls = %d/%d, want 1/0", synchronizer.calls.Load(), reservations.reconcileCalls.Load())
+	}
+}
+
+func TestRefreshFillEvidencePendingDoesNotSelfTriggerReconciliation(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	for _, testCase := range []struct {
+		name    string
+		syncErr error
+	}{
+		{name: "ledger lag"},
+		{name: "fill source unavailable", syncErr: errors.New("fill source unavailable")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			suffix := strings.ReplaceAll(testCase.name, " ", "-")
+			repository := memory.NewOrderRepository()
+			venue := &fakeVenue{}
+			trigger := &reconciliationTrigger{}
+			synchronizer := &fakeFillSynchronizer{sync: func(context.Context, string) error {
+				return testCase.syncErr
+			}}
+			service, err := execution.New(execution.Params{
+				Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+				Reservations: paper.NewReservationManager(), Reconciliation: trigger,
+				FillSynchronizer: synchronizer, AuthoritativeFills: true,
+				Now: func() time.Time { return now }, NewID: func() string { return "ord-refresh-no-self-trigger-" + suffix },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := service.Submit(context.Background(), validIntent("client-refresh-no-self-trigger-"+suffix))
+			if err != nil {
+				t.Fatal(err)
+			}
+			venue.getOrder = &port.VenueOrder{
+				ID: result.Order.VenueOrderID, State: port.VenueOrderPartiallyFilled, RawStatus: "matched",
+				FilledSize: "4", TradeIDs: []string{"trade-pending"}, ObservedAt: now,
+			}
+			refreshed, refreshErr := service.Refresh(context.Background(), result.Order.ID)
+			if (refreshErr != nil) != (testCase.syncErr != nil) {
+				t.Fatalf("Refresh() error = %v, sync error = %v", refreshErr, testCase.syncErr)
+			}
+			if refreshed.Status != domain.OrderStatusUnknown || refreshed.FailureCode != "VENUE_FILL_EVIDENCE_PENDING" {
+				t.Fatalf("Refresh() order = %#v, want durable fill-evidence UNKNOWN", refreshed)
+			}
+			if len(trigger.calls) != 0 {
+				t.Fatalf("reconciliation triggers = %#v, want none from Refresh", trigger.calls)
+			}
+		})
+	}
+}
+
+func TestRefreshFillDetailsUnavailableStaysRecoverableWithoutUsingGenericRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	paperReservations := paper.NewReservationManager()
+	reservations := &trackingReservations{delegate: paperReservations}
+	trigger := &reconciliationTrigger{}
+	synchronizer := &fakeFillSynchronizer{}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, Reconciliation: trigger, FillSynchronizer: synchronizer,
+		AuthoritativeFills: true, MaxReconcileAttempts: 2,
+		Now: func() time.Time { return now }, NewID: func() string { return "ord-fill-details-pending" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validIntent("client-fill-details-pending")
+	intent.Side = domain.SideSell
+	intent.TargetLotID = "lot-fill-details-pending"
+	result, err := service.Submit(ctx, intent)
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	venue.getErr = &port.VenueError{
+		Kind: port.VenueErrorUnavailable, Code: "CLOB_FILL_DETAILS_UNAVAILABLE",
+		Message: "order fill was observed but exact trade details are not complete",
+	}
+	venue.getOrder = &port.VenueOrder{
+		ID: result.Order.VenueOrderID, State: port.VenueOrderPartiallyFilled, RawStatus: "matched",
+		FilledSize: "4", TradeIDs: []string{"trade-pending"}, ObservedAt: now,
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		refreshed, refreshErr := service.Refresh(ctx, result.Order.ID)
+		if refreshErr != nil || refreshed.Status != domain.OrderStatusUnknown ||
+			refreshed.FailureCode != "CLOB_FILL_DETAILS_UNAVAILABLE" {
+			t.Fatalf("special Refresh() #%d = %#v, %v; want recoverable UNKNOWN", attempt+1, refreshed, refreshErr)
+		}
+		if !refreshed.FilledSize.Equal("0") || !refreshed.FilledNotional.Equal("0") {
+			t.Fatalf("special Refresh() #%d applied unconfirmed venue amounts: %#v", attempt+1, refreshed)
+		}
+	}
+	if venue.getCalls.Load() != 4 || synchronizer.calls.Load() != 4 {
+		t.Fatalf("venue GET/fill sync calls = %d/%d, want 4/4", venue.getCalls.Load(), synchronizer.calls.Load())
+	}
+	if len(trigger.calls) != 0 {
+		t.Fatalf("recursive reconciliation triggers = %#v, want none", trigger.calls)
+	}
+	reservation, ok := paperReservations.Get(result.Order.ID)
+	if !ok || reservation.Status != domain.ReservationStatusReconciliationRequired ||
+		!reservation.RemainingReservedShares.Equal(intent.Size) || reservation.UncertainReason != "VENUE_FILL_EVIDENCE_PENDING" {
+		t.Fatalf("reservation = %#v, %v; want all shares held for fill evidence", reservation, ok)
+	}
+	attempts, err := repository.Attempts(ctx, result.Order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 5 {
+		t.Fatalf("attempt count = %d, want submit plus four reconciliations", len(attempts))
+	}
+	for index, attempt := range attempts[1:] {
+		if attempt.Kind != domain.OrderAttemptReconcile || attempt.Outcome != domain.AttemptOutcomeUnknown ||
+			attempt.ErrorCode != "CLOB_FILL_DETAILS_UNAVAILABLE" || attempt.VenueStatus != "matched" {
+			t.Fatalf("special reconcile attempt #%d = %#v", index+1, attempt)
+		}
+	}
+
+	// The special attempts above do not consume the ordinary bounded retry
+	// budget: two subsequent generic failures still receive the full 2 attempts.
+	venue.getErr = errors.New("venue timeout")
+	firstGeneric, firstGenericErr := service.Refresh(ctx, result.Order.ID)
+	if firstGenericErr == nil || firstGeneric.Status != domain.OrderStatusUnknown || firstGeneric.FailureCode != "RECONCILE_FAILED" {
+		t.Fatalf("first generic Refresh() = %#v, %v; want UNKNOWN", firstGeneric, firstGenericErr)
+	}
+	secondGeneric, secondGenericErr := service.Refresh(ctx, result.Order.ID)
+	if secondGenericErr == nil || secondGeneric.Status != domain.OrderStatusManualReview || secondGeneric.FailureCode != "RECONCILE_FAILED" {
+		t.Fatalf("second generic Refresh() = %#v, %v; want MANUAL_REVIEW", secondGeneric, secondGenericErr)
+	}
+	attempts, err = repository.Attempts(ctx, result.Order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts[len(attempts)-2].Outcome != domain.AttemptOutcomeUnknown ||
+		attempts[len(attempts)-1].Outcome != domain.AttemptOutcomeFailed {
+		t.Fatalf("generic reconcile outcomes = %#v", attempts[len(attempts)-2:])
+	}
+}
+
+func TestRefreshFillDetailsUnavailableReturnsOrderReloadedFromFillLedger(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	synchronizer := &fakeFillSynchronizer{sync: func(ctx context.Context, orderID string) error {
+		return persistConfirmedFill(ctx, repository, orderID, domain.OrderStatusPartiallyFilled, "4", "0.5")
+	}}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: paper.NewReservationManager(), FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		MaxReconcileAttempts: 1, Now: func() time.Time { return now },
+		NewID: func() string { return "ord-fill-details-recovered" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(ctx, validIntent("client-fill-details-recovered"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	venue.getOrder = &port.VenueOrder{
+		ID: result.Order.VenueOrderID, State: port.VenueOrderPartiallyFilled, RawStatus: "matched",
+		FilledSize: "4", TradeIDs: []string{"trade-recovered"}, ObservedAt: now,
+	}
+	venue.getErr = &port.VenueError{
+		Kind: port.VenueErrorUnavailable, Code: "CLOB_FILL_DETAILS_UNAVAILABLE",
+		Message: "order fill was observed but exact trade details are not complete",
+	}
+	refreshed, refreshErr := service.Refresh(ctx, result.Order.ID)
+	if refreshErr != nil || refreshed.Status != domain.OrderStatusPartiallyFilled ||
+		!refreshed.FilledSize.Equal("4") || !refreshed.AverageFillPrice.Equal("0.5") {
+		t.Fatalf("Refresh() = %#v, %v; want ledger-reloaded partial fill", refreshed, refreshErr)
+	}
+	if synchronizer.calls.Load() != 1 {
+		t.Fatalf("fill sync calls = %d, want 1", synchronizer.calls.Load())
+	}
+	attempts, err := repository.Attempts(ctx, result.Order.ID)
+	if err != nil || len(attempts) != 2 || attempts[1].ErrorCode != "CLOB_FILL_DETAILS_UNAVAILABLE" ||
+		attempts[1].Outcome != domain.AttemptOutcomeUnknown {
+		t.Fatalf("attempts = %#v, %v; want audited incomplete GET", attempts, err)
+	}
+}
+
+func TestRefreshFillDetailsUnavailableKeepsRecoveredPartialBehindVenuePending(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	currentTime := now
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	synchronizer := &fakeFillSynchronizer{sync: func(ctx context.Context, orderID string) error {
+		err := persistConfirmedFill(ctx, repository, orderID, domain.OrderStatusPartiallyFilled, "2", "0.5")
+		currentTime = now.Add(time.Second)
+		return err
+	}}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: paper.NewReservationManager(), FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		MaxReconcileAttempts: 1, Now: func() time.Time { return currentTime },
+		NewID: func() string { return "ord-fill-details-still-pending" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(ctx, validIntent("client-fill-details-still-pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	venue.getOrder = &port.VenueOrder{
+		ID: result.Order.VenueOrderID, State: port.VenueOrderPartiallyFilled, RawStatus: "matched",
+		FilledSize: "4", TradeIDs: []string{"trade-confirmed", "trade-pending"}, ObservedAt: now,
+	}
+	venue.getErr = &port.VenueError{
+		Kind: port.VenueErrorUnavailable, Code: "CLOB_FILL_DETAILS_UNAVAILABLE",
+		Message: "order fill was observed but exact trade details are not complete",
+	}
+	refreshed, refreshErr := service.Refresh(ctx, result.Order.ID)
+	if refreshErr != nil || refreshed.Status != domain.OrderStatusUnknown ||
+		refreshed.FailureCode != "VENUE_FILL_EVIDENCE_PENDING" || !refreshed.FilledSize.Equal("2") {
+		t.Fatalf("Refresh() = %#v, %v; want ledger partial retained in durable pending state", refreshed, refreshErr)
 	}
 }
 
@@ -938,6 +1234,23 @@ func persistConfirmedFill(ctx context.Context, repository port.OrderRepository, 
 	if err != nil {
 		return err
 	}
+	// Production FillLedger moves UNKNOWN through RECONCILING before applying a
+	// confirmed partial fill; mirror that legal state-machine path in the fake.
+	if order.Status == domain.OrderStatusUnknown {
+		next, event, transitionErr := orderstate.Apply(order, orderstate.Transition{
+			EventID: fmt.Sprintf("event:%s:%d", order.ID, order.Revision+1),
+			To:      domain.OrderStatusReconciling,
+			Trigger: domain.TransitionTriggerFill,
+			At:      order.UpdatedAt.Add(time.Nanosecond),
+		})
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if transitionErr = repository.Transition(ctx, next, event); transitionErr != nil {
+			return transitionErr
+		}
+		order = next
+	}
 	next, event, err := orderstate.Apply(order, orderstate.Transition{
 		EventID:          fmt.Sprintf("event:%s:%d", order.ID, order.Revision+1),
 		To:               target,
@@ -1082,7 +1395,9 @@ func (trigger *reconciliationTrigger) Trigger(accountID string, reason domain.Re
 type fakeVenue struct {
 	placeCalls        atomic.Int64
 	cancelCalls       atomic.Int64
+	getCalls          atomic.Int64
 	placeErr          error
+	getErr            error
 	invalidFilledSize bool
 	placeOrder        *port.VenueOrder
 	cancelOrder       *port.VenueOrder
@@ -1195,6 +1510,13 @@ func (venue *fakeVenue) Cancel(_ context.Context, order domain.Order) (port.Venu
 
 // Get 返回模拟仓储中的测试记录。
 func (venue *fakeVenue) Get(_ context.Context, order domain.Order) (port.VenueOrder, error) {
+	venue.getCalls.Add(1)
+	if venue.getErr != nil {
+		if venue.getOrder != nil {
+			return *venue.getOrder, venue.getErr
+		}
+		return port.VenueOrder{}, venue.getErr
+	}
 	if venue.getOrder != nil {
 		return *venue.getOrder, nil
 	}
