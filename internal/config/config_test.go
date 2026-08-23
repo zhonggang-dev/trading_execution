@@ -173,7 +173,7 @@ func TestLoadAcceptsRequiredWallet67SubmissionDisabledAccounts(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsRemovingRequiredWallet67QuarantineInShadowOrSubmissionMode(t *testing.T) {
+func TestLoadAcceptsWallet67QuarantineSubsetOrEmpty(t *testing.T) {
 	for _, test := range []struct {
 		name             string
 		disabledAccounts string
@@ -192,8 +192,8 @@ func TestLoadRejectsRemovingRequiredWallet67QuarantineInShadowOrSubmissionMode(t
 			if test.submitEnabled == "true" {
 				t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 			}
-			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "requires wallet-6 and wallet-7") {
-				t.Fatalf("Load() error = %v, want release quarantine rejection", err)
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() error = %v, want activation subset accepted", err)
 			}
 		})
 	}
@@ -210,6 +210,7 @@ func TestLoadRejectsInvalidDecisionSubmissionDisabledAccounts(t *testing.T) {
 		{name: "empty", value: `[" "]`, want: "account 0 is empty"},
 		{name: "duplicate", value: `["wallet-7","wallet-7"]`, want: "duplicate account"},
 		{name: "unbound", value: `["wallet-3"]`, want: "not a configured binding"},
+		{name: "retained wallet", value: `["main"]`, want: "permits only wallet-6 and wallet-7"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			clearConfigEnvironment(t)

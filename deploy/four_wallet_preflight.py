@@ -37,6 +37,7 @@ EXPECTED_ROUTES = {
 }
 EXPECTED_ACCOUNTS = frozenset(EXPECTED_ROUTES.values())
 CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS = frozenset({"wallet-6", "wallet-7"})
+ACTIVATABLE_ACCOUNTS = CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS
 POLICY_LIMIT_FIELDS = (
     "max_order_notional",
     "max_market_exposure",
@@ -99,6 +100,8 @@ CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT = {
 }
 MAX_CONFIG_BYTES = 4 << 20
 DISABLED_EVIDENCE_SCHEMA = "four_wallet.disabled_preflight.v1"
+ACTIVATION_RISK_APPROVAL_SCHEMA = "four_wallet.activation_risk_approval.v1"
+ACTIVATION_RISK_DECISION = "APPROVED_FOR_LIVE_ACTIVATION"
 IMMUTABLE_RELEASE_IDENTITY = re.compile(r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})")
 
 TRADING_RUNTIME_KEYS = frozenset(
@@ -428,11 +431,12 @@ def decode_submission_disabled_accounts(
     return tuple(sorted(accounts))
 
 
-def require_current_rollout_quarantine(accounts: tuple[str, ...]) -> None:
-    if set(accounts) != CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS:
+def validate_rollout_quarantine(accounts: tuple[str, ...]) -> None:
+    unsupported = set(accounts) - ACTIVATABLE_ACCOUNTS
+    if unsupported:
         raise PreflightError(
-            "this release requires wallet-6 and wallet-7 to remain submission-disabled; "
-            "activation requires a separate release and approved evidence"
+            "this release permits only wallet-6 and wallet-7 in the submission-disabled "
+            f"set; unsupported={sorted(unsupported)}"
         )
 
 
@@ -613,7 +617,7 @@ def validate_environment(
         environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
         bindings,
     )
-    require_current_rollout_quarantine(quarantined_accounts)
+    validate_rollout_quarantine(quarantined_accounts)
     wallet_path = environment.get("POLYMARKET_ACCOUNTS_FILE", "").strip()
     if not wallet_path:
         raise PreflightError("POLYMARKET_ACCOUNTS_FILE is required")
@@ -778,6 +782,7 @@ def validate_database_state(
     submission_disabled_accounts: tuple[str, ...] = tuple(
         sorted(CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS)
     ),
+    approved_risk_contracts: dict[str, dict[str, object]] | None = None,
 ) -> str:
     if not isinstance(state, dict):
         raise PreflightError("database preflight result must be a JSON object")
@@ -786,7 +791,7 @@ def validate_database_state(
     if state.get("global_kill_switch") is not True:
         raise PreflightError("database global kill switch must remain enabled during preflight")
     disabled = set(submission_disabled_accounts)
-    require_current_rollout_quarantine(tuple(sorted(disabled)))
+    validate_rollout_quarantine(tuple(sorted(disabled)))
     unknown_disabled = disabled - EXPECTED_ACCOUNTS
     if unknown_disabled:
         raise PreflightError(
@@ -914,16 +919,39 @@ def validate_database_state(
             raise PreflightError(
                 f"database risk policy for {account_id!r} must use daily_timezone UTC"
             )
+    approved_risk_contracts = approved_risk_contracts or {}
+    activated_wallets = ACTIVATABLE_ACCOUNTS - disabled
+    if set(approved_risk_contracts) != activated_wallets:
+        raise PreflightError(
+            "active wallet-6/wallet-7 risk approvals do not match the activation set; "
+            f"missing={sorted(activated_wallets - set(approved_risk_contracts))}, "
+            f"unexpected={sorted(set(approved_risk_contracts) - activated_wallets)}"
+        )
     for account_id in sorted(EXPECTED_ACCOUNTS):
         contract = {
             field: policies[account_id][field] for field in POLICY_LIMIT_FIELDS
         }
         contract["daily_timezone"] = policies[account_id]["daily_timezone"]
-        rollout_contract = CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT[account_id]
+        if account_id in activated_wallets:
+            approval = approved_risk_contracts[account_id]
+            if (
+                approval.get("policy_id") != policies[account_id]["policy_id"]
+                or approval.get("version") != policies[account_id]["version"]
+            ):
+                raise PreflightError(
+                    f"database risk policy identity for {account_id!r} differs from its "
+                    "approved activation artifact"
+                )
+            rollout_contract = {
+                field: approval[field] for field in POLICY_LIMIT_FIELDS
+            }
+            rollout_contract["daily_timezone"] = approval["daily_timezone"]
+        else:
+            rollout_contract = CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT[account_id]
         if contract != rollout_contract:
             raise PreflightError(
                 f"database risk policy contract for {account_id!r} differs from its "
-                f"reviewed current-rollout contract"
+                f"reviewed {'activation artifact' if account_id in activated_wallets else 'current-rollout contract'}"
             )
 
     raw_controls = state.get("account_controls")
@@ -1597,6 +1625,7 @@ def configuration_sha256(
     approved_trading_commit: str,
     approved_prediction_version: str,
     wallet_file_sha256: str,
+    activation_risk_approval_sha256: str | None = None,
 ) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", wallet_file_sha256):
         raise PreflightError("wallet file SHA-256 identity is invalid")
@@ -1615,6 +1644,7 @@ def configuration_sha256(
         "direct_prediction_models": sorted(model_groups),
         "direct_model_groups": model_groups,
         "wallet_file_sha256": wallet_file_sha256,
+        "activation_risk_approval_sha256": activation_risk_approval_sha256,
         "approved_release_identity": {
             "trading_commit": approved_trading_commit,
             "prediction_version": approved_prediction_version,
@@ -1780,6 +1810,137 @@ def read_disabled_evidence(path: pathlib.Path) -> object:
         return json.loads(payload)
     except json.JSONDecodeError as error:
         raise PreflightError("disabled-phase evidence is invalid JSON") from error
+
+
+def read_activation_risk_approval(
+    path: pathlib.Path, expected_sha256: str
+) -> object:
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise PreflightError(
+            "approved activation-risk artifact SHA-256 must be 64 lowercase hex characters"
+        )
+    payload = _read_bounded_regular_file(path, "activation-risk approval")
+    info = path.stat()
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise PreflightError(
+            "activation-risk approval must not be accessible to group or other users"
+        )
+    if info.st_uid != os.geteuid():
+        raise PreflightError("activation-risk approval must be owned by the preflight user")
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise PreflightError("activation-risk approval SHA-256 differs from the approved digest")
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise PreflightError("activation-risk approval is invalid JSON") from error
+
+
+def validate_activation_risk_approval(
+    approval: object,
+    *,
+    active_accounts: frozenset[str],
+    expected_trading_commit: str,
+    now: dt.datetime,
+    max_age: dt.timedelta,
+) -> dict[str, dict[str, object]]:
+    if not isinstance(approval, dict):
+        raise PreflightError("activation-risk approval must be a JSON object")
+    expected_fields = {
+        "schema_version",
+        "decision",
+        "approval_id",
+        "approved_by",
+        "approved_at",
+        "expires_at",
+        "approved_trading_commit",
+        "accounts",
+    }
+    if set(approval) != expected_fields:
+        raise PreflightError(
+            "activation-risk approval must contain the exact reviewed schema fields"
+        )
+    if approval.get("schema_version") != ACTIVATION_RISK_APPROVAL_SCHEMA:
+        raise PreflightError(
+            "activation-risk approval schema is unsupported; disabled-phase evidence "
+            "cannot authorize wallet activation"
+        )
+    if approval.get("decision") != ACTIVATION_RISK_DECISION:
+        raise PreflightError("activation-risk decision is not approved for live activation")
+    for field in ("approval_id", "approved_by"):
+        value = approval.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise PreflightError(f"activation-risk approval has an empty {field}")
+    if approval.get("approved_trading_commit") != expected_trading_commit:
+        raise PreflightError("activation-risk approval belongs to a different Trading commit")
+    approved_at = _fresh_observation(
+        approval.get("approved_at"),
+        "activation-risk approved_at",
+        now=now,
+        max_age=max_age,
+    )
+    expires_at = _utc_timestamp(
+        approval.get("expires_at"), "activation-risk expires_at"
+    )
+    if expires_at <= approved_at or expires_at <= now:
+        raise PreflightError("activation-risk approval is expired or has an invalid expiry")
+
+    rows = approval.get("accounts")
+    if not isinstance(rows, list):
+        raise PreflightError("activation-risk approval accounts must be an array")
+    account_fields = {
+        "execution_account_id",
+        "policy_id",
+        "version",
+        *POLICY_LIMIT_FIELDS,
+        "daily_timezone",
+    }
+    contracts: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != account_fields:
+            raise PreflightError(
+                "activation-risk approval account must contain the exact policy fields"
+            )
+        account_id = row.get("execution_account_id")
+        policy_id = row.get("policy_id")
+        version = row.get("version")
+        if (
+            not isinstance(account_id, str)
+            or not account_id.strip()
+            or account_id.strip() in contracts
+            or not isinstance(policy_id, str)
+            or not policy_id.strip()
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+        ):
+            raise PreflightError(
+                "activation-risk approval contains a duplicate or invalid account identity"
+            )
+        contract = dict(row)
+        contract.pop("execution_account_id")
+        for field in POLICY_LIMIT_FIELDS:
+            value = contract.get(field)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise PreflightError(
+                    f"activation-risk approval for {account_id!r} has invalid {field}"
+                )
+        if contract.get("daily_timezone") != "UTC":
+            raise PreflightError(
+                f"activation-risk approval for {account_id!r} must use daily_timezone UTC"
+            )
+        contracts[account_id.strip()] = contract
+    if set(contracts) != active_accounts:
+        raise PreflightError(
+            "activation-risk approval account set differs from active wallet-6/wallet-7; "
+            f"missing={sorted(active_accounts - set(contracts))}, "
+            f"unexpected={sorted(set(contracts) - active_accounts)}"
+        )
+    return contracts
 
 
 def _pgpass_escape(value: str) -> str:
@@ -2290,6 +2451,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="disabled-phase artifact; required after restarting with submission enabled",
     )
     parser.add_argument(
+        "--activation-risk-approval-json",
+        type=pathlib.Path,
+        help=(
+            "independently reviewed mode-0600 risk approval; required when wallet-6 "
+            "or wallet-7 is active"
+        ),
+    )
+    parser.add_argument(
+        "--activation-risk-approval-sha256",
+        help="externally approved SHA-256 of the activation-risk artifact",
+    )
+    parser.add_argument(
         "--database-state-json",
         type=pathlib.Path,
         help="offline/test input; production should query PostgreSQL directly",
@@ -2340,6 +2513,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--max-evidence-age-seconds", type=int, default=120)
     parser.add_argument("--max-dry-run-age-seconds", type=int, default=1800)
+    parser.add_argument("--max-risk-approval-age-seconds", type=int, default=86400)
     parser.add_argument("--max-consumer-idle-seconds", type=int, default=900)
     parser.add_argument(
         "--minimum-activation-window-seconds",
@@ -2357,6 +2531,7 @@ def main(argv: list[str] | None = None) -> int:
         if (
             args.max_evidence_age_seconds < 1
             or args.max_dry_run_age_seconds < 1
+            or args.max_risk_approval_age_seconds < 1
             or args.max_consumer_idle_seconds < 1
             or args.minimum_activation_window_seconds < 1
             or args.minimum_activation_window_seconds >= 600
@@ -2437,7 +2612,43 @@ def main(argv: list[str] | None = None) -> int:
             environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
             bindings,
         )
-        require_current_rollout_quarantine(submission_disabled_accounts)
+        validate_rollout_quarantine(submission_disabled_accounts)
+        active_wallet67 = frozenset(
+            ACTIVATABLE_ACCOUNTS - set(submission_disabled_accounts)
+        )
+        activation_risk_approval_sha = (
+            args.activation_risk_approval_sha256 or ""
+        ).strip()
+        if active_wallet67:
+            if (
+                args.activation_risk_approval_json is None
+                or not activation_risk_approval_sha
+            ):
+                raise PreflightError(
+                    "active wallet-6/wallet-7 requires an independent activation-risk "
+                    "approval artifact and its externally approved SHA-256"
+                )
+            activation_risk_approval = read_activation_risk_approval(
+                args.activation_risk_approval_json,
+                activation_risk_approval_sha,
+            )
+            approved_risk_contracts = validate_activation_risk_approval(
+                activation_risk_approval,
+                active_accounts=active_wallet67,
+                expected_trading_commit=expected_trading_commit,
+                now=dt.datetime.now(dt.timezone.utc),
+                max_age=dt.timedelta(seconds=args.max_risk_approval_age_seconds),
+            )
+        else:
+            if (
+                args.activation_risk_approval_json is not None
+                or activation_risk_approval_sha
+            ):
+                raise PreflightError(
+                    "activation-risk approval is forbidden while wallet-6 and wallet-7 "
+                    "remain quarantined"
+                )
+            approved_risk_contracts = {}
         active_bindings = active_rollout_bindings(
             bindings, submission_disabled_accounts
         )
@@ -2464,6 +2675,9 @@ def main(argv: list[str] | None = None) -> int:
             approved_trading_commit=expected_trading_commit,
             approved_prediction_version=expected_prediction_version,
             wallet_file_sha256=wallet_file_sha,
+            activation_risk_approval_sha256=(
+                activation_risk_approval_sha or None
+            ),
         )
 
         if args.runtime_state_json is None:
@@ -2504,6 +2718,7 @@ def main(argv: list[str] | None = None) -> int:
             bindings,
             submission_state=args.submission_state,
             submission_disabled_accounts=submission_disabled_accounts,
+            approved_risk_contracts=approved_risk_contracts,
         )
         delivery_watermark = validate_delivery_state(
             state, entry_submission_state=args.entry_submission_state
@@ -2662,6 +2877,7 @@ def main(argv: list[str] | None = None) -> int:
                 bindings,
                 submission_state=args.submission_state,
                 submission_disabled_accounts=submission_disabled_accounts,
+                approved_risk_contracts=approved_risk_contracts,
             )
             if final_account_identity_sha != database_account_identity_sha:
                 raise PreflightError(

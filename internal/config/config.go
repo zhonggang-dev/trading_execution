@@ -654,21 +654,18 @@ func validateDecisionSubmissionDisabledAccounts(
 	return nil
 }
 
-// validateCurrentWallet67Quarantine is a release-level activation boundary.
-// wallet-6/wallet-7 onboarding evidence is approved only while both remain
-// quarantined; activating either requires a separate reviewed release.
+// validateCurrentWallet67Quarantine keeps the release quarantine boundary
+// limited to the two newly managed wallets. Either wallet may be activated by
+// removing it explicitly from this list, but retained main/wallet-1 routes may
+// never be hidden behind the onboarding quarantine.
 func validateCurrentWallet67Quarantine(accounts []string) error {
-	expected := map[string]struct{}{"wallet-6": {}, "wallet-7": {}}
-	configured := make(map[string]struct{}, len(accounts))
+	allowed := map[string]struct{}{"wallet-6": {}, "wallet-7": {}}
 	for _, accountID := range accounts {
-		configured[strings.TrimSpace(accountID)] = struct{}{}
-	}
-	if len(configured) != len(expected) {
-		return fmt.Errorf("this release requires wallet-6 and wallet-7 to remain submission-disabled; activation requires a separate release and approved evidence")
-	}
-	for accountID := range expected {
-		if _, exists := configured[accountID]; !exists {
-			return fmt.Errorf("this release requires wallet-6 and wallet-7 to remain submission-disabled; activation requires a separate release and approved evidence")
+		accountID = strings.TrimSpace(accountID)
+		if _, exists := allowed[accountID]; !exists {
+			return fmt.Errorf(
+				"this release permits only wallet-6 and wallet-7 in DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
+			)
 		}
 	}
 	return nil

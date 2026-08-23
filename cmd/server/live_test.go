@@ -118,7 +118,7 @@ func TestPartitionReconciliationAccountsQuarantinesOneOfFour(t *testing.T) {
 	}
 }
 
-func TestCurrentLiveReleaseRejectsRetiredWalletOrReducedQuarantineBeforePreflight(t *testing.T) {
+func TestCurrentLiveReleaseRejectsRetiredWalletOrUnsupportedQuarantineBeforePreflight(t *testing.T) {
 	tests := []struct {
 		name        string
 		configured  []string
@@ -132,10 +132,10 @@ func TestCurrentLiveReleaseRejectsRetiredWalletOrReducedQuarantineBeforePrefligh
 			want:        "wallet file must contain exactly",
 		},
 		{
-			name:        "wallet-7 removed from quarantine",
+			name:        "retained wallet placed in quarantine",
 			configured:  []string{"main", "wallet-1", "wallet-6", "wallet-7"},
-			quarantined: []string{"wallet-6"},
-			want:        "submission-disabled account list must contain exactly",
+			quarantined: []string{"main"},
+			want:        "may contain only wallet-6 and wallet-7",
 		},
 	}
 	for _, test := range tests {
@@ -149,6 +149,41 @@ func TestCurrentLiveReleaseRejectsRetiredWalletOrReducedQuarantineBeforePrefligh
 				t.Fatalf("release validation reached venue probes: %#v/%#v", client.accountCalls, client.fundingCalls)
 			}
 		})
+	}
+}
+
+func TestCurrentLiveReleaseAcceptsWallet67QuarantineSubsetOrEmpty(t *testing.T) {
+	configured := []string{"main", "wallet-1", "wallet-6", "wallet-7"}
+	for _, quarantined := range [][]string{
+		{"wallet-6", "wallet-7"},
+		{"wallet-6"},
+		{"wallet-7"},
+		{},
+	} {
+		if err := validateCurrentLiveWallet67Release(configured, quarantined); err != nil {
+			t.Fatalf("validateCurrentLiveWallet67Release(%v) error = %v", quarantined, err)
+		}
+	}
+}
+
+func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
+	authorizations, err := currentLiveWallet67Authorizations(
+		[]string{"main", "wallet-1", "wallet-6", "wallet-7"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authorizations) != 4 ||
+		authorizations[2].ExecutionAccountID != "wallet-6" ||
+		authorizations[2].ModelID != "gemini_masked" ||
+		authorizations[2].StrategyID != domain.StrategyIDMultfactorV1 ||
+		authorizations[3].ExecutionAccountID != "wallet-7" ||
+		authorizations[3].StrategyID != domain.StrategyIDMultfactorV2 {
+		t.Fatalf("active authorizations = %#v", authorizations)
+	}
+	if _, err := currentLiveWallet67Authorizations([]string{"wallet-2"}); err == nil ||
+		!strings.Contains(err.Error(), "no current live route") {
+		t.Fatalf("retired authorization error = %v", err)
 	}
 }
 

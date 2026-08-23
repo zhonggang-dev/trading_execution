@@ -15,6 +15,142 @@ type ExpectedExecutionAccount struct {
 	WalletAddress      string
 }
 
+// ExpectedActiveExecutionAccount is the exact database authorization that an
+// account must hold before the live process may include it in placement or
+// automatic reconciliation.
+type ExpectedActiveExecutionAccount struct {
+	ExecutionAccountID string
+	ModelID            string
+	StrategyID         string
+}
+
+// CheckLiveActiveAccountAuthorization verifies the three independent durable
+// activation gates for every active account: the globally enabled strategy
+// binding set is exactly the expected active routes, every risk policy is
+// enabled, and every mandatory ACCOUNT control is unpaused.
+// Venue funding/allowance/placement and reconciliation are checked separately
+// by the live composition after this database-only gate succeeds.
+func CheckLiveActiveAccountAuthorization(
+	ctx context.Context,
+	db *sql.DB,
+	accounts []ExpectedActiveExecutionAccount,
+) error {
+	if db == nil || len(accounts) == 0 {
+		return fmt.Errorf("postgres and active execution accounts are required")
+	}
+	seen := make(map[string]struct{}, len(accounts))
+	expectedBindings := make(map[string]struct{}, len(accounts))
+	normalized := make([]ExpectedActiveExecutionAccount, 0, len(accounts))
+	for _, expected := range accounts {
+		accountID := strings.TrimSpace(expected.ExecutionAccountID)
+		modelID := strings.TrimSpace(expected.ModelID)
+		strategyID := strings.TrimSpace(expected.StrategyID)
+		if accountID == "" || modelID == "" || strategyID == "" {
+			return fmt.Errorf("active execution account authorization is incomplete")
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return fmt.Errorf("active execution account %q is duplicated", accountID)
+		}
+		seen[accountID] = struct{}{}
+		expectedBindings[modelID+"\x00"+strategyID+"\x00"+accountID] = struct{}{}
+		normalized = append(normalized, ExpectedActiveExecutionAccount{
+			ExecutionAccountID: accountID,
+			ModelID:            modelID,
+			StrategyID:         strategyID,
+		})
+	}
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return fmt.Errorf("begin active execution account authorization snapshot: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, expected := range normalized {
+		var bindingEnabled, policyEnabled, accountPaused bool
+		var policyID string
+		var policyVersion int64
+		err := tx.QueryRowContext(ctx, `
+			SELECT binding.enabled, policy.policy_id, policy.version,
+			       policy.enabled, control.paused
+			FROM execution_strategy_bindings AS binding
+			JOIN execution_risk_policies AS policy
+			  ON policy.execution_account_id=binding.execution_account_id
+			JOIN execution_risk_controls AS control
+			  ON control.execution_account_id=binding.execution_account_id
+			 AND control.control_scope='ACCOUNT' AND control.control_key=''
+			WHERE binding.execution_account_id=$1
+			  AND binding.model_id=$2 AND binding.strategy_id=$3`,
+			expected.ExecutionAccountID, expected.ModelID, expected.StrategyID,
+		).Scan(
+			&bindingEnabled, &policyID, &policyVersion, &policyEnabled, &accountPaused,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf(
+				"active execution account %q is missing its exact database binding, risk policy, or ACCOUNT control",
+				expected.ExecutionAccountID,
+			)
+		}
+		if err != nil {
+			return fmt.Errorf("read active execution account %q authorization: %w", expected.ExecutionAccountID, err)
+		}
+		if !bindingEnabled {
+			return fmt.Errorf("active execution account %q strategy binding is disabled", expected.ExecutionAccountID)
+		}
+		if strings.TrimSpace(policyID) == "" || policyVersion < 1 {
+			return fmt.Errorf("active execution account %q risk policy identity is invalid", expected.ExecutionAccountID)
+		}
+		if !policyEnabled {
+			return fmt.Errorf("active execution account %q risk policy is disabled", expected.ExecutionAccountID)
+		}
+		if accountPaused {
+			return fmt.Errorf("active execution account %q ACCOUNT risk control is paused", expected.ExecutionAccountID)
+		}
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT model_id, strategy_id, execution_account_id
+		FROM execution_strategy_bindings
+		WHERE enabled=TRUE`)
+	if err != nil {
+		return fmt.Errorf("read globally enabled strategy bindings: %w", err)
+	}
+	actualBindings := make(map[string]struct{}, len(expectedBindings))
+	for rows.Next() {
+		var modelID, strategyID, accountID string
+		if err := rows.Scan(&modelID, &strategyID, &accountID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan globally enabled strategy binding: %w", err)
+		}
+		// Use the stored identity verbatim. Normalizing here could collapse an
+		// additional enabled whitespace-variant row onto the reviewed route and
+		// make a non-exact database set appear exact.
+		key := modelID + "\x00" + strategyID + "\x00" + accountID
+		actualBindings[key] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close globally enabled strategy bindings: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate globally enabled strategy bindings: %w", err)
+	}
+	if len(actualBindings) != len(expectedBindings) {
+		return fmt.Errorf("globally enabled strategy binding set differs from the exact active routes")
+	}
+	for binding := range expectedBindings {
+		if _, exists := actualBindings[binding]; !exists {
+			return fmt.Errorf("globally enabled strategy binding set differs from the exact active routes")
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit active execution account authorization snapshot: %w", err)
+	}
+	return nil
+}
+
 // ExecutionAccountQuarantineChecker verifies that every account excluded from
 // automatic reconciliation is still protected by the durable ACCOUNT pause.
 // The check is intentionally read-only and is safe to call from readiness and

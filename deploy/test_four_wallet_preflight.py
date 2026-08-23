@@ -166,6 +166,60 @@ def quarantine_accounts(
             row["version"] += 1
 
 
+def activate_accounts(
+    state: dict[str, object], *execution_account_ids: str
+) -> None:
+    activated = set(execution_account_ids)
+    for row in state["bindings"]:
+        if row["execution_account_id"] in activated:
+            row["enabled"] = True
+    for row in state["risk_policies"]:
+        if row["execution_account_id"] in activated:
+            row["enabled"] = True
+    for row in state["account_controls"]:
+        if row["execution_account_id"] in activated:
+            row["paused"] = False
+            row["reason"] = "TEST_ACTIVATION_APPROVED"
+            row["version"] += 1
+
+
+def approved_risk_contracts(
+    state: dict[str, object], *execution_account_ids: str
+) -> dict[str, dict[str, object]]:
+    wanted = set(execution_account_ids)
+    return {
+        row["execution_account_id"]: {
+            "policy_id": row["policy_id"],
+            "version": row["version"],
+            **{field: row[field] for field in preflight.POLICY_LIMIT_FIELDS},
+            "daily_timezone": row["daily_timezone"],
+        }
+        for row in state["risk_policies"]
+        if row["execution_account_id"] in wanted
+    }
+
+
+def activation_risk_approval(
+    now: dt.datetime,
+    state: dict[str, object],
+    *execution_account_ids: str,
+) -> dict[str, object]:
+    contracts = approved_risk_contracts(state, *execution_account_ids)
+    return {
+        "schema_version": preflight.ACTIVATION_RISK_APPROVAL_SCHEMA,
+        "decision": preflight.ACTIVATION_RISK_DECISION,
+        "approval_id": "risk-review-ticket-123",
+        "approved_by": "risk-reviewer",
+        "approved_at": iso(now - dt.timedelta(minutes=5)),
+        "expires_at": iso(now + dt.timedelta(hours=1)),
+        "approved_trading_commit": TRADING_COMMIT,
+        "accounts": [
+            {"execution_account_id": account_id, **contracts[account_id]}
+            for account_id in sorted(contracts)
+        ],
+    }
+
+
 def consumer_state(now: dt.datetime) -> dict[str, object]:
     return {
         "observed_at": iso(now),
@@ -402,16 +456,30 @@ class DatabaseStateTests(unittest.TestCase):
                 submission_disabled_accounts=("wallet-6", "wallet-7"),
             )
 
-    def test_rejects_removing_or_reducing_current_release_quarantine(self) -> None:
-        for disabled in ((), ("wallet-6",), ("wallet-7",)):
-            with self.subTest(disabled=disabled), self.assertRaisesRegex(
-                preflight.PreflightError, "separate release and approved evidence"
-            ):
-                preflight.validate_database_state(
-                    database_state(),
-                    self.bindings,
-                    submission_disabled_accounts=disabled,
-                )
+    def test_active_wallet67_requires_matching_approved_risk_contract(self) -> None:
+        state = database_state()
+        activate_accounts(state, "wallet-6")
+        with self.assertRaisesRegex(preflight.PreflightError, "risk approvals"):
+            preflight.validate_database_state(
+                state,
+                self.bindings,
+                submission_disabled_accounts=("wallet-7",),
+            )
+        contracts = approved_risk_contracts(state, "wallet-6")
+        preflight.validate_database_state(
+            state,
+            self.bindings,
+            submission_disabled_accounts=("wallet-7",),
+            approved_risk_contracts=contracts,
+        )
+        contracts["wallet-6"]["policy_id"] = "disabled-template"
+        with self.assertRaisesRegex(preflight.PreflightError, "approved activation artifact"):
+            preflight.validate_database_state(
+                state,
+                self.bindings,
+                submission_disabled_accounts=("wallet-7",),
+                approved_risk_contracts=contracts,
+            )
 
     def test_rejects_unapproved_or_invalid_risk_contract(self) -> None:
         drifted = database_state()
@@ -539,7 +607,7 @@ class EnvironmentTests(unittest.TestCase):
             )
         self.assertEqual(len(bindings), 4)
 
-    def test_rejects_reduced_current_release_quarantine(self) -> None:
+    def test_accepts_wallet67_quarantine_subset_or_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wallet_path = self.write_wallet_file(
                 pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
@@ -547,11 +615,14 @@ class EnvironmentTests(unittest.TestCase):
             environment = self.environment(wallet_path)
             for value in ('[]', '["wallet-6"]', '["wallet-7"]'):
                 environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = value
-                with self.subTest(value=value), self.assertRaisesRegex(
-                    preflight.PreflightError, "separate release and approved evidence"
-                ):
-                    preflight.validate_environment(
-                        environment, submission_state="disabled"
+                with self.subTest(value=value):
+                    self.assertEqual(
+                        len(
+                            preflight.validate_environment(
+                                environment, submission_state="disabled"
+                            )
+                        ),
+                        4,
                     )
 
     def test_rejects_invalid_submission_disabled_accounts(self) -> None:
@@ -562,6 +633,7 @@ class EnvironmentTests(unittest.TestCase):
             for value, message in (
                 ('["wallet-7","wallet-7"]', "duplicates"),
                 ('["wallet-missing"]', "unbound accounts"),
+                ('["main"]', "permits only wallet-6 and wallet-7"),
             ):
                 environment = self.environment(wallet_path)
                 environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = value
@@ -609,6 +681,74 @@ class EnvironmentTests(unittest.TestCase):
                 preflight.validate_environment(
                     self.environment(wallet_path), submission_state="disabled"
                 )
+
+
+class ActivationRiskApprovalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = dt.datetime.now(dt.timezone.utc)
+        self.state = database_state()
+        activate_accounts(self.state, "wallet-6")
+        self.approval = activation_risk_approval(
+            self.now, self.state, "wallet-6"
+        )
+
+    def test_accepts_independent_exact_activation_artifact(self) -> None:
+        contracts = preflight.validate_activation_risk_approval(
+            self.approval,
+            active_accounts=frozenset({"wallet-6"}),
+            expected_trading_commit=TRADING_COMMIT,
+            now=self.now,
+            max_age=dt.timedelta(hours=1),
+        )
+        self.assertEqual(set(contracts), {"wallet-6"})
+        self.assertEqual(contracts["wallet-6"]["policy_id"], "policy-wallet-6")
+
+    def test_rejects_disabled_evidence_as_risk_approval(self) -> None:
+        reused = dict(self.approval)
+        reused["schema_version"] = preflight.DISABLED_EVIDENCE_SCHEMA
+        with self.assertRaisesRegex(
+            preflight.PreflightError, "disabled-phase evidence cannot authorize"
+        ):
+            preflight.validate_activation_risk_approval(
+                reused,
+                active_accounts=frozenset({"wallet-6"}),
+                expected_trading_commit=TRADING_COMMIT,
+                now=self.now,
+                max_age=dt.timedelta(hours=1),
+            )
+
+    def test_rejects_wrong_account_or_stale_approval(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "account set differs"):
+            preflight.validate_activation_risk_approval(
+                self.approval,
+                active_accounts=frozenset({"wallet-6", "wallet-7"}),
+                expected_trading_commit=TRADING_COMMIT,
+                now=self.now,
+                max_age=dt.timedelta(hours=1),
+            )
+        stale = dict(self.approval)
+        stale["approved_at"] = iso(self.now - dt.timedelta(days=2))
+        with self.assertRaisesRegex(preflight.PreflightError, "approved_at is stale"):
+            preflight.validate_activation_risk_approval(
+                stale,
+                active_accounts=frozenset({"wallet-6"}),
+                expected_trading_commit=TRADING_COMMIT,
+                now=self.now,
+                max_age=dt.timedelta(hours=1),
+            )
+
+    def test_reader_requires_external_digest_and_protected_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "risk-approval.json"
+            payload = (json.dumps(self.approval, sort_keys=True) + "\n").encode()
+            path.write_bytes(payload)
+            path.chmod(0o600)
+            digest = preflight.hashlib.sha256(payload).hexdigest()
+            self.assertEqual(
+                preflight.read_activation_risk_approval(path, digest), self.approval
+            )
+            with self.assertRaisesRegex(preflight.PreflightError, "differs"):
+                preflight.read_activation_risk_approval(path, "0" * 64)
 
 
 class PredictionEnvironmentTests(unittest.TestCase):

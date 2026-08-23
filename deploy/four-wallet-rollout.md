@@ -56,18 +56,24 @@ wallet-6/wallet-7 policies and bindings are disabled and controls paused.
 That state must exactly match
 `DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON` in both preflight phases.
 These wallet-6/wallet-7 template values are not approval to activate either
-wallet; activation requires fresh funding/allowance/position evidence and an
-explicitly reviewed risk decision. The rollout must not modify the existing
-main/wallet-1 policies.
+wallet. An active wallet-6 or wallet-7 requires a separate mode-`0600`
+`four_wallet.activation_risk_approval.v1` artifact and its externally reviewed
+SHA-256 on both preflight passes. The artifact pins the release commit, exact
+active wallet set, policy identity/version and every limit; the disabled-phase
+evidence schema cannot be reused as this approval. Activation also requires
+fresh funding/allowance/placement and strict startup reconciliation. The
+rollout must not modify the existing main/wallet-1 policies.
 Retired wallet rows stay in PostgreSQL for audit, but their strategy bindings
 must not remain enabled and they must not appear in the runtime wallet file.
 
-This release cannot remove wallet-6 or wallet-7 from quarantine: both the Go
-runtime and the preflight enforce that exact pair. A future, separate release
-may do so only after fresh funding/allowance/position evidence and explicit
-approval; its reviewed stopped-service cutover must atomically enable the
-policy/binding, unpause the ACCOUNT control with an increasing version, and
-change the runtime quarantine list while the global kill switch stays closed.
+The quarantine list may be the exact pair, either one-wallet subset, or empty;
+main/wallet-1 may never be added. Removing wallet-6 or wallet-7 requires a
+reviewed stopped-service cutover that atomically enables the exact
+policy/binding, unpauses the ACCOUNT control with an increasing version, and
+changes the runtime quarantine list while the global kill switch stays closed.
+Retained quarantined wallets keep the original semantics: identity/open-order
+preflight only, mandatory durable ACCOUNT pause, no funding/placement probe,
+heartbeat, automatic reconciliation, decision delivery, or new submission.
 
 Prediction must publish the same source-model set, not the logical aliases.
 The following values are mandatory in `/etc/prediction-infra/env` and must be
@@ -114,6 +120,15 @@ python3 deploy/four_wallet_preflight.py \
   --direct-model-groups-json \
   '{"EXACT_ECHO_SNAPSHOT_MODEL_NAME":"predict-echo-v1"}' \
   --write-disabled-evidence /var/lib/trading-execution/four-wallet-disabled-evidence.json
+```
+
+When either onboarding wallet is active, add both of the following to this
+command and the enabled-phase command. The SHA must come from the reviewed
+change record, not be calculated ad hoc during deployment:
+
+```text
+--activation-risk-approval-json /var/lib/trading-execution/wallet67-risk-approval.json
+--activation-risk-approval-sha256 REVIEWED_64_LOWERCASE_HEX_SHA256
 ```
 
 The preflight exits non-zero if any of these invariants is false:

@@ -126,6 +126,15 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure live execution account scope: %w", err)
 	}
+	activeAuthorizations, err := currentLiveWallet67Authorizations(reconciliationAccountIDs)
+	if err != nil {
+		return nil, err
+	}
+	if err := postgresadapter.CheckLiveActiveAccountAuthorization(
+		ctx, database, activeAuthorizations,
+	); err != nil {
+		return nil, fmt.Errorf("verify active execution account authorization: %w", err)
+	}
 	provider, err := polymarket.NewStaticCredentialProvider(accounts)
 	if err != nil {
 		return nil, err
@@ -479,15 +488,67 @@ func validateCurrentLiveWallet67Release(configured, quarantined []string) error 
 	); err != nil {
 		return err
 	}
-	if err := requireExactLiveAccountSet(
-		"submission-disabled account list", quarantined, []string{"wallet-6", "wallet-7"},
-	); err != nil {
-		return fmt.Errorf(
-			"%w; this release cannot activate wallet-6/wallet-7 without a separate release and approved evidence",
-			err,
-		)
+	allowedQuarantine := map[string]struct{}{"wallet-6": {}, "wallet-7": {}}
+	seen := make(map[string]struct{}, len(quarantined))
+	for index, raw := range quarantined {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return fmt.Errorf("submission-disabled account list execution account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return fmt.Errorf("submission-disabled account list contains duplicate execution account %q", accountID)
+		}
+		if _, allowed := allowedQuarantine[accountID]; !allowed {
+			return fmt.Errorf("submission-disabled account list may contain only wallet-6 and wallet-7")
+		}
+		seen[accountID] = struct{}{}
 	}
 	return nil
+}
+
+func currentLiveWallet67Authorizations(
+	activeAccountIDs []string,
+) ([]postgresadapter.ExpectedActiveExecutionAccount, error) {
+	routes := map[string]postgresadapter.ExpectedActiveExecutionAccount{
+		"main": {
+			ExecutionAccountID: "main",
+			ModelID:            "echo",
+			StrategyID:         domain.StrategyIDMultfactorV2,
+		},
+		"wallet-1": {
+			ExecutionAccountID: "wallet-1",
+			ModelID:            "echo",
+			StrategyID:         domain.StrategyIDMultfactorV1,
+		},
+		"wallet-6": {
+			ExecutionAccountID: "wallet-6",
+			ModelID:            "gemini_masked",
+			StrategyID:         domain.StrategyIDMultfactorV1,
+		},
+		"wallet-7": {
+			ExecutionAccountID: "wallet-7",
+			ModelID:            "gemini_masked",
+			StrategyID:         domain.StrategyIDMultfactorV2,
+		},
+	}
+	result := make([]postgresadapter.ExpectedActiveExecutionAccount, 0, len(activeAccountIDs))
+	seen := make(map[string]struct{}, len(activeAccountIDs))
+	for _, raw := range activeAccountIDs {
+		accountID := strings.TrimSpace(raw)
+		route, exists := routes[accountID]
+		if !exists {
+			return nil, fmt.Errorf("execution account %q has no current live route", accountID)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return nil, fmt.Errorf("active execution account %q is duplicated", accountID)
+		}
+		seen[accountID] = struct{}{}
+		result = append(result, route)
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("current live release requires at least one active execution account")
+	}
+	return result, nil
 }
 
 func requireExactLiveAccountSet(label string, actual, expected []string) error {
