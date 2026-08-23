@@ -125,7 +125,7 @@ func TestNextScheduleUsesUTCBoundaryAndSkipsExpiredWindow(t *testing.T) {
 func TestBindingRunSummariesExposePredictionRoutingAndCounts(t *testing.T) {
 	summaries := bindingRunSummaries(decisioncycle.RunResult{Runs: []decisioncycle.BindingRunResult{{
 		Context: domain.StrategyExecutionContext{
-			ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-3",
+			ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7",
 		},
 		PredictionModelID:         "gemini-3.6-flash",
 		PredictionCount:           2,
@@ -141,7 +141,7 @@ func TestBindingRunSummariesExposePredictionRoutingAndCounts(t *testing.T) {
 		Error:   errors.New("strategy unavailable"),
 	}}})
 	if len(summaries) != 1 || summaries[0].PredictionModelID != "gemini-3.6-flash" ||
-		summaries[0].ModelID != "gemini_masked" || summaries[0].ExecutionAccountID != "wallet-3" ||
+		summaries[0].ModelID != "gemini_masked" || summaries[0].ExecutionAccountID != "wallet-7" ||
 		summaries[0].Predictions != 2 || summaries[0].Positions != 1 || summaries[0].Intents != 1 ||
 		!summaries[0].AccountSubmissionDisabled || summaries[0].EntrySubmissionEnabled || summaries[0].EntryBlockReason != domain.StrategyEntryBlockIncompleteModelCoverage ||
 		!summaries[0].Failed {

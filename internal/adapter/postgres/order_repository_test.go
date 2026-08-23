@@ -94,8 +94,24 @@ func TestOrderRepositoryRecoverySelectionPostgresIntegration(t *testing.T) {
 		}
 		insertReconciliationSelectionReservation(t, db, order, fixture.reservationStatus, fixture.emptyReservation)
 	}
+	insertAccount(t, db, "account-retired-selection", "0xretiredselection", "0", "0", "0")
+	retiredOrder := integrationOrder(
+		"reconcile-retired", "account-retired-selection", "token-retired",
+		domain.SideBuy, "1", "0.5",
+	)
+	retiredOrder.Status = domain.OrderStatusUnknown
+	retiredOrder.FailureCode = "CLOB_ORDER_NOT_FOUND"
+	retiredOrder.CreatedAt = old
+	retiredOrder.UpdatedAt = old
+	insertReconciliationSelectionOrder(t, db, retiredOrder)
 
 	pending, err := repository.ListPending(context.Background(), now.Add(-2*time.Second), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopedPending, err := repository.ListPendingForAccounts(
+		context.Background(), []string{accountID}, now.Add(-2*time.Second), 100,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,16 +122,32 @@ func TestOrderRepositoryRecoverySelectionPostgresIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	pendingIDs := selectedFixtureOrderIDs(pending, fixtureIDs)
+	scopedPendingIDs := selectedFixtureOrderIDs(scopedPending, fixtureIDs)
+	if !containsOrderID(pending, retiredOrder.ID) || containsOrderID(scopedPending, retiredOrder.ID) {
+		t.Fatalf("retired order global/scoped selection = %t/%t", containsOrderID(pending, retiredOrder.ID), containsOrderID(scopedPending, retiredOrder.ID))
+	}
 	reconciliationIDs := selectedFixtureOrderIDs(reconciliationOrders, fixtureIDs)
 	for _, fixture := range fixtures {
 		orderID := "order-reconcile-" + fixture.name
 		if _, selected := pendingIDs[orderID]; selected != fixture.wantPending {
 			t.Errorf("pending selection for %s = %t, want %t", fixture.name, selected, fixture.wantPending)
 		}
+		if _, selected := scopedPendingIDs[orderID]; selected != fixture.wantPending {
+			t.Errorf("scoped pending selection for %s = %t, want %t", fixture.name, selected, fixture.wantPending)
+		}
 		if _, selected := reconciliationIDs[orderID]; selected != fixture.wantReconcile {
 			t.Errorf("reconciliation selection for %s = %t, want %t", fixture.name, selected, fixture.wantReconcile)
 		}
 	}
+}
+
+func containsOrderID(orders []domain.Order, orderID string) bool {
+	for _, order := range orders {
+		if order.ID == orderID {
+			return true
+		}
+	}
+	return false
 }
 
 func insertReconciliationSelectionOrder(t *testing.T, db *sql.DB, order domain.Order) {

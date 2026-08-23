@@ -204,6 +204,7 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 		SELECT count(*)
 		FROM (VALUES
 			('execution_fills_polygon_settlement_event_uidx'),
+			('execution_strategy_bindings_enabled_model_strategy_uidx'),
 			('strategy_decision_runs_account_time_idx'),
 			('strategy_order_intent_deliveries_cycle_sequence_unique'),
 			('execution_external_position_dispositions_accounted_trade_uidx'),

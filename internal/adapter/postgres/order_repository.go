@@ -306,8 +306,39 @@ func (repository *OrderRepository) Attempts(ctx context.Context, orderID string)
 
 // ListPending 分页查询需要协调器继续处理的非终态订单。
 func (repository *OrderRepository) ListPending(ctx context.Context, before time.Time, limit int) ([]domain.Order, error) {
+	return repository.listPending(ctx, nil, before, limit)
+}
+
+// ListPendingForAccounts selects automatic coordinator work only for active
+// execution accounts. Historical rows for retired or quarantined accounts are
+// deliberately excluded without mutation.
+func (repository *OrderRepository) ListPendingForAccounts(
+	ctx context.Context,
+	executionAccountIDs []string,
+	before time.Time,
+	limit int,
+) ([]domain.Order, error) {
+	executionAccountIDs, err := normalizePendingOrderAccounts(executionAccountIDs)
+	if err != nil {
+		return nil, err
+	}
+	return repository.listPending(ctx, executionAccountIDs, before, limit)
+}
+
+func (repository *OrderRepository) listPending(
+	ctx context.Context,
+	executionAccountIDs []string,
+	before time.Time,
+	limit int,
+) ([]domain.Order, error) {
 	if limit <= 0 || limit > 1000 {
 		return nil, fmt.Errorf("pending-order limit must be between 1 and 1000")
+	}
+	accountClause := ""
+	arguments := []any{before.UTC(), limit}
+	if executionAccountIDs != nil {
+		accountClause = " AND execution_account_id=ANY($3::text[])"
+		arguments = append(arguments, executionAccountIDs)
 	}
 	rows, err := repository.db.QueryContext(ctx, selectOrderColumns+`
 		WHERE status IN ('RECEIVED', 'VALIDATING', 'RESERVED',
@@ -317,9 +348,9 @@ func (repository *OrderRepository) ListPending(ctx context.Context, before time.
 			status = 'UNKNOWN'
 			AND failure_code IN ('CLOB_FILL_DETAILS_UNAVAILABLE', 'VENUE_FILL_EVIDENCE_PENDING')
 		  )
-		  AND updated_at <= $1
+		  AND updated_at <= $1`+accountClause+`
 		ORDER BY updated_at, order_id
-		LIMIT $2`, before.UTC(), limit)
+		LIMIT $2`, arguments...)
 	if err != nil {
 		return nil, fmt.Errorf("query pending orders: %w", err)
 	}
@@ -336,6 +367,26 @@ func (repository *OrderRepository) ListPending(ctx context.Context, before time.
 		return nil, fmt.Errorf("iterate pending orders: %w", err)
 	}
 	return orders, nil
+}
+
+func normalizePendingOrderAccounts(accountIDs []string) ([]string, error) {
+	if len(accountIDs) == 0 {
+		return nil, fmt.Errorf("active execution accounts are required for pending-order selection")
+	}
+	result := make([]string, 0, len(accountIDs))
+	seen := make(map[string]struct{}, len(accountIDs))
+	for index, raw := range accountIDs {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return nil, fmt.Errorf("active execution account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return nil, fmt.Errorf("active execution account %q is duplicated", accountID)
+		}
+		seen[accountID] = struct{}{}
+		result = append(result, accountID)
+	}
+	return result, nil
 }
 
 // ListForReconciliation 查询本服务创建且需要参与对账的订单。

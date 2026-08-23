@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountscope"
 	"github.com/UniPat-AI/trading_execution/internal/service/clobheartbeat"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
@@ -41,6 +42,7 @@ type liveRuntime struct {
 	runner         *reconciliation.Runner
 	operations     *liveoperations.Service
 	decisionRunner *decisionrunner.Runner
+	activeAccounts []string
 }
 
 // buildLiveRuntimeParams 收拢实盘依赖装配参数，避免长参数列表破坏函数声明可读性。
@@ -51,6 +53,17 @@ type buildLiveRuntimeParams struct {
 	databaseReadiness *postgresadapter.HealthChecker
 	guard             port.Guard
 	logger            *slog.Logger
+}
+
+type liveAccountProbeClient interface {
+	ProbeAccount(context.Context, string) (polymarket.AccountProbe, error)
+	ProbeFunding(context.Context, string) (polymarket.FundingProbe, error)
+}
+
+type liveAccountPreflightResult struct {
+	account     polymarket.AccountProbe
+	funding     *polymarket.FundingProbe
+	eligibility *polymarket.GeographicEligibility
 }
 
 // buildLiveRuntime 装配 Polymarket V2 实盘链路，并在开放 HTTP 前完成启动对账和首次只读快照。
@@ -80,6 +93,38 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("load Polymarket live accounts: %w", err)
+	}
+	accountIDs := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		accountIDs = append(accountIDs, account.ExecutionAccountID)
+	}
+	if err := validateCurrentLiveWallet67Release(
+		accountIDs, cfg.DecisionCycle.SubmissionDisabledAccounts,
+	); err != nil {
+		return nil, err
+	}
+	if cfg.DecisionCycle.Enabled {
+		// This set equality must be proven before the first authenticated venue
+		// read. A retired wallet left in the secret must never be recovered,
+		// reconciled, or enrolled in a heartbeat by a shadow-mode process.
+		if err := validateDecisionAccounts(cfg.DecisionCycle, accountIDs); err != nil {
+			return nil, err
+		}
+	}
+	reconciliationAccountIDs, quarantinedAccountIDs, err := partitionReconciliationAccounts(
+		accountIDs,
+		cfg.DecisionCycle.SubmissionDisabledAccounts,
+	)
+	if err != nil {
+		return nil, err
+	}
+	quarantinedAccountSet := make(map[string]struct{}, len(quarantinedAccountIDs))
+	for _, accountID := range quarantinedAccountIDs {
+		quarantinedAccountSet[accountID] = struct{}{}
+	}
+	executionAccountScope, err := accountscope.New(reconciliationAccountIDs, accountIDs)
+	if err != nil {
+		return nil, fmt.Errorf("configure live execution account scope: %w", err)
 	}
 	provider, err := polymarket.NewStaticCredentialProvider(accounts)
 	if err != nil {
@@ -135,40 +180,32 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, err
 	}
 
-	accountIDs := make([]string, 0, len(accounts))
 	expectedBindings := make([]postgresadapter.ExpectedExecutionAccount, 0, len(accounts))
 	for _, account := range accounts {
-		probe, probeErr := tradingClient.ProbeAccount(ctx, account.ExecutionAccountID)
-		if probeErr != nil {
-			return nil, fmt.Errorf("execution account %q authenticated CLOB preflight: %w", account.ExecutionAccountID, probeErr)
+		_, quarantined := quarantinedAccountSet[account.ExecutionAccountID]
+		preflight, preflightErr := preflightLiveAccount(
+			ctx, account.ExecutionAccountID, quarantined, tradingClient, eligibility,
+		)
+		if preflightErr != nil {
+			return nil, preflightErr
 		}
-		funding, fundingErr := tradingClient.ProbeFunding(ctx, account.ExecutionAccountID)
-		if fundingErr != nil {
-			return nil, fmt.Errorf("execution account %q CLOB funding preflight: %w", account.ExecutionAccountID, fundingErr)
-		}
-		if !funding.CollateralBalancePositive {
-			return nil, fmt.Errorf("execution account %q has no positive CLOB pUSD collateral balance", account.ExecutionAccountID)
-		}
-		if !funding.RequiredAllowancesPositive {
-			return nil, fmt.Errorf("execution account %q is missing a positive pUSD allowance for a required CLOB V2 exchange", account.ExecutionAccountID)
-		}
-		placement, placementErr := eligibility.Check(ctx, account.ExecutionAccountID)
-		if placementErr != nil {
-			return nil, fmt.Errorf("execution account %q placement eligibility preflight: %w", account.ExecutionAccountID, placementErr)
-		}
-		if placement.Blocked {
-			return nil, fmt.Errorf("execution account %q is not eligible to place CLOB orders (%s)", account.ExecutionAccountID, placement.Reason)
-		}
-		accountIDs = append(accountIDs, account.ExecutionAccountID)
 		expectedBindings = append(expectedBindings, postgresadapter.ExpectedExecutionAccount{
 			ExecutionAccountID: account.ExecutionAccountID,
-			WalletAddress:      probe.FunderAddress,
+			WalletAddress:      preflight.account.FunderAddress,
 		})
+		if quarantined {
+			logger.Warn("Polymarket quarantined account identity preflight passed",
+				"execution_account_id", account.ExecutionAccountID,
+				"open_orders", preflight.account.OpenOrderCount,
+				"funding_and_placement_preflight_skipped", true,
+			)
+			continue
+		}
 		logger.Info("Polymarket live account preflight passed",
 			"execution_account_id", account.ExecutionAccountID,
-			"open_orders", probe.OpenOrderCount,
-			"required_v2_allowances_positive", funding.RequiredAllowancesPositive,
-			"eligibility_reason", placement.Reason,
+			"open_orders", preflight.account.OpenOrderCount,
+			"required_v2_allowances_positive", preflight.funding.RequiredAllowancesPositive,
+			"eligibility_reason", preflight.eligibility.Reason,
 		)
 	}
 	if err := postgresadapter.CheckLiveAccountBindings(
@@ -178,13 +215,6 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	}
 	if err := postgresadapter.CheckLiveLedgerBootstrap(ctx, database, expectedBindings); err != nil {
 		return nil, fmt.Errorf("validate PostgreSQL live ledger bootstrap: %w", err)
-	}
-	reconciliationAccountIDs, quarantinedAccountIDs, err := partitionReconciliationAccounts(
-		accountIDs,
-		cfg.DecisionCycle.SubmissionDisabledAccounts,
-	)
-	if err != nil {
-		return nil, err
 	}
 	var quarantineChecker *postgresadapter.ExecutionAccountQuarantineChecker
 	if len(quarantinedAccountIDs) > 0 {
@@ -291,6 +321,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		CancelFillFinalityGrace:  cfg.Polymarket.CancelFillFinalityGrace,
 		ImmediateCancelFinality:  false,
 		MaxReconcileAttempts:     cfg.Polymarket.MaxReconcileAttempts,
+		AccountScope:             executionAccountScope,
 		RequirePreparedPlacement: true,
 		EntrySubmissionDisabled:  cfg.DecisionCycle.EntrySubmissionDisabled,
 	})
@@ -337,6 +368,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		TradeLookback:             cfg.Polymarket.ReconciliationLookback,
 		PositionEpsilon:           cfg.Polymarket.PositionEpsilon,
 		BalanceEpsilon:            cfg.Polymarket.BalanceEpsilon,
+		AccountScope:              executionAccountScope,
 	})
 	if err != nil {
 		return nil, err
@@ -383,7 +415,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		Repository: liveOperationsRepository, Venue: tradingClient,
 		PositionSource: positionSource, PositionBaselines: positionBaselines,
 		BalanceSource: balanceSource, OrderBooks: orderBooks,
-		Accounts: accountIDs, VenueName: "Polymarket CLOB", StartedAt: startedAt,
+		Accounts: reconciliationAccountIDs, VenueName: "Polymarket CLOB", StartedAt: startedAt,
 		RunID:    "live-" + startedAt.Format("20060102T150405.000000000Z"),
 		Interval: cfg.LiveOperations.Interval, RefreshTimeout: cfg.LiveOperations.RefreshTimeout,
 		MaxSnapshotAge: cfg.LiveOperations.MaxSnapshotAge, EventLimit: cfg.LiveOperations.EventLimit,
@@ -437,7 +469,108 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		repository: repository, execution: executionService,
 		reconciliation: reconciliationService, readiness: combinedReadiness,
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
+		activeAccounts: append([]string(nil), reconciliationAccountIDs...),
 	}, nil
+}
+
+func validateCurrentLiveWallet67Release(configured, quarantined []string) error {
+	if err := requireExactLiveAccountSet(
+		"wallet file", configured, []string{"main", "wallet-1", "wallet-6", "wallet-7"},
+	); err != nil {
+		return err
+	}
+	if err := requireExactLiveAccountSet(
+		"submission-disabled account list", quarantined, []string{"wallet-6", "wallet-7"},
+	); err != nil {
+		return fmt.Errorf(
+			"%w; this release cannot activate wallet-6/wallet-7 without a separate release and approved evidence",
+			err,
+		)
+	}
+	return nil
+}
+
+func requireExactLiveAccountSet(label string, actual, expected []string) error {
+	actualSet := make(map[string]struct{}, len(actual))
+	for index, raw := range actual {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return fmt.Errorf("%s execution account %d is empty", label, index)
+		}
+		if _, duplicate := actualSet[accountID]; duplicate {
+			return fmt.Errorf("%s contains duplicate execution account %q", label, accountID)
+		}
+		actualSet[accountID] = struct{}{}
+	}
+	expectedSet := make(map[string]struct{}, len(expected))
+	for _, accountID := range expected {
+		expectedSet[accountID] = struct{}{}
+	}
+	if len(actualSet) != len(expectedSet) {
+		return fmt.Errorf("%s must contain exactly execution accounts %v", label, expected)
+	}
+	for accountID := range expectedSet {
+		if _, exists := actualSet[accountID]; !exists {
+			return fmt.Errorf("%s must contain exactly execution accounts %v", label, expected)
+		}
+	}
+	return nil
+}
+
+func preflightLiveAccount(
+	ctx context.Context,
+	executionAccountID string,
+	quarantined bool,
+	client liveAccountProbeClient,
+	eligibility polymarket.GeographicEligibilityChecker,
+) (liveAccountPreflightResult, error) {
+	probe, err := client.ProbeAccount(ctx, executionAccountID)
+	if err != nil {
+		return liveAccountPreflightResult{}, fmt.Errorf(
+			"execution account %q authenticated CLOB preflight: %w", executionAccountID, err,
+		)
+	}
+	result := liveAccountPreflightResult{account: probe}
+	if quarantined {
+		if probe.OpenOrderCount != 0 {
+			return liveAccountPreflightResult{}, fmt.Errorf(
+				"quarantined execution account %q has %d open CLOB order(s); cancel them before startup",
+				executionAccountID, probe.OpenOrderCount,
+			)
+		}
+		return result, nil
+	}
+
+	funding, err := client.ProbeFunding(ctx, executionAccountID)
+	if err != nil {
+		return liveAccountPreflightResult{}, fmt.Errorf(
+			"execution account %q CLOB funding preflight: %w", executionAccountID, err,
+		)
+	}
+	result.funding = &funding
+	if !funding.CollateralBalancePositive {
+		return liveAccountPreflightResult{}, fmt.Errorf(
+			"execution account %q has no positive CLOB pUSD collateral balance", executionAccountID,
+		)
+	}
+	if !funding.RequiredAllowancesPositive {
+		return liveAccountPreflightResult{}, fmt.Errorf(
+			"execution account %q is missing a positive pUSD allowance for a required CLOB V2 exchange", executionAccountID,
+		)
+	}
+	placement, err := eligibility.Check(ctx, executionAccountID)
+	if err != nil {
+		return liveAccountPreflightResult{}, fmt.Errorf(
+			"execution account %q placement eligibility preflight: %w", executionAccountID, err,
+		)
+	}
+	result.eligibility = &placement
+	if placement.Blocked {
+		return liveAccountPreflightResult{}, fmt.Errorf(
+			"execution account %q is not eligible to place CLOB orders (%s)", executionAccountID, placement.Reason,
+		)
+	}
+	return result, nil
 }
 
 func partitionReconciliationAccounts(configured, quarantined []string) ([]string, []string, error) {

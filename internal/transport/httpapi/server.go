@@ -107,6 +107,17 @@ func New(params Params) (*Server, error) {
 	if params.ReadinessTimeout < 100*time.Millisecond || params.ReadinessTimeout > 30*time.Second {
 		return nil, fmt.Errorf("HTTP readiness timeout must be between 100ms and 30s")
 	}
+	apiToken := strings.TrimSpace(params.APIToken)
+	jobToken := strings.TrimSpace(params.JobToken)
+	readOnlyToken := strings.TrimSpace(params.ReadOnlyToken)
+	if params.Reconciliation != nil || params.PositionExitJob != nil {
+		if jobToken == "" {
+			return nil, fmt.Errorf("internal HTTP jobs require a dedicated job token")
+		}
+		if (apiToken != "" && jobToken == apiToken) || (readOnlyToken != "" && jobToken == readOnlyToken) {
+			return nil, fmt.Errorf("internal HTTP job token must differ from execution and read-only tokens")
+		}
+	}
 	server := &Server{
 		service:          params.Service,
 		positionExitJob:  params.PositionExitJob,
@@ -116,9 +127,9 @@ func New(params Params) (*Server, error) {
 		readinessChecker: params.Readiness,
 		readinessTimeout: params.ReadinessTimeout,
 		logger:           params.Logger,
-		apiToken:         strings.TrimSpace(params.APIToken),
-		jobToken:         strings.TrimSpace(params.JobToken),
-		readOnlyToken:    strings.TrimSpace(params.ReadOnlyToken),
+		apiToken:         apiToken,
+		jobToken:         jobToken,
+		readOnlyToken:    readOnlyToken,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", server.liveness)
@@ -137,18 +148,10 @@ func New(params Params) (*Server, error) {
 		mux.Handle("GET /api/v1/live-operations", server.authenticateReadOnly(http.HandlerFunc(server.getLiveOperations)))
 	}
 	if server.positionExitJob != nil {
-		token := server.jobToken
-		if token == "" {
-			token = server.apiToken
-		}
-		mux.Handle("POST /internal/jobs/position-exit-evaluation/run", server.authenticateToken(token, http.HandlerFunc(server.runPositionExitJob)))
+		mux.Handle("POST /internal/jobs/position-exit-evaluation/run", server.authenticateToken(server.jobToken, http.HandlerFunc(server.runPositionExitJob)))
 	}
 	if server.reconciliation != nil {
-		token := server.jobToken
-		if token == "" {
-			token = server.apiToken
-		}
-		mux.Handle("POST /internal/jobs/reconciliation/run", server.authenticateToken(token, http.HandlerFunc(server.runReconciliation)))
+		mux.Handle("POST /internal/jobs/reconciliation/run", server.authenticateToken(server.jobToken, http.HandlerFunc(server.runReconciliation)))
 	}
 	server.handler = server.recover(server.logRequests(mux))
 	return server, nil

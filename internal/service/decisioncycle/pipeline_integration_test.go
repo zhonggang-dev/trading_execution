@@ -84,7 +84,11 @@ func (recorder *replayDecisionRecorder) CountUnresolvedIntentsForAccounts(_ cont
 	return count, nil
 }
 
-func (recorder *replayDecisionRecorder) ClaimPendingIntents(_ context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
+func (recorder *replayDecisionRecorder) ClaimPendingIntents(_ context.Context, activeAccountIDs []string, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
+	active := make(map[string]struct{}, len(activeAccountIDs))
+	for _, accountID := range activeAccountIDs {
+		active[accountID] = struct{}{}
+	}
 	result := make([]domain.DecisionIntentDelivery, 0)
 	for key, deliveries := range recorder.deliveries {
 		if cycleID != "" && key != cycleID {
@@ -93,6 +97,9 @@ func (recorder *replayDecisionRecorder) ClaimPendingIntents(_ context.Context, c
 		for index := range deliveries {
 			if deliveries[index].Status != domain.DecisionIntentPending ||
 				(side != "" && deliveries[index].Intent.Side != side) || len(result) >= limit {
+				continue
+			}
+			if _, enabled := active[deliveries[index].Intent.ExecutionAccountID]; !enabled {
 				continue
 			}
 			deliveries[index].Status = domain.DecisionIntentSubmitting
@@ -104,7 +111,7 @@ func (recorder *replayDecisionRecorder) ClaimPendingIntents(_ context.Context, c
 	return result, nil
 }
 
-func (recorder *replayDecisionRecorder) RequeueStaleSubmitting(_ context.Context, _ time.Time, _ domain.Side, _ int) (int, error) {
+func (recorder *replayDecisionRecorder) RequeueStaleSubmitting(_ context.Context, _ []string, _ time.Time, _ domain.Side, _ int) (int, error) {
 	return 0, nil
 }
 

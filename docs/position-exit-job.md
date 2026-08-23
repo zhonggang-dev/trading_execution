@@ -29,8 +29,9 @@ business time; receipt time is never substituted. Configure XXL-Job with
 the Python request plus market-data capture. Duplicate delivery is safe.
 
 The route is registered when `httpapi.Params.PositionExitJob` is injected.
-`JobToken` is separate from the public execution token and falls back to that
-token only when omitted.
+`JobToken` is a dedicated secret separate from the public execution and
+read-only tokens. Live configuration rejects a missing, short, or shared token;
+internal job routes never fall back to the execution API token.
 
 Production assembly uses the existing live adapters:
 

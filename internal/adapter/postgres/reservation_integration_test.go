@@ -95,6 +95,52 @@ func TestOrderRepositoryPostgresIntegration(t *testing.T) {
 	}
 }
 
+func TestExecutionStrategyBindingEnabledUniquenessPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	insertAccount(t, db, "wallet-retired", "0xretired", "0", "0", "0")
+	insertAccount(t, db, "wallet-active", "0xactive", "0", "0", "0")
+	insertAccount(t, db, "wallet-conflict", "0xconflict", "0", "0", "0")
+
+	if _, err := db.Exec(`
+		INSERT INTO execution_strategy_bindings (
+			model_id,strategy_id,execution_account_id,enabled,version
+		) VALUES
+			('model-a','multfactor_v1','wallet-retired',FALSE,2),
+			('model-a','multfactor_v1','wallet-active',TRUE,1)`); err != nil {
+		t.Fatalf("retain disabled route and insert replacement: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_strategy_bindings (
+			model_id,strategy_id,execution_account_id,enabled,version
+		) VALUES ('model-a','multfactor_v1','wallet-conflict',FALSE,1)`); err != nil {
+		t.Fatalf("insert second disabled audit route: %v", err)
+	}
+	if _, err := db.Exec(`
+		UPDATE execution_strategy_bindings
+		SET enabled=TRUE,version=version+1
+		WHERE model_id='model-a' AND strategy_id='multfactor_v1'
+		  AND execution_account_id='wallet-conflict'`); err == nil {
+		t.Fatal("enabling a second model/strategy route succeeded, want unique-index rejection")
+	}
+
+	var disabledRows, enabledRows int
+	if err := db.QueryRow(`
+		SELECT count(*) FILTER (WHERE NOT enabled), count(*) FILTER (WHERE enabled)
+		FROM execution_strategy_bindings
+		WHERE model_id='model-a' AND strategy_id='multfactor_v1'`).Scan(
+		&disabledRows, &enabledRows,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if disabledRows != 2 || enabledRows != 1 {
+		t.Fatalf("binding history = disabled %d, enabled %d", disabledRows, enabledRows)
+	}
+}
+
 // TestReservationManagerPostgresIntegration 验证 Reservation Manager Postgres Integration 场景下的行为。
 func TestReservationManagerPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
@@ -2189,7 +2235,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 	db := stdlib.OpenDB(*testConfig)
 	db.SetMaxOpenConns(8)
 	t.Cleanup(func() { _ = db.Close() })
-	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql", "0014_external_position_ownership_baselines.sql", "0015_position_lot_model_routes.sql", "0016_external_position_dispositions.sql"} {
+	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql", "0014_external_position_ownership_baselines.sql", "0015_position_lot_model_routes.sql", "0016_external_position_dispositions.sql", "0017_enabled_strategy_binding_uniqueness.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", name, err)

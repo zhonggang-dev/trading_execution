@@ -27,6 +27,8 @@ var (
 const (
 	clobFillDetailsUnavailableCode = "CLOB_FILL_DETAILS_UNAVAILABLE"
 	venueFillEvidencePendingCode   = "VENUE_FILL_EVIDENCE_PENDING"
+	accountNotActiveCode           = "EXECUTION_ACCOUNT_NOT_ACTIVE"
+	accountNotManagedCode          = "EXECUTION_ACCOUNT_NOT_MANAGED"
 )
 
 // Params 表示后端使用的 Params 类型。
@@ -42,6 +44,9 @@ type Params struct {
 	CancelFillFinalityGrace time.Duration
 	ImmediateCancelFinality bool
 	MaxReconcileAttempts    int
+	// AccountScope is mandatory in live composition. A nil scope preserves the
+	// unrestricted paper/test behavior for local development.
+	AccountScope port.ExecutionAccountScope
 	// EntrySubmissionDisabled is a process-wide sell-only gate. It is enforced
 	// here, below every caller (HTTP, decision cycle, and crash recovery), so a
 	// BUY can never reach Venue.Place while the operator is exiting positions.
@@ -66,6 +71,7 @@ type Service struct {
 	cancelFillFinalityGrace  time.Duration
 	immediateCancelFinality  bool
 	maxReconcileAttempts     int
+	accountScope             port.ExecutionAccountScope
 	entrySubmissionDisabled  bool
 	requirePreparedPlacement bool
 	now                      func() time.Time
@@ -86,6 +92,9 @@ func New(params Params) (*Service, error) {
 	if params.RequirePreparedPlacement {
 		if _, ok := params.Venue.(port.PreparedVenue); !ok {
 			return nil, fmt.Errorf("live execution venue must support prepared placement")
+		}
+		if params.AccountScope == nil {
+			return nil, fmt.Errorf("live execution requires an explicit account scope")
 		}
 	}
 	if params.AuthoritativeFills && params.FillSynchronizer == nil {
@@ -124,6 +133,7 @@ func New(params Params) (*Service, error) {
 		cancelFillFinalityGrace:  params.CancelFillFinalityGrace,
 		immediateCancelFinality:  params.ImmediateCancelFinality,
 		maxReconcileAttempts:     params.MaxReconcileAttempts,
+		accountScope:             params.AccountScope,
 		entrySubmissionDisabled:  params.EntrySubmissionDisabled,
 		requirePreparedPlacement: params.RequirePreparedPlacement,
 		now:                      params.Now,
@@ -139,6 +149,9 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 	}
 	if intent.Venue != strings.ToLower(strings.TrimSpace(service.venue.Name())) {
 		return SubmitResult{}, fmt.Errorf("%w: venue %q is not served by %q", ErrInvalidIntent, intent.Venue, service.venue.Name())
+	}
+	if err := service.requireActiveAccount(intent.ExecutionAccountID); err != nil {
+		return SubmitResult{}, err
 	}
 	if existing, err := service.repository.GetByClientOrderID(ctx, intent.ClientOrderID); err == nil {
 		if !existing.Intent.Equivalent(intent) {
@@ -200,6 +213,9 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 
 // submitReserved 为已预占订单记录提交尝试并处理交易所结果。
 func (service *Service) submitReserved(ctx context.Context, stored domain.Order, created bool) (SubmitResult, error) {
+	if err := service.requireActiveAccount(stored.Intent.ExecutionAccountID); err != nil {
+		return SubmitResult{Order: stored, Created: created}, err
+	}
 	if service.entrySubmissionDisabled && stored.Intent.Side == domain.SideBuy {
 		cause := entrySubmissionDisabledError()
 		if err := service.reject(ctx, &stored, cause.Code, cause); err != nil {
@@ -382,8 +398,14 @@ func (service *Service) finishSubmitError(ctx context.Context, order domain.Orde
 // Resume 恢复尚未发起外部提交的中断订单并重新校验后继续执行。
 func (service *Service) Resume(ctx context.Context, orderID string) (domain.Order, error) {
 	order, err := service.Get(ctx, orderID)
-	if err != nil || order.Terminal() {
+	if err != nil {
 		return order, err
+	}
+	if err := service.requireActiveAccount(order.Intent.ExecutionAccountID); err != nil {
+		return order, err
+	}
+	if order.Terminal() {
+		return order, nil
 	}
 	if order.Status == domain.OrderStatusReceived {
 		if err := service.transition(ctx, &order, domain.OrderStatusValidating, domain.TransitionTriggerValidation, transitionDetails{}); err != nil {
@@ -450,8 +472,14 @@ func (service *Service) Get(ctx context.Context, orderID string) (domain.Order, 
 // Refresh 查询交易所最新状态并通过审计状态机对账本地订单。
 func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Order, error) {
 	order, err := service.Get(ctx, orderID)
-	if err != nil || order.Terminal() {
+	if err != nil {
 		return order, err
+	}
+	if err := service.requireManagedAccount(order.Intent.ExecutionAccountID); err != nil {
+		return order, err
+	}
+	if order.Terminal() {
+		return order, nil
 	}
 	if order.Status == domain.OrderStatusSubmitting || order.Status == domain.OrderStatusReconciling {
 		if err := service.forceUnknown(ctx, &order, "INCOMPLETE_SUBMIT_ATTEMPT", errors.New("process recovered while submit attempt was still STARTED"), order.VenueOrderID); err != nil {
@@ -570,8 +598,14 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 // Cancel 为可撤订单记录撤单尝试并处理明确或不确定的交易所结果。
 func (service *Service) Cancel(ctx context.Context, orderID string) (domain.Order, error) {
 	order, err := service.Get(ctx, orderID)
-	if err != nil || order.Terminal() {
+	if err != nil {
 		return order, err
+	}
+	if err := service.requireManagedAccount(order.Intent.ExecutionAccountID); err != nil {
+		return order, err
+	}
+	if order.Terminal() {
+		return order, nil
 	}
 	if order.Status != domain.OrderStatusAcknowledged && order.Status != domain.OrderStatusLive && order.Status != domain.OrderStatusPartiallyFilled {
 		return order, fmt.Errorf("%w: %s", ErrOrderNotCancelable, order.Status)
@@ -637,6 +671,9 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 	if err != nil {
 		return order, err
 	}
+	if err := service.requireManagedAccount(order.Intent.ExecutionAccountID); err != nil {
+		return order, err
+	}
 	if order.Status == domain.OrderStatusFilled {
 		return order, nil
 	}
@@ -651,6 +688,30 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 		return order, errors.Join(fmt.Errorf("finalize cancelled reservation: %w", err), uncertainErr)
 	}
 	return order, nil
+}
+
+func (service *Service) requireActiveAccount(executionAccountID string) error {
+	if service.accountScope == nil || service.accountScope.IsActive(executionAccountID) {
+		return nil
+	}
+	return &port.Rejection{
+		Code: accountNotActiveCode,
+		Reason: fmt.Sprintf(
+			"execution account %q is not active in this process", strings.TrimSpace(executionAccountID),
+		),
+	}
+}
+
+func (service *Service) requireManagedAccount(executionAccountID string) error {
+	if service.accountScope == nil || service.accountScope.IsManaged(executionAccountID) {
+		return nil
+	}
+	return &port.Rejection{
+		Code: accountNotManagedCode,
+		Reason: fmt.Sprintf(
+			"execution account %q is not managed by this process", strings.TrimSpace(executionAccountID),
+		),
+	}
 }
 
 // holdCancellationFinality 保留撤单后的资产预占并触发成交终局对账。

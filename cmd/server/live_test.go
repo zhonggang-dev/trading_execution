@@ -1,14 +1,55 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarket"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 )
+
+type livePreflightProbeClient struct {
+	account      polymarket.AccountProbe
+	accountErr   error
+	funding      polymarket.FundingProbe
+	fundingErr   error
+	accountCalls []string
+	fundingCalls []string
+}
+
+func (client *livePreflightProbeClient) ProbeAccount(
+	_ context.Context,
+	executionAccountID string,
+) (polymarket.AccountProbe, error) {
+	client.accountCalls = append(client.accountCalls, executionAccountID)
+	return client.account, client.accountErr
+}
+
+func (client *livePreflightProbeClient) ProbeFunding(
+	_ context.Context,
+	executionAccountID string,
+) (polymarket.FundingProbe, error) {
+	client.fundingCalls = append(client.fundingCalls, executionAccountID)
+	return client.funding, client.fundingErr
+}
+
+type livePreflightEligibility struct {
+	result polymarket.GeographicEligibility
+	err    error
+	calls  []string
+}
+
+func (checker *livePreflightEligibility) Check(
+	_ context.Context,
+	executionAccountID string,
+) (polymarket.GeographicEligibility, error) {
+	checker.calls = append(checker.calls, executionAccountID)
+	return checker.result, checker.err
+}
 
 func TestValidateStartupReconciliationRequiresEveryAccountCompleted(t *testing.T) {
 	completed := reconciliation.SweepResult{Runs: []reconciliation.Result{{
@@ -63,17 +104,66 @@ func TestValidateStartupReconciliationRequiresEveryAccountCompleted(t *testing.T
 
 func TestPartitionReconciliationAccountsQuarantinesOneOfFour(t *testing.T) {
 	active, quarantined, err := partitionReconciliationAccounts(
-		[]string{"main", "wallet-1", "wallet-2", "wallet-3"},
-		[]string{"wallet-3"},
+		[]string{"main", "wallet-1", "wallet-6", "wallet-7"},
+		[]string{"wallet-7"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"main", "wallet-1", "wallet-2"}; !reflect.DeepEqual(active, want) {
+	if want := []string{"main", "wallet-1", "wallet-6"}; !reflect.DeepEqual(active, want) {
 		t.Fatalf("active accounts = %#v, want %#v", active, want)
 	}
-	if want := []string{"wallet-3"}; !reflect.DeepEqual(quarantined, want) {
+	if want := []string{"wallet-7"}; !reflect.DeepEqual(quarantined, want) {
 		t.Fatalf("quarantined accounts = %#v, want %#v", quarantined, want)
+	}
+}
+
+func TestCurrentLiveReleaseRejectsRetiredWalletOrReducedQuarantineBeforePreflight(t *testing.T) {
+	tests := []struct {
+		name        string
+		configured  []string
+		quarantined []string
+		want        string
+	}{
+		{
+			name:        "decision cycle disabled with retired wallets",
+			configured:  []string{"main", "wallet-1", "wallet-2", "wallet-3"},
+			quarantined: []string{"wallet-6", "wallet-7"},
+			want:        "wallet file must contain exactly",
+		},
+		{
+			name:        "wallet-7 removed from quarantine",
+			configured:  []string{"main", "wallet-1", "wallet-6", "wallet-7"},
+			quarantined: []string{"wallet-6"},
+			want:        "submission-disabled account list must contain exactly",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &livePreflightProbeClient{}
+			err := validateCurrentLiveWallet67Release(test.configured, test.quarantined)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateCurrentLiveWallet67Release() error = %v, want %q", err, test.want)
+			}
+			if len(client.accountCalls) != 0 || len(client.fundingCalls) != 0 {
+				t.Fatalf("release validation reached venue probes: %#v/%#v", client.accountCalls, client.fundingCalls)
+			}
+		})
+	}
+}
+
+func TestCurrentLiveReleaseSelectsOnlyMainAndWallet1ForAutomaticOperations(t *testing.T) {
+	configured := []string{"main", "wallet-1", "wallet-6", "wallet-7"}
+	quarantined := []string{"wallet-6", "wallet-7"}
+	if err := validateCurrentLiveWallet67Release(configured, quarantined); err != nil {
+		t.Fatal(err)
+	}
+	active, _, err := partitionReconciliationAccounts(configured, quarantined)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"main", "wallet-1"}; !reflect.DeepEqual(active, want) {
+		t.Fatalf("automatic operations accounts = %#v, want %#v", active, want)
 	}
 }
 
@@ -84,9 +174,9 @@ func TestPartitionReconciliationAccountsFailsClosed(t *testing.T) {
 		quarantined []string
 		want        string
 	}{
-		{name: "unknown", configured: []string{"wallet-1"}, quarantined: []string{"wallet-3"}, want: "not configured"},
-		{name: "duplicate", configured: []string{"wallet-1", "wallet-2"}, quarantined: []string{"wallet-2", "wallet-2"}, want: "duplicated"},
-		{name: "all", configured: []string{"wallet-3"}, quarantined: []string{"wallet-3"}, want: "cannot exclude every"},
+		{name: "unknown", configured: []string{"wallet-1"}, quarantined: []string{"wallet-7"}, want: "not configured"},
+		{name: "duplicate", configured: []string{"wallet-1", "wallet-6"}, quarantined: []string{"wallet-6", "wallet-6"}, want: "duplicated"},
+		{name: "all", configured: []string{"wallet-7"}, quarantined: []string{"wallet-7"}, want: "cannot exclude every"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -95,5 +185,72 @@ func TestPartitionReconciliationAccountsFailsClosed(t *testing.T) {
 				t.Fatalf("partitionReconciliationAccounts() error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestPreflightLiveAccountAllowsUnfundedQuarantine(t *testing.T) {
+	client := &livePreflightProbeClient{
+		account:    polymarket.AccountProbe{ExecutionAccountID: "wallet-6", FunderAddress: "0xfunder"},
+		fundingErr: errors.New("funding probe must be skipped"),
+	}
+	eligibility := &livePreflightEligibility{err: errors.New("eligibility probe must be skipped")}
+
+	result, err := preflightLiveAccount(
+		context.Background(), "wallet-6", true, client, eligibility,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.account.FunderAddress != "0xfunder" || result.funding != nil || result.eligibility != nil {
+		t.Fatalf("quarantined preflight result = %#v", result)
+	}
+	if want := []string{"wallet-6"}; !reflect.DeepEqual(client.accountCalls, want) {
+		t.Fatalf("account probe calls = %#v, want %#v", client.accountCalls, want)
+	}
+	if len(client.fundingCalls) != 0 || len(eligibility.calls) != 0 {
+		t.Fatalf("quarantined trading-capability probes were called: funding=%#v eligibility=%#v", client.fundingCalls, eligibility.calls)
+	}
+}
+
+func TestPreflightLiveAccountRejectsQuarantinedOpenOrder(t *testing.T) {
+	client := &livePreflightProbeClient{
+		account: polymarket.AccountProbe{
+			ExecutionAccountID: "wallet-6", FunderAddress: "0xfunder", OpenOrderCount: 1,
+		},
+	}
+	eligibility := &livePreflightEligibility{}
+
+	_, err := preflightLiveAccount(
+		context.Background(), "wallet-6", true, client, eligibility,
+	)
+	if err == nil || !strings.Contains(err.Error(), "has 1 open CLOB order") {
+		t.Fatalf("preflightLiveAccount() error = %v, want quarantined open-order rejection", err)
+	}
+	if len(client.fundingCalls) != 0 || len(eligibility.calls) != 0 {
+		t.Fatalf("rejected quarantine ran trading-capability probes: funding=%#v eligibility=%#v", client.fundingCalls, eligibility.calls)
+	}
+}
+
+func TestPreflightLiveAccountRejectsUnfundedActiveAccount(t *testing.T) {
+	client := &livePreflightProbeClient{
+		account: polymarket.AccountProbe{ExecutionAccountID: "main", FunderAddress: "0xfunder"},
+		funding: polymarket.FundingProbe{
+			ExecutionAccountID: "main", CollateralBalancePositive: false,
+			RequiredAllowancesPositive: false,
+		},
+	}
+	eligibility := &livePreflightEligibility{}
+
+	_, err := preflightLiveAccount(
+		context.Background(), "main", false, client, eligibility,
+	)
+	if err == nil || !strings.Contains(err.Error(), "has no positive CLOB pUSD collateral balance") {
+		t.Fatalf("preflightLiveAccount() error = %v, want active collateral rejection", err)
+	}
+	if want := []string{"main"}; !reflect.DeepEqual(client.fundingCalls, want) {
+		t.Fatalf("funding probe calls = %#v, want %#v", client.fundingCalls, want)
+	}
+	if len(eligibility.calls) != 0 {
+		t.Fatalf("eligibility calls = %#v, want none after funding rejection", eligibility.calls)
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
@@ -23,6 +25,7 @@ type Params struct {
 	Execution    Execution
 	PollInterval time.Duration
 	BatchSize    int
+	Accounts     []string
 	Now          func() time.Time
 }
 
@@ -32,6 +35,7 @@ type Coordinator struct {
 	execution    Execution
 	pollInterval time.Duration
 	batchSize    int
+	accounts     []string
 	now          func() time.Time
 }
 
@@ -74,16 +78,31 @@ func New(params Params) (*Coordinator, error) {
 	if params.Now == nil {
 		params.Now = time.Now
 	}
+	accounts, err := normalizeAccounts(params.Accounts)
+	if err != nil {
+		return nil, err
+	}
 	return &Coordinator{
 		repository: params.Repository, execution: params.Execution,
-		pollInterval: params.PollInterval, batchSize: params.BatchSize, now: params.Now,
+		pollInterval: params.PollInterval, batchSize: params.BatchSize,
+		accounts: accounts, now: params.Now,
 	}, nil
 }
 
 // Sweep 执行一次有界扫描并处理选中的记录。
 func (coordinator *Coordinator) Sweep(ctx context.Context) SweepResult {
 	now := coordinator.now().UTC()
-	orders, err := coordinator.repository.ListPending(ctx, now.Add(-coordinator.pollInterval), coordinator.batchSize)
+	var orders []domain.Order
+	var err error
+	if len(coordinator.accounts) == 0 {
+		orders, err = coordinator.repository.ListPending(
+			ctx, now.Add(-coordinator.pollInterval), coordinator.batchSize,
+		)
+	} else {
+		orders, err = coordinator.repository.ListPendingForAccounts(
+			ctx, coordinator.accounts, now.Add(-coordinator.pollInterval), coordinator.batchSize,
+		)
+	}
 	if err != nil {
 		return SweepResult{Errors: []error{err}}
 	}
@@ -101,6 +120,24 @@ func (coordinator *Coordinator) Sweep(ctx context.Context) SweepResult {
 		result.record(action)
 	}
 	return result
+}
+
+func normalizeAccounts(accountIDs []string) ([]string, error) {
+	result := make([]string, 0, len(accountIDs))
+	seen := make(map[string]struct{}, len(accountIDs))
+	for index, raw := range accountIDs {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return nil, fmt.Errorf("order coordinator active account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return nil, fmt.Errorf("order coordinator active account %q is duplicated", accountID)
+		}
+		seen[accountID] = struct{}{}
+		result = append(result, accountID)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 // processOrder 根据订单状态选择并执行一次恢复、刷新或撤单动作。

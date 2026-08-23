@@ -12,8 +12,8 @@ Go 启动时注入绑定表，例如：
 ```text
 echo / multfactor_v2 / main
 echo / multfactor_v1 / wallet-1
-gemini_masked / multfactor_v1 / wallet-2
-gemini_masked / multfactor_v2 / wallet-3
+gemini_masked / multfactor_v1 / wallet-6
+gemini_masked / multfactor_v2 / wallet-7
 ```
 
 框架拒绝重复的 model/strategy 组合，也拒绝把同一个 execution account 绑定两次。
@@ -182,8 +182,8 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
 [
   {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
   {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-  {"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
-  {"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
+  {"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+  {"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 ]
 ```
 

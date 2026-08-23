@@ -14,6 +14,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -27,8 +28,75 @@ import urllib.parse
 import urllib.request
 
 
-EXPECTED_ACCOUNTS = frozenset({"main", "wallet-1", "wallet-2", "wallet-3"})
 EXPECTED_STRATEGIES = frozenset({"multfactor_v1", "multfactor_v2"})
+EXPECTED_ROUTES = {
+    ("echo", "multfactor_v2"): "main",
+    ("echo", "multfactor_v1"): "wallet-1",
+    ("gemini_masked", "multfactor_v1"): "wallet-6",
+    ("gemini_masked", "multfactor_v2"): "wallet-7",
+}
+EXPECTED_ACCOUNTS = frozenset(EXPECTED_ROUTES.values())
+CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS = frozenset({"wallet-6", "wallet-7"})
+POLICY_LIMIT_FIELDS = (
+    "max_order_notional",
+    "max_market_exposure",
+    "max_strategy_exposure",
+    "max_wallet_exposure",
+    "max_daily_traded_notional",
+    "max_price_age_ms",
+    "max_signal_age_ms",
+    "max_state_age_ms",
+)
+# Current rollout evidence contract. main/wallet-1 values come from the
+# production read-only baseline; wallet-6/wallet-7 are the disabled quarantine
+# template. This constant is not approval to activate wallet-6/wallet-7: that
+# requires a new evidence pass and explicit operator approval.
+CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT = {
+    "main": {
+        "max_order_notional": 1.10,
+        "max_market_exposure": 2.10,
+        "max_strategy_exposure": 2.10,
+        "max_wallet_exposure": 2.10,
+        "max_daily_traded_notional": 1.10,
+        "max_price_age_ms": 90_000,
+        "max_signal_age_ms": 30_000,
+        "max_state_age_ms": 600_000,
+        "daily_timezone": "UTC",
+    },
+    "wallet-1": {
+        "max_order_notional": 1.10,
+        "max_market_exposure": 2.10,
+        "max_strategy_exposure": 2.10,
+        "max_wallet_exposure": 2.10,
+        "max_daily_traded_notional": 1.10,
+        "max_price_age_ms": 90_000,
+        "max_signal_age_ms": 30_000,
+        "max_state_age_ms": 600_000,
+        "daily_timezone": "UTC",
+    },
+    "wallet-6": {
+        "max_order_notional": 1.10,
+        "max_market_exposure": 2.10,
+        "max_strategy_exposure": 2.10,
+        "max_wallet_exposure": 2.10,
+        "max_daily_traded_notional": 1.10,
+        "max_price_age_ms": 90_000,
+        "max_signal_age_ms": 30_000,
+        "max_state_age_ms": 600_000,
+        "daily_timezone": "UTC",
+    },
+    "wallet-7": {
+        "max_order_notional": 1.10,
+        "max_market_exposure": 2.10,
+        "max_strategy_exposure": 2.10,
+        "max_wallet_exposure": 2.10,
+        "max_daily_traded_notional": 1.10,
+        "max_price_age_ms": 90_000,
+        "max_signal_age_ms": 30_000,
+        "max_state_age_ms": 600_000,
+        "daily_timezone": "UTC",
+    },
+}
 MAX_CONFIG_BYTES = 4 << 20
 DISABLED_EVIDENCE_SCHEMA = "four_wallet.disabled_preflight.v1"
 IMMUTABLE_RELEASE_IDENTITY = re.compile(r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})")
@@ -69,6 +137,9 @@ PREDICTION_RUNTIME_KEYS = frozenset(
 TRADING_RUNTIME_SECRET_KEYS = frozenset(
     {
         "TRADING_EXECUTION_DATABASE_URL",
+        "EXECUTION_API_TOKEN",
+        "POSITION_EXIT_JOB_TOKEN",
+        "LIVE_OPERATIONS_READ_ONLY_TOKEN",
         "DECISION_CYCLE_PREDICTION_INFRA_TOKEN",
         "DECISION_CYCLE_STRATEGY_TOKEN",
     }
@@ -83,6 +154,9 @@ PREDICTION_RUNTIME_SECRET_KEYS = frozenset(
 )
 
 DATABASE_STATE_SQL = r"""
+WITH managed_accounts(execution_account_id) AS (
+  VALUES ('main'),('wallet-1'),('wallet-6'),('wallet-7')
+)
 SELECT json_build_object(
   'observed_at',clock_timestamp(),
   'global_kill_switch',(
@@ -103,6 +177,36 @@ SELECT json_build_object(
       'enabled',enabled
     ) ORDER BY model_id,strategy_id,execution_account_id),'[]'::json)
       FROM execution_strategy_bindings
+  ),
+  'risk_policies',(
+    SELECT COALESCE(json_agg(json_build_object(
+      'execution_account_id',execution_account_id,
+      'policy_id',policy_id,
+      'version',version,
+      'enabled',enabled,
+      'max_order_notional',max_order_notional,
+      'max_market_exposure',max_market_exposure,
+      'max_strategy_exposure',max_strategy_exposure,
+      'max_wallet_exposure',max_wallet_exposure,
+      'max_daily_traded_notional',max_daily_traded_notional,
+      'max_price_age_ms',max_price_age_ms,
+      'max_signal_age_ms',max_signal_age_ms,
+      'max_state_age_ms',max_state_age_ms,
+      'daily_timezone',daily_timezone
+    ) ORDER BY execution_account_id),'[]'::json)
+      FROM execution_risk_policies
+  ),
+  'account_controls',(
+    SELECT COALESCE(json_agg(json_build_object(
+      'execution_account_id',execution_account_id,
+      'control_scope',control_scope,
+      'control_key',control_key,
+      'paused',paused,
+      'reason',reason,
+      'version',version
+    ) ORDER BY execution_account_id),'[]'::json)
+      FROM execution_risk_controls
+     WHERE control_scope='ACCOUNT' AND control_key=''
   ),
   'dry_runs',(
     SELECT COALESCE(json_agg(row_to_json(run) ORDER BY run.decision_at DESC),'[]'::json)
@@ -128,25 +232,29 @@ SELECT json_build_object(
           ) ORDER BY model_id,strategy_id,execution_account_id) AS bindings
           FROM strategy_decision_runs
          WHERE decision_at >= clock_timestamp() - interval '48 hours'
+           AND execution_account_id IN (SELECT execution_account_id FROM managed_accounts)
          GROUP BY decision_at,input_payload->>'prediction_snapshot_id'
          ORDER BY decision_at DESC
          LIMIT 20
       ) AS run
   ),
   'decision_delivery_state',json_build_object(
-    'count',(SELECT count(*) FROM strategy_order_intent_deliveries),
+    'count',(SELECT count(*) FROM strategy_order_intent_deliveries
+             WHERE intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts)),
     'status_counts',json_build_object(
-      'PENDING',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='PENDING'),
-      'SUBMITTING',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='SUBMITTING'),
-      'SUBMITTED',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='SUBMITTED'),
-      'FAILED',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='FAILED'),
-      'UNKNOWN',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='UNKNOWN')
+      'PENDING',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='PENDING' AND intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts)),
+      'SUBMITTING',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='SUBMITTING' AND intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts)),
+      'SUBMITTED',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='SUBMITTED' AND intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts)),
+      'FAILED',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='FAILED' AND intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts)),
+      'UNKNOWN',(SELECT count(*) FROM strategy_order_intent_deliveries WHERE status='UNKNOWN' AND intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts))
     ),
     'unsafe_order_status_count',(
       SELECT count(*) FROM strategy_order_intent_deliveries
        WHERE order_status IN ('UNKNOWN','MANUAL_REVIEW')
+         AND intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts)
     ),
-    'max_updated_at',(SELECT max(updated_at) FROM strategy_order_intent_deliveries),
+    'max_updated_at',(SELECT max(updated_at) FROM strategy_order_intent_deliveries
+                      WHERE intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts)),
     'risky_samples',(
       SELECT COALESCE(json_agg(json_build_object(
         'client_order_id',client_order_id,
@@ -156,8 +264,9 @@ SELECT json_build_object(
         FROM (
           SELECT client_order_id,status,order_status
             FROM strategy_order_intent_deliveries
-           WHERE status IN ('PENDING','SUBMITTING','UNKNOWN')
-              OR order_status IN ('UNKNOWN','MANUAL_REVIEW')
+           WHERE intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts)
+             AND (status IN ('PENDING','SUBMITTING','UNKNOWN')
+               OR order_status IN ('UNKNOWN','MANUAL_REVIEW'))
            ORDER BY client_order_id
            LIMIT 20
         ) AS risky_delivery
@@ -167,6 +276,7 @@ SELECT json_build_object(
     'count',(
       SELECT count(*) FROM execution_orders
        WHERE status IN ('UNKNOWN','MANUAL_REVIEW')
+         AND execution_account_id IN (SELECT execution_account_id FROM managed_accounts)
     ),
     'orders',(
       SELECT COALESCE(json_agg(json_build_object(
@@ -180,6 +290,7 @@ SELECT json_build_object(
           SELECT order_id,client_order_id,execution_account_id,status,updated_at
             FROM execution_orders
            WHERE status IN ('UNKNOWN','MANUAL_REVIEW')
+             AND execution_account_id IN (SELECT execution_account_id FROM managed_accounts)
            ORDER BY order_id
            LIMIT 20
       ) AS risky_order
@@ -189,6 +300,7 @@ SELECT json_build_object(
     'count',(
       SELECT count(*) FROM execution_orders
        WHERE intent->>'side'='BUY'
+         AND execution_account_id IN (SELECT execution_account_id FROM managed_accounts)
          AND status NOT IN ('FILLED','CANCELLED','REJECTED','MANUAL_REVIEW')
     ),
     'orders',(
@@ -203,6 +315,7 @@ SELECT json_build_object(
           SELECT order_id,client_order_id,execution_account_id,status,updated_at
             FROM execution_orders
            WHERE intent->>'side'='BUY'
+             AND execution_account_id IN (SELECT execution_account_id FROM managed_accounts)
              AND status NOT IN ('FILLED','CANCELLED','REJECTED','MANUAL_REVIEW')
            ORDER BY order_id
            LIMIT 20
@@ -315,6 +428,28 @@ def decode_submission_disabled_accounts(
     return tuple(sorted(accounts))
 
 
+def require_current_rollout_quarantine(accounts: tuple[str, ...]) -> None:
+    if set(accounts) != CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS:
+        raise PreflightError(
+            "this release requires wallet-6 and wallet-7 to remain submission-disabled; "
+            "activation requires a separate release and approved evidence"
+        )
+
+
+def active_rollout_bindings(
+    bindings: tuple[Binding, ...], quarantined_accounts: tuple[str, ...]
+) -> tuple[Binding, ...]:
+    quarantined = set(quarantined_accounts)
+    result = tuple(
+        binding
+        for binding in bindings
+        if binding.execution_account_id not in quarantined
+    )
+    if not result:
+        raise PreflightError("current rollout quarantine excludes every binding")
+    return result
+
+
 def validate_topology(bindings: list[Binding] | tuple[Binding, ...]) -> tuple[Binding, ...]:
     normalized = tuple(sorted(bindings))
     accounts = {binding.execution_account_id for binding in normalized}
@@ -356,13 +491,16 @@ def validate_topology(bindings: list[Binding] | tuple[Binding, ...]) -> tuple[Bi
             raise PreflightError(f"duplicate database authorization: {binding.authorization}")
         authorizations.add(binding.authorization)
 
-    expected_pairs = {
-        (model_id, strategy_id)
-        for model_id in logical_models
-        for strategy_id in EXPECTED_STRATEGIES
-    }
+    expected_pairs = set(EXPECTED_ROUTES)
     if pairs != expected_pairs:
-        raise PreflightError("bindings must contain the complete 2 models x 2 strategies matrix")
+        raise PreflightError("bindings must contain the exact echo/gemini_masked route matrix")
+    for binding in normalized:
+        expected_account = EXPECTED_ROUTES[(binding.model_id, binding.strategy_id)]
+        if binding.execution_account_id != expected_account:
+            raise PreflightError(
+                f"route {binding.model_id!r}/{binding.strategy_id!r} must use "
+                f"execution account {expected_account!r}"
+            )
     return normalized
 
 
@@ -471,10 +609,11 @@ def validate_environment(
             submission_state == "enabled",
         )
     bindings = decode_bindings(environment.get("DECISION_CYCLE_BINDINGS_JSON", ""))
-    decode_submission_disabled_accounts(
+    quarantined_accounts = decode_submission_disabled_accounts(
         environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
         bindings,
     )
+    require_current_rollout_quarantine(quarantined_accounts)
     wallet_path = environment.get("POLYMARKET_ACCOUNTS_FILE", "").strip()
     if not wallet_path:
         raise PreflightError("POLYMARKET_ACCOUNTS_FILE is required")
@@ -489,7 +628,10 @@ def validate_environment(
 
 
 def validate_prediction_environment(
-    environment: dict[str, str], bindings: tuple[Binding, ...]
+    environment: dict[str, str],
+    bindings: tuple[Binding, ...],
+    *,
+    required_bindings: tuple[Binding, ...] | None = None,
 ) -> None:
     _required_boolean(environment, "REDIS_ENABLED", True)
     _required_boolean(environment, "DIRECT_PREDICTION_ENABLED", True)
@@ -525,11 +667,19 @@ def validate_prediction_environment(
     normalized_models = [value.strip() for value in configured_models]
     if len(normalized_models) != len(set(normalized_models)):
         raise PreflightError("DIRECT_PREDICTION_MODEL_IDS_JSON contains duplicate models")
-    expected_models = {binding.prediction_model_id for binding in bindings}
-    if set(normalized_models) != expected_models:
+    configured_model_set = set(normalized_models)
+    known_models = {binding.prediction_model_id for binding in bindings}
+    required_models = {
+        binding.prediction_model_id
+        for binding in (bindings if required_bindings is None else required_bindings)
+    }
+    unknown_models = configured_model_set - known_models
+    missing_models = required_models - configured_model_set
+    if unknown_models or missing_models:
         raise PreflightError(
-            "Prediction Direct model set must exactly equal Trading prediction_model_id set; "
-            f"expected={sorted(expected_models)}, configured={sorted(normalized_models)}"
+            "Prediction Direct model set must include every active Trading prediction model "
+            "and no unconfigured model; "
+            f"missing={sorted(missing_models)}, unknown={sorted(unknown_models)}"
         )
 
 
@@ -582,7 +732,10 @@ def validate_cross_service_credentials(
 
 
 def decode_model_groups(
-    payload: str, bindings: tuple[Binding, ...]
+    payload: str,
+    bindings: tuple[Binding, ...],
+    *,
+    required_bindings: tuple[Binding, ...] | None = None,
 ) -> dict[str, str]:
     try:
         raw = json.loads(payload)
@@ -590,17 +743,25 @@ def decode_model_groups(
         raise PreflightError(f"Direct model-group mapping is invalid JSON: {error.msg}") from error
     if not isinstance(raw, dict):
         raise PreflightError("Direct model-group mapping must be one JSON object")
-    expected_models = {binding.prediction_model_id for binding in bindings}
-    if set(raw) != expected_models:
+    known_models = {binding.prediction_model_id for binding in bindings}
+    required_models = {
+        binding.prediction_model_id
+        for binding in (bindings if required_bindings is None else required_bindings)
+    }
+    unknown_models = set(raw) - known_models
+    missing_models = required_models - set(raw)
+    if unknown_models or missing_models:
         raise PreflightError(
-            "Direct model-group mapping keys must exactly equal Trading prediction_model_id set; "
-            f"expected={sorted(expected_models)}, configured={sorted(raw)}"
+            "Direct model-group mapping must include every active Trading prediction model "
+            "and no unconfigured model; "
+            f"missing={sorted(missing_models)}, unknown={sorted(unknown_models)}"
         )
     result: dict[str, str] = {}
     for model_id, group in raw.items():
         if not isinstance(group, str) or not group.strip():
             raise PreflightError(f"Direct consumer group is empty for model {model_id!r}")
-        result[model_id] = group.strip()
+        if model_id in required_models:
+            result[model_id] = group.strip()
     if len(set(result.values())) != len(result):
         raise PreflightError(
             "per-model Direct consumer groups must be distinct; consumers for different "
@@ -609,11 +770,28 @@ def decode_model_groups(
     return dict(sorted(result.items()))
 
 
-def validate_database_state(state: object, bindings: tuple[Binding, ...]) -> str:
+def validate_database_state(
+    state: object,
+    bindings: tuple[Binding, ...],
+    *,
+    submission_state: str = "disabled",
+    submission_disabled_accounts: tuple[str, ...] = tuple(
+        sorted(CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS)
+    ),
+) -> str:
     if not isinstance(state, dict):
         raise PreflightError("database preflight result must be a JSON object")
+    if submission_state not in {"disabled", "enabled"}:
+        raise PreflightError("database submission state must be disabled or enabled")
     if state.get("global_kill_switch") is not True:
         raise PreflightError("database global kill switch must remain enabled during preflight")
+    disabled = set(submission_disabled_accounts)
+    require_current_rollout_quarantine(tuple(sorted(disabled)))
+    unknown_disabled = disabled - EXPECTED_ACCOUNTS
+    if unknown_disabled:
+        raise PreflightError(
+            f"database quarantine contains unexpected accounts: {sorted(unknown_disabled)}"
+        )
 
     raw_accounts = state.get("accounts")
     if not isinstance(raw_accounts, list):
@@ -639,12 +817,10 @@ def validate_database_state(state: object, bindings: tuple[Binding, ...]) -> str
     raw_bindings = state.get("bindings")
     if not isinstance(raw_bindings, list):
         raise PreflightError("database bindings result must be an array")
-    enabled: set[tuple[str, str, str]] = set()
+    database_bindings: dict[tuple[str, str, str], dict[str, object]] = {}
     for item in raw_bindings:
         if not isinstance(item, dict):
             raise PreflightError("database returned an invalid strategy binding row")
-        if item.get("enabled") is not True:
-            continue
         try:
             authorization = (
                 str(item["model_id"]).strip(),
@@ -653,22 +829,158 @@ def validate_database_state(state: object, bindings: tuple[Binding, ...]) -> str
             )
         except KeyError as error:
             raise PreflightError(f"database binding is missing {error.args[0]}") from error
-        if authorization in enabled:
-            raise PreflightError(f"database returned duplicate enabled binding {authorization}")
-        enabled.add(authorization)
+        if (
+            any(not value for value in authorization)
+            or not isinstance(item.get("enabled"), bool)
+            or authorization in database_bindings
+        ):
+            raise PreflightError(f"database returned duplicate or invalid binding {authorization}")
+        database_bindings[authorization] = item
 
     expected = {binding.authorization for binding in bindings}
-    if enabled != expected:
-        missing = sorted(expected - enabled)
-        unexpected = sorted(enabled - expected)
+    missing_rows = expected - set(database_bindings)
+    if missing_rows:
         raise PreflightError(
-            f"enabled database authorizations are not the atomic four-wallet set; "
+            f"database is missing configured strategy binding rows: {sorted(missing_rows)}"
+        )
+    expected_enabled = {
+        authorization for authorization in expected if authorization[2] not in disabled
+    }
+    enabled = {
+        authorization
+        for authorization, item in database_bindings.items()
+        if item["enabled"] is True
+    }
+    if enabled != expected_enabled:
+        missing = sorted(expected_enabled - enabled)
+        unexpected = sorted(enabled - expected_enabled)
+        raise PreflightError(
+            f"enabled database authorizations are not the active managed-wallet set; "
             f"missing={missing}, unexpected={unexpected}"
         )
+    for authorization in expected:
+        should_enable = authorization in expected_enabled
+        if database_bindings[authorization]["enabled"] is not should_enable:
+            raise PreflightError(
+                f"configured database binding {authorization} must have enabled={should_enable}"
+            )
+
+    raw_policies = state.get("risk_policies")
+    if not isinstance(raw_policies, list):
+        raise PreflightError("database risk policies result must be an array")
+    policies: dict[str, dict[str, object]] = {}
+    for item in raw_policies:
+        if not isinstance(item, dict):
+            raise PreflightError("database returned an invalid risk policy row")
+        account_id = item.get("execution_account_id")
+        policy_id = item.get("policy_id")
+        version = item.get("version")
+        enabled_policy = item.get("enabled")
+        if (
+            not isinstance(account_id, str)
+            or not account_id.strip()
+            or account_id.strip() in policies
+            or not isinstance(policy_id, str)
+            or not policy_id.strip()
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+            or not isinstance(enabled_policy, bool)
+        ):
+            raise PreflightError("database returned a duplicate or invalid risk policy")
+        policies[account_id.strip()] = item
+    for account_id in sorted(EXPECTED_ACCOUNTS):
+        policy = policies.get(account_id)
+        if policy is None:
+            raise PreflightError(f"database is missing risk policy for {account_id!r}")
+        expected_policy_enabled = account_id not in disabled
+        if policy["enabled"] is not expected_policy_enabled:
+            raise PreflightError(
+                f"database risk policy for {account_id!r} must have "
+                f"enabled={expected_policy_enabled}"
+            )
+        for field in POLICY_LIMIT_FIELDS:
+            value = policy.get(field)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise PreflightError(
+                    f"database risk policy for {account_id!r} has invalid {field}"
+                )
+        if policy.get("daily_timezone") != "UTC":
+            raise PreflightError(
+                f"database risk policy for {account_id!r} must use daily_timezone UTC"
+            )
+    for account_id in sorted(EXPECTED_ACCOUNTS):
+        contract = {
+            field: policies[account_id][field] for field in POLICY_LIMIT_FIELDS
+        }
+        contract["daily_timezone"] = policies[account_id]["daily_timezone"]
+        rollout_contract = CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT[account_id]
+        if contract != rollout_contract:
+            raise PreflightError(
+                f"database risk policy contract for {account_id!r} differs from its "
+                f"reviewed current-rollout contract"
+            )
+
+    raw_controls = state.get("account_controls")
+    if not isinstance(raw_controls, list):
+        raise PreflightError("database ACCOUNT controls result must be an array")
+    controls: dict[str, dict[str, object]] = {}
+    for item in raw_controls:
+        if not isinstance(item, dict):
+            raise PreflightError("database returned an invalid ACCOUNT control row")
+        account_id = item.get("execution_account_id")
+        paused = item.get("paused")
+        reason = item.get("reason")
+        version = item.get("version")
+        control_scope = item.get("control_scope")
+        control_key = item.get("control_key")
+        if (
+            not isinstance(account_id, str)
+            or not account_id.strip()
+            or account_id.strip() in controls
+            or not isinstance(paused, bool)
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+            or control_scope != "ACCOUNT"
+            or control_key != ""
+        ):
+            raise PreflightError("database returned a duplicate or invalid ACCOUNT control")
+        controls[account_id.strip()] = item
+    for account_id in sorted(EXPECTED_ACCOUNTS):
+        control = controls.get(account_id)
+        if control is None:
+            raise PreflightError(f"database is missing ACCOUNT control for {account_id!r}")
+        expected_paused = account_id in disabled
+        if control["paused"] is not expected_paused:
+            expected_state = "paused" if expected_paused else "unpaused"
+            raise PreflightError(
+                f"account quarantine requires {account_id!r} ACCOUNT control "
+                f"to be {expected_state}"
+            )
     return _canonical_sha256(
         {
-            account_id: database_accounts[account_id]
-            for account_id in sorted(EXPECTED_ACCOUNTS)
+            "accounts": {
+                account_id: database_accounts[account_id]
+                for account_id in sorted(EXPECTED_ACCOUNTS)
+            },
+            "bindings": [
+                database_bindings[authorization]
+                for authorization in sorted(expected)
+            ],
+            "risk_policies": [
+                policies[account_id] for account_id in sorted(EXPECTED_ACCOUNTS)
+            ],
+            "account_controls": [
+                controls[account_id] for account_id in sorted(EXPECTED_ACCOUNTS)
+            ],
         }
     )
 
@@ -1300,9 +1612,7 @@ def configuration_sha256(
         "trading": trading,
         "prediction": prediction,
         "bindings": [dataclasses.asdict(binding) for binding in bindings],
-        "direct_prediction_models": sorted(
-            {binding.prediction_model_id for binding in bindings}
-        ),
+        "direct_prediction_models": sorted(model_groups),
         "direct_model_groups": model_groups,
         "wallet_file_sha256": wallet_file_sha256,
         "approved_release_identity": {
@@ -2127,13 +2437,25 @@ def main(argv: list[str] | None = None) -> int:
             environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
             bindings,
         )
+        require_current_rollout_quarantine(submission_disabled_accounts)
+        active_bindings = active_rollout_bindings(
+            bindings, submission_disabled_accounts
+        )
         wallet_path = pathlib.Path(environment["POLYMARKET_ACCOUNTS_FILE"])
         wallet_file_sha = hashlib.sha256(
             _read_bounded_regular_file(wallet_path, "wallet")
         ).hexdigest()
-        validate_prediction_environment(prediction_environment, bindings)
+        validate_prediction_environment(
+            prediction_environment,
+            bindings,
+            required_bindings=active_bindings,
+        )
         validate_cross_service_credentials(environment, prediction_environment)
-        model_groups = decode_model_groups(args.direct_model_groups_json, bindings)
+        model_groups = decode_model_groups(
+            args.direct_model_groups_json,
+            bindings,
+            required_bindings=active_bindings,
+        )
         configuration_sha = configuration_sha256(
             environment,
             prediction_environment,
@@ -2177,7 +2499,12 @@ def main(argv: list[str] | None = None) -> int:
             state = json.loads(_read_bounded_regular_file(args.database_state_json, "database state"))
         database_now = dt.datetime.now(dt.timezone.utc)
         validate_database_observation(state, now=database_now, max_age=evidence_age)
-        database_account_identity_sha = validate_database_state(state, bindings)
+        database_account_identity_sha = validate_database_state(
+            state,
+            bindings,
+            submission_state=args.submission_state,
+            submission_disabled_accounts=submission_disabled_accounts,
+        )
         delivery_watermark = validate_delivery_state(
             state, entry_submission_state=args.entry_submission_state
         )
@@ -2218,7 +2545,9 @@ def main(argv: list[str] | None = None) -> int:
             snapshot = json.loads(
                 _read_bounded_regular_file(args.prediction_snapshot_json, "Prediction snapshot")
             )
-        manifest_markets = validate_snapshot_manifest(snapshot, dry_run, bindings)
+        manifest_markets = validate_snapshot_manifest(
+            snapshot, dry_run, active_bindings
+        )
 
         if args.consumer_state_json is None:
             consumer_state = collect_consumer_state(
@@ -2328,7 +2657,12 @@ def main(argv: list[str] | None = None) -> int:
                     "final database evidence must be collected after the initial database "
                     "and final runtime/Direct consumer evidence"
                 )
-            final_account_identity_sha = validate_database_state(final_state, bindings)
+            final_account_identity_sha = validate_database_state(
+                final_state,
+                bindings,
+                submission_state=args.submission_state,
+                submission_disabled_accounts=submission_disabled_accounts,
+            )
             if final_account_identity_sha != database_account_identity_sha:
                 raise PreflightError(
                     "four-wallet database address identity changed during enabled preflight"

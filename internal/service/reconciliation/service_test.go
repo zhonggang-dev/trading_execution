@@ -11,10 +11,77 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountscope"
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
 )
 
 var testNow = time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+
+func TestRunAccountRejectsRetiredAccountBeforeAuditOrEvidenceWrites(t *testing.T) {
+	scope, err := accountscope.New(
+		[]string{"main"}, []string{"main", "wallet-6"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &fakeRecorder{}
+	orders := &fakeOrders{}
+	service := newTestService(t, Params{
+		Orders: orders, Venue: &fakeVenue{}, Ledger: &fakeLedger{balance: testBalance("0")},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{}, Recorder: recorder,
+		AccountScope: scope,
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			t.Fatal("retired account reached external position source")
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			t.Fatal("retired account reached external balance source")
+			return domain.ExternalBalance{}, nil
+		})},
+	})
+	_, runErr := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "wallet-2", Trigger: domain.ReconciliationTriggerAssetDrift,
+		FocusOrderID: "retired-order",
+	})
+	if runErr == nil || !strings.Contains(runErr.Error(), "not managed") {
+		t.Fatalf("RunAccount() error = %v, want retired-account rejection", runErr)
+	}
+	if orders.calls != 0 || len(recorder.runs) != 0 || len(recorder.issues) != 0 {
+		t.Fatalf("retired reconciliation wrote/read state: orders=%d runs=%#v issues=%#v", orders.calls, recorder.runs, recorder.issues)
+	}
+}
+
+func TestRunAccountAllowsExplicitManagedQuarantineBreakGlass(t *testing.T) {
+	scope, err := accountscope.New(
+		[]string{"main"}, []string{"main", "wallet-6"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	balance := testBalance("0")
+	balance.ExecutionAccountID = "wallet-6"
+	recorder := &fakeRecorder{}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{}, Venue: &fakeVenue{}, Ledger: &fakeLedger{balance: balance},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{}, Recorder: recorder,
+		AccountScope: scope,
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "0", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+	result, runErr := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "wallet-6", Trigger: domain.ReconciliationTriggerAssetDrift,
+	})
+	if runErr != nil || result.Run.Status != domain.ReconciliationRunCompleted {
+		t.Fatalf("managed break-glass RunAccount() = %#v, %v", result, runErr)
+	}
+	if len(recorder.runs) != 2 || recorder.runs[0].ExecutionAccountID != "wallet-6" {
+		t.Fatalf("managed break-glass audit runs = %#v", recorder.runs)
+	}
+}
 
 // TestRunAccountRepairsOnlyProvableFacts 验证 Run Account Repairs Only Provable Facts 场景下的行为。
 func TestRunAccountRepairsOnlyProvableFacts(t *testing.T) {
@@ -813,10 +880,13 @@ func (function balanceSourceFunc) GetExternalBalance(ctx context.Context, wallet
 type fakeOrders struct {
 	orders []domain.Order
 	err    error
+	calls  int
 }
 
 // ListForReconciliation 返回模拟数据源中的测试列表。
+
 func (repository *fakeOrders) ListForReconciliation(context.Context, string, time.Time) ([]domain.Order, error) {
+	repository.calls++
 	return append([]domain.Order(nil), repository.orders...), repository.err
 }
 
@@ -930,7 +1000,9 @@ func (recorder *fakeRecorder) Complete(_ context.Context, run domain.Reconciliat
 // newTestService 创建测试所需的模拟对象。
 func newTestService(t *testing.T, params Params) *Service {
 	t.Helper()
-	params.Recorder = &fakeRecorder{}
+	if params.Recorder == nil {
+		params.Recorder = &fakeRecorder{}
+	}
 	if params.PositionBaselines == nil {
 		params.PositionBaselines = positionBaselineSourceFunc(func(context.Context, string) ([]domain.ExternalPositionBaseline, error) {
 			return nil, nil

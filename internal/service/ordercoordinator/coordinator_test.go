@@ -31,6 +31,34 @@ func TestSweepCancelsExpiredLiveAndRefreshesUnknown(t *testing.T) {
 	}
 }
 
+func TestSweepDoesNotRefreshRetiredAccount(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 10, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	for _, accountID := range []string{"account-active", "account-retired"} {
+		createOrder(t, repository, domain.Order{
+			ID: "order-" + accountID,
+			Intent: domain.OrderIntent{
+				ClientOrderID: "client-" + accountID, ExecutionAccountID: accountID,
+			},
+			Status: domain.OrderStatusUnknown, FilledSize: "0",
+			CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute), Revision: 1,
+		})
+	}
+	execution := &fakeExecution{}
+	coordinator, err := ordercoordinator.New(ordercoordinator.Params{
+		Repository: repository, Execution: execution, PollInterval: time.Second,
+		Accounts: []string{"account-active"}, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Sweep(context.Background())
+	if result.Selected != 1 || result.Refreshed != 1 || len(result.Errors) != 0 ||
+		len(execution.refreshed) != 1 || execution.refreshed[0] != "order-account-active" {
+		t.Fatalf("Sweep()=%#v refreshed=%#v", result, execution.refreshed)
+	}
+}
+
 // fakeExecution 表示后端使用的 fakeExecution 类型。
 type fakeExecution struct {
 	refreshed []string

@@ -145,10 +145,15 @@ func run() error {
 	}
 
 	if database != nil {
+		var coordinatorAccounts []string
+		if live != nil {
+			coordinatorAccounts = live.activeAccounts
+		}
 		coordinator, err := ordercoordinator.New(ordercoordinator.Params{
 			Repository: repository, Execution: executionService,
 			PollInterval: cfg.Execution.CoordinatorInterval,
 			BatchSize:    cfg.Execution.CoordinatorBatchSize,
+			Accounts:     coordinatorAccounts,
 		})
 		if err != nil {
 			return err

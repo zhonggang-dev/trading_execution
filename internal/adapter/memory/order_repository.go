@@ -2,7 +2,9 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -189,10 +191,37 @@ func (repository *OrderRepository) Attempts(_ context.Context, orderID string) (
 
 // ListPending 分页查询需要协调器继续处理的非终态订单。
 func (repository *OrderRepository) ListPending(_ context.Context, before time.Time, limit int) ([]domain.Order, error) {
+	return repository.listPending(before, limit, nil), nil
+}
+
+// ListPendingForAccounts returns coordinator work only for active accounts.
+func (repository *OrderRepository) ListPendingForAccounts(
+	_ context.Context,
+	executionAccountIDs []string,
+	before time.Time,
+	limit int,
+) ([]domain.Order, error) {
+	accounts, err := normalizePendingAccounts(executionAccountIDs)
+	if err != nil {
+		return nil, err
+	}
+	return repository.listPending(before, limit, accounts), nil
+}
+
+func (repository *OrderRepository) listPending(
+	before time.Time,
+	limit int,
+	accounts map[string]struct{},
+) []domain.Order {
 	repository.mu.RLock()
 	defer repository.mu.RUnlock()
 	orders := make([]domain.Order, 0)
 	for _, order := range repository.byID {
+		if accounts != nil {
+			if _, active := accounts[order.Intent.ExecutionAccountID]; !active {
+				continue
+			}
+		}
 		if coordinatorEligible(order) && !order.UpdatedAt.After(before) {
 			orders = append(orders, domain.CloneOrder(order))
 		}
@@ -206,7 +235,25 @@ func (repository *OrderRepository) ListPending(_ context.Context, before time.Ti
 	if limit > 0 && len(orders) > limit {
 		orders = orders[:limit]
 	}
-	return orders, nil
+	return orders
+}
+
+func normalizePendingAccounts(accountIDs []string) (map[string]struct{}, error) {
+	if len(accountIDs) == 0 {
+		return nil, fmt.Errorf("active execution accounts are required for pending-order selection")
+	}
+	result := make(map[string]struct{}, len(accountIDs))
+	for index, raw := range accountIDs {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return nil, fmt.Errorf("active execution account %d is empty", index)
+		}
+		if _, duplicate := result[accountID]; duplicate {
+			return nil, fmt.Errorf("active execution account %q is duplicated", accountID)
+		}
+		result[accountID] = struct{}{}
+	}
+	return result, nil
 }
 
 // coordinatorEligible 判断当前业务条件是否成立。等待权威成交明细的 UNKNOWN

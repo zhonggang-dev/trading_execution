@@ -378,6 +378,15 @@ func (config Config) Validate() error {
 		if len(config.HTTP.ReadOnlyToken) < 32 {
 			return fmt.Errorf("LIVE_OPERATIONS_READ_ONLY_TOKEN must contain at least 32 bytes in live mode")
 		}
+		if len(config.HTTP.JobToken) < 32 {
+			return fmt.Errorf("POSITION_EXIT_JOB_TOKEN must contain at least 32 bytes in live mode")
+		}
+		if config.HTTP.JobToken == config.HTTP.APIToken ||
+			config.HTTP.JobToken == config.HTTP.ReadOnlyToken ||
+			(config.DecisionCycle.PredictionInfraToken != "" && config.HTTP.JobToken == config.DecisionCycle.PredictionInfraToken) ||
+			(config.DecisionCycle.StrategyToken != "" && config.HTTP.JobToken == config.DecisionCycle.StrategyToken) {
+			return fmt.Errorf("POSITION_EXIT_JOB_TOKEN must be different from execution, read-only, and decision-cycle tokens")
+		}
 		if config.HTTP.ReadOnlyToken == config.HTTP.APIToken || (config.HTTP.JobToken != "" && config.HTTP.ReadOnlyToken == config.HTTP.JobToken) {
 			return fmt.Errorf("LIVE_OPERATIONS_READ_ONLY_TOKEN must be different from execution and job tokens")
 		}
@@ -465,16 +474,17 @@ func (config Config) Validate() error {
 		if err := validateDecisionBindings(config.DecisionCycle.Bindings); err != nil {
 			return err
 		}
+		if err := validateFourWalletSubmissionTopology(config.DecisionCycle.Bindings); err != nil {
+			return err
+		}
 		if err := validateDecisionSubmissionDisabledAccounts(
 			config.DecisionCycle.Bindings,
 			config.DecisionCycle.SubmissionDisabledAccounts,
 		); err != nil {
 			return err
 		}
-		if config.DecisionCycle.OrderSubmissionEnabled {
-			if err := validateFourWalletSubmissionTopology(config.DecisionCycle.Bindings); err != nil {
-				return err
-			}
+		if err := validateCurrentWallet67Quarantine(config.DecisionCycle.SubmissionDisabledAccounts); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -644,6 +654,26 @@ func validateDecisionSubmissionDisabledAccounts(
 	return nil
 }
 
+// validateCurrentWallet67Quarantine is a release-level activation boundary.
+// wallet-6/wallet-7 onboarding evidence is approved only while both remain
+// quarantined; activating either requires a separate reviewed release.
+func validateCurrentWallet67Quarantine(accounts []string) error {
+	expected := map[string]struct{}{"wallet-6": {}, "wallet-7": {}}
+	configured := make(map[string]struct{}, len(accounts))
+	for _, accountID := range accounts {
+		configured[strings.TrimSpace(accountID)] = struct{}{}
+	}
+	if len(configured) != len(expected) {
+		return fmt.Errorf("this release requires wallet-6 and wallet-7 to remain submission-disabled; activation requires a separate release and approved evidence")
+	}
+	for accountID := range expected {
+		if _, exists := configured[accountID]; !exists {
+			return fmt.Errorf("this release requires wallet-6 and wallet-7 to remain submission-disabled; activation requires a separate release and approved evidence")
+		}
+	}
+	return nil
+}
+
 // validateFourWalletSubmissionTopology prevents a legacy one-binding canary
 // from becoming production merely by enabling the two generic cycle gates.
 // Changing the live topology is a deliberate code/config contract change.
@@ -652,10 +682,13 @@ func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBin
 		return fmt.Errorf("live decision submission requires the exact 2 models x 2 strategies x 4 accounts topology")
 	}
 	expectedAccounts := map[string]struct{}{
-		"main": {}, "wallet-1": {}, "wallet-2": {}, "wallet-3": {},
+		"main": {}, "wallet-1": {}, "wallet-6": {}, "wallet-7": {},
 	}
-	expectedStrategies := map[string]struct{}{
-		domain.StrategyIDMultfactorV1: {}, domain.StrategyIDMultfactorV2: {},
+	expectedRoutes := map[string]string{
+		"echo\x00" + domain.StrategyIDMultfactorV2:          "main",
+		"echo\x00" + domain.StrategyIDMultfactorV1:          "wallet-1",
+		"gemini_masked\x00" + domain.StrategyIDMultfactorV1: "wallet-6",
+		"gemini_masked\x00" + domain.StrategyIDMultfactorV2: "wallet-7",
 	}
 	accounts := make(map[string]struct{}, len(bindings))
 	logicalModels := make(map[string]struct{}, 2)
@@ -666,24 +699,30 @@ func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBin
 		accounts[binding.ExecutionAccountID] = struct{}{}
 		logicalModels[binding.ModelID] = struct{}{}
 		predictionModels[binding.PredictionModelID] = struct{}{}
-		if _, expected := expectedStrategies[binding.StrategyID]; !expected {
-			return fmt.Errorf("live decision submission requires multfactor_v1 and multfactor_v2 for every model")
+		pair := binding.ModelID + "\x00" + binding.StrategyID
+		expectedAccountID, expected := expectedRoutes[pair]
+		if !expected {
+			return fmt.Errorf("live decision submission contains unsupported model/strategy route %q/%q", binding.ModelID, binding.StrategyID)
 		}
-		pairs[binding.ModelID+"\x00"+binding.StrategyID] = struct{}{}
+		if binding.ExecutionAccountID != expectedAccountID {
+			return fmt.Errorf(
+				"live decision submission route %q/%q must use execution account %q",
+				binding.ModelID, binding.StrategyID, expectedAccountID,
+			)
+		}
+		pairs[pair] = struct{}{}
 	}
 	if len(logicalModels) != 2 || len(predictionModels) != 2 || len(pairs) != 4 {
 		return fmt.Errorf("live decision submission requires the exact 2 models x 2 strategies x 4 accounts topology")
 	}
 	for accountID := range expectedAccounts {
 		if _, exists := accounts[accountID]; !exists {
-			return fmt.Errorf("live decision submission requires execution accounts main, wallet-1, wallet-2, and wallet-3")
+			return fmt.Errorf("live decision submission requires execution accounts main, wallet-1, wallet-6, and wallet-7")
 		}
 	}
-	for modelID := range logicalModels {
-		for strategyID := range expectedStrategies {
-			if _, exists := pairs[modelID+"\x00"+strategyID]; !exists {
-				return fmt.Errorf("live decision submission requires both strategies for logical model %q", modelID)
-			}
+	for pair := range expectedRoutes {
+		if _, exists := pairs[pair]; !exists {
+			return fmt.Errorf("live decision submission requires the exact echo/gemini_masked route matrix")
 		}
 	}
 	return nil

@@ -57,6 +57,194 @@ func TestSubmitRejectsClientOrderIDConflict(t *testing.T) {
 	}
 }
 
+func TestAccountScopeRejectsRetiredSubmitBeforeAnyWrite(t *testing.T) {
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		AccountScope: fixedAccountScope{
+			active:  map[string]struct{}{"main": {}},
+			managed: map[string]struct{}{"main": {}, "wallet-6": {}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validIntent("retired-submit")
+	intent.ExecutionAccountID = "wallet-2"
+	_, submitErr := service.Submit(context.Background(), intent)
+	var rejection *port.Rejection
+	if !errors.As(submitErr, &rejection) || rejection.Code != "EXECUTION_ACCOUNT_NOT_ACTIVE" {
+		t.Fatalf("Submit() error = %v, rejection=%#v", submitErr, rejection)
+	}
+	if _, getErr := repository.GetByClientOrderID(context.Background(), intent.ClientOrderID); !errors.Is(getErr, port.ErrOrderNotFound) {
+		t.Fatalf("retired Submit() wrote an order: %v", getErr)
+	}
+	if venue.placeCalls.Load() != 0 || reservations.reserveCalls.Load() != 0 ||
+		reservations.reconcileCalls.Load() != 0 || reservations.uncertainCalls.Load() != 0 {
+		t.Fatalf("retired Submit() side effects: venue=%d reserve=%d reconcile=%d uncertain=%d",
+			venue.placeCalls.Load(), reservations.reserveCalls.Load(),
+			reservations.reconcileCalls.Load(), reservations.uncertainCalls.Load())
+	}
+}
+
+func TestAccountScopeAllowsActiveMainSubmit(t *testing.T) {
+	venue := &fakeVenue{}
+	service, err := execution.New(execution.Params{
+		Repository: memory.NewOrderRepository(), Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		AccountScope: fixedAccountScope{
+			active:  map[string]struct{}{"main": {}},
+			managed: map[string]struct{}{"main": {}, "wallet-6": {}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validIntent("active-main-submit")
+	intent.ExecutionAccountID = "main"
+	if _, err := service.Submit(context.Background(), intent); err != nil {
+		t.Fatalf("active main Submit() error = %v", err)
+	}
+	if venue.placeCalls.Load() != 1 {
+		t.Fatalf("active main venue calls = %d, want 1", venue.placeCalls.Load())
+	}
+}
+
+func TestAccountScopeQuarantinedWalletBlocksPlacementButAllowsManagedMaintenance(t *testing.T) {
+	ctx := context.Background()
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	now := time.Date(2026, 8, 22, 1, 0, 0, 0, time.UTC)
+	reservations := &successfulReservations{}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		AccountScope: fixedAccountScope{
+			active:  map[string]struct{}{"main": {}},
+			managed: map[string]struct{}{"main": {}, "wallet-6": {}},
+		},
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blockedIntent := validIntent("quarantined-submit")
+	blockedIntent.ExecutionAccountID = "wallet-6"
+	if _, err := service.Submit(ctx, blockedIntent); err == nil {
+		t.Fatal("quarantined Submit() error = nil")
+	}
+
+	create := func(id string, status domain.OrderStatus) domain.Order {
+		intent := validIntent("quarantined-" + id)
+		intent.ExecutionAccountID = "wallet-6"
+		observedAt := now.Add(-time.Hour)
+		order := domain.Order{
+			ID: id, Intent: intent, Status: status, VenueOrderID: "venue-" + id,
+			FilledSize: "0", CreatedAt: observedAt, UpdatedAt: observedAt, Revision: 1,
+		}
+		if status == domain.OrderStatusCancelled {
+			order.VenueLastObservedAt = &observedAt
+		}
+		if _, created, err := repository.Create(ctx, order); err != nil || !created {
+			t.Fatalf("Create(%s) = %t, %v", id, created, err)
+		}
+		return order
+	}
+
+	resumeOrder := create("resume-wallet6", domain.OrderStatusReceived)
+	if _, err := service.Resume(ctx, resumeOrder.ID); err == nil {
+		t.Fatal("quarantined Resume() error = nil")
+	}
+
+	refreshOrder := create("refresh-wallet6", domain.OrderStatusUnknown)
+	if _, err := service.Refresh(ctx, refreshOrder.ID); err != nil {
+		t.Fatalf("managed quarantined Refresh() error = %v", err)
+	}
+
+	cancelOrder := create("cancel-wallet6", domain.OrderStatusLive)
+	if _, err := service.Cancel(ctx, cancelOrder.ID); err != nil {
+		t.Fatalf("managed quarantined Cancel() error = %v", err)
+	}
+
+	finalizeOrder := create("finalize-wallet6", domain.OrderStatusCancelled)
+	if _, err := service.FinalizeCancellation(ctx, finalizeOrder.ID); err != nil {
+		t.Fatalf("managed quarantined FinalizeCancellation() error = %v", err)
+	}
+	if venue.placeCalls.Load() != 0 || venue.getCalls.Load() != 1 || venue.cancelCalls.Load() != 1 {
+		t.Fatalf("managed maintenance venue calls place/get/cancel = %d/%d/%d",
+			venue.placeCalls.Load(), venue.getCalls.Load(), venue.cancelCalls.Load())
+	}
+	if reservations.reconcileCalls.Load() == 0 {
+		t.Fatal("managed cancellation finality did not reconcile reservation")
+	}
+}
+
+func TestAccountScopeRejectsRetiredOrderMutationsBeforeAnyWrite(t *testing.T) {
+	methods := []struct {
+		name   string
+		status domain.OrderStatus
+		call   func(*execution.Service, context.Context, string) (domain.Order, error)
+	}{
+		{name: "resume", status: domain.OrderStatusReceived, call: (*execution.Service).Resume},
+		{name: "refresh", status: domain.OrderStatusUnknown, call: (*execution.Service).Refresh},
+		{name: "cancel", status: domain.OrderStatusLive, call: (*execution.Service).Cancel},
+		{name: "finalize", status: domain.OrderStatusCancelled, call: (*execution.Service).FinalizeCancellation},
+	}
+	for _, test := range methods {
+		t.Run(test.name, func(t *testing.T) {
+			repository := memory.NewOrderRepository()
+			venue := &fakeVenue{}
+			reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+			service, err := execution.New(execution.Params{
+				Repository: repository, Venue: venue, Guard: allowGuard{},
+				MarketValidator: allowMarketValidator{}, Reservations: reservations,
+				AccountScope: fixedAccountScope{
+					active:  map[string]struct{}{"main": {}},
+					managed: map[string]struct{}{"main": {}, "wallet-6": {}},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			intent := validIntent("retired-" + test.name)
+			intent.ExecutionAccountID = "wallet-2"
+			now := time.Date(2026, 8, 22, 1, 0, 0, 0, time.UTC)
+			order := domain.Order{
+				ID: "order-retired-" + test.name, Intent: intent, Status: test.status,
+				FilledSize: "0", CreatedAt: now, UpdatedAt: now, Revision: 1,
+			}
+			if _, created, err := repository.Create(context.Background(), order); err != nil || !created {
+				t.Fatalf("Create() = %t, %v", created, err)
+			}
+			beforeEvents, _ := repository.Events(context.Background(), order.ID)
+			_, mutationErr := test.call(service, context.Background(), order.ID)
+			want := "EXECUTION_ACCOUNT_NOT_MANAGED"
+			if test.name == "resume" {
+				want = "EXECUTION_ACCOUNT_NOT_ACTIVE"
+			}
+			var rejection *port.Rejection
+			if !errors.As(mutationErr, &rejection) || rejection.Code != want {
+				t.Fatalf("%s error=%v rejection=%#v, want %s", test.name, mutationErr, rejection, want)
+			}
+			after, _ := repository.Get(context.Background(), order.ID)
+			afterEvents, _ := repository.Events(context.Background(), order.ID)
+			attempts, _ := repository.Attempts(context.Background(), order.ID)
+			if after.Revision != order.Revision || len(afterEvents) != len(beforeEvents) || len(attempts) != 0 ||
+				venue.placeCalls.Load() != 0 || venue.getCalls.Load() != 0 || venue.cancelCalls.Load() != 0 ||
+				reservations.reserveCalls.Load() != 0 || reservations.reconcileCalls.Load() != 0 || reservations.uncertainCalls.Load() != 0 {
+				t.Fatalf("%s mutated retired order: order=%#v events=%d/%d attempts=%d venue=%d/%d/%d reservations=%d/%d/%d",
+					test.name, after, len(beforeEvents), len(afterEvents), len(attempts),
+					venue.placeCalls.Load(), venue.getCalls.Load(), venue.cancelCalls.Load(),
+					reservations.reserveCalls.Load(), reservations.reconcileCalls.Load(), reservations.uncertainCalls.Load())
+			}
+		})
+	}
+}
+
 func TestSellOnlyGateBlocksDirectBuyButAllowsSell(t *testing.T) {
 	venue := &fakeVenue{}
 	service, err := execution.New(execution.Params{
@@ -152,6 +340,7 @@ func TestPreparedPlacementPersistsExpectedHashBeforeNetworkCall(t *testing.T) {
 		Repository: repository, Venue: venue, Guard: allowGuard{},
 		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
 		RequirePreparedPlacement: true,
+		AccountScope:             allowAllAccountScope{},
 		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) },
 		NewID:                    func() string { return "ord-prepared-crash-window" },
 	})
@@ -187,6 +376,7 @@ func TestPreparedPlacementIDMismatchKeepsExpectedHashAndBecomesUnknown(t *testin
 		Repository: repository, Venue: venue, Guard: allowGuard{},
 		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
 		RequirePreparedPlacement: true,
+		AccountScope:             allowAllAccountScope{},
 		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) },
 		NewID:                    func() string { return "ord-prepared-mismatch" },
 	})
@@ -217,6 +407,7 @@ func TestPreparedPlacementPersistenceFailureNeverCallsNetwork(t *testing.T) {
 		Repository: repository, Venue: venue, Guard: allowGuard{},
 		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
 		RequirePreparedPlacement: true,
+		AccountScope:             allowAllAccountScope{},
 		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) },
 		NewID:                    func() string { return "ord-prepared-persist-failure" },
 	})
@@ -246,6 +437,7 @@ func TestCrashAfterPreparedPostReconcilesByPersistedExpectedHash(t *testing.T) {
 		Repository: repository, Venue: venue, Guard: allowGuard{},
 		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
 		RequirePreparedPlacement: true,
+		AccountScope:             allowAllAccountScope{},
 		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 1, 0, time.UTC) },
 		NewID:                    func() string { return "ord-prepared-crash-after-post" },
 	})
@@ -274,6 +466,21 @@ func TestLiveExecutionRejectsVenueWithoutPreparedPlacement(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "must support prepared placement") {
 		t.Fatalf("New() error = %v, want fail-closed live venue rejection", err)
+	}
+}
+
+func TestLiveExecutionRejectsMissingAccountScope(t *testing.T) {
+	repository := memory.NewOrderRepository()
+	_, err := execution.New(execution.Params{
+		Repository: repository,
+		Venue: &preparedTestVenue{
+			expectedHash: "0x" + strings.Repeat("34", 32), repository: repository,
+		},
+		Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: paper.NewReservationManager(), RequirePreparedPlacement: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "explicit account scope") {
+		t.Fatalf("New() error = %v, want missing live account scope rejection", err)
 	}
 }
 
@@ -1181,16 +1388,39 @@ func newServiceWithReservations(t *testing.T, venue port.Venue, guard port.Guard
 // rejectingReservations 表示后端使用的 rejectingReservations 类型。
 type rejectingReservations struct{}
 
+type successfulReservations struct {
+	reserveCalls   atomic.Int64
+	reconcileCalls atomic.Int64
+	uncertainCalls atomic.Int64
+}
+
+func (reservations *successfulReservations) Reserve(context.Context, domain.Order) (domain.AssetReservation, error) {
+	reservations.reserveCalls.Add(1)
+	return domain.AssetReservation{}, nil
+}
+
+func (reservations *successfulReservations) Reconcile(context.Context, domain.Order) (domain.AssetReservation, error) {
+	reservations.reconcileCalls.Add(1)
+	return domain.AssetReservation{}, nil
+}
+
+func (reservations *successfulReservations) MarkUncertain(context.Context, domain.Order, string) error {
+	reservations.uncertainCalls.Add(1)
+	return nil
+}
+
 // trackingReservations records whether execution bypassed the authoritative
 // fill ledger and attempted legacy aggregate reconciliation.
 type trackingReservations struct {
 	delegate       port.AssetReservationManager
+	reserveCalls   atomic.Int64
 	reconcileCalls atomic.Int64
 	uncertainCalls atomic.Int64
 }
 
 // Reserve delegates the reservation operation.
 func (reservations *trackingReservations) Reserve(ctx context.Context, order domain.Order) (domain.AssetReservation, error) {
+	reservations.reserveCalls.Add(1)
 	return reservations.delegate.Reserve(ctx, order)
 }
 
@@ -1345,6 +1575,26 @@ type allowGuard struct{}
 
 // Check 模拟检查并返回配置结果。
 func (allowGuard) Check(context.Context, domain.OrderIntent) error { return nil }
+
+type allowAllAccountScope struct{}
+
+func (allowAllAccountScope) IsActive(string) bool  { return true }
+func (allowAllAccountScope) IsManaged(string) bool { return true }
+
+type fixedAccountScope struct {
+	active  map[string]struct{}
+	managed map[string]struct{}
+}
+
+func (scope fixedAccountScope) IsActive(accountID string) bool {
+	_, exists := scope.active[accountID]
+	return exists
+}
+
+func (scope fixedAccountScope) IsManaged(accountID string) bool {
+	_, exists := scope.managed[accountID]
+	return exists
+}
 
 // allowMarketValidator 表示后端使用的 allowMarketValidator 类型。
 type allowMarketValidator struct{}

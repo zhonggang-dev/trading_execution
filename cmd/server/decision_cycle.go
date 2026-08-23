@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarket"
 	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
@@ -98,13 +99,36 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 
 func validateDecisionAccounts(cycleConfig config.DecisionCycle, accountIDs []string) error {
 	available := make(map[string]struct{}, len(accountIDs))
-	for _, accountID := range accountIDs {
+	for index, raw := range accountIDs {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return fmt.Errorf("wallet file execution account %d is empty", index)
+		}
+		if _, duplicate := available[accountID]; duplicate {
+			return fmt.Errorf("wallet file contains duplicate execution account %q", accountID)
+		}
 		available[accountID] = struct{}{}
 	}
+	if len(available) == 0 {
+		return fmt.Errorf("decision cycle requires at least one wallet-file execution account")
+	}
+	bound := make(map[string]struct{}, len(cycleConfig.Bindings))
 	for _, binding := range cycleConfig.Bindings {
 		binding = binding.Normalize()
+		if binding.ExecutionAccountID == "" {
+			return fmt.Errorf("decision-cycle binding execution account is empty")
+		}
+		if _, duplicate := bound[binding.ExecutionAccountID]; duplicate {
+			return fmt.Errorf("decision-cycle binding repeats execution account %q", binding.ExecutionAccountID)
+		}
+		bound[binding.ExecutionAccountID] = struct{}{}
 		if _, exists := available[binding.ExecutionAccountID]; !exists {
 			return fmt.Errorf("decision-cycle binding references execution account %q which is absent from the wallet file", binding.ExecutionAccountID)
+		}
+	}
+	for accountID := range available {
+		if _, exists := bound[accountID]; !exists {
+			return fmt.Errorf("wallet file execution account %q has no decision-cycle binding", accountID)
 		}
 	}
 	return nil

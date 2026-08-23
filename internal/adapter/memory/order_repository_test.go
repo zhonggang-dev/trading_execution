@@ -72,3 +72,30 @@ func TestListPendingDefersDurableFillEvidenceStatesToReconciliation(t *testing.T
 		t.Fatalf("ListPending() = %#v, want only ordinary UNKNOWN", orders)
 	}
 }
+
+func TestListPendingForAccountsExcludesRetiredOrders(t *testing.T) {
+	repository := NewOrderRepository()
+	now := time.Date(2026, 8, 22, 1, 0, 0, 0, time.UTC)
+	for _, accountID := range []string{"account-active", "account-retired"} {
+		order := domain.Order{
+			ID: "order-" + accountID,
+			Intent: domain.OrderIntent{
+				ClientOrderID: "client-" + accountID, ExecutionAccountID: accountID,
+			},
+			Status: domain.OrderStatusUnknown, FilledSize: "0",
+			CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute), Revision: 1,
+		}
+		if _, created, err := repository.Create(context.Background(), order); err != nil || !created {
+			t.Fatalf("create %s: created=%t err=%v", accountID, created, err)
+		}
+	}
+	orders, err := repository.ListPendingForAccounts(
+		context.Background(), []string{"account-active"}, now, 10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 1 || orders[0].Intent.ExecutionAccountID != "account-active" {
+		t.Fatalf("scoped pending orders = %#v", orders)
+	}
+}

@@ -147,23 +147,24 @@ func TestDecisionRecorderDurableIntentDeliveryPostgresIntegration(t *testing.T) 
 		t.Fatalf("submission-mode replay error = %v", err)
 	}
 
-	claimedSell, err := recorder.ClaimPendingIntents(context.Background(), request.CycleID, domain.SideSell, 10)
+	activeAccounts := []string{request.Context.ExecutionAccountID}
+	claimedSell, err := recorder.ClaimPendingIntents(context.Background(), activeAccounts, request.CycleID, domain.SideSell, 10)
 	if err != nil || len(claimedSell) != 1 || claimedSell[0].ClientOrderID != secondIntent.ClientOrderID ||
 		claimedSell[0].Attempt != 1 || claimedSell[0].Status != domain.DecisionIntentSubmitting {
 		t.Fatalf("claimed SELL deliveries = %#v, error %v", claimedSell, err)
 	}
-	claimedBuy, err := recorder.ClaimPendingIntents(context.Background(), request.CycleID, domain.SideBuy, 10)
+	claimedBuy, err := recorder.ClaimPendingIntents(context.Background(), activeAccounts, request.CycleID, domain.SideBuy, 10)
 	if err != nil || len(claimedBuy) != 1 || claimedBuy[0].ClientOrderID != firstIntent.ClientOrderID ||
 		claimedBuy[0].Attempt != 1 || claimedBuy[0].Status != domain.DecisionIntentSubmitting {
 		t.Fatalf("claimed BUY deliveries = %#v, error %v", claimedBuy, err)
 	}
 	requeued, err := recorder.RequeueStaleSubmitting(
-		context.Background(), now.Add(time.Second), domain.SideSell, 10,
+		context.Background(), activeAccounts, now.Add(time.Second), domain.SideSell, 10,
 	)
 	if err != nil || requeued != 1 {
 		t.Fatalf("requeued SELL deliveries = %d, error %v", requeued, err)
 	}
-	reclaimedSell, err := recorder.ClaimPendingIntents(context.Background(), request.CycleID, domain.SideSell, 10)
+	reclaimedSell, err := recorder.ClaimPendingIntents(context.Background(), activeAccounts, request.CycleID, domain.SideSell, 10)
 	if err != nil || len(reclaimedSell) != 1 || reclaimedSell[0].ClientOrderID != secondIntent.ClientOrderID ||
 		reclaimedSell[0].Attempt != 2 {
 		t.Fatalf("reclaimed SELL deliveries = %#v, error %v", reclaimedSell, err)
@@ -188,8 +189,98 @@ func TestDecisionRecorderDurableIntentDeliveryPostgresIntegration(t *testing.T) 
 		deliveries[0].OrderID != "order-delivery" || deliveries[0].Attempt != 1 {
 		t.Fatalf("stored deliveries = %#v, error %v", deliveries, err)
 	}
-	if claimed, err := recorder.ClaimPendingIntents(context.Background(), "", "", 10); err != nil || len(claimed) != 0 {
+	if claimed, err := recorder.ClaimPendingIntents(context.Background(), activeAccounts, "", "", 10); err != nil || len(claimed) != 0 {
 		t.Fatalf("terminal delivery reclaimed = %#v, error %v", claimed, err)
+	}
+}
+
+func TestDecisionRecorderRecoveryScopesRetiredAccountsPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	decisionAt := time.Date(2026, 8, 19, 11, 20, 0, 0, time.UTC)
+	now := decisionAt.Add(time.Minute)
+	recorder, err := NewDecisionRecorder(db, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	makePending := func(accountID, clientOrderID string) domain.StrategyDecisionRequest {
+		t.Helper()
+		request := integrationDecisionRequestForAccount(
+			t, decisionAt, "snapshot-"+accountID, decisionAt.Add(time.Second), accountID,
+		)
+		if _, _, err := recorder.ClaimInput(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		response := domain.StrategyDecisionResponse{
+			SchemaVersion: domain.StrategyOutputSchemaVersion,
+			CycleID:       request.CycleID,
+			InputID:       request.InputID,
+			Context:       request.Context,
+			DecidedAt:     decisionAt.Add(2 * time.Second),
+			Evaluations:   []domain.StrategyEvaluation{},
+			Exits:         []domain.StrategyExit{},
+		}
+		intent := integrationDecisionIntentWithID(
+			t, request, decisionAt, "signal-"+accountID, clientOrderID,
+		)
+		if _, created, err := recorder.ClaimOutput(
+			context.Background(), response, []domain.OrderIntent{intent}, true,
+		); err != nil || !created {
+			t.Fatalf("create %s delivery: created=%t err=%v", accountID, created, err)
+		}
+		return request
+	}
+	active := makePending("account-active", "client-active")
+	retired := makePending("account-retired", "client-retired")
+
+	claimed, err := recorder.ClaimPendingIntents(
+		context.Background(), []string{"account-active"}, "", "", 10,
+	)
+	if err != nil || len(claimed) != 1 || claimed[0].ClientOrderID != "client-active" {
+		t.Fatalf("active claim = %#v, error %v", claimed, err)
+	}
+	var retiredStatus string
+	if err := db.QueryRow(`
+		SELECT status FROM strategy_order_intent_deliveries WHERE cycle_id=$1`,
+		retired.CycleID,
+	).Scan(&retiredStatus); err != nil {
+		t.Fatal(err)
+	}
+	if retiredStatus != string(domain.DecisionIntentPending) {
+		t.Fatalf("retired delivery status = %s, want PENDING", retiredStatus)
+	}
+
+	if _, err := db.Exec(`
+		UPDATE strategy_order_intent_deliveries
+		SET status='SUBMITTING',attempt_count=1,claimed_at=$2,updated_at=$2
+		WHERE cycle_id=$1`, retired.CycleID, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	requeued, err := recorder.RequeueStaleSubmitting(
+		context.Background(), []string{"account-active"}, now, "", 10,
+	)
+	if err != nil || requeued != 1 {
+		t.Fatalf("active requeue = %d, error %v", requeued, err)
+	}
+	var activeStatus string
+	if err := db.QueryRow(`
+		SELECT status FROM strategy_order_intent_deliveries WHERE cycle_id=$1`,
+		active.CycleID,
+	).Scan(&activeStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`
+		SELECT status FROM strategy_order_intent_deliveries WHERE cycle_id=$1`,
+		retired.CycleID,
+	).Scan(&retiredStatus); err != nil {
+		t.Fatal(err)
+	}
+	if activeStatus != string(domain.DecisionIntentPending) || retiredStatus != string(domain.DecisionIntentSubmitting) {
+		t.Fatalf("requeue statuses = active %s, retired %s", activeStatus, retiredStatus)
 	}
 }
 
@@ -219,13 +310,23 @@ func integrationDecisionIntentWithID(t *testing.T, request domain.StrategyDecisi
 }
 
 func integrationDecisionRequest(t *testing.T, decisionAt time.Time, snapshotID string, generatedAt time.Time) domain.StrategyDecisionRequest {
+	return integrationDecisionRequestForAccount(t, decisionAt, snapshotID, generatedAt, "account-a")
+}
+
+func integrationDecisionRequestForAccount(
+	t *testing.T,
+	decisionAt time.Time,
+	snapshotID string,
+	generatedAt time.Time,
+	accountID string,
+) domain.StrategyDecisionRequest {
 	t.Helper()
 	request, err := (domain.StrategyDecisionRequestParams{
-		CycleID:     "account-a:" + decisionAt.Format("20060102T150405Z"),
+		CycleID:     accountID + ":" + decisionAt.Format("20060102T150405Z"),
 		DecisionAt:  decisionAt,
 		GeneratedAt: generatedAt,
 		Context: domain.StrategyExecutionContext{
-			ModelID: "model-a", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-a",
+			ModelID: "model-a", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: accountID,
 		},
 		PredictionSnapshotID: snapshotID,
 		Predictions:          []domain.Prediction{},

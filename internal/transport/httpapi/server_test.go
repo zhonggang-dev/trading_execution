@@ -248,6 +248,16 @@ func TestPositionExitJobEndpointUsesDedicatedTokenAndBoundary(t *testing.T) {
 	}
 }
 
+func TestPositionExitJobEndpointRejectsExecutionTokenFallback(t *testing.T) {
+	_, err := New(Params{
+		Service: baseExecutionService(t), PositionExitJob: &fakePositionExitJob{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), APIToken: "api-secret",
+	})
+	if err == nil || !strings.Contains(err.Error(), "dedicated job token") {
+		t.Fatalf("New() error = %v, want execution-token fallback rejection", err)
+	}
+}
+
 // fakeReconciliationJob 表示后端使用的 fakeReconciliationJob 类型。
 type fakeReconciliationJob struct {
 	accountID string
@@ -368,7 +378,8 @@ func TestReconciliationEndpointUsesJobToken(t *testing.T) {
 	job := &fakeReconciliationJob{}
 	server, err := New(Params{
 		Service: baseExecutionService(t), Reconciliation: job,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), JobToken: "job-secret",
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		APIToken: "api-secret", JobToken: "job-secret",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -378,12 +389,56 @@ func TestReconciliationEndpointUsesJobToken(t *testing.T) {
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthorized status = %d", unauthorized.Code)
 	}
+	apiTokenResponse := performRequest(t, server, http.MethodPost, "/internal/jobs/reconciliation/run", body, "api-secret")
+	if apiTokenResponse.Code != http.StatusUnauthorized || job.accountID != "" {
+		t.Fatalf("API-token response status=%d job=%#v", apiTokenResponse.Code, job)
+	}
 	response := performRequest(t, server, http.MethodPost, "/internal/jobs/reconciliation/run", body, "job-secret")
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"COMPLETED"`) {
 		t.Fatalf("reconciliation response status=%d body=%s", response.Code, response.Body.String())
 	}
 	if job.accountID != "account-1" || job.trigger != domain.ReconciliationTriggerAssetDrift || job.orderID != "order-1" {
 		t.Fatalf("reconciliation input = %#v", job)
+	}
+}
+
+func TestReconciliationEndpointRejectsMissingDedicatedJobToken(t *testing.T) {
+	_, err := New(Params{
+		Service: baseExecutionService(t), Reconciliation: &fakeReconciliationJob{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), APIToken: "api-secret",
+	})
+	if err == nil || !strings.Contains(err.Error(), "dedicated job token") {
+		t.Fatalf("New() error = %v, want dedicated job-token rejection", err)
+	}
+}
+
+func TestReconciliationEndpointRejectsSharedJobToken(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		apiToken      string
+		readOnlyToken string
+		jobToken      string
+	}{
+		{name: "execution", apiToken: "shared-secret", jobToken: "shared-secret"},
+		{name: "read only", readOnlyToken: "shared-secret", jobToken: "shared-secret"},
+		{name: "position exit execution", apiToken: "shared-secret", jobToken: "shared-secret"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var reconciliationJob reconciliationJob = &fakeReconciliationJob{}
+			var positionJob positionExitJob
+			if test.name == "position exit execution" {
+				reconciliationJob = nil
+				positionJob = &fakePositionExitJob{}
+			}
+			_, err := New(Params{
+				Service: baseExecutionService(t), Reconciliation: reconciliationJob, PositionExitJob: positionJob,
+				Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+				APIToken: test.apiToken, ReadOnlyToken: test.readOnlyToken, JobToken: test.jobToken,
+			})
+			if err == nil || !strings.Contains(err.Error(), "must differ") {
+				t.Fatalf("New() error = %v, want shared job-token rejection", err)
+			}
+		})
 	}
 }
 

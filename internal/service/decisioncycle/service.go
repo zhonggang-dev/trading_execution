@@ -77,6 +77,7 @@ type Service struct {
 	requireCompleteModelCoverage bool
 	bindings                     []domain.StrategyExecutionBinding
 	activeBindings               []domain.StrategyExecutionBinding
+	activeExecutionAccountIDs    []string
 	venue                        string
 	predictionLookback           time.Duration
 	midPriceLookback             time.Duration
@@ -184,6 +185,7 @@ func New(params Params) (*Service, error) {
 		requireCompleteModelCoverage: params.RequireCompleteModelCoverage,
 		bindings:                     bindings,
 		activeBindings:               activeBindings,
+		activeExecutionAccountIDs:    executionAccountIDs(activeBindings),
 		venue:                        params.Venue,
 		predictionLookback:           params.PredictionLookback,
 		midPriceLookback:             params.MidPriceLookback,
@@ -635,7 +637,9 @@ func (service *Service) recoverDeliveries(ctx context.Context, cutoff time.Time)
 		side = domain.SideSell
 	}
 	for {
-		requeued, err := service.recorder.RequeueStaleSubmitting(ctx, cutoff, side, defaultDeliveryBatch)
+		requeued, err := service.recorder.RequeueStaleSubmitting(
+			ctx, service.activeExecutionAccountIDs, cutoff, side, defaultDeliveryBatch,
+		)
 		if err != nil {
 			return fmt.Errorf("requeue stale strategy intents: %w", err)
 		}
@@ -655,7 +659,9 @@ func (service *Service) deliverPending(ctx context.Context, cycleID string) ([]I
 	results := make([]IntentResult, 0)
 	deliveryErrors := make([]error, 0)
 	for {
-		deliveries, err := service.recorder.ClaimPendingIntents(ctx, cycleID, side, defaultDeliveryBatch)
+		deliveries, err := service.recorder.ClaimPendingIntents(
+			ctx, service.activeExecutionAccountIDs, cycleID, side, defaultDeliveryBatch,
+		)
 		if err != nil {
 			return results, errors.Join(errors.Join(deliveryErrors...), fmt.Errorf("claim strategy intents: %w", err))
 		}
@@ -804,6 +810,15 @@ func filterSubmissionEnabledBindings(
 		}
 		result = append(result, binding)
 	}
+	return result
+}
+
+func executionAccountIDs(bindings []domain.StrategyExecutionBinding) []string {
+	result := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		result = append(result, binding.ExecutionAccountID)
+	}
+	sort.Strings(result)
 	return result
 }
 

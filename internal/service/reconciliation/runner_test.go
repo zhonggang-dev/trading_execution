@@ -73,8 +73,8 @@ func TestRunnerQuarantineExcludesStartupAndSuppressesAutomaticTrigger(t *testing
 	service := &fakeAccountReconciler{}
 	runner, err := NewRunner(RunnerParams{
 		Service:             service,
-		Accounts:            []string{"wallet-1", "wallet-2", "wallet-4"},
-		QuarantinedAccounts: []string{"wallet-3"},
+		Accounts:            []string{"main", "wallet-1", "wallet-6"},
+		QuarantinedAccounts: []string{"wallet-7"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestRunnerQuarantineExcludesStartupAndSuppressesAutomaticTrigger(t *testing
 		t.Fatalf("startup sweep = %#v, calls = %#v", result, service.calls)
 	}
 	for _, call := range service.calls {
-		if call.accountID == "wallet-3" {
+		if call.accountID == "wallet-7" {
 			t.Fatalf("quarantined account was reconciled: %#v", service.calls)
 		}
 	}
@@ -93,7 +93,7 @@ func TestRunnerQuarantineExcludesStartupAndSuppressesAutomaticTrigger(t *testing
 		t.Fatalf("scheduled sweep = %#v, calls = %#v", scheduled, service.calls)
 	}
 	for _, call := range service.calls {
-		if call.accountID == "wallet-3" {
+		if call.accountID == "wallet-7" {
 			t.Fatalf("quarantined account was reconciled: %#v", service.calls)
 		}
 	}
@@ -117,8 +117,8 @@ func TestRunnerQuarantineExcludesStartupAndSuppressesAutomaticTrigger(t *testing
 		t.Fatalf("RunAfterStartupReady() error = %v, want context canceled", err)
 	}
 
-	runner.Trigger("wallet-3", domain.ReconciliationTriggerOrderUnknown, "order-quarantined")
-	if got := runner.SuppressedTriggerCount("wallet-3"); got != 1 {
+	runner.Trigger("wallet-7", domain.ReconciliationTriggerOrderUnknown, "order-quarantined")
+	if got := runner.SuppressedTriggerCount("wallet-7"); got != 1 {
 		t.Fatalf("suppressed trigger count = %d, want 1", got)
 	}
 	if len(runner.requests) != 0 {
@@ -129,8 +129,8 @@ func TestRunnerQuarantineExcludesStartupAndSuppressesAutomaticTrigger(t *testing
 func TestRunnerRejectsAccountConfiguredAsActiveAndQuarantined(t *testing.T) {
 	_, err := NewRunner(RunnerParams{
 		Service:             &fakeAccountReconciler{},
-		Accounts:            []string{"wallet-1", "wallet-3"},
-		QuarantinedAccounts: []string{"wallet-3"},
+		Accounts:            []string{"wallet-1", "wallet-7"},
+		QuarantinedAccounts: []string{"wallet-7"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "both active and quarantined") {
 		t.Fatalf("NewRunner() error = %v, want overlap rejection", err)

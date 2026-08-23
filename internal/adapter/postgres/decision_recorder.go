@@ -313,7 +313,17 @@ func (recorder *DecisionRecorder) CountUnresolvedIntentsForAccounts(
 
 // ClaimPendingIntents atomically claims a bounded batch with SKIP LOCKED so
 // concurrent workers cannot submit the same row.
-func (recorder *DecisionRecorder) ClaimPendingIntents(ctx context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
+func (recorder *DecisionRecorder) ClaimPendingIntents(
+	ctx context.Context,
+	activeExecutionAccountIDs []string,
+	cycleID string,
+	side domain.Side,
+	limit int,
+) ([]domain.DecisionIntentDelivery, error) {
+	activeExecutionAccountIDs, err := normalizeDecisionRecoveryAccounts(activeExecutionAccountIDs)
+	if err != nil {
+		return nil, err
+	}
 	cycleID = strings.TrimSpace(cycleID)
 	if side != "" && side != domain.SideBuy && side != domain.SideSell {
 		return nil, fmt.Errorf("decision intent claim side must be BUY, SELL, or empty")
@@ -328,6 +338,7 @@ func (recorder *DecisionRecorder) ClaimPendingIntents(ctx context.Context, cycle
 			FROM strategy_order_intent_deliveries
 			WHERE status='PENDING' AND ($1='' OR cycle_id=$1)
 				AND ($2='' OR intent_payload->>'side'=$2)
+				AND intent_payload->>'execution_account_id'=ANY($5::text[])
 			ORDER BY created_at, cycle_id, sequence_no
 			FOR UPDATE SKIP LOCKED
 			LIMIT $3
@@ -341,7 +352,7 @@ func (recorder *DecisionRecorder) ClaimPendingIntents(ctx context.Context, cycle
 			delivery.sequence_no, delivery.intent_payload, delivery.status,
 			delivery.attempt_count, delivery.claimed_at, delivery.completed_at,
 			delivery.order_id, delivery.order_status, delivery.last_error,
-			delivery.created_at, delivery.updated_at`, cycleID, side, limit, now)
+			 delivery.created_at, delivery.updated_at`, cycleID, side, limit, now, activeExecutionAccountIDs)
 	if err != nil {
 		return nil, fmt.Errorf("claim pending strategy decision intents: %w", err)
 	}
@@ -378,7 +389,17 @@ func (recorder *DecisionRecorder) ClaimPendingIntents(ctx context.Context, cycle
 // RequeueStaleSubmitting recovers a crashed worker claim. Retrying through
 // OrderExecutor is safe because it first resolves the stable client_order_id;
 // it never sends a second venue Place for an already-created order.
-func (recorder *DecisionRecorder) RequeueStaleSubmitting(ctx context.Context, before time.Time, side domain.Side, limit int) (int, error) {
+func (recorder *DecisionRecorder) RequeueStaleSubmitting(
+	ctx context.Context,
+	activeExecutionAccountIDs []string,
+	before time.Time,
+	side domain.Side,
+	limit int,
+) (int, error) {
+	activeExecutionAccountIDs, err := normalizeDecisionRecoveryAccounts(activeExecutionAccountIDs)
+	if err != nil {
+		return 0, err
+	}
 	if side != "" && side != domain.SideBuy && side != domain.SideSell {
 		return 0, fmt.Errorf("stale decision intent side must be BUY, SELL, or empty")
 	}
@@ -391,6 +412,7 @@ func (recorder *DecisionRecorder) RequeueStaleSubmitting(ctx context.Context, be
 			FROM strategy_order_intent_deliveries
 			WHERE status='SUBMITTING' AND claimed_at <= $1
 				AND ($2='' OR intent_payload->>'side'=$2)
+				AND intent_payload->>'execution_account_id'=ANY($5::text[])
 			ORDER BY claimed_at, cycle_id, sequence_no
 			FOR UPDATE SKIP LOCKED
 			LIMIT $3
@@ -399,7 +421,7 @@ func (recorder *DecisionRecorder) RequeueStaleSubmitting(ctx context.Context, be
 		SET status='PENDING', claimed_at=NULL, completed_at=NULL,
 			last_error='worker claim expired before durable completion', updated_at=$4
 		FROM candidates
-		WHERE delivery.client_order_id=candidates.client_order_id`, before.UTC(), side, limit, recorder.now().UTC())
+		WHERE delivery.client_order_id=candidates.client_order_id`, before.UTC(), side, limit, recorder.now().UTC(), activeExecutionAccountIDs)
 	if err != nil {
 		return 0, fmt.Errorf("requeue stale strategy decision intents: %w", err)
 	}
@@ -408,6 +430,26 @@ func (recorder *DecisionRecorder) RequeueStaleSubmitting(ctx context.Context, be
 		return 0, fmt.Errorf("count requeued strategy decision intents: %w", err)
 	}
 	return int(count), nil
+}
+
+func normalizeDecisionRecoveryAccounts(accountIDs []string) ([]string, error) {
+	if len(accountIDs) == 0 {
+		return nil, fmt.Errorf("active execution accounts are required for strategy intent recovery")
+	}
+	result := make([]string, 0, len(accountIDs))
+	seen := make(map[string]struct{}, len(accountIDs))
+	for index, raw := range accountIDs {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return nil, fmt.Errorf("active execution account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return nil, fmt.Errorf("active execution account %q is duplicated", accountID)
+		}
+		seen[accountID] = struct{}{}
+		result = append(result, accountID)
+	}
+	return result, nil
 }
 
 // CompleteIntent fences completion by attempt_count. UNKNOWN is terminal and

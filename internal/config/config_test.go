@@ -33,8 +33,8 @@ func TestLoadAcceptsDecisionCycleWithSubmissionDisabled(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 	if !config.DecisionCycle.Enabled || config.DecisionCycle.OrderSubmissionEnabled ||
-		len(config.DecisionCycle.Bindings) != 1 || config.DecisionCycle.Interval != 10*time.Minute ||
-		config.DecisionCycle.Bindings[0].PredictionModelID != "model-a" {
+		len(config.DecisionCycle.Bindings) != 4 || config.DecisionCycle.Interval != 10*time.Minute ||
+		config.DecisionCycle.Bindings[0].PredictionModelID != "echo-source" {
 		t.Fatalf("decision cycle config = %#v", config.DecisionCycle)
 	}
 }
@@ -44,10 +44,10 @@ func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
-		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
+		{"prediction_model_id":"echo-producer-current","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echo-producer-current","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 	config, err := Load()
@@ -59,7 +59,7 @@ func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
 		config.DecisionCycle.Bindings[0].StrategyID != "multfactor_v2" ||
 		config.DecisionCycle.Bindings[1].ExecutionAccountID != "wallet-1" ||
 		config.DecisionCycle.Bindings[1].StrategyID != "multfactor_v1" ||
-		config.DecisionCycle.Bindings[2].PredictionModelID != "gemini-3.6-flash" ||
+		config.DecisionCycle.Bindings[2].PredictionModelID != "masked-producer-current" ||
 		config.DecisionCycle.Bindings[2].ModelID != "gemini_masked" {
 		t.Fatalf("decision routes = %#v", config.DecisionCycle.Bindings)
 	}
@@ -71,7 +71,7 @@ func TestLoadRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
 	setCompleteDecisionCycleEnvironment(t)
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"producer-a","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
-		{"prediction_model_id":"producer-a","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"}
+		{"prediction_model_id":"producer-a","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"account-b"}
 	]`)
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "multiple logical models") {
 		t.Fatalf("Load() error = %v", err)
@@ -83,10 +83,10 @@ func TestLoadAcceptsExplicitLiveDecisionSubmission(t *testing.T) {
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
-		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
+		{"prediction_model_id":"echo-producer-current","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echo-producer-current","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
@@ -99,7 +99,40 @@ func TestLoadAcceptsExplicitLiveDecisionSubmission(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsBoundDecisionSubmissionDisabledAccount(t *testing.T) {
+func TestLoadRejectsRemappedFourWalletRoutes(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-7"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-6"}
+	]`)
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must use execution account") {
+		t.Fatalf("Load() error = %v, want exact-route rejection", err)
+	}
+}
+
+func TestLoadRejectsRemappedRetainedWalletRoutes(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+	]`)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must use execution account") {
+		t.Fatalf("Load() error = %v, want retained-wallet route rejection", err)
+	}
+}
+
+func TestLoadRejectsRetiredWalletTopology(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
@@ -109,16 +142,60 @@ func TestLoadAcceptsBoundDecisionSubmissionDisabledAccount(t *testing.T) {
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
 	]`)
-	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[" wallet-3 "]`)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "wallet-6") {
+		t.Fatalf("Load() error = %v, want retired-wallet rejection", err)
+	}
+}
+
+func TestLoadAcceptsRequiredWallet67SubmissionDisabledAccounts(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+	]`)
+	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[" wallet-7 ","wallet-6"]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 	config, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(config.DecisionCycle.SubmissionDisabledAccounts) != 1 ||
-		config.DecisionCycle.SubmissionDisabledAccounts[0] != "wallet-3" {
+	if len(config.DecisionCycle.SubmissionDisabledAccounts) != 2 ||
+		config.DecisionCycle.SubmissionDisabledAccounts[0] != "wallet-7" ||
+		config.DecisionCycle.SubmissionDisabledAccounts[1] != "wallet-6" {
 		t.Fatalf("submission-disabled accounts = %#v", config.DecisionCycle.SubmissionDisabledAccounts)
+	}
+}
+
+func TestLoadRejectsRemovingRequiredWallet67QuarantineInShadowOrSubmissionMode(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		disabledAccounts string
+		submitEnabled    string
+	}{
+		{name: "remove both in shadow", disabledAccounts: `[]`, submitEnabled: "false"},
+		{name: "remove wallet-7 in shadow", disabledAccounts: `["wallet-6"]`, submitEnabled: "false"},
+		{name: "remove wallet-6 with submission enabled", disabledAccounts: `["wallet-7"]`, submitEnabled: "true"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", test.disabledAccounts)
+			t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", test.submitEnabled)
+			if test.submitEnabled == "true" {
+				t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "requires wallet-6 and wallet-7") {
+				t.Fatalf("Load() error = %v, want release quarantine rejection", err)
+			}
+		})
 	}
 }
 
@@ -131,7 +208,7 @@ func TestLoadRejectsInvalidDecisionSubmissionDisabledAccounts(t *testing.T) {
 		{name: "not array", value: `"wallet-3"`, want: "cannot unmarshal"},
 		{name: "trailing value", value: `["account-a"] []`, want: "exactly one JSON array"},
 		{name: "empty", value: `[" "]`, want: "account 0 is empty"},
-		{name: "duplicate", value: `["account-a","account-a"]`, want: "duplicate account"},
+		{name: "duplicate", value: `["wallet-7","wallet-7"]`, want: "duplicate account"},
 		{name: "unbound", value: `["wallet-3"]`, want: "not a configured binding"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -160,10 +237,38 @@ func TestLoadAcceptsSellOnlyDecisionSubmission(t *testing.T) {
 	}
 }
 
+func TestLoadRequiresDedicatedLiveJobToken(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "missing", value: "", want: "at least 32 bytes"},
+		{name: "short", value: "short", want: "at least 32 bytes"},
+		{name: "same as api", value: strings.Repeat("x", 32), want: "must be different"},
+		{name: "same as readonly", value: strings.Repeat("r", 32), want: "must be different"},
+		{name: "same as prediction", value: strings.Repeat("p", 32), want: "must be different"},
+		{name: "same as strategy", value: strings.Repeat("s", 32), want: "must be different"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			t.Setenv("POSITION_EXIT_JOB_TOKEN", test.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsSingleBindingLiveDecisionSubmission(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echo-source","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"}
+	]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "2 models x 2 strategies x 4 accounts") {
@@ -367,7 +472,13 @@ func setCompleteDecisionCycleEnvironment(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_TIMEOUT", "8m")
 	t.Setenv("DECISION_CYCLE_PREDICTION_LOOKBACK", "3h")
 	t.Setenv("DECISION_CYCLE_MID_PRICE_LOOKBACK", "48h")
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[{"model_id":"model-a","strategy_id":"multfactor_v1","execution_account_id":"account-a"}]`)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echo-source","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echo-source","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"masked-source","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"masked-source","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+	]`)
+	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `["wallet-6","wallet-7"]`)
 }
 
 func setCompleteLiveEnvironment(t *testing.T) {
@@ -375,6 +486,7 @@ func setCompleteLiveEnvironment(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("HTTP_ADDRESS", "127.0.0.1:14000")
 	t.Setenv("EXECUTION_API_TOKEN", strings.Repeat("x", 32))
+	t.Setenv("POSITION_EXIT_JOB_TOKEN", strings.Repeat("j", 32))
 	t.Setenv("LIVE_OPERATIONS_READ_ONLY_TOKEN", strings.Repeat("r", 32))
 	t.Setenv("TRADING_EXECUTION_DATABASE_URL", "postgres://example.invalid/trading")
 	t.Setenv("EXECUTION_MODE", "live")

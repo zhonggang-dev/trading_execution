@@ -157,6 +157,8 @@ type fakeRecorder struct {
 	inputError               error
 	deliveries               []domain.DecisionIntentDelivery
 	requeueCalls             int
+	claimAccountCalls        [][]string
+	requeueAccountCalls      [][]string
 	claimedOutputs           []domain.StrategyDecisionResponse
 	claimedIntents           []domain.OrderIntent
 	claimedSubmissionEnabled []bool
@@ -251,12 +253,20 @@ func (strategy *coverageBuyExitStrategy) Decide(_ context.Context, request domai
 	}, nil
 }
 
-func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
+func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, activeAccountIDs []string, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
+	recorder.claimAccountCalls = append(recorder.claimAccountCalls, append([]string(nil), activeAccountIDs...))
+	active := make(map[string]struct{}, len(activeAccountIDs))
+	for _, accountID := range activeAccountIDs {
+		active[accountID] = struct{}{}
+	}
 	result := make([]domain.DecisionIntentDelivery, 0)
 	for index := range recorder.deliveries {
 		delivery := &recorder.deliveries[index]
 		if delivery.Status != domain.DecisionIntentPending || (cycleID != "" && delivery.CycleID != cycleID) ||
 			(side != "" && delivery.Intent.Side != side) || len(result) >= limit {
+			continue
+		}
+		if _, enabled := active[delivery.Intent.ExecutionAccountID]; !enabled {
 			continue
 		}
 		delivery.Status = domain.DecisionIntentSubmitting
@@ -266,8 +276,13 @@ func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, cycleID str
 	return result, nil
 }
 
-func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, _ time.Time, side domain.Side, limit int) (int, error) {
+func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, activeAccountIDs []string, _ time.Time, side domain.Side, limit int) (int, error) {
 	recorder.requeueCalls++
+	recorder.requeueAccountCalls = append(recorder.requeueAccountCalls, append([]string(nil), activeAccountIDs...))
+	active := make(map[string]struct{}, len(activeAccountIDs))
+	for _, accountID := range activeAccountIDs {
+		active[accountID] = struct{}{}
+	}
 	requeued := 0
 	for index := range recorder.deliveries {
 		if requeued >= limit {
@@ -275,6 +290,9 @@ func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, _ time.T
 		}
 		delivery := &recorder.deliveries[index]
 		if delivery.Status != domain.DecisionIntentSubmitting || (side != "" && delivery.Intent.Side != side) {
+			continue
+		}
+		if _, enabled := active[delivery.Intent.ExecutionAccountID]; !enabled {
 			continue
 		}
 		delivery.Status = domain.DecisionIntentPending
@@ -1773,14 +1791,14 @@ func TestDecisionIntentCompletionRequiresDurableExecutionOwnership(t *testing.T)
 func TestDeliverPendingSurfacesReplayedRejectedAndUnknownOrders(t *testing.T) {
 	for _, status := range []domain.OrderStatus{domain.OrderStatusRejected, domain.OrderStatusUnknown} {
 		t.Run(string(status), func(t *testing.T) {
-			intent := domain.OrderIntent{ClientOrderID: "client-1"}
+			intent := domain.OrderIntent{ClientOrderID: "client-1", ExecutionAccountID: "account-active"}
 			recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{{
 				CycleID: "cycle-1", ClientOrderID: intent.ClientOrderID,
 				Intent: intent, Status: domain.DecisionIntentPending,
 			}}}
 			service := &Service{recorder: recorder, executor: fixedResultExecutor{result: port.OrderSubmitResult{
 				Order: domain.Order{ID: "order-1", Status: status},
-			}}}
+			}}, activeExecutionAccountIDs: []string{"account-active"}}
 			results, err := service.deliverPending(context.Background(), "cycle-1")
 			if err == nil || len(results) != 1 || results[0].Error == nil {
 				t.Fatalf("deliverPending() results=%#v error=%v", results, err)
@@ -1797,12 +1815,12 @@ func TestDeliverPendingSurfacesReplayedRejectedAndUnknownOrders(t *testing.T) {
 }
 
 func TestDeliverPendingLeavesMissingOrderOwnershipLeasedAndUnhealthy(t *testing.T) {
-	intent := domain.OrderIntent{ClientOrderID: "client-1"}
+	intent := domain.OrderIntent{ClientOrderID: "client-1", ExecutionAccountID: "account-active"}
 	recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{{
 		CycleID: "cycle-1", ClientOrderID: intent.ClientOrderID,
 		Intent: intent, Status: domain.DecisionIntentPending,
 	}}}
-	service := &Service{recorder: recorder, executor: fixedResultExecutor{}}
+	service := &Service{recorder: recorder, executor: fixedResultExecutor{}, activeExecutionAccountIDs: []string{"account-active"}}
 	results, err := service.deliverPending(context.Background(), "cycle-1")
 	if err == nil || len(results) != 1 || results[0].Error == nil ||
 		recorder.deliveries[0].Status != domain.DecisionIntentSubmitting {
@@ -1816,16 +1834,19 @@ func TestRecoverStartupDrainsMoreThanOneClaimBatchBeforeNewSchedule(t *testing.T
 		deliveries[index] = domain.DecisionIntentDelivery{
 			CycleID:       "old-cycle",
 			ClientOrderID: fmt.Sprintf("client-%03d", index),
-			Intent:        domain.OrderIntent{ClientOrderID: fmt.Sprintf("client-%03d", index)},
-			Status:        domain.DecisionIntentSubmitting,
-			Attempt:       1,
+			Intent: domain.OrderIntent{
+				ClientOrderID: fmt.Sprintf("client-%03d", index), ExecutionAccountID: "account-active",
+			},
+			Status:  domain.DecisionIntentSubmitting,
+			Attempt: 1,
 		}
 	}
 	recorder := &fakeRecorder{deliveries: deliveries}
 	executor := &fakeExecutor{}
 	service := &Service{
 		recorder: recorder, executor: executor, submitEnabled: true,
-		now: func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
+		activeExecutionAccountIDs: []string{"account-active"},
+		now:                       func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
 	}
 	if err := service.RecoverStartup(context.Background()); err != nil {
 		t.Fatalf("RecoverStartup() error = %v", err)
@@ -1836,6 +1857,48 @@ func TestRecoverStartupDrainsMoreThanOneClaimBatchBeforeNewSchedule(t *testing.T
 	for _, delivery := range recorder.deliveries {
 		if delivery.Status != domain.DecisionIntentSubmitted {
 			t.Fatalf("delivery %q status = %s", delivery.ClientOrderID, delivery.Status)
+		}
+	}
+}
+
+func TestRecoverStartupLeavesRetiredDeliveriesUntouched(t *testing.T) {
+	recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{
+		{
+			CycleID: "old-active", ClientOrderID: "active-submitting",
+			Intent: domain.OrderIntent{ClientOrderID: "active-submitting", ExecutionAccountID: "account-active"},
+			Status: domain.DecisionIntentSubmitting, Attempt: 1,
+		},
+		{
+			CycleID: "old-retired", ClientOrderID: "retired-submitting",
+			Intent: domain.OrderIntent{ClientOrderID: "retired-submitting", ExecutionAccountID: "account-retired"},
+			Status: domain.DecisionIntentSubmitting, Attempt: 1,
+		},
+		{
+			CycleID: "old-retired", ClientOrderID: "retired-pending",
+			Intent: domain.OrderIntent{ClientOrderID: "retired-pending", ExecutionAccountID: "account-retired"},
+			Status: domain.DecisionIntentPending,
+		},
+	}}
+	executor := &fakeExecutor{}
+	service := &Service{
+		recorder: recorder, executor: executor, submitEnabled: true,
+		activeExecutionAccountIDs: []string{"account-active"},
+		now:                       func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
+	}
+	if err := service.RecoverStartup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(executor.intents) != 1 || executor.intents[0].ExecutionAccountID != "account-active" {
+		t.Fatalf("submitted intents = %#v", executor.intents)
+	}
+	if recorder.deliveries[0].Status != domain.DecisionIntentSubmitted ||
+		recorder.deliveries[1].Status != domain.DecisionIntentSubmitting ||
+		recorder.deliveries[2].Status != domain.DecisionIntentPending {
+		t.Fatalf("delivery statuses = %s/%s/%s", recorder.deliveries[0].Status, recorder.deliveries[1].Status, recorder.deliveries[2].Status)
+	}
+	for _, accounts := range append(recorder.requeueAccountCalls, recorder.claimAccountCalls...) {
+		if len(accounts) != 1 || accounts[0] != "account-active" {
+			t.Fatalf("recovery allowlist = %#v", accounts)
 		}
 	}
 }
@@ -1856,6 +1919,7 @@ func TestRecoverStartupFailsClosedForUnresolvedQuarantinedDelivery(t *testing.T)
 	executor := &fakeExecutor{}
 	service := &Service{
 		recorder: recorder, executor: executor, submitEnabled: true,
+		activeExecutionAccountIDs:    []string{"account-active"},
 		submissionDisabledAccounts:   []string{"account-quarantined"},
 		submissionDisabledAccountSet: map[string]struct{}{"account-quarantined": {}},
 		now:                          func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
@@ -1875,24 +1939,25 @@ func TestSellOnlyRecoveryNeverClaimsOrRequeuesBuy(t *testing.T) {
 	recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{
 		{
 			CycleID: "old-cycle", ClientOrderID: "old-buy-submitting",
-			Intent: domain.OrderIntent{ClientOrderID: "old-buy-submitting", Side: domain.SideBuy},
+			Intent: domain.OrderIntent{ClientOrderID: "old-buy-submitting", ExecutionAccountID: "account-active", Side: domain.SideBuy},
 			Status: domain.DecisionIntentSubmitting, Attempt: 1,
 		},
 		{
 			CycleID: "old-cycle", ClientOrderID: "old-buy-pending",
-			Intent: domain.OrderIntent{ClientOrderID: "old-buy-pending", Side: domain.SideBuy},
+			Intent: domain.OrderIntent{ClientOrderID: "old-buy-pending", ExecutionAccountID: "account-active", Side: domain.SideBuy},
 			Status: domain.DecisionIntentPending,
 		},
 		{
 			CycleID: "old-cycle", ClientOrderID: "old-sell-submitting",
-			Intent: domain.OrderIntent{ClientOrderID: "old-sell-submitting", Side: domain.SideSell},
+			Intent: domain.OrderIntent{ClientOrderID: "old-sell-submitting", ExecutionAccountID: "account-active", Side: domain.SideSell},
 			Status: domain.DecisionIntentSubmitting, Attempt: 1,
 		},
 	}}
 	executor := &fakeExecutor{}
 	service := &Service{
 		recorder: recorder, executor: executor, submitEnabled: true, entrySubmissionDisabled: true,
-		now: func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
+		activeExecutionAccountIDs: []string{"account-active"},
+		now:                       func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
 	}
 
 	if err := service.RecoverStartup(context.Background()); err != nil {

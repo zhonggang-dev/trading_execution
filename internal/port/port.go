@@ -27,6 +27,15 @@ var (
 	ErrCancelFinalityPending   = errors.New("cancel fill finality window has not elapsed")
 )
 
+// ExecutionAccountScope is the process-owned account boundary for live
+// mutation paths. Active accounts may create/resume orders; managed accounts
+// may additionally receive risk-reducing maintenance such as cancel/refresh
+// and explicit reconciliation. Read-only history does not require this gate.
+type ExecutionAccountScope interface {
+	IsActive(executionAccountID string) bool
+	IsManaged(executionAccountID string) bool
+}
+
 // OrderRepository 表示后端使用的 OrderRepository 类型。
 type OrderRepository interface {
 	// Create is atomic. created=false returns the order already associated with
@@ -49,6 +58,10 @@ type OrderRepository interface {
 	// ListPending supports the reconciliation/timeout coordinator. It returns
 	// non-terminal orders whose updated_at is no later than before.
 	ListPending(ctx context.Context, before time.Time, limit int) ([]domain.Order, error)
+	// ListPendingForAccounts is the production recovery boundary. It must return
+	// pending rows only for the explicit active account allowlist; retired or
+	// quarantined evidence is left untouched for manual reconciliation.
+	ListPendingForAccounts(ctx context.Context, executionAccountIDs []string, before time.Time, limit int) ([]domain.Order, error)
 }
 
 // VenueOrderState 表示后端使用的 VenueOrderState 类型。
@@ -380,15 +393,15 @@ type DecisionRecorder interface {
 	// accounts whose automatic submission has been quarantined. PENDING and
 	// SUBMITTING rows are unresolved; terminal rows are not recoverable work.
 	CountUnresolvedIntentsForAccounts(ctx context.Context, executionAccountIDs []string) (int, error)
-	// ClaimPendingIntents exclusively moves PENDING rows to SUBMITTING. An empty
-	// cycleID claims across cycles for crash recovery; an empty side permits both
-	// BUY and SELL. A side filter is the durable boundary used by sell-only mode,
-	// including startup recovery of intents frozen by an older process.
-	ClaimPendingIntents(ctx context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error)
+	// ClaimPendingIntents exclusively moves PENDING rows for the explicit active
+	// account allowlist to SUBMITTING. An empty cycleID claims across cycles for
+	// crash recovery; an empty side permits both BUY and SELL. Retired and
+	// quarantined account rows remain durable operator-visible evidence.
+	ClaimPendingIntents(ctx context.Context, activeExecutionAccountIDs []string, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error)
 	// RequeueStaleSubmitting makes abandoned claims retryable. The stable
 	// client_order_id and execution service's durable lookup make this safe;
 	// an execution result already recorded as UNKNOWN is never requeued.
-	RequeueStaleSubmitting(ctx context.Context, before time.Time, side domain.Side, limit int) (int, error)
+	RequeueStaleSubmitting(ctx context.Context, activeExecutionAccountIDs []string, before time.Time, side domain.Side, limit int) (int, error)
 	// CompleteIntent uses Attempt as a fencing token and accepts only terminal
 	// SUBMITTED, FAILED, or UNKNOWN states.
 	CompleteIntent(ctx context.Context, clientOrderID string, attempt int, completion domain.DecisionIntentCompletion) error

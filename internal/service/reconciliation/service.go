@@ -37,8 +37,11 @@ type Params struct {
 	TradeLookback             time.Duration
 	PositionEpsilon           domain.Decimal
 	BalanceEpsilon            domain.Decimal
-	Now                       func() time.Time
-	NewID                     func() string
+	// AccountScope is the live process boundary. Nil preserves isolated unit and
+	// paper-mode behavior; live wiring always supplies the wallet-file scope.
+	AccountScope port.ExecutionAccountScope
+	Now          func() time.Time
+	NewID        func() string
 }
 
 // Service 表示后端使用的 Service 类型。
@@ -56,6 +59,7 @@ type Service struct {
 	tradeLookback             time.Duration
 	positionEpsilon           domain.Decimal
 	balanceEpsilon            domain.Decimal
+	accountScope              port.ExecutionAccountScope
 	now                       func() time.Time
 	newID                     func() string
 }
@@ -127,7 +131,8 @@ func New(params Params) (*Service, error) {
 		ledger:                    params.Ledger, fills: params.Fills, orderRefresher: params.OrderRefresher,
 		recorder: params.Recorder, tradeLookback: params.TradeLookback,
 		positionEpsilon: params.PositionEpsilon, balanceEpsilon: params.BalanceEpsilon,
-		now: params.Now, newID: params.NewID,
+		accountScope: params.AccountScope,
+		now:          params.Now, newID: params.NewID,
 	}, nil
 }
 
@@ -136,6 +141,12 @@ func (service *Service) RunAccount(ctx context.Context, params RunAccountParams)
 	params = params.normalize()
 	if params.ExecutionAccountID == "" {
 		return Result{}, fmt.Errorf("execution account id is required")
+	}
+	if service.accountScope != nil && !service.accountScope.IsManaged(params.ExecutionAccountID) {
+		return Result{}, fmt.Errorf(
+			"execution account %q is not managed by this reconciliation process",
+			params.ExecutionAccountID,
+		)
 	}
 	if !validTrigger(params.Trigger) {
 		return Result{}, fmt.Errorf("unsupported reconciliation trigger %q", params.Trigger)

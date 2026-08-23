@@ -15,26 +15,26 @@ VALID_BINDINGS = [
     {
         "prediction_model_id": "echo-producer-v7",
         "model_id": "echo",
-        "strategy_id": "multfactor_v1",
+        "strategy_id": "multfactor_v2",
         "execution_account_id": "main",
     },
     {
         "prediction_model_id": "echo-producer-v7",
         "model_id": "echo",
-        "strategy_id": "multfactor_v2",
+        "strategy_id": "multfactor_v1",
         "execution_account_id": "wallet-1",
     },
     {
         "prediction_model_id": "gemini-3.6-flash",
         "model_id": "gemini_masked",
         "strategy_id": "multfactor_v1",
-        "execution_account_id": "wallet-2",
+        "execution_account_id": "wallet-6",
     },
     {
         "prediction_model_id": "gemini-3.6-flash",
         "model_id": "gemini_masked",
         "strategy_id": "multfactor_v2",
-        "execution_account_id": "wallet-3",
+        "execution_account_id": "wallet-7",
     },
 ]
 MODEL_GROUPS = {
@@ -112,7 +112,7 @@ def database_state(bindings: list[dict[str, object]] | None = None) -> dict[str,
         }
         for item in VALID_BINDINGS
     ]
-    return {
+    state = {
         "observed_at": iso(dt.datetime.now(dt.timezone.utc)),
         "global_kill_switch": True,
         "accounts": [
@@ -120,10 +120,50 @@ def database_state(bindings: list[dict[str, object]] | None = None) -> dict[str,
             for account in sorted(preflight.EXPECTED_ACCOUNTS)
         ],
         "bindings": rows,
+        "risk_policies": [
+            {
+                "execution_account_id": account,
+                "policy_id": f"policy-{account}",
+                "version": 1,
+                "enabled": True,
+                **preflight.CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT[account],
+            }
+            for account in sorted(preflight.EXPECTED_ACCOUNTS)
+        ],
+        "account_controls": [
+            {
+                "execution_account_id": account,
+                "control_scope": "ACCOUNT",
+                "control_key": "",
+                "paused": False,
+                "reason": "TEST_READY",
+                "version": 1,
+            }
+            for account in sorted(preflight.EXPECTED_ACCOUNTS)
+        ],
         "decision_deliveries": [],
         "manual_review_orders": [],
         "nonterminal_buy_orders": [],
     }
+    quarantine_accounts(state, "wallet-6", "wallet-7")
+    return state
+
+
+def quarantine_accounts(
+    state: dict[str, object], *execution_account_ids: str
+) -> None:
+    quarantined = set(execution_account_ids)
+    for row in state["bindings"]:
+        if row["execution_account_id"] in quarantined:
+            row["enabled"] = False
+    for row in state["risk_policies"]:
+        if row["execution_account_id"] in quarantined:
+            row["enabled"] = False
+    for row in state["account_controls"]:
+        if row["execution_account_id"] in quarantined:
+            row["paused"] = True
+            row["reason"] = "TEST_QUARANTINE"
+            row["version"] += 1
 
 
 def consumer_state(now: dt.datetime) -> dict[str, object]:
@@ -183,9 +223,17 @@ class BindingTopologyTests(unittest.TestCase):
             preflight.EXPECTED_ACCOUNTS,
         )
 
+    def test_accepts_current_prediction_source_names_without_hardcoding(self) -> None:
+        current = [dict(item) for item in VALID_BINDINGS]
+        current[0]["prediction_model_id"] = "echo-producer-current"
+        current[1]["prediction_model_id"] = "echo-producer-current"
+        current[2]["prediction_model_id"] = "masked-producer-current"
+        current[3]["prediction_model_id"] = "masked-producer-current"
+        self.assertEqual(len(preflight.decode_bindings(json.dumps(current))), 4)
+
     def test_rejects_missing_wallet(self) -> None:
         broken = [dict(item) for item in VALID_BINDINGS]
-        broken[-1]["execution_account_id"] = "wallet-2"
+        broken[-1]["execution_account_id"] = "wallet-6"
         with self.assertRaisesRegex(preflight.PreflightError, "binding accounts must be exactly"):
             preflight.decode_bindings(json.dumps(broken))
 
@@ -193,6 +241,20 @@ class BindingTopologyTests(unittest.TestCase):
         broken = [dict(item) for item in VALID_BINDINGS]
         broken[-1]["strategy_id"] = "multfactor_v1"
         with self.assertRaisesRegex(preflight.PreflightError, "duplicate logical model/strategy"):
+            preflight.decode_bindings(json.dumps(broken))
+
+    def test_rejects_swapped_execution_account_routes(self) -> None:
+        broken = [dict(item) for item in VALID_BINDINGS]
+        broken[2]["execution_account_id"] = "wallet-7"
+        broken[3]["execution_account_id"] = "wallet-6"
+        with self.assertRaisesRegex(preflight.PreflightError, "must use execution account"):
+            preflight.decode_bindings(json.dumps(broken))
+
+    def test_rejects_swapped_retained_account_routes(self) -> None:
+        broken = [dict(item) for item in VALID_BINDINGS]
+        broken[0]["execution_account_id"] = "wallet-1"
+        broken[1]["execution_account_id"] = "main"
+        with self.assertRaisesRegex(preflight.PreflightError, "must use execution account"):
             preflight.decode_bindings(json.dumps(broken))
 
     def test_rejects_prediction_model_alias_collision(self) -> None:
@@ -212,14 +274,17 @@ class BindingTopologyTests(unittest.TestCase):
 class DatabaseStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        self.active_bindings = preflight.active_rollout_bindings(
+            self.bindings, ("wallet-6", "wallet-7")
+        )
 
-    def test_accepts_exact_enabled_authorization_set(self) -> None:
+    def test_accepts_exact_active_and_quarantined_authorization_set(self) -> None:
         preflight.validate_database_state(database_state(), self.bindings)
 
     def test_rejects_missing_authorization(self) -> None:
         state = database_state()
         state["bindings"] = state["bindings"][:-1]
-        with self.assertRaisesRegex(preflight.PreflightError, "missing="):
+        with self.assertRaisesRegex(preflight.PreflightError, "missing configured"):
             preflight.validate_database_state(state, self.bindings)
 
     def test_rejects_unexpected_enabled_authorization(self) -> None:
@@ -241,12 +306,196 @@ class DatabaseStateTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "kill switch"):
             preflight.validate_database_state(state, self.bindings)
 
+    def test_rejects_missing_or_disabled_expected_risk_policy(self) -> None:
+        missing = database_state()
+        missing["risk_policies"] = missing["risk_policies"][:-1]
+        with self.assertRaisesRegex(preflight.PreflightError, "missing risk policy"):
+            preflight.validate_database_state(missing, self.bindings)
+
+        disabled = database_state()
+        disabled["risk_policies"][0]["enabled"] = False
+        with self.assertRaisesRegex(preflight.PreflightError, "enabled=True"):
+            preflight.validate_database_state(disabled, self.bindings)
+
+    def test_rejects_missing_or_duplicate_account_control(self) -> None:
+        missing = database_state()
+        missing["account_controls"] = missing["account_controls"][:-1]
+        with self.assertRaisesRegex(preflight.PreflightError, "missing ACCOUNT control"):
+            preflight.validate_database_state(missing, self.bindings)
+
+        duplicate = database_state()
+        duplicate["account_controls"].append(dict(duplicate["account_controls"][0]))
+        with self.assertRaisesRegex(preflight.PreflightError, "duplicate or invalid ACCOUNT"):
+            preflight.validate_database_state(duplicate, self.bindings)
+
+    def test_disabled_phase_rejects_paused_active_control(self) -> None:
+        state = database_state()
+        state["account_controls"][0]["paused"] = True
+        state["account_controls"][0]["reason"] = "CUTOVER_NOT_ARMED"
+        with self.assertRaisesRegex(preflight.PreflightError, "to be unpaused"):
+            preflight.validate_database_state(
+                state, self.bindings, submission_state="disabled"
+            )
+
+    def test_enabled_phase_requires_active_controls_unpaused(self) -> None:
+        state = database_state()
+        state["account_controls"][0]["paused"] = True
+        state["account_controls"][0]["reason"] = "CUTOVER_NOT_ARMED"
+        with self.assertRaisesRegex(preflight.PreflightError, "to be unpaused"):
+            preflight.validate_database_state(
+                state, self.bindings, submission_state="enabled"
+            )
+
+    def test_enabled_phase_requires_quarantined_control_paused(self) -> None:
+        state = database_state()
+        preflight.validate_database_state(
+            state,
+            self.bindings,
+            submission_state="enabled",
+            submission_disabled_accounts=("wallet-6", "wallet-7"),
+        )
+
+        for control in state["account_controls"]:
+            if control["execution_account_id"] == "wallet-7":
+                control["paused"] = False
+        with self.assertRaisesRegex(preflight.PreflightError, "to be paused"):
+            preflight.validate_database_state(
+                state,
+                self.bindings,
+                submission_state="enabled",
+                submission_disabled_accounts=("wallet-6", "wallet-7"),
+            )
+
+    def test_accepts_initial_wallet6_wallet7_quarantine_contract(self) -> None:
+        state = database_state()
+        preflight.validate_database_state(
+            state,
+            self.bindings,
+            submission_state="disabled",
+            submission_disabled_accounts=("wallet-6", "wallet-7"),
+        )
+
+    def test_rejects_enabled_binding_or_policy_for_quarantined_account(self) -> None:
+        state = database_state()
+        wallet7_binding = next(
+            row for row in state["bindings"] if row["execution_account_id"] == "wallet-7"
+        )
+        wallet7_binding["enabled"] = True
+        with self.assertRaisesRegex(preflight.PreflightError, "active managed-wallet set"):
+            preflight.validate_database_state(
+                state,
+                self.bindings,
+                submission_disabled_accounts=("wallet-6", "wallet-7"),
+            )
+
+        wallet7_binding["enabled"] = False
+        wallet7_policy = next(
+            row
+            for row in state["risk_policies"]
+            if row["execution_account_id"] == "wallet-7"
+        )
+        wallet7_policy["enabled"] = True
+        with self.assertRaisesRegex(preflight.PreflightError, "enabled=False"):
+            preflight.validate_database_state(
+                state,
+                self.bindings,
+                submission_disabled_accounts=("wallet-6", "wallet-7"),
+            )
+
+    def test_rejects_removing_or_reducing_current_release_quarantine(self) -> None:
+        for disabled in ((), ("wallet-6",), ("wallet-7",)):
+            with self.subTest(disabled=disabled), self.assertRaisesRegex(
+                preflight.PreflightError, "separate release and approved evidence"
+            ):
+                preflight.validate_database_state(
+                    database_state(),
+                    self.bindings,
+                    submission_disabled_accounts=disabled,
+                )
+
+    def test_rejects_unapproved_or_invalid_risk_contract(self) -> None:
+        drifted = database_state()
+        drifted["risk_policies"][0]["max_wallet_exposure"] = 99
+        with self.assertRaisesRegex(preflight.PreflightError, "reviewed current-rollout"):
+            preflight.validate_database_state(drifted, self.bindings)
+
+        invalid = database_state()
+        invalid["risk_policies"][0]["max_order_notional"] = 0
+        with self.assertRaisesRegex(preflight.PreflightError, "invalid max_order_notional"):
+            preflight.validate_database_state(invalid, self.bindings)
+
+        timezone = database_state()
+        timezone["risk_policies"][0]["daily_timezone"] = "Asia/Shanghai"
+        with self.assertRaisesRegex(preflight.PreflightError, "daily_timezone UTC"):
+            preflight.validate_database_state(timezone, self.bindings)
+
+    def test_retired_rows_remain_auditable_without_blocking_managed_scope(self) -> None:
+        state = database_state()
+        state["accounts"].append(
+            {"execution_account_id": "wallet-2", "wallet_address": "0x22"}
+        )
+        state["bindings"].append(
+            {
+                "model_id": "gemini_masked",
+                "strategy_id": "multfactor_v1",
+                "execution_account_id": "wallet-2",
+                "enabled": False,
+            }
+        )
+        state["risk_policies"].append(
+            {
+                "execution_account_id": "wallet-2",
+                "policy_id": "retired-policy",
+                "version": 9,
+                "enabled": False,
+            }
+        )
+        state["account_controls"].append(
+            {
+                "execution_account_id": "wallet-2",
+                "control_scope": "ACCOUNT",
+                "control_key": "",
+                "paused": True,
+                "reason": "RETIRED",
+                "version": 9,
+            }
+        )
+        preflight.validate_database_state(state, self.bindings)
+
+    def test_database_query_scopes_mutating_history_checks_to_managed_accounts(self) -> None:
+        sql = preflight.DATABASE_STATE_SQL
+        self.assertIn("WITH managed_accounts(execution_account_id)", sql)
+        self.assertIn(
+            "intent_payload->>'execution_account_id' IN (SELECT execution_account_id FROM managed_accounts)",
+            sql,
+        )
+        self.assertIn(
+            "execution_account_id IN (SELECT execution_account_id FROM managed_accounts)",
+            sql,
+        )
+
     def test_account_identity_hash_changes_with_wallet_address(self) -> None:
         state = database_state()
         original = preflight.validate_database_state(state, self.bindings)
         state["accounts"][0]["wallet_address"] = "0x11"
         self.assertNotEqual(
             preflight.validate_database_state(state, self.bindings), original
+        )
+
+    def test_database_identity_hash_covers_policy_and_control_identity(self) -> None:
+        state = database_state()
+        original = preflight.validate_database_state(state, self.bindings)
+
+        changed_policy = database_state()
+        changed_policy["risk_policies"][0]["version"] = 2
+        self.assertNotEqual(
+            preflight.validate_database_state(changed_policy, self.bindings), original
+        )
+
+        changed_control = database_state()
+        changed_control["account_controls"][0]["reason"] = "REVIEWED_READY"
+        self.assertNotEqual(
+            preflight.validate_database_state(changed_control, self.bindings), original
         )
 
 
@@ -274,7 +523,7 @@ class EnvironmentTests(unittest.TestCase):
             "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED": "false",
             "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "false",
             "DECISION_CYCLE_BINDINGS_JSON": json.dumps(VALID_BINDINGS),
-            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON": "[]",
+            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON": '["wallet-6","wallet-7"]',
             "POLYMARKET_ACCOUNTS_FILE": str(wallet_path),
             "TRADING_EXECUTION_DATABASE_URL": "postgres://user:secret@db/trading",
             "DECISION_CYCLE_PREDICTION_LOOKBACK": "3h",
@@ -290,19 +539,20 @@ class EnvironmentTests(unittest.TestCase):
             )
         self.assertEqual(len(bindings), 4)
 
-    def test_accepts_bound_submission_disabled_account(self) -> None:
+    def test_rejects_reduced_current_release_quarantine(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wallet_path = self.write_wallet_file(
                 pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
             )
             environment = self.environment(wallet_path)
-            environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = (
-                '["wallet-3"]'
-            )
-            bindings = preflight.validate_environment(
-                environment, submission_state="disabled"
-            )
-        self.assertEqual(len(bindings), 4)
+            for value in ('[]', '["wallet-6"]', '["wallet-7"]'):
+                environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = value
+                with self.subTest(value=value), self.assertRaisesRegex(
+                    preflight.PreflightError, "separate release and approved evidence"
+                ):
+                    preflight.validate_environment(
+                        environment, submission_state="disabled"
+                    )
 
     def test_rejects_invalid_submission_disabled_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -310,7 +560,7 @@ class EnvironmentTests(unittest.TestCase):
                 pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
             )
             for value, message in (
-                ('["wallet-3","wallet-3"]', "duplicates"),
+                ('["wallet-7","wallet-7"]', "duplicates"),
                 ('["wallet-missing"]', "unbound accounts"),
             ):
                 environment = self.environment(wallet_path)
@@ -354,7 +604,7 @@ class EnvironmentTests(unittest.TestCase):
 
     def test_rejects_wallet_subset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            wallet_path = self.write_wallet_file(pathlib.Path(temporary), ["wallet-2"])
+            wallet_path = self.write_wallet_file(pathlib.Path(temporary), ["wallet-6"])
             with self.assertRaisesRegex(preflight.PreflightError, "wallet accounts must be exactly"):
                 preflight.validate_environment(
                     self.environment(wallet_path), submission_state="disabled"
@@ -364,6 +614,9 @@ class EnvironmentTests(unittest.TestCase):
 class PredictionEnvironmentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        self.active_bindings = preflight.active_rollout_bindings(
+            self.bindings, ("wallet-6", "wallet-7")
+        )
         self.environment = {
             "REDIS_ENABLED": "true",
             "REDIS_ADDRESS": "127.0.0.1:6379",
@@ -384,8 +637,25 @@ class PredictionEnvironmentTests(unittest.TestCase):
 
     def test_rejects_different_direct_model_set(self) -> None:
         self.environment["DIRECT_PREDICTION_MODEL_IDS_JSON"] = '["gemini-3.6-flash"]'
-        with self.assertRaisesRegex(preflight.PreflightError, "exactly equal"):
+        with self.assertRaisesRegex(preflight.PreflightError, "include every active"):
             preflight.validate_prediction_environment(self.environment, self.bindings)
+
+    def test_current_rollout_allows_missing_quarantined_gemini_model(self) -> None:
+        self.environment["DIRECT_PREDICTION_MODEL_IDS_JSON"] = '["echo-producer-v7"]'
+        preflight.validate_prediction_environment(
+            self.environment,
+            self.bindings,
+            required_bindings=self.active_bindings,
+        )
+
+    def test_current_rollout_rejects_missing_active_echo_model(self) -> None:
+        self.environment["DIRECT_PREDICTION_MODEL_IDS_JSON"] = '["gemini-3.6-flash"]'
+        with self.assertRaisesRegex(preflight.PreflightError, "echo-producer-v7"):
+            preflight.validate_prediction_environment(
+                self.environment,
+                self.bindings,
+                required_bindings=self.active_bindings,
+            )
 
     def test_requires_explicit_redis_identity(self) -> None:
         self.environment.pop("REDIS_DATABASE")
@@ -410,6 +680,9 @@ class RuntimeEvidenceTests(unittest.TestCase):
             "DECISION_CYCLE_PREDICTION_INFRA_URL": "http://127.0.0.1:11000",
             "DECISION_CYCLE_PREDICTION_LOOKBACK": "3h",
             "TRADING_EXECUTION_DATABASE_URL": "postgres://trading:secret@db/trading",
+            "EXECUTION_API_TOKEN": "execution-token",
+            "POSITION_EXIT_JOB_TOKEN": "job-token",
+            "LIVE_OPERATIONS_READ_ONLY_TOKEN": "read-only-token",
             "DECISION_CYCLE_PREDICTION_INFRA_TOKEN": "snapshot-token",
             "DECISION_CYCLE_STRATEGY_TOKEN": "strategy-token",
         }
@@ -561,11 +834,11 @@ class DryRunEvidenceTests(unittest.TestCase):
             entry_submission_state="blocked",
         )
 
-    def validate_wallet3_quarantine(self) -> dict[str, object]:
+    def validate_wallet7_quarantine(self) -> dict[str, object]:
         return preflight.validate_dry_run_state(
             self.state,
             self.bindings,
-            submission_disabled_accounts=("wallet-3",),
+            submission_disabled_accounts=("wallet-7",),
             not_before=self.now - dt.timedelta(minutes=20),
             now=self.now,
             max_age=dt.timedelta(minutes=30),
@@ -574,29 +847,29 @@ class DryRunEvidenceTests(unittest.TestCase):
     def test_accepts_legacy_healthy_output_without_entry_policy(self) -> None:
         self.assertEqual(self.validate()["prediction_snapshot_id"], "snapshot-1")
 
-    def test_accepts_exact_three_active_rows_when_wallet3_is_quarantined(self) -> None:
+    def test_accepts_exact_three_active_rows_when_wallet7_is_quarantined(self) -> None:
         self.state["dry_runs"][0]["bindings"] = [
             row
             for row in dry_run_rows()
-            if row["execution_account_id"] != "wallet-3"
+            if row["execution_account_id"] != "wallet-7"
         ]
         self.assertEqual(
-            self.validate_wallet3_quarantine()["prediction_snapshot_id"],
+            self.validate_wallet7_quarantine()["prediction_snapshot_id"],
             "snapshot-1",
         )
 
     def test_rejects_quarantined_wallet_row_in_dry_run(self) -> None:
         with self.assertRaisesRegex(preflight.PreflightError, "exactly 3 active"):
-            self.validate_wallet3_quarantine()
+            self.validate_wallet7_quarantine()
 
-    def test_rejects_missing_active_row_when_wallet3_is_quarantined(self) -> None:
+    def test_rejects_missing_active_row_when_wallet7_is_quarantined(self) -> None:
         self.state["dry_runs"][0]["bindings"] = [
             row
             for row in dry_run_rows()
-            if row["execution_account_id"] not in {"wallet-2", "wallet-3"}
+            if row["execution_account_id"] not in {"wallet-6", "wallet-7"}
         ]
         with self.assertRaisesRegex(preflight.PreflightError, "exactly 3 active"):
-            self.validate_wallet3_quarantine()
+            self.validate_wallet7_quarantine()
 
     def test_accepts_explicit_enabled_entry_policy(self) -> None:
         self.state["dry_runs"][0]["bindings"] = dry_run_rows(True, "")
@@ -643,6 +916,9 @@ class SnapshotManifestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.decision_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
         self.bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        self.active_bindings = preflight.active_rollout_bindings(
+            self.bindings, ("wallet-6", "wallet-7")
+        )
         self.dry_run = {
             "decision_at": iso(self.decision_at),
             "prediction_snapshot_id": "snapshot-1",
@@ -670,6 +946,28 @@ class SnapshotManifestTests(unittest.TestCase):
         self.snapshot["data"]["expected_predictions"][1]["selection_id"] = 102
         with self.assertRaisesRegex(preflight.PreflightError, "mixes generations"):
             preflight.validate_snapshot_manifest(self.snapshot, self.dry_run, self.bindings)
+
+    def test_current_rollout_ignores_missing_quarantined_gemini_manifest(self) -> None:
+        self.snapshot["data"]["expected_predictions"] = self.snapshot["data"][
+            "expected_predictions"
+        ][:1]
+        self.snapshot["data"]["predictions"] = self.snapshot["data"]["predictions"][:1]
+        self.assertEqual(
+            preflight.validate_snapshot_manifest(
+                self.snapshot, self.dry_run, self.active_bindings
+            ),
+            1,
+        )
+
+    def test_current_rollout_rejects_missing_active_echo_manifest(self) -> None:
+        self.snapshot["data"]["expected_predictions"] = self.snapshot["data"][
+            "expected_predictions"
+        ][1:]
+        self.snapshot["data"]["predictions"] = self.snapshot["data"]["predictions"][1:]
+        with self.assertRaisesRegex(preflight.PreflightError, "no configured"):
+            preflight.validate_snapshot_manifest(
+                self.snapshot, self.dry_run, self.active_bindings
+            )
 
 
 class ConsumerEvidenceTests(unittest.TestCase):
@@ -714,9 +1012,44 @@ class ConsumerEvidenceTests(unittest.TestCase):
 
     def test_rejects_mapping_missing_a_source_model(self) -> None:
         bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
-        with self.assertRaisesRegex(preflight.PreflightError, "keys must exactly equal"):
+        with self.assertRaisesRegex(preflight.PreflightError, "include every active"):
             preflight.decode_model_groups(
                 json.dumps({"echo-producer-v7": "predict-echo-v1"}), bindings
+            )
+
+    def test_current_rollout_checks_only_active_echo_consumer(self) -> None:
+        bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        active_bindings = preflight.active_rollout_bindings(
+            bindings, ("wallet-6", "wallet-7")
+        )
+        model_groups = preflight.decode_model_groups(
+            json.dumps(MODEL_GROUPS),
+            bindings,
+            required_bindings=active_bindings,
+        )
+        self.assertEqual(model_groups, {"echo-producer-v7": "predict-echo-v1"})
+
+        state = consumer_state(self.now)
+        state["model_groups"] = model_groups
+        state["groups"] = [
+            group
+            for group in state["groups"]
+            if group["model_id"] == "echo-producer-v7"
+        ]
+        preflight.validate_consumer_state(
+            state,
+            self.environment,
+            model_groups=model_groups,
+            now=self.now,
+            max_age=dt.timedelta(minutes=2),
+            max_idle=dt.timedelta(minutes=15),
+        )
+
+        with self.assertRaisesRegex(preflight.PreflightError, "echo-producer-v7"):
+            preflight.decode_model_groups(
+                json.dumps({"gemini-3.6-flash": "predict-gemini-v1"}),
+                bindings,
+                required_bindings=active_bindings,
             )
 
 
@@ -807,6 +1140,9 @@ class CredentialAndConfigurationTests(unittest.TestCase):
         self.bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
         self.trading = {
             "TRADING_EXECUTION_DATABASE_URL": "postgres://trading:secret@db/trading",
+            "EXECUTION_API_TOKEN": "execution-token",
+            "POSITION_EXIT_JOB_TOKEN": "job-token",
+            "LIVE_OPERATIONS_READ_ONLY_TOKEN": "read-only-token",
             "DECISION_CYCLE_PREDICTION_INFRA_TOKEN": "snapshot-token",
             "DECISION_CYCLE_STRATEGY_TOKEN": "strategy-token",
             "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE": "true",
@@ -869,6 +1205,11 @@ class CredentialAndConfigurationTests(unittest.TestCase):
             wallet_file_sha256="f" * 64,
         )
         self.assertNotEqual(changed_release, original)
+
+    def test_configuration_hash_binds_dedicated_job_token(self) -> None:
+        original = self.configuration_hash()
+        self.trading["POSITION_EXIT_JOB_TOKEN"] = "rotated-job-token"
+        self.assertNotEqual(self.configuration_hash(), original)
 
     def test_subsecond_redis_timeout_is_not_truncated_to_zero(self) -> None:
         self.assertEqual(preflight._duration_seconds("500ms", "timeout"), 0.5)
@@ -1033,8 +1374,12 @@ class MainWiringTests(unittest.TestCase):
                 "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "false",
                 "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE": "true",
                 "DECISION_CYCLE_BINDINGS_JSON": compact_bindings,
+                "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON": '["wallet-6","wallet-7"]',
                 "POLYMARKET_ACCOUNTS_FILE": str(wallet_path),
                 "TRADING_EXECUTION_DATABASE_URL": "postgres://user:secret@db/trading",
+                "EXECUTION_API_TOKEN": "execution-token",
+                "POSITION_EXIT_JOB_TOKEN": "job-token",
+                "LIVE_OPERATIONS_READ_ONLY_TOKEN": "read-only-token",
                 "DECISION_CYCLE_PREDICTION_INFRA_URL": "http://127.0.0.1:11000",
                 "DECISION_CYCLE_PREDICTION_INFRA_TOKEN": "snapshot-token",
                 "DECISION_CYCLE_PREDICTION_LOOKBACK": "3h",
@@ -1102,10 +1447,18 @@ class MainWiringTests(unittest.TestCase):
                     "decision_at": iso(decision_at),
                     "created_at": iso(decision_at + dt.timedelta(minutes=1)),
                     "prediction_snapshot_id": "snapshot-1",
-                    "bindings": dry_run_rows(),
+                    "bindings": [
+                        row
+                        for row in dry_run_rows()
+                        if row["execution_account_id"] in {"main", "wallet-1"}
+                    ],
                 }
             ]
             direct_consumer_state = consumer_state(now - dt.timedelta(seconds=1))
+            direct_consumer_state["model_groups"] = {
+                "echo-producer-v7": "predict-echo-v1"
+            }
+            direct_consumer_state["groups"] = [direct_consumer_state["groups"][0]]
             runtime_path = self.write_json(directory, "runtime.json", runtime_state)
             database_path = self.write_json(directory, "database.json", state)
             snapshot_path = self.write_json(
