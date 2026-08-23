@@ -125,9 +125,20 @@ func (snapshot PredictionSnapshot) Validate(expectedDecisionAt time.Time) error 
 		if _, exists := seenExpectedJobs[expectation.SourceJobID]; exists {
 			return fmt.Errorf("prediction snapshot contains duplicate expected source_job_id %q", expectation.SourceJobID)
 		}
-		dimension := fmt.Sprintf("%d\x00%s\x00%s", expectation.SelectionRunID, expectation.MarketID, expectation.PredictionModelID)
+		// A selection run may publish more than one complete generation for the
+		// same Market/Model (for example, the initial task and a later refresh).
+		// prediction_as_of is part of that immutable generation identity. Keep
+		// rejecting a second row for the exact same generation while allowing a
+		// newer task from the same frozen selection run.
+		dimension := fmt.Sprintf(
+			"%d\x00%s\x00%s\x00%s",
+			expectation.SelectionRunID,
+			expectation.MarketID,
+			expectation.PredictionModelID,
+			expectation.PredictionAsOf.UTC().Format(time.RFC3339Nano),
+		)
 		if _, exists := seenExpectedDimensions[dimension]; exists {
-			return fmt.Errorf("prediction snapshot contains duplicate expected Market/Model task")
+			return fmt.Errorf("prediction snapshot contains duplicate expected Market/Model generation task")
 		}
 		seenExpectedPredictions[expectation.PredictionID] = struct{}{}
 		seenExpectedJobs[expectation.SourceJobID] = struct{}{}

@@ -51,6 +51,77 @@ func TestStrategyExecutionBindingSeparatesPredictionAndLogicalModels(t *testing.
 	}
 }
 
+func TestPredictionSnapshotAllowsRefreshedGenerationInSameSelectionRun(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 24, 1, 0, 0, 0, time.UTC)
+	initial := validPredictionExpectationForTest(decisionAt.Add(-3*time.Hour), decisionAt)
+	refresh := initial
+	refresh.PredictionID = "prediction-refresh"
+	refresh.SourceJobID = "job-refresh"
+	refresh.PredictionAsOf = decisionAt.Add(-30 * time.Minute)
+	refresh.TaskAvailableAt = refresh.PredictionAsOf.Add(time.Minute)
+	resultAvailableAt := refresh.TaskAvailableAt.Add(time.Minute)
+	refresh.ResultAvailableAt = &resultAvailableAt
+
+	snapshot := PredictionSnapshot{
+		SchemaVersion: PredictionSnapshotSchemaVersion,
+		SnapshotID:    "snapshot-generations",
+		DecisionAt:    decisionAt,
+		GeneratedAt:   decisionAt,
+		ExpectedPredictions: []PredictionExpectation{
+			initial,
+			refresh,
+		},
+	}
+	if err := snapshot.Validate(decisionAt); err != nil {
+		t.Fatalf("Validate() refreshed generation error = %v", err)
+	}
+}
+
+func TestPredictionSnapshotRejectsDuplicateMarketModelGeneration(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 24, 1, 0, 0, 0, time.UTC)
+	first := validPredictionExpectationForTest(decisionAt.Add(-time.Hour), decisionAt)
+	duplicate := first
+	duplicate.PredictionID = "prediction-duplicate"
+	duplicate.SourceJobID = "job-duplicate"
+
+	snapshot := PredictionSnapshot{
+		SchemaVersion: PredictionSnapshotSchemaVersion,
+		SnapshotID:    "snapshot-duplicate-generation",
+		DecisionAt:    decisionAt,
+		GeneratedAt:   decisionAt,
+		ExpectedPredictions: []PredictionExpectation{
+			first,
+			duplicate,
+		},
+	}
+	err := snapshot.Validate(decisionAt)
+	if err == nil || !strings.Contains(err.Error(), "duplicate expected Market/Model generation task") {
+		t.Fatalf("Validate() error = %v, want duplicate generation rejection", err)
+	}
+}
+
+func validPredictionExpectationForTest(predictionAsOf, decisionAt time.Time) PredictionExpectation {
+	taskAvailableAt := predictionAsOf.Add(time.Minute)
+	resultAvailableAt := taskAvailableAt.Add(time.Minute)
+	return PredictionExpectation{
+		PredictionID:      "prediction-initial",
+		SourceJobID:       "job-initial",
+		PredictionModelID: "gemini-3.6-flash",
+		SelectionID:       1,
+		SelectionRunID:    7,
+		MarketID:          "market-1",
+		ConditionID:       "condition-1",
+		Outcomes: []PredictionOutcome{
+			{Index: 0, Name: "Yes", TokenID: "token-yes"},
+			{Index: 1, Name: "No", TokenID: "token-no"},
+		},
+		PredictionAsOf:    predictionAsOf,
+		TaskAvailableAt:   taskAvailableAt,
+		Status:            PredictionExpectationCompleted,
+		ResultAvailableAt: &resultAvailableAt,
+	}
+}
+
 // TestMidPricePointWireFormatIsUnambiguousRawP 验证 Mid Price Point Wire Format Is Unambiguous Raw P 场景下的行为。
 func TestMidPricePointWireFormatIsUnambiguousRawP(t *testing.T) {
 	point := MidPricePoint{IntervalEndAt: time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC), P: "0.41"}
