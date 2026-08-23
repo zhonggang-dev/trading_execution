@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -14,16 +16,45 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarket"
 )
 
+type options struct {
+	refreshBalanceAllowance bool
+}
+
 // main 启动当前命令并在失败时记录错误后退出。
 func main() {
-	if err := run(); err != nil {
+	options, err := parseOptions(os.Args[1:])
+	if err != nil {
+		slog.Error("Polymarket wallet check arguments are invalid", "error", err)
+		os.Exit(2)
+	}
+	if err := run(options); err != nil {
 		slog.Error("Polymarket wallet check failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-// run 加载钱包账户并执行只读的 Polymarket 连通性检查。
-func run() error {
+func parseOptions(arguments []string) (options, error) {
+	var result options
+	flags := flag.NewFlagSet("walletcheck", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.BoolVar(
+		&result.refreshBalanceAllowance,
+		"refresh-balance-allowance",
+		false,
+		"refresh each account's CLOB COLLATERAL balance/allowance cache before checking it",
+	)
+	if err := flags.Parse(arguments); err != nil {
+		return options{}, err
+	}
+	if flags.NArg() != 0 {
+		return options{}, fmt.Errorf("unexpected positional arguments")
+	}
+	return result, nil
+}
+
+// run 加载钱包账户并执行 Polymarket 连通性检查。默认只读；显式刷新选项只更新 CLOB 的
+// balance/allowance 缓存，不会签署链上交易或创建、修改、撤销订单。
+func run(options options) error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
@@ -114,6 +145,20 @@ func run() error {
 			"signature_type", uint8(probe.SignatureType),
 			"open_orders", probe.OpenOrderCount,
 		)
+		if options.refreshBalanceAllowance {
+			if refreshErr := client.UpdateBalanceAllowance(
+				ctx,
+				account.ExecutionAccountID,
+				polymarket.BalanceAssetCollateral,
+				"",
+			); refreshErr != nil {
+				return fmt.Errorf("execution account %q: refresh CLOB collateral balance allowance: %w", account.ExecutionAccountID, refreshErr)
+			}
+			logger.Info("Polymarket wallet collateral cache refreshed",
+				"execution_account_id", account.ExecutionAccountID,
+				"asset_type", polymarket.BalanceAssetCollateral,
+			)
+		}
 		funding, fundingErr := client.ProbeFunding(ctx, account.ExecutionAccountID)
 		if fundingErr != nil {
 			return fmt.Errorf("execution account %q: CLOB collateral probe: %w", account.ExecutionAccountID, fundingErr)
@@ -146,7 +191,11 @@ func run() error {
 			return fmt.Errorf("execution account %q: Polymarket reports placement unavailable (%s)", account.ExecutionAccountID, placement.Reason)
 		}
 	}
-	logger.Info("Polymarket wallet check completed", "accounts", len(accounts), "orders_mutated", false)
+	logger.Info("Polymarket wallet check completed",
+		"accounts", len(accounts),
+		"balance_allowance_cache_refreshed", options.refreshBalanceAllowance,
+		"orders_mutated", false,
+	)
 	return nil
 }
 

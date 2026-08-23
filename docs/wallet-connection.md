@@ -82,6 +82,17 @@ go run ./cmd/walletcheck
 成功日志只包含 execution account、signer/funder 公共地址、signature type 和 Open Orders 数量；
 不会打印 private key、API secret、passphrase、HMAC 或订单签名。
 
+链上 collateral approval 已经独立完成并达到最终性后，可以显式要求 CLOB 刷新其
+balance/allowance 缓存，再立即执行同一套 funding 检查：
+
+```bash
+go run ./cmd/walletcheck --refresh-balance-allowance
+```
+
+该选项默认关闭，只对每个配置账户的 `COLLATERAL` 调用经过 L2 鉴权的缓存刷新接口；它不会
+签署或广播 Polygon 交易，也不会创建、修改或撤销订单。刷新后的检查仍要求 Standard V2 与
+NegRisk V2 两个 exchange allowance 都为正。
+
 默认要求文件已经包含完整 L2 凭证。如果旧钱包缺少三项凭证，可以由运维人员一次性显式启用：
 
 ```bash

@@ -705,6 +705,49 @@ func TestGetBalanceAllowanceSignsPathAndSendsRequiredQuery(t *testing.T) {
 	}
 }
 
+func TestUpdateBalanceAllowanceSignsRefreshPathAndSendsRequiredQuery(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Path != "/balance-allowance/update" {
+			t.Fatalf("request = %s %s", request.Method, request.URL.Path)
+		}
+		if request.URL.Query().Get("asset_type") != "COLLATERAL" || request.URL.Query().Get("signature_type") != "0" ||
+			request.URL.Query().Has("token_id") {
+			t.Fatalf("query = %s", request.URL.RawQuery)
+		}
+		expected, err := hmacSignature(base64.URLEncoding.EncodeToString([]byte("test-secret")), now.Unix(), http.MethodGet, "/balance-allowance/update", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if request.Header.Get("POLY_SIGNATURE") != expected {
+			t.Fatalf("POLY_SIGNATURE = %q, want %q", request.Header.Get("POLY_SIGNATURE"), expected)
+		}
+		writeTestJSON(writer, map[string]any{"updated": true})
+	}))
+	defer server.Close()
+
+	client := newTestTradingClient(t, server.URL, now)
+	if err := client.UpdateBalanceAllowance(context.Background(), "account-1", BalanceAssetCollateral, ""); err != nil {
+		t.Fatalf("UpdateBalanceAllowance() error = %v", err)
+	}
+}
+
+func TestUpdateBalanceAllowanceRequiresConditionalTokenIDBeforeRequest(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+
+	client := newTestTradingClient(t, server.URL, time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC))
+	if err := client.UpdateBalanceAllowance(context.Background(), "account-1", BalanceAssetConditional, " "); err == nil {
+		t.Fatal("UpdateBalanceAllowance() error = nil, want missing token id rejection")
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want 0", requests)
+	}
+}
+
 func TestRequiredAllowancesRejectsIncompleteContractSet(t *testing.T) {
 	allowance := BalanceAllowance{Allowances: map[string]string{
 		strings.ToLower(StandardExchangeV2Address): "1",

@@ -882,19 +882,9 @@ func (client *TradingClient) GetBalanceAllowance(
 	if err != nil {
 		return BalanceAllowance{}, err
 	}
-	if assetType != BalanceAssetCollateral && assetType != BalanceAssetConditional {
-		return BalanceAllowance{}, newInvalidError("CLOB_ASSET_TYPE_INVALID", "asset type must be COLLATERAL or CONDITIONAL")
-	}
-	tokenID = strings.TrimSpace(tokenID)
-	if assetType == BalanceAssetConditional && tokenID == "" {
-		return BalanceAllowance{}, newInvalidError("CLOB_TOKEN_ID_REQUIRED", "conditional balance allowance requires token id")
-	}
-	query := url.Values{
-		"asset_type":     []string{string(assetType)},
-		"signature_type": []string{strconv.Itoa(int(account.SignatureType))},
-	}
-	if tokenID != "" {
-		query.Set("token_id", tokenID)
+	query, err := balanceAllowanceQuery(account, assetType, tokenID)
+	if err != nil {
+		return BalanceAllowance{}, err
 	}
 	body, _, err := client.doAuthenticated(ctx, account, http.MethodGet, "/balance-allowance", query, nil, false)
 	if err != nil {
@@ -925,10 +915,49 @@ func (client *TradingClient) GetBalanceAllowance(
 	}
 	return BalanceAllowance{
 		AssetType:  assetType,
-		TokenID:    tokenID,
+		TokenID:    strings.TrimSpace(tokenID),
 		Balance:    balance,
 		Allowances: allowances,
 	}, nil
+}
+
+// UpdateBalanceAllowance asks CLOB V2 to refresh its authenticated cache after
+// an independently finalized on-chain approval. It never signs or broadcasts
+// an EVM transaction and is safe to repeat after an ambiguous transport error.
+func (client *TradingClient) UpdateBalanceAllowance(
+	ctx context.Context,
+	executionAccountID string,
+	assetType BalanceAssetType,
+	tokenID string,
+) error {
+	account, err := client.account(ctx, executionAccountID)
+	if err != nil {
+		return err
+	}
+	query, err := balanceAllowanceQuery(account, assetType, tokenID)
+	if err != nil {
+		return err
+	}
+	_, _, err = client.doAuthenticated(ctx, account, http.MethodGet, "/balance-allowance/update", query, nil, false)
+	return err
+}
+
+func balanceAllowanceQuery(account TradingAccount, assetType BalanceAssetType, tokenID string) (url.Values, error) {
+	if assetType != BalanceAssetCollateral && assetType != BalanceAssetConditional {
+		return nil, newInvalidError("CLOB_ASSET_TYPE_INVALID", "asset type must be COLLATERAL or CONDITIONAL")
+	}
+	tokenID = strings.TrimSpace(tokenID)
+	if assetType == BalanceAssetConditional && tokenID == "" {
+		return nil, newInvalidError("CLOB_TOKEN_ID_REQUIRED", "conditional balance allowance requires token id")
+	}
+	query := url.Values{
+		"asset_type":     []string{string(assetType)},
+		"signature_type": []string{strconv.Itoa(int(account.SignatureType))},
+	}
+	if tokenID != "" {
+		query.Set("token_id", tokenID)
+	}
+	return query, nil
 }
 
 // ProbeFunding checks the collateral prerequisite without logging quantities.
