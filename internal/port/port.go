@@ -376,6 +376,10 @@ type DecisionRecorder interface {
 	// submissionEnabled was true for this first claim, its complete SUBMIT
 	// intent set. Replays must use the same mode and exact intent set.
 	ClaimOutput(ctx context.Context, response domain.StrategyDecisionResponse, intents []domain.OrderIntent, submissionEnabled bool) (stored domain.StrategyDecisionResponse, created bool, err error)
+	// CountUnresolvedIntentsForAccounts is the fail-closed recovery guard for
+	// accounts whose automatic submission has been quarantined. PENDING and
+	// SUBMITTING rows are unresolved; terminal rows are not recoverable work.
+	CountUnresolvedIntentsForAccounts(ctx context.Context, executionAccountIDs []string) (int, error)
 	// ClaimPendingIntents exclusively moves PENDING rows to SUBMITTING. An empty
 	// cycleID claims across cycles for crash recovery; an empty side permits both
 	// BUY and SELL. A side filter is the durable boundary used by sell-only mode,

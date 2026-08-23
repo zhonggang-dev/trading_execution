@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/evmrpc"
@@ -178,6 +179,27 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err := postgresadapter.CheckLiveLedgerBootstrap(ctx, database, expectedBindings); err != nil {
 		return nil, fmt.Errorf("validate PostgreSQL live ledger bootstrap: %w", err)
 	}
+	reconciliationAccountIDs, quarantinedAccountIDs, err := partitionReconciliationAccounts(
+		accountIDs,
+		cfg.DecisionCycle.SubmissionDisabledAccounts,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var quarantineChecker *postgresadapter.ExecutionAccountQuarantineChecker
+	if len(quarantinedAccountIDs) > 0 {
+		quarantineChecker, err = postgresadapter.NewExecutionAccountQuarantineChecker(database, quarantinedAccountIDs)
+		if err != nil {
+			return nil, fmt.Errorf("configure execution account quarantine: %w", err)
+		}
+		if err := quarantineChecker.Check(ctx); err != nil {
+			return nil, fmt.Errorf("verify execution account quarantine: %w", err)
+		}
+		logger.Warn("execution accounts quarantined from automatic reconciliation",
+			"execution_account_ids", quarantinedAccountIDs,
+			"active_reconciliation_accounts", len(reconciliationAccountIDs),
+		)
+	}
 
 	repository, err := postgresadapter.NewOrderRepository(database)
 	if err != nil {
@@ -232,7 +254,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 
 	heartbeat, err := clobheartbeat.New(clobheartbeat.Params{
 		Client:      tradingClient,
-		Accounts:    accountIDs,
+		Accounts:    reconciliationAccountIDs,
 		Interval:    cfg.Polymarket.HeartbeatInterval,
 		CallTimeout: cfg.Polymarket.HeartbeatCallTimeout,
 		StaleAfter:  cfg.Polymarket.HeartbeatStaleAfter,
@@ -320,14 +342,26 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, err
 	}
 	runner, err := reconciliation.NewRunner(reconciliation.RunnerParams{
-		Service:  reconciliationService,
-		Accounts: accountIDs,
-		Interval: cfg.Polymarket.ReconciliationInterval,
+		Service:             reconciliationService,
+		Accounts:            reconciliationAccountIDs,
+		QuarantinedAccounts: quarantinedAccountIDs,
+		Interval:            cfg.Polymarket.ReconciliationInterval,
+		Logger:              logger,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := reconciliationVenue.Bind(runner); err != nil {
+	var placementReconciliationReadiness readiness.Checker = runner
+	if quarantineChecker != nil {
+		placementReconciliationReadiness, err = readiness.NewAll(
+			readiness.NamedChecker{Name: "reconciliation", Checker: runner},
+			readiness.NamedChecker{Name: "account_quarantine", Checker: quarantineChecker},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := reconciliationVenue.Bind(placementReconciliationReadiness); err != nil {
 		return nil, err
 	}
 	if err := triggerBridge.Bind(runner); err != nil {
@@ -335,7 +369,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	}
 
 	startupSweep := runner.Sweep(ctx, domain.ReconciliationTriggerStartup)
-	if err := validateStartupReconciliation(startupSweep, len(accountIDs)); err != nil {
+	if err := validateStartupReconciliation(startupSweep, len(reconciliationAccountIDs)); err != nil {
 		return nil, err
 	}
 	if triggerBridge.Dropped() != 0 {
@@ -374,6 +408,11 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		readiness.NamedChecker{Name: "reconciliation", Checker: runner},
 		readiness.NamedChecker{Name: "clob_heartbeat", Checker: heartbeat},
 	}
+	if quarantineChecker != nil {
+		readinessChecks = append(readinessChecks,
+			readiness.NamedChecker{Name: "account_quarantine", Checker: quarantineChecker},
+		)
+	}
 	if decisionRunner != nil {
 		readinessChecks = append(readinessChecks, readiness.NamedChecker{Name: "decision_cycle", Checker: decisionRunner})
 	}
@@ -390,12 +429,56 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err := heartbeat.Check(ctx); err != nil {
 		return nil, fmt.Errorf("verify initial Polymarket CLOB heartbeat freshness: %w", err)
 	}
-	logger.Info("Polymarket live startup reconciliation passed", "accounts", len(accountIDs))
+	logger.Info("Polymarket live startup reconciliation passed",
+		"accounts", len(reconciliationAccountIDs),
+		"quarantined_accounts", len(quarantinedAccountIDs),
+	)
 	return &liveRuntime{
 		repository: repository, execution: executionService,
 		reconciliation: reconciliationService, readiness: combinedReadiness,
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
 	}, nil
+}
+
+func partitionReconciliationAccounts(configured, quarantined []string) ([]string, []string, error) {
+	configuredSet := make(map[string]struct{}, len(configured))
+	active := make([]string, 0, len(configured))
+	for index, raw := range configured {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return nil, nil, fmt.Errorf("configured execution account %d is empty", index)
+		}
+		if _, duplicate := configuredSet[accountID]; duplicate {
+			return nil, nil, fmt.Errorf("configured execution account %q is duplicated", accountID)
+		}
+		configuredSet[accountID] = struct{}{}
+	}
+	quarantinedSet := make(map[string]struct{}, len(quarantined))
+	normalizedQuarantined := make([]string, 0, len(quarantined))
+	for index, raw := range quarantined {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return nil, nil, fmt.Errorf("quarantined execution account %d is empty", index)
+		}
+		if _, exists := configuredSet[accountID]; !exists {
+			return nil, nil, fmt.Errorf("quarantined execution account %q is not configured", accountID)
+		}
+		if _, duplicate := quarantinedSet[accountID]; duplicate {
+			return nil, nil, fmt.Errorf("quarantined execution account %q is duplicated", accountID)
+		}
+		quarantinedSet[accountID] = struct{}{}
+		normalizedQuarantined = append(normalizedQuarantined, accountID)
+	}
+	for _, raw := range configured {
+		accountID := strings.TrimSpace(raw)
+		if _, excluded := quarantinedSet[accountID]; !excluded {
+			active = append(active, accountID)
+		}
+	}
+	if len(active) == 0 {
+		return nil, nil, fmt.Errorf("account quarantine cannot exclude every configured reconciliation account")
+	}
+	return active, normalizedQuarantined, nil
 }
 
 // noRedirectHTTPClient 禁止把请求头或供应商 URL 中的凭证重放到重定向目标。

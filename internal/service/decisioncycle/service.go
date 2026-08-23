@@ -41,6 +41,10 @@ type Params struct {
 	// SubmitEnabled is an independent, fail-closed gate. A disabled cycle still
 	// records the validated strategy output but never invokes execution.Submit.
 	SubmitEnabled bool
+	// SubmissionDisabledAccounts keeps selected bindings in the configured
+	// topology while excluding them from automatic data capture, strategy calls,
+	// durable delivery, and recovery.
+	SubmissionDisabledAccounts []string
 	// EntrySubmissionDisabled keeps validated exits executable while
 	// suppressing every BUY intent.
 	EntrySubmissionDisabled bool
@@ -67,9 +71,12 @@ type Service struct {
 	recorder                     port.DecisionRecorder
 	executor                     port.OrderExecutor
 	submitEnabled                bool
+	submissionDisabledAccounts   []string
+	submissionDisabledAccountSet map[string]struct{}
 	entrySubmissionDisabled      bool
 	requireCompleteModelCoverage bool
 	bindings                     []domain.StrategyExecutionBinding
+	activeBindings               []domain.StrategyExecutionBinding
 	venue                        string
 	predictionLookback           time.Duration
 	midPriceLookback             time.Duration
@@ -89,16 +96,18 @@ type IntentResult struct {
 
 // BindingRunResult 表示后端使用的 BindingRunResult 类型。
 type BindingRunResult struct {
-	Context                domain.StrategyExecutionContext
-	PredictionModelID      string
-	PredictionCount        int
-	PositionCount          int
-	EntrySubmissionEnabled bool
-	EntryBlockReason       string
-	Request                domain.StrategyDecisionRequest
-	Response               domain.StrategyDecisionResponse
-	Intents                []IntentResult
-	Error                  error
+	Context                   domain.StrategyExecutionContext
+	PredictionModelID         string
+	PredictionCount           int
+	PositionCount             int
+	OrderSubmissionEnabled    bool
+	AccountSubmissionDisabled bool
+	EntrySubmissionEnabled    bool
+	EntryBlockReason          string
+	Request                   domain.StrategyDecisionRequest
+	Response                  domain.StrategyDecisionResponse
+	Intents                   []IntentResult
+	Error                     error
 }
 
 // RunResult 表示后端使用的 RunResult 类型。
@@ -124,6 +133,17 @@ func New(params Params) (*Service, error) {
 	bindings, err := normalizeBindings(params.Bindings)
 	if err != nil {
 		return nil, err
+	}
+	disabledAccounts, disabledAccountSet, err := normalizeSubmissionDisabledAccounts(
+		bindings,
+		params.SubmissionDisabledAccounts,
+	)
+	if err != nil {
+		return nil, err
+	}
+	activeBindings := filterSubmissionEnabledBindings(bindings, disabledAccountSet)
+	if len(activeBindings) == 0 {
+		return nil, fmt.Errorf("submission-disabled accounts cannot exclude every decision binding")
 	}
 	if params.Venue == "" {
 		return nil, fmt.Errorf("execution venue is required")
@@ -158,9 +178,12 @@ func New(params Params) (*Service, error) {
 		recorder:                     params.Recorder,
 		executor:                     params.Executor,
 		submitEnabled:                params.SubmitEnabled,
+		submissionDisabledAccounts:   disabledAccounts,
+		submissionDisabledAccountSet: disabledAccountSet,
 		entrySubmissionDisabled:      params.EntrySubmissionDisabled,
 		requireCompleteModelCoverage: params.RequireCompleteModelCoverage,
 		bindings:                     bindings,
+		activeBindings:               activeBindings,
 		venue:                        params.Venue,
 		predictionLookback:           params.PredictionLookback,
 		midPriceLookback:             params.MidPriceLookback,
@@ -169,7 +192,7 @@ func New(params Params) (*Service, error) {
 	}, nil
 }
 
-// Run 采集一次冻结决策快照并逐个隔离账户调用策略和提交订单。
+// Run 采集一次冻结决策快照，并只为未隔离的绑定调用策略和提交订单。
 func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResult, error) {
 	decisionAt = decisionAt.UTC()
 	if decisionAt.IsZero() || decisionAt.Unix()%int64(decisionInterval/time.Second) != 0 {
@@ -185,7 +208,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err := snapshot.Validate(decisionAt); err != nil {
 		return RunResult{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}
-	modelIDs := configuredPredictionModels(service.bindings)
+	modelIDs := configuredPredictionModels(service.activeBindings)
 	selectedPredictions, err := selectAvailablePredictions(
 		snapshot.Predictions, modelIDs, decisionAt.Add(-service.predictionLookback),
 	)
@@ -200,7 +223,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err != nil {
 		return RunResult{}, err
 	}
-	historyTargets, err := buildHistoryTargets(selectedPredictions, positionLots, service.bindings)
+	historyTargets, err := buildHistoryTargets(selectedPredictions, positionLots, service.activeBindings)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -229,6 +252,16 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	runErrors := make([]error, 0)
 	for _, binding := range service.bindings {
 		executionContext := binding.Context()
+		_, bindingSubmissionDisabled := service.submissionDisabledAccountSet[binding.ExecutionAccountID]
+		if bindingSubmissionDisabled {
+			result.Runs = append(result.Runs, BindingRunResult{
+				Context: executionContext, PredictionModelID: binding.PredictionModelID,
+				PredictionCount:        len(predictionsForBinding(selectedPredictions, binding)),
+				OrderSubmissionEnabled: false, AccountSubmissionDisabled: true,
+			})
+			continue
+		}
+		bindingSubmissionEnabled := service.submitEnabled
 		predictions := predictionsForBinding(selectedPredictions, binding)
 		var bindingCoverageErr error
 		if service.requireCompleteModelCoverage && len(predictions) == 0 {
@@ -241,7 +274,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		if selectErr != nil {
 			run := BindingRunResult{
 				Context: executionContext, PredictionModelID: binding.PredictionModelID,
-				PredictionCount: len(predictions), PositionCount: len(positions), Error: selectErr,
+				PredictionCount: len(predictions), PositionCount: len(positions),
+				OrderSubmissionEnabled: bindingSubmissionEnabled, Error: selectErr,
 			}
 			result.Runs = append(result.Runs, run)
 			runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
@@ -251,7 +285,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		if selectErr != nil {
 			run := BindingRunResult{
 				Context: executionContext, PredictionModelID: binding.PredictionModelID,
-				PredictionCount: len(predictions), PositionCount: len(positions), Error: selectErr,
+				PredictionCount: len(predictions), PositionCount: len(positions),
+				OrderSubmissionEnabled: bindingSubmissionEnabled, Error: selectErr,
 			}
 			result.Runs = append(result.Runs, run)
 			runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
@@ -263,7 +298,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 				selectErr = fmt.Errorf("capture mid-price histories: %w", historyCaptureErr)
 				run := BindingRunResult{
 					Context: executionContext, PredictionModelID: binding.PredictionModelID,
-					PredictionCount: len(predictions), PositionCount: len(positions), Error: selectErr,
+					PredictionCount: len(predictions), PositionCount: len(positions),
+					OrderSubmissionEnabled: bindingSubmissionEnabled, Error: selectErr,
 				}
 				result.Runs = append(result.Runs, run)
 				runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
@@ -273,7 +309,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			if selectErr != nil {
 				run := BindingRunResult{
 					Context: executionContext, PredictionModelID: binding.PredictionModelID,
-					PredictionCount: len(predictions), PositionCount: len(positions), Error: selectErr,
+					PredictionCount: len(predictions), PositionCount: len(positions),
+					OrderSubmissionEnabled: bindingSubmissionEnabled, Error: selectErr,
 				}
 				result.Runs = append(result.Runs, run)
 				runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
@@ -292,6 +329,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			predictions: predictions, positions: positions, books: bindingBooks, histories: bindingHistories,
 			allowEntries:     bindingCoverageErr == nil && !service.entrySubmissionDisabled,
 			entryBlockReason: entryBlockReason(bindingCoverageErr, service.entrySubmissionDisabled),
+			submitEnabled:    bindingSubmissionEnabled,
 		})
 		run.PredictionModelID = binding.PredictionModelID
 		run.Error = runErr
@@ -305,8 +343,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 
 // loadPositionLots 加载 Position Lots。
 func (service *Service) loadPositionLots(ctx context.Context, decisionAt time.Time) (map[string][]domain.StrategyPositionLot, error) {
-	result := make(map[string][]domain.StrategyPositionLot, len(service.bindings))
-	for _, binding := range service.bindings {
+	result := make(map[string][]domain.StrategyPositionLot, len(service.activeBindings))
+	for _, binding := range service.activeBindings {
 		lots, err := service.positionSource.ListOpenLots(ctx, binding.ExecutionAccountID)
 		if err != nil {
 			return nil, fmt.Errorf("load position lots for %s: %w", binding.ExecutionAccountID, err)
@@ -452,6 +490,7 @@ type runBindingParams struct {
 	histories            []domain.MidPriceHistory
 	allowEntries         bool
 	entryBlockReason     string
+	submitEnabled        bool
 }
 
 // runBinding 为单个绑定冻结输入、调用策略、持久化输出并提交订单意图。
@@ -469,6 +508,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	}).Build()
 	run := BindingRunResult{
 		Context: params.binding, PredictionCount: len(params.predictions), PositionCount: len(params.positions),
+		OrderSubmissionEnabled: params.submitEnabled,
 		EntrySubmissionEnabled: params.allowEntries, EntryBlockReason: params.entryBlockReason, Request: request,
 	}
 	if err != nil {
@@ -505,7 +545,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, err
 	}
-	response, _, err = service.recorder.ClaimOutput(ctx, response, intents, service.submitEnabled)
+	response, _, err = service.recorder.ClaimOutput(ctx, response, intents, params.submitEnabled)
 	run.Response = response
 	if err != nil {
 		return run, fmt.Errorf("record strategy output: %w", err)
@@ -514,7 +554,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, fmt.Errorf("validate recorded strategy output: %w", err)
 	}
-	if !service.submitEnabled {
+	if !params.submitEnabled {
 		run.Intents = make([]IntentResult, 0, len(intents))
 		for _, intent := range intents {
 			run.Intents = append(run.Intents, IntentResult{Intent: intent, SubmissionDisabled: true})
@@ -552,6 +592,9 @@ func (service *Service) RecoverPending(ctx context.Context) error {
 	if !service.submitEnabled {
 		return nil
 	}
+	if err := service.guardDisabledAccountRecovery(ctx); err != nil {
+		return err
+	}
 	return service.recoverDeliveries(ctx, service.now().UTC().Add(-service.deliveryStaleAge))
 }
 
@@ -563,7 +606,27 @@ func (service *Service) RecoverStartup(ctx context.Context) error {
 	if !service.submitEnabled {
 		return nil
 	}
+	if err := service.guardDisabledAccountRecovery(ctx); err != nil {
+		return err
+	}
 	return service.recoverDeliveries(ctx, service.now().UTC())
+}
+
+func (service *Service) guardDisabledAccountRecovery(ctx context.Context) error {
+	if len(service.submissionDisabledAccounts) == 0 {
+		return nil
+	}
+	count, err := service.recorder.CountUnresolvedIntentsForAccounts(ctx, service.submissionDisabledAccounts)
+	if err != nil {
+		return fmt.Errorf("check quarantined strategy intents: %w", err)
+	}
+	if count != 0 {
+		return fmt.Errorf(
+			"automatic submission is disabled for %d account(s), but %d unresolved intent(s) require operator disposition",
+			len(service.submissionDisabledAccounts), count,
+		)
+	}
+	return nil
 }
 
 func (service *Service) recoverDeliveries(ctx context.Context, cutoff time.Time) error {
@@ -700,6 +763,48 @@ func normalizeBindings(bindings []domain.StrategyExecutionBinding) ([]domain.Str
 		return result[i].ExecutionAccountID < result[j].ExecutionAccountID
 	})
 	return result, nil
+}
+
+func normalizeSubmissionDisabledAccounts(
+	bindings []domain.StrategyExecutionBinding,
+	accounts []string,
+) ([]string, map[string]struct{}, error) {
+	bound := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		bound[binding.ExecutionAccountID] = struct{}{}
+	}
+	result := make([]string, 0, len(accounts))
+	seen := make(map[string]struct{}, len(accounts))
+	for index, accountID := range accounts {
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			return nil, nil, fmt.Errorf("submission-disabled account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return nil, nil, fmt.Errorf("duplicate submission-disabled account %q", accountID)
+		}
+		if _, exists := bound[accountID]; !exists {
+			return nil, nil, fmt.Errorf("submission-disabled account %q is not a configured binding", accountID)
+		}
+		seen[accountID] = struct{}{}
+		result = append(result, accountID)
+	}
+	sort.Strings(result)
+	return result, seen, nil
+}
+
+func filterSubmissionEnabledBindings(
+	bindings []domain.StrategyExecutionBinding,
+	disabledAccounts map[string]struct{},
+) []domain.StrategyExecutionBinding {
+	result := make([]domain.StrategyExecutionBinding, 0, len(bindings))
+	for _, binding := range bindings {
+		if _, disabled := disabledAccounts[binding.ExecutionAccountID]; disabled {
+			continue
+		}
+		result = append(result, binding)
+	}
+	return result
 }
 
 // configuredPredictionModels 返回去重且稳定排序的上游模型身份。

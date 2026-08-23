@@ -69,6 +69,74 @@ func TestRunnerStartupSweepCoversEveryConfiguredAccount(t *testing.T) {
 	}
 }
 
+func TestRunnerQuarantineExcludesStartupAndSuppressesAutomaticTrigger(t *testing.T) {
+	service := &fakeAccountReconciler{}
+	runner, err := NewRunner(RunnerParams{
+		Service:             service,
+		Accounts:            []string{"wallet-1", "wallet-2", "wallet-4"},
+		QuarantinedAccounts: []string{"wallet-3"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := runner.Sweep(context.Background(), domain.ReconciliationTriggerStartup)
+	if len(result.Errors) != 0 || len(result.Runs) != 3 || len(service.calls) != 3 {
+		t.Fatalf("startup sweep = %#v, calls = %#v", result, service.calls)
+	}
+	for _, call := range service.calls {
+		if call.accountID == "wallet-3" {
+			t.Fatalf("quarantined account was reconciled: %#v", service.calls)
+		}
+	}
+	scheduled := runner.Sweep(context.Background(), domain.ReconciliationTriggerScheduled)
+	if len(scheduled.Errors) != 0 || len(scheduled.Runs) != 3 || len(service.calls) != 6 {
+		t.Fatalf("scheduled sweep = %#v, calls = %#v", scheduled, service.calls)
+	}
+	for _, call := range service.calls {
+		if call.accountID == "wallet-3" {
+			t.Fatalf("quarantined account was reconciled: %#v", service.calls)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	done := make(chan error, 1)
+	go func() { done <- runner.RunAfterStartupReady(ctx, ready) }()
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("active-account reconciliation loop did not become ready")
+	}
+	if err := runner.Check(context.Background()); err != nil {
+		cancel()
+		t.Fatalf("active-account readiness check: %v", err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunAfterStartupReady() error = %v, want context canceled", err)
+	}
+
+	runner.Trigger("wallet-3", domain.ReconciliationTriggerOrderUnknown, "order-quarantined")
+	if got := runner.SuppressedTriggerCount("wallet-3"); got != 1 {
+		t.Fatalf("suppressed trigger count = %d, want 1", got)
+	}
+	if len(runner.requests) != 0 {
+		t.Fatalf("quarantined trigger queue length = %d, want 0", len(runner.requests))
+	}
+}
+
+func TestRunnerRejectsAccountConfiguredAsActiveAndQuarantined(t *testing.T) {
+	_, err := NewRunner(RunnerParams{
+		Service:             &fakeAccountReconciler{},
+		Accounts:            []string{"wallet-1", "wallet-3"},
+		QuarantinedAccounts: []string{"wallet-3"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "both active and quarantined") {
+		t.Fatalf("NewRunner() error = %v, want overlap rejection", err)
+	}
+}
+
 // TestRunnerTriggerDoesNotBlockOrderPathWhenQueueIsFull 验证 Runner Trigger Does Not Block Order Path When Queue Is Full 场景下的行为。
 func TestRunnerTriggerDoesNotBlockOrderPathWhenQueueIsFull(t *testing.T) {
 	runner, err := NewRunner(RunnerParams{Service: &fakeAccountReconciler{}, Accounts: []string{"account-1"}})

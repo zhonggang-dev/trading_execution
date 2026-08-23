@@ -56,3 +56,36 @@ func TestLiveLedgerBootstrapPostgresIntegration(t *testing.T) {
 		t.Fatalf("inconsistent live ledger bootstrap error = %v", err)
 	}
 }
+
+func TestExecutionAccountQuarantineCheckerPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	insertAccount(t, db, "wallet-quarantined", "0xquarantined", "10", "10", "0")
+	if _, err := db.Exec(`
+		INSERT INTO execution_risk_controls (
+			execution_account_id, control_scope, control_key, paused, reason
+		) VALUES ('wallet-quarantined','ACCOUNT','',TRUE,'TEST_QUARANTINE')`); err != nil {
+		t.Fatal(err)
+	}
+	checker, err := NewExecutionAccountQuarantineChecker(db, []string{"wallet-quarantined"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.Check(context.Background()); err != nil {
+		t.Fatalf("paused quarantine check: %v", err)
+	}
+
+	if _, err := db.Exec(`
+		UPDATE execution_risk_controls
+		SET paused=FALSE, reason='TEST_UNPAUSED', version=version+1
+		WHERE execution_account_id='wallet-quarantined'
+		  AND control_scope='ACCOUNT' AND control_key=''`); err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "is not paused") {
+		t.Fatalf("unpaused quarantine check error = %v", err)
+	}
+}

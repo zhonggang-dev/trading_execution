@@ -274,6 +274,7 @@ class EnvironmentTests(unittest.TestCase):
             "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED": "false",
             "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "false",
             "DECISION_CYCLE_BINDINGS_JSON": json.dumps(VALID_BINDINGS),
+            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON": "[]",
             "POLYMARKET_ACCOUNTS_FILE": str(wallet_path),
             "TRADING_EXECUTION_DATABASE_URL": "postgres://user:secret@db/trading",
             "DECISION_CYCLE_PREDICTION_LOOKBACK": "3h",
@@ -288,6 +289,38 @@ class EnvironmentTests(unittest.TestCase):
                 self.environment(wallet_path), submission_state="disabled"
             )
         self.assertEqual(len(bindings), 4)
+
+    def test_accepts_bound_submission_disabled_account(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
+            )
+            environment = self.environment(wallet_path)
+            environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = (
+                '["wallet-3"]'
+            )
+            bindings = preflight.validate_environment(
+                environment, submission_state="disabled"
+            )
+        self.assertEqual(len(bindings), 4)
+
+    def test_rejects_invalid_submission_disabled_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
+            )
+            for value, message in (
+                ('["wallet-3","wallet-3"]', "duplicates"),
+                ('["wallet-missing"]', "unbound accounts"),
+            ):
+                environment = self.environment(wallet_path)
+                environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = value
+                with self.subTest(value=value), self.assertRaisesRegex(
+                    preflight.PreflightError, message
+                ):
+                    preflight.validate_environment(
+                        environment, submission_state="disabled"
+                    )
 
     def test_sell_only_preflight_requires_entry_submission_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -528,8 +561,42 @@ class DryRunEvidenceTests(unittest.TestCase):
             entry_submission_state="blocked",
         )
 
+    def validate_wallet3_quarantine(self) -> dict[str, object]:
+        return preflight.validate_dry_run_state(
+            self.state,
+            self.bindings,
+            submission_disabled_accounts=("wallet-3",),
+            not_before=self.now - dt.timedelta(minutes=20),
+            now=self.now,
+            max_age=dt.timedelta(minutes=30),
+        )
+
     def test_accepts_legacy_healthy_output_without_entry_policy(self) -> None:
         self.assertEqual(self.validate()["prediction_snapshot_id"], "snapshot-1")
+
+    def test_accepts_exact_three_active_rows_when_wallet3_is_quarantined(self) -> None:
+        self.state["dry_runs"][0]["bindings"] = [
+            row
+            for row in dry_run_rows()
+            if row["execution_account_id"] != "wallet-3"
+        ]
+        self.assertEqual(
+            self.validate_wallet3_quarantine()["prediction_snapshot_id"],
+            "snapshot-1",
+        )
+
+    def test_rejects_quarantined_wallet_row_in_dry_run(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "exactly 3 active"):
+            self.validate_wallet3_quarantine()
+
+    def test_rejects_missing_active_row_when_wallet3_is_quarantined(self) -> None:
+        self.state["dry_runs"][0]["bindings"] = [
+            row
+            for row in dry_run_rows()
+            if row["execution_account_id"] not in {"wallet-2", "wallet-3"}
+        ]
+        with self.assertRaisesRegex(preflight.PreflightError, "exactly 3 active"):
+            self.validate_wallet3_quarantine()
 
     def test_accepts_explicit_enabled_entry_policy(self) -> None:
         self.state["dry_runs"][0]["bindings"] = dry_run_rows(True, "")

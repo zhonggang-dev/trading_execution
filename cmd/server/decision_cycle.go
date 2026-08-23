@@ -73,6 +73,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		Recorder:                     recorder,
 		Executor:                     params.executor,
 		SubmitEnabled:                cycleConfig.OrderSubmissionEnabled,
+		SubmissionDisabledAccounts:   cycleConfig.SubmissionDisabledAccounts,
 		EntrySubmissionDisabled:      cycleConfig.EntrySubmissionDisabled,
 		RequireCompleteModelCoverage: cycleConfig.RequireCompleteModelCoverage,
 		Bindings:                     cycleConfig.Bindings,

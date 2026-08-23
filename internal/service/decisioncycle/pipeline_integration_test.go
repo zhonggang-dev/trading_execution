@@ -65,6 +65,25 @@ func (recorder *replayDecisionRecorder) ClaimOutput(_ context.Context, response 
 	return response, true, nil
 }
 
+func (recorder *replayDecisionRecorder) CountUnresolvedIntentsForAccounts(_ context.Context, executionAccountIDs []string) (int, error) {
+	accounts := make(map[string]struct{}, len(executionAccountIDs))
+	for _, accountID := range executionAccountIDs {
+		accounts[accountID] = struct{}{}
+	}
+	count := 0
+	for _, deliveries := range recorder.deliveries {
+		for _, delivery := range deliveries {
+			if delivery.Status != domain.DecisionIntentPending && delivery.Status != domain.DecisionIntentSubmitting {
+				continue
+			}
+			if _, disabled := accounts[delivery.Intent.ExecutionAccountID]; disabled {
+				count++
+			}
+		}
+	}
+	return count, nil
+}
+
 func (recorder *replayDecisionRecorder) ClaimPendingIntents(_ context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
 	result := make([]domain.DecisionIntentDelivery, 0)
 	for key, deliveries := range recorder.deliveries {

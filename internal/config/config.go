@@ -60,6 +60,10 @@ type LiveOperations struct {
 type DecisionCycle struct {
 	Enabled                bool
 	OrderSubmissionEnabled bool
+	// SubmissionDisabledAccounts keeps a configured binding in the four-wallet
+	// topology while excluding that account from automatic decision processing,
+	// reconciliation, and durable intent delivery.
+	SubmissionDisabledAccounts []string
 	// EntrySubmissionDisabled is an operator-owned sell-only gate. It blocks
 	// BUY intents without blocking validated exits from managed position lots.
 	EntrySubmissionDisabled      bool
@@ -461,6 +465,12 @@ func (config Config) Validate() error {
 		if err := validateDecisionBindings(config.DecisionCycle.Bindings); err != nil {
 			return err
 		}
+		if err := validateDecisionSubmissionDisabledAccounts(
+			config.DecisionCycle.Bindings,
+			config.DecisionCycle.SubmissionDisabledAccounts,
+		); err != nil {
+			return err
+		}
 		if config.DecisionCycle.OrderSubmissionEnabled {
 			if err := validateFourWalletSubmissionTopology(config.DecisionCycle.Bindings); err != nil {
 				return err
@@ -515,8 +525,15 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	submissionDisabledAccounts, err := decodeDecisionSubmissionDisabledAccounts(
+		os.Getenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"),
+	)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	return DecisionCycle{
 		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
+		SubmissionDisabledAccounts:   submissionDisabledAccounts,
 		EntrySubmissionDisabled:      entrySubmissionDisabled,
 		RequireCompleteModelCoverage: requireCompleteModelCoverage,
 		PredictionInfraBaseURL:       strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_URL")),
@@ -528,6 +545,26 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		PredictionLookback: predictionLookback, MidPriceLookback: midPriceLookback,
 		Bindings: bindings,
 	}, nil
+}
+
+func decodeDecisionSubmissionDisabledAccounts(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+	var accounts []string
+	if err := decoder.Decode(&accounts); err != nil {
+		return nil, fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON must contain exactly one JSON array")
+	}
+	for index := range accounts {
+		accounts[index] = strings.TrimSpace(accounts[index])
+	}
+	return accounts, nil
 }
 
 func decodeDecisionBindings(value string) ([]domain.StrategyExecutionBinding, error) {
@@ -578,6 +615,31 @@ func validateDecisionBindings(bindings []domain.StrategyExecutionBinding) error 
 		logicalModelSources[binding.ModelID] = binding.PredictionModelID
 		sourceModelTargets[binding.PredictionModelID] = binding.ModelID
 		bindings[index] = binding
+	}
+	return nil
+}
+
+func validateDecisionSubmissionDisabledAccounts(
+	bindings []domain.StrategyExecutionBinding,
+	accounts []string,
+) error {
+	bound := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		bound[binding.Normalize().ExecutionAccountID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(accounts))
+	for index, accountID := range accounts {
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			return fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON contains duplicate account %q", accountID)
+		}
+		if _, exists := bound[accountID]; !exists {
+			return fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON account %q is not a configured binding", accountID)
+		}
+		seen[accountID] = struct{}{}
 	}
 	return nil
 }

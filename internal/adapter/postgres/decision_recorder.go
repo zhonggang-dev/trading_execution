@@ -275,6 +275,42 @@ func verifyStoredDecisionIntents(ctx context.Context, tx *sql.Tx, cycleID string
 	return nil
 }
 
+// CountUnresolvedIntentsForAccounts prevents startup or cadence recovery from
+// reviving durable work for an operator-quarantined execution account.
+func (recorder *DecisionRecorder) CountUnresolvedIntentsForAccounts(
+	ctx context.Context,
+	executionAccountIDs []string,
+) (int, error) {
+	if len(executionAccountIDs) == 0 {
+		return 0, nil
+	}
+	placeholders := make([]string, len(executionAccountIDs))
+	args := make([]any, len(executionAccountIDs))
+	seen := make(map[string]struct{}, len(executionAccountIDs))
+	for index, accountID := range executionAccountIDs {
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			return 0, fmt.Errorf("quarantined execution account id is required")
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return 0, fmt.Errorf("duplicate quarantined execution account %q", accountID)
+		}
+		seen[accountID] = struct{}{}
+		placeholders[index] = fmt.Sprintf("$%d", index+1)
+		args[index] = accountID
+	}
+	query := fmt.Sprintf(`
+		SELECT count(*)
+		FROM strategy_order_intent_deliveries
+		WHERE status IN ('PENDING','SUBMITTING')
+			AND intent_payload->>'execution_account_id' IN (%s)`, strings.Join(placeholders, ","))
+	var count int
+	if err := recorder.db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count unresolved quarantined strategy intents: %w", err)
+	}
+	return count, nil
+}
+
 // ClaimPendingIntents atomically claims a bounded batch with SKIP LOCKED so
 // concurrent workers cannot submit the same row.
 func (recorder *DecisionRecorder) ClaimPendingIntents(ctx context.Context, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {

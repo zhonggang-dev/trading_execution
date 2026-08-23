@@ -43,6 +43,7 @@ TRADING_RUNTIME_KEYS = frozenset(
         "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
         "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",
         "DECISION_CYCLE_BINDINGS_JSON",
+        "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
         "POLYMARKET_ACCOUNTS_FILE",
         "DECISION_CYCLE_PREDICTION_INFRA_URL",
         "DECISION_CYCLE_PREDICTION_LOOKBACK",
@@ -278,6 +279,42 @@ def decode_bindings(payload: str) -> tuple[Binding, ...]:
     return validate_topology(bindings)
 
 
+def decode_submission_disabled_accounts(
+    payload: str, bindings: tuple[Binding, ...]
+) -> tuple[str, ...]:
+    try:
+        raw = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise PreflightError(
+            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON is invalid JSON: "
+            f"{error.msg}"
+        ) from error
+    if not isinstance(raw, list):
+        raise PreflightError(
+            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON must be one JSON array"
+        )
+    accounts: list[str] = []
+    for index, value in enumerate(raw):
+        if not isinstance(value, str) or not value.strip():
+            raise PreflightError(
+                "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON "
+                f"account {index} is empty or non-string"
+            )
+        accounts.append(value.strip())
+    if len(set(accounts)) != len(accounts):
+        raise PreflightError(
+            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON contains duplicates"
+        )
+    bound_accounts = {binding.execution_account_id for binding in bindings}
+    unknown = set(accounts) - bound_accounts
+    if unknown:
+        raise PreflightError(
+            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON contains unbound accounts: "
+            f"{sorted(unknown)}"
+        )
+    return tuple(sorted(accounts))
+
+
 def validate_topology(bindings: list[Binding] | tuple[Binding, ...]) -> tuple[Binding, ...]:
     normalized = tuple(sorted(bindings))
     accounts = {binding.execution_account_id for binding in normalized}
@@ -434,6 +471,10 @@ def validate_environment(
             submission_state == "enabled",
         )
     bindings = decode_bindings(environment.get("DECISION_CYCLE_BINDINGS_JSON", ""))
+    decode_submission_disabled_accounts(
+        environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
+        bindings,
+    )
     wallet_path = environment.get("POLYMARKET_ACCOUNTS_FILE", "").strip()
     if not wallet_path:
         raise PreflightError("POLYMARKET_ACCOUNTS_FILE is required")
@@ -937,6 +978,7 @@ def validate_dry_run_state(
     state: object,
     bindings: tuple[Binding, ...],
     *,
+    submission_disabled_accounts: tuple[str, ...] = (),
     not_before: dt.datetime,
     now: dt.datetime,
     max_age: dt.timedelta,
@@ -984,10 +1026,22 @@ def validate_dry_run_state(
     snapshot_id = selected.get("prediction_snapshot_id")
     if not isinstance(snapshot_id, str) or not snapshot_id.strip():
         raise PreflightError("dry-run prediction_snapshot_id is missing")
+    disabled = set(submission_disabled_accounts)
+    configured_accounts = {binding.execution_account_id for binding in bindings}
+    if not disabled <= configured_accounts:
+        raise PreflightError("dry-run quarantine contains an unbound execution account")
+    expected = {
+        binding.authorization
+        for binding in bindings
+        if binding.execution_account_id not in disabled
+    }
+    if not expected:
+        raise PreflightError("submission-disabled accounts cannot exclude every dry-run binding")
     rows = selected.get("bindings")
-    if not isinstance(rows, list) or len(rows) != 4:
-        raise PreflightError("latest dry run must contain exactly 4 binding rows")
-    expected = {binding.authorization for binding in bindings}
+    if not isinstance(rows, list) or len(rows) != len(expected):
+        raise PreflightError(
+            f"latest dry run must contain exactly {len(expected)} active binding rows"
+        )
     actual: set[tuple[str, str, str]] = set()
     for row in rows:
         if not isinstance(row, dict):
@@ -2069,6 +2123,10 @@ def main(argv: list[str] | None = None) -> int:
             submission_state=args.submission_state,
             entry_submission_state=args.entry_submission_state,
         )
+        submission_disabled_accounts = decode_submission_disabled_accounts(
+            environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
+            bindings,
+        )
         wallet_path = pathlib.Path(environment["POLYMARKET_ACCOUNTS_FILE"])
         wallet_file_sha = hashlib.sha256(
             _read_bounded_regular_file(wallet_path, "wallet")
@@ -2142,6 +2200,7 @@ def main(argv: list[str] | None = None) -> int:
         dry_run = validate_dry_run_state(
             state,
             bindings,
+            submission_disabled_accounts=submission_disabled_accounts,
             not_before=(
                 process_started_at
                 if args.submission_state == "disabled"
@@ -2287,6 +2346,7 @@ def main(argv: list[str] | None = None) -> int:
             final_dry_run = validate_dry_run_state(
                 final_state,
                 bindings,
+                submission_disabled_accounts=submission_disabled_accounts,
                 not_before=final_dry_run_now - dry_run_age,
                 now=final_dry_run_now,
                 max_age=dry_run_age,

@@ -99,6 +99,53 @@ func TestLoadAcceptsExplicitLiveDecisionSubmission(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsBoundDecisionSubmissionDisabledAccount(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
+	]`)
+	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[" wallet-3 "]`)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(config.DecisionCycle.SubmissionDisabledAccounts) != 1 ||
+		config.DecisionCycle.SubmissionDisabledAccounts[0] != "wallet-3" {
+		t.Fatalf("submission-disabled accounts = %#v", config.DecisionCycle.SubmissionDisabledAccounts)
+	}
+}
+
+func TestLoadRejectsInvalidDecisionSubmissionDisabledAccounts(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "not array", value: `"wallet-3"`, want: "cannot unmarshal"},
+		{name: "trailing value", value: `["account-a"] []`, want: "exactly one JSON array"},
+		{name: "empty", value: `[" "]`, want: "account 0 is empty"},
+		{name: "duplicate", value: `["account-a","account-a"]`, want: "duplicate account"},
+		{name: "unbound", value: `["wallet-3"]`, want: "not a configured binding"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", test.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadAcceptsSellOnlyDecisionSubmission(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -300,7 +347,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"DECISION_CYCLE_STRATEGY_URL", "DECISION_CYCLE_STRATEGY_TOKEN",
 		"DECISION_CYCLE_INTERVAL", "DECISION_CYCLE_STARTUP_DELAY", "DECISION_CYCLE_MAX_START_LATENESS", "DECISION_CYCLE_TIMEOUT",
 		"DECISION_CYCLE_PREDICTION_LOOKBACK", "DECISION_CYCLE_MID_PRICE_LOOKBACK",
-		"DECISION_CYCLE_BINDINGS_JSON",
+		"DECISION_CYCLE_BINDINGS_JSON", "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
 	} {
 		t.Setenv(key, "")
 	}

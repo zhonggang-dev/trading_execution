@@ -25,6 +25,11 @@ type fakePositionSource struct {
 
 type accountPositionSource map[string][]domain.PositionLot
 
+type quarantinePositionSource struct {
+	calls           []string
+	rejectedAccount string
+}
+
 // ListOpenLots 返回模拟数据源中的测试列表。
 func (source fakePositionSource) ListOpenLots(context.Context, string) ([]domain.PositionLot, error) {
 	return source.lots, nil
@@ -32,6 +37,14 @@ func (source fakePositionSource) ListOpenLots(context.Context, string) ([]domain
 
 func (source accountPositionSource) ListOpenLots(_ context.Context, executionAccountID string) ([]domain.PositionLot, error) {
 	return source[executionAccountID], nil
+}
+
+func (source *quarantinePositionSource) ListOpenLots(_ context.Context, executionAccountID string) ([]domain.PositionLot, error) {
+	source.calls = append(source.calls, executionAccountID)
+	if executionAccountID == source.rejectedAccount {
+		return nil, fmt.Errorf("quarantined account must not be queried")
+	}
+	return nil, nil
 }
 
 // Snapshot 返回模拟预测快照。
@@ -139,13 +152,15 @@ func (strategy *fakeStrategy) Decide(_ context.Context, request domain.StrategyD
 
 // fakeRecorder 表示后端使用的 fakeRecorder 类型。
 type fakeRecorder struct {
-	inputRecorded  bool
-	outputRecorded bool
-	inputError     error
-	deliveries     []domain.DecisionIntentDelivery
-	requeueCalls   int
-	claimedOutputs []domain.StrategyDecisionResponse
-	claimedIntents []domain.OrderIntent
+	inputRecorded            bool
+	outputRecorded           bool
+	inputError               error
+	deliveries               []domain.DecisionIntentDelivery
+	requeueCalls             int
+	claimedOutputs           []domain.StrategyDecisionResponse
+	claimedIntents           []domain.OrderIntent
+	claimedSubmissionEnabled []bool
+	unresolvedCountError     error
 }
 
 // ClaimInput 模拟幂等认领并保存测试数据。
@@ -159,6 +174,7 @@ func (recorder *fakeRecorder) ClaimOutput(_ context.Context, response domain.Str
 	recorder.outputRecorded = true
 	recorder.claimedOutputs = append(recorder.claimedOutputs, response)
 	recorder.claimedIntents = append(recorder.claimedIntents, intents...)
+	recorder.claimedSubmissionEnabled = append(recorder.claimedSubmissionEnabled, submissionEnabled)
 	if submissionEnabled && recorder.deliveries == nil {
 		recorder.deliveries = make([]domain.DecisionIntentDelivery, len(intents))
 		for index, intent := range intents {
@@ -169,6 +185,26 @@ func (recorder *fakeRecorder) ClaimOutput(_ context.Context, response domain.Str
 		}
 	}
 	return response, true, nil
+}
+
+func (recorder *fakeRecorder) CountUnresolvedIntentsForAccounts(_ context.Context, executionAccountIDs []string) (int, error) {
+	if recorder.unresolvedCountError != nil {
+		return 0, recorder.unresolvedCountError
+	}
+	accounts := make(map[string]struct{}, len(executionAccountIDs))
+	for _, accountID := range executionAccountIDs {
+		accounts[accountID] = struct{}{}
+	}
+	count := 0
+	for _, delivery := range recorder.deliveries {
+		if delivery.Status != domain.DecisionIntentPending && delivery.Status != domain.DecisionIntentSubmitting {
+			continue
+		}
+		if _, disabled := accounts[delivery.Intent.ExecutionAccountID]; disabled {
+			count++
+		}
+	}
+	return count, nil
 }
 
 type coverageBuyExitStrategy struct {
@@ -414,6 +450,103 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		!intent.MarketSnapshotAt.Equal(bookSource.books[0].SourceAt) || intent.SignalAt == nil ||
 		!intent.SignalAt.Equal(strategy.response.DecidedAt) || intent.WorstPrice != "0.50" {
 		t.Fatalf("execution market context = %#v", intent)
+	}
+}
+
+func TestRunSkipsQuarantinedBindingWhileOtherBindingSubmits(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	books := make([]domain.OrderBookSnapshot, 0, len(prediction.Outcomes))
+	histories := make([]domain.MidPriceHistory, 0, len(prediction.Outcomes))
+	for _, outcome := range prediction.Outcomes {
+		books = append(books, domain.OrderBookSnapshot{
+			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, Status: domain.OrderBookStatusOK,
+			SourceAt: decisionAt, ObservedAt: decisionAt.Add(time.Second),
+			DepthLimit: domain.StrategyOrderBookDepth, MinOrderSize: "1",
+			Bids: []domain.PriceLevel{{Price: "0.48", Size: "20"}},
+			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
+		})
+		histories = append(histories, validMidPriceHistory(prediction, outcome.Index, decisionAt))
+	}
+	strategy := &fakeStrategy{response: domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion,
+		DecidedAt:     decisionAt.Add(2 * time.Second),
+		Evaluations: []domain.StrategyEvaluation{
+			{
+				DecisionID: "decision-submit", PredictionID: prediction.PredictionID,
+				MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+				OutcomeIndex: 0, TokenID: prediction.Outcomes[0].TokenID,
+				Action: domain.StrategyActionSubmit, ReasonCode: domain.StrategyReasonEntrySignal,
+				Evidence: domain.StrategyEvidence{Probability: 0.7, Edge: "0.20", Metrics: map[string]string{
+					"best_ask": "0.50", "near_logdiff_usd": "1.2", "rel_spread": "0.04",
+					"MOM": "0.01", "MACD_SIGNAL": "0.02",
+				}},
+				Order: &domain.StrategyOrderParams{
+					Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.50",
+					Size: "5", TimeInForce: domain.TimeInForceFOK,
+				},
+			},
+			{
+				DecisionID: "decision-skip", PredictionID: prediction.PredictionID,
+				MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+				OutcomeIndex: 1, TokenID: prediction.Outcomes[1].TokenID,
+				Action: domain.StrategyActionSkip, ReasonCode: domain.StrategyReasonInvalidBook,
+				Evidence: domain.StrategyEvidence{Probability: 0.3},
+			},
+		},
+	}}
+	recorder := &fakeRecorder{}
+	executor := &fakeExecutor{}
+	positionSource := &quarantinePositionSource{rejectedAccount: "account-quarantined"}
+	midPriceSource := &fakeMidPriceHistorySource{histories: histories}
+	service, err := New(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "snapshot-quarantine",
+			DecisionAt: decisionAt, GeneratedAt: decisionAt.Add(time.Second),
+			Predictions: []domain.Prediction{prediction},
+			ExpectedPredictions: []domain.PredictionExpectation{
+				completedPredictionExpectation(prediction, 1, 1),
+			},
+		}},
+		PositionSource: positionSource, OrderBookSource: &fakeOrderBookSource{books: books},
+		MidPriceSource: midPriceSource, Strategy: strategy,
+		Recorder: recorder, Executor: executor, SubmitEnabled: true,
+		SubmissionDisabledAccounts:   []string{"account-quarantined"},
+		RequireCompleteModelCoverage: true,
+		Bindings: []domain.StrategyExecutionBinding{
+			{PredictionModelID: prediction.Model.Name, ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-active"},
+			{PredictionModelID: prediction.Model.Name, ModelID: "test", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "account-quarantined"},
+		},
+		Venue: "polymarket-paper", Now: func() time.Time { return decisionAt.Add(5 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, runErr := service.Run(context.Background(), decisionAt)
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
+	}
+	if len(result.Runs) != 2 || len(recorder.claimedOutputs) != 1 ||
+		len(recorder.claimedSubmissionEnabled) != 1 {
+		t.Fatalf("runs/outputs/modes = %d/%d/%#v", len(result.Runs), len(recorder.claimedOutputs), recorder.claimedSubmissionEnabled)
+	}
+	if !result.Runs[0].OrderSubmissionEnabled || result.Runs[0].AccountSubmissionDisabled ||
+		result.Runs[1].OrderSubmissionEnabled || !result.Runs[1].AccountSubmissionDisabled ||
+		!recorder.claimedSubmissionEnabled[0] {
+		t.Fatalf("binding submission modes = %#v / %#v", result.Runs, recorder.claimedSubmissionEnabled)
+	}
+	if len(executor.intents) != 1 || executor.intents[0].ExecutionAccountID != "account-active" ||
+		len(recorder.deliveries) != 1 || recorder.deliveries[0].Intent.ExecutionAccountID != "account-active" {
+		t.Fatalf("executed=%#v deliveries=%#v, want active binding only", executor.intents, recorder.deliveries)
+	}
+	if len(result.Runs[1].Intents) != 0 || result.Runs[1].Error != nil ||
+		result.Runs[1].Request.CycleID != "" || result.Runs[1].Response.CycleID != "" {
+		t.Fatalf("quarantined run = %#v, want skipped binding and no error", result.Runs[1])
+	}
+	if len(positionSource.calls) != 1 || positionSource.calls[0] != "account-active" ||
+		strategy.request.Context.ExecutionAccountID != "account-active" || midPriceSource.calls != 0 {
+		t.Fatalf("quarantined dependencies were called: positions=%#v strategy=%#v history_calls=%d", positionSource.calls, strategy.request.Context, midPriceSource.calls)
 	}
 }
 
@@ -1370,6 +1503,27 @@ func TestNewRejectsSubmissionWithoutCompleteModelCoverage(t *testing.T) {
 	}
 }
 
+func TestNewRejectsQuarantiningEveryBinding(t *testing.T) {
+	binding := testExecutionBinding()
+	_, err := New(Params{
+		PredictionSource:             fakePredictionSource{},
+		PositionSource:               fakePositionSource{},
+		OrderBookSource:              &fakeOrderBookSource{},
+		MidPriceSource:               &fakeMidPriceHistorySource{},
+		Strategy:                     &fakeStrategy{},
+		Recorder:                     &fakeRecorder{},
+		Executor:                     &fakeExecutor{},
+		SubmitEnabled:                true,
+		SubmissionDisabledAccounts:   []string{binding.ExecutionAccountID},
+		RequireCompleteModelCoverage: true,
+		Bindings:                     []domain.StrategyExecutionBinding{binding},
+		Venue:                        "polymarket-paper",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot exclude every decision binding") {
+		t.Fatalf("New() error = %v", err)
+	}
+}
+
 // TestRunRejectsNonBoundaryTime 验证 Run Rejects Non Boundary Time 场景下的行为。
 func TestRunRejectsNonBoundaryTime(t *testing.T) {
 	service, err := New(Params{
@@ -1683,6 +1837,37 @@ func TestRecoverStartupDrainsMoreThanOneClaimBatchBeforeNewSchedule(t *testing.T
 		if delivery.Status != domain.DecisionIntentSubmitted {
 			t.Fatalf("delivery %q status = %s", delivery.ClientOrderID, delivery.Status)
 		}
+	}
+}
+
+func TestRecoverStartupFailsClosedForUnresolvedQuarantinedDelivery(t *testing.T) {
+	recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{
+		{
+			CycleID: "old-active", ClientOrderID: "active-pending",
+			Intent: domain.OrderIntent{ClientOrderID: "active-pending", ExecutionAccountID: "account-active"},
+			Status: domain.DecisionIntentPending,
+		},
+		{
+			CycleID: "old-quarantined", ClientOrderID: "quarantined-pending",
+			Intent: domain.OrderIntent{ClientOrderID: "quarantined-pending", ExecutionAccountID: "account-quarantined"},
+			Status: domain.DecisionIntentPending,
+		},
+	}}
+	executor := &fakeExecutor{}
+	service := &Service{
+		recorder: recorder, executor: executor, submitEnabled: true,
+		submissionDisabledAccounts:   []string{"account-quarantined"},
+		submissionDisabledAccountSet: map[string]struct{}{"account-quarantined": {}},
+		now:                          func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
+	}
+	err := service.RecoverStartup(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unresolved intent") {
+		t.Fatalf("RecoverStartup() error = %v, want quarantined intent rejection", err)
+	}
+	if len(executor.intents) != 0 || recorder.requeueCalls != 0 ||
+		recorder.deliveries[0].Status != domain.DecisionIntentPending ||
+		recorder.deliveries[1].Status != domain.DecisionIntentPending {
+		t.Fatalf("fail-closed recovery mutated or submitted work: executor=%#v recorder=%#v", executor.intents, recorder)
 	}
 }
 

@@ -15,6 +15,74 @@ type ExpectedExecutionAccount struct {
 	WalletAddress      string
 }
 
+// ExecutionAccountQuarantineChecker verifies that every account excluded from
+// automatic reconciliation is still protected by the durable ACCOUNT pause.
+// The check is intentionally read-only and is safe to call from readiness and
+// the placement gate.
+type ExecutionAccountQuarantineChecker struct {
+	db       *sql.DB
+	accounts []string
+}
+
+// NewExecutionAccountQuarantineChecker creates the dynamic half of account
+// quarantine. Configuration disables decision submission and automatic
+// reconciliation; this checker requires the independent database pause to
+// remain armed for the whole process lifetime.
+func NewExecutionAccountQuarantineChecker(
+	db *sql.DB,
+	accountIDs []string,
+) (*ExecutionAccountQuarantineChecker, error) {
+	if db == nil {
+		return nil, fmt.Errorf("postgres database is required")
+	}
+	seen := make(map[string]struct{}, len(accountIDs))
+	accounts := make([]string, 0, len(accountIDs))
+	for index, raw := range accountIDs {
+		accountID := strings.TrimSpace(raw)
+		if accountID == "" {
+			return nil, fmt.Errorf("quarantined execution account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return nil, fmt.Errorf("quarantined execution account %q is duplicated", accountID)
+		}
+		seen[accountID] = struct{}{}
+		accounts = append(accounts, accountID)
+	}
+	if len(accounts) == 0 {
+		return nil, fmt.Errorf("at least one quarantined execution account is required")
+	}
+	return &ExecutionAccountQuarantineChecker{db: db, accounts: accounts}, nil
+}
+
+// Check fails closed if a quarantined account loses or disables its ACCOUNT
+// pause. It never mutates controls, orders, reservations, runs, or issues.
+func (checker *ExecutionAccountQuarantineChecker) Check(ctx context.Context) error {
+	if checker == nil || checker.db == nil || len(checker.accounts) == 0 {
+		return fmt.Errorf("execution account quarantine checker is not configured")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, accountID := range checker.accounts {
+		var paused bool
+		err := checker.db.QueryRowContext(ctx, `
+			SELECT paused
+			FROM execution_risk_controls
+			WHERE execution_account_id=$1
+			  AND control_scope='ACCOUNT' AND control_key=''`, accountID).Scan(&paused)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("quarantined execution account %q has no ACCOUNT risk control", accountID)
+		}
+		if err != nil {
+			return fmt.Errorf("read quarantined execution account %q ACCOUNT risk control: %w", accountID, err)
+		}
+		if !paused {
+			return fmt.Errorf("quarantined execution account %q ACCOUNT risk control is not paused", accountID)
+		}
+	}
+	return nil
+}
+
 // CheckLiveAccountBindings fails closed when a configured wallet is missing,
 // attached to another account, or still denominated in the legacy collateral.
 func CheckLiveAccountBindings(
