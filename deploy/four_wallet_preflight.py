@@ -26,6 +26,7 @@ import sys
 import tempfile
 import urllib.parse
 import urllib.request
+from decimal import Decimal, InvalidOperation
 
 
 EXPECTED_STRATEGIES = frozenset({"multfactor_v1", "multfactor_v2"})
@@ -602,17 +603,18 @@ def _explicit_boolean(environment: dict[str, str], key: str) -> None:
 
 def _required_static_decimal(
     environment: dict[str, str], key: str, *, allow_zero: bool = False
-) -> None:
+) -> Decimal:
     value = environment.get(key, "").strip()
     if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value):
         raise PreflightError(f"{key} must be an explicit base-10 decimal")
     try:
-        parsed = float(value)
-    except ValueError as error:
+        parsed = Decimal(value)
+    except InvalidOperation as error:
         raise PreflightError(f"{key} must be an explicit base-10 decimal") from error
-    if not math.isfinite(parsed) or parsed < 0 or (parsed == 0 and not allow_zero):
+    if not parsed.is_finite() or parsed < 0 or (parsed == 0 and not allow_zero):
         qualifier = "non-negative" if allow_zero else "positive"
         raise PreflightError(f"{key} must be an explicit {qualifier} base-10 decimal")
+    return parsed
 
 
 def validate_environment(
@@ -621,10 +623,10 @@ def validate_environment(
     _required_boolean(environment, "EXECUTION_ALLOW_MARKET_ORDERS", False)
     _required_static_decimal(environment, "EXECUTION_MAX_ORDER_SIZE")
     _required_static_decimal(environment, "EXECUTION_MAX_ORDER_NOTIONAL")
-    _required_static_decimal(
+    max_buy_fee_rate_bps = _required_static_decimal(
         environment, "POLYMARKET_MAX_BUY_FEE_RATE_BPS", allow_zero=True
     )
-    if float(environment["POLYMARKET_MAX_BUY_FEE_RATE_BPS"].strip()) > 10_000:
+    if max_buy_fee_rate_bps > Decimal(10_000):
         raise PreflightError("POLYMARKET_MAX_BUY_FEE_RATE_BPS must not exceed 10000")
     confirmations = environment.get("POLYGON_ORDER_FILLED_CONFIRMATIONS", "").strip()
     if not re.fullmatch(r"[+-]?\d+", confirmations):

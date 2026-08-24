@@ -720,6 +720,20 @@ class EnvironmentTests(unittest.TestCase):
                     environment, submission_state="disabled"
                 )
 
+    def test_static_decimal_validation_is_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
+            )
+            environment = self.environment(wallet_path)
+            environment["POLYMARKET_MAX_BUY_FEE_RATE_BPS"] = "10000.0000000000000001"
+            with self.assertRaisesRegex(preflight.PreflightError, "must not exceed 10000"):
+                preflight.validate_environment(environment, submission_state="disabled")
+
+            environment = self.environment(wallet_path)
+            environment["EXECUTION_MAX_ORDER_SIZE"] = "0.0000000000000001"
+            preflight.validate_environment(environment, submission_state="disabled")
+
     def test_rejects_wallet_subset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wallet_path = self.write_wallet_file(pathlib.Path(temporary), ["wallet-6"])
