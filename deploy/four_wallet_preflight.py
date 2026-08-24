@@ -1564,22 +1564,132 @@ def validate_dry_run_state(
     }
 
 
-def _expectation_recency(item: dict[str, object]) -> tuple[dt.datetime, dt.datetime, int, int, str]:
-    try:
-        selection_run_id = int(item["selection_run_id"])
-        selection_id = int(item["selection_id"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise PreflightError("snapshot manifest contains invalid selection identity") from error
-    prediction_id = item.get("prediction_id")
-    if not isinstance(prediction_id, str) or not prediction_id.strip():
-        raise PreflightError("snapshot manifest contains an invalid prediction_id")
-    return (
-        _utc_timestamp(item.get("prediction_as_of"), "manifest prediction_as_of"),
-        _utc_timestamp(item.get("task_available_at"), "manifest task_available_at"),
-        selection_run_id,
-        selection_id,
-        prediction_id,
+def _snapshot_expectation(
+    item: object, decision_at: dt.datetime
+) -> dict[str, object]:
+    if not isinstance(item, dict):
+        raise PreflightError("Prediction snapshot manifest contains an invalid task")
+
+    def required_string(field: str) -> str:
+        value = item.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise PreflightError(
+                f"Prediction snapshot manifest has an invalid {field}"
+            )
+        return value
+
+    prediction_id = required_string("prediction_id")
+    source_job_id = required_string("source_job_id")
+    prediction_model_id = required_string("prediction_model_id").strip()
+    market_id = required_string("market_id").strip()
+    condition_id = required_string("condition_id").strip()
+    selection_id = item.get("selection_id")
+    selection_run_id = item.get("selection_run_id")
+    if (
+        type(selection_id) is not int
+        or selection_id < 1
+        or type(selection_run_id) is not int
+        or selection_run_id < 1
+    ):
+        raise PreflightError(
+            "Prediction snapshot manifest contains invalid selection identity"
+        )
+
+    outcomes = item.get("outcomes")
+    if not isinstance(outcomes, list) or len(outcomes) != 2:
+        raise PreflightError(
+            "Prediction snapshot manifest task must contain exactly two outcomes"
+        )
+    outcome_identity: list[tuple[int, str, str]] = []
+    token_ids: set[str] = set()
+    for index, outcome in enumerate(outcomes):
+        if (
+            not isinstance(outcome, dict)
+            or type(outcome.get("index")) is not int
+            or outcome.get("index") != index
+        ):
+            raise PreflightError(
+                f"Prediction snapshot manifest outcome {index} has an invalid index"
+            )
+        name = outcome.get("name")
+        token_id = outcome.get("token_id")
+        if not isinstance(name, str) or not name.strip():
+            raise PreflightError(
+                f"Prediction snapshot manifest outcome {index} has an invalid name"
+            )
+        if not isinstance(token_id, str) or not token_id.strip():
+            raise PreflightError(
+                f"Prediction snapshot manifest outcome {index} has an invalid token_id"
+            )
+        normalized_token_id = token_id.strip()
+        if normalized_token_id in token_ids:
+            raise PreflightError(
+                "Prediction snapshot manifest task contains duplicate token ids"
+            )
+        token_ids.add(normalized_token_id)
+        outcome_identity.append((index, name.strip(), normalized_token_id))
+
+    prediction_as_of = _utc_timestamp(
+        item.get("prediction_as_of"), "manifest prediction_as_of"
     )
+    task_available_at = _utc_timestamp(
+        item.get("task_available_at"), "manifest task_available_at"
+    )
+    if prediction_as_of > decision_at or task_available_at > decision_at:
+        raise PreflightError("Prediction snapshot manifest task is not PIT-visible")
+    if task_available_at < prediction_as_of:
+        raise PreflightError(
+            "Prediction snapshot manifest task is available before prediction_as_of"
+        )
+
+    status = item.get("status")
+    result_available_at: dt.datetime | None = None
+    if status == "PENDING":
+        if item.get("result_available_at") is not None:
+            raise PreflightError(
+                "PENDING Prediction snapshot manifest task must not have result_available_at"
+            )
+    elif status == "COMPLETED":
+        result_available_at = _utc_timestamp(
+            item.get("result_available_at"), "manifest result_available_at"
+        )
+        if result_available_at > decision_at:
+            raise PreflightError(
+                "COMPLETED Prediction snapshot manifest task is not PIT-visible"
+            )
+        if result_available_at < task_available_at:
+            raise PreflightError(
+                "Prediction snapshot manifest result is available before its task"
+            )
+    else:
+        raise PreflightError(
+            f"Prediction snapshot manifest has invalid status {status!r}"
+        )
+
+    return {
+        "raw": item,
+        "prediction_id": prediction_id,
+        # Direct Prediction task identity is immutable and exact. Unlike the
+        # human-readable market fields, whitespace is not normalized here.
+        "source_job_id": source_job_id,
+        "prediction_model_id": prediction_model_id,
+        "selection_id": selection_id,
+        "selection_run_id": selection_run_id,
+        "market_id": market_id,
+        "condition_id": condition_id,
+        "outcome_identity": tuple(outcome_identity),
+        "prediction_as_of": prediction_as_of,
+        "task_available_at": task_available_at,
+        "status": status,
+        "result_available_at": result_available_at,
+        "recency": (
+            prediction_as_of,
+            task_available_at,
+            selection_run_id,
+            selection_id,
+            prediction_id,
+        ),
+    }
 
 
 def _snapshot_prediction(
@@ -1632,7 +1742,11 @@ def _snapshot_prediction(
     token_ids: set[str] = set()
     probability_sum = 0.0
     for index, outcome in enumerate(outcomes):
-        if not isinstance(outcome, dict) or outcome.get("index") != index:
+        if (
+            not isinstance(outcome, dict)
+            or type(outcome.get("index")) is not int
+            or outcome.get("index") != index
+        ):
             raise PreflightError(
                 f"Prediction snapshot result outcome {index} has an invalid index"
             )
@@ -1647,9 +1761,10 @@ def _snapshot_prediction(
             raise PreflightError(
                 f"Prediction snapshot result outcome {index} has an invalid token_id"
             )
-        if token_id in token_ids:
+        normalized_token_id = token_id.strip()
+        if normalized_token_id in token_ids:
             raise PreflightError("Prediction snapshot result contains duplicate token ids")
-        token_ids.add(token_id)
+        token_ids.add(normalized_token_id)
         if (
             isinstance(probability, bool)
             or not isinstance(probability, (int, float))
@@ -1706,6 +1821,7 @@ def _snapshot_prediction(
     return {
         "raw": item,
         "prediction_id": prediction_id,
+        "source_job_id": item.get("source_job_id", ""),
         "market_id": market_id.strip(),
         "condition_id": condition_id.strip(),
         "model_id": model_name.strip(),
@@ -1714,6 +1830,14 @@ def _snapshot_prediction(
         "completed_at": completed_at,
         "available_at": available_at,
         "payload_identity": payload_identity,
+        "outcome_identity": tuple(
+            (
+                int(outcome["index"]),
+                str(outcome["name"]).strip(),
+                str(outcome["token_id"]).strip(),
+            )
+            for outcome in canonical_outcomes
+        ),
         "identity": (
             condition_id.strip(),
             neg_risk,
@@ -1839,25 +1963,47 @@ def validate_snapshot_manifest(
     }
     latest: dict[tuple[str, str], dict[str, object]] = {}
     latest_recency: dict[tuple[str, str], tuple[dt.datetime, dt.datetime, int, int, str]] = {}
+    seen_expectation_predictions: set[str] = set()
+    seen_expectation_jobs: set[str] = set()
+    seen_expectation_dimensions: set[tuple[int, str, str, dt.datetime]] = set()
     for item in expectations:
-        if not isinstance(item, dict):
-            raise PreflightError("Prediction snapshot manifest contains an invalid task")
-        model_id = item.get("prediction_model_id")
+        expectation = _snapshot_expectation(item, snapshot_decision_at)
+        prediction_id = str(expectation["prediction_id"])
+        source_job_id = str(expectation["source_job_id"])
+        if prediction_id in seen_expectation_predictions:
+            raise PreflightError(
+                f"Prediction snapshot manifest duplicates prediction_id {prediction_id!r}"
+            )
+        if source_job_id in seen_expectation_jobs:
+            raise PreflightError(
+                f"Prediction snapshot manifest duplicates source_job_id {source_job_id!r}"
+            )
+        dimension = (
+            int(expectation["selection_run_id"]),
+            str(expectation["market_id"]),
+            str(expectation["prediction_model_id"]),
+            expectation["prediction_as_of"],
+        )
+        if dimension in seen_expectation_dimensions:
+            raise PreflightError(
+                "Prediction snapshot manifest duplicates a Market/Model generation task"
+            )
+        seen_expectation_predictions.add(prediction_id)
+        seen_expectation_jobs.add(source_job_id)
+        seen_expectation_dimensions.add(dimension)
+
+        model_id = str(expectation["prediction_model_id"])
         if model_id in configured_sandbox_models:
             raise PreflightError(
                 f"SANDBOX model {model_id!r} must not have a Direct task expectation"
             )
         if model_id not in direct_models:
             continue
-        market_id = item.get("market_id")
-        if not isinstance(market_id, str) or not market_id.strip():
-            raise PreflightError("Prediction snapshot manifest contains an invalid market_id")
-        key = (market_id.strip(), str(model_id))
-        recency = _expectation_recency(item)
-        if recency[0] > snapshot_decision_at or recency[1] > snapshot_decision_at:
-            raise PreflightError(f"Direct task manifest is not PIT-visible for {key[0]}/{key[1]}")
+        market_id = str(expectation["market_id"])
+        key = (market_id, model_id)
+        recency = expectation["recency"]
         if key not in latest or recency > latest_recency[key]:
-            latest[key] = item
+            latest[key] = expectation
             latest_recency[key] = recency
     if direct_models and not latest:
         raise PreflightError("Prediction snapshot has no configured Direct task manifest")
@@ -1879,32 +2025,52 @@ def validate_snapshot_manifest(
         market_models.setdefault(market_id, set()).add(model_id)
         market_runs.setdefault(market_id, set()).add(int(expectation["selection_run_id"]))
         market_selections.setdefault(market_id, set()).add(int(expectation["selection_id"]))
-        market_as_of.setdefault(market_id, set()).add(
-            _utc_timestamp(expectation.get("prediction_as_of"), "manifest prediction_as_of")
+        market_as_of.setdefault(market_id, set()).add(expectation["prediction_as_of"])
+        market_conditions.setdefault(market_id, set()).add(
+            str(expectation["condition_id"])
         )
-        condition_id = expectation.get("condition_id")
-        if not isinstance(condition_id, str) or not condition_id.strip():
-            raise PreflightError("Direct task manifest contains an invalid condition_id")
-        market_conditions.setdefault(market_id, set()).add(condition_id.strip())
-        if expectation.get("status") != "COMPLETED":
-            raise PreflightError(f"Direct task manifest is not COMPLETED for {market_id}/{model_id}")
-        result_available_at = _utc_timestamp(
-            expectation.get("result_available_at"), "manifest result_available_at"
-        )
-        if result_available_at > snapshot_decision_at:
+        if expectation["status"] != "COMPLETED":
             raise PreflightError(
-                f"COMPLETED Direct task is not PIT-visible for {market_id}/{model_id}"
+                f"Direct task manifest is not COMPLETED for {market_id}/{model_id}"
             )
-        prediction_id = str(expectation.get("prediction_id", ""))
+        prediction_id = str(expectation["prediction_id"])
         result = results.get(prediction_id)
-        if (
-            result is None
-            or result["market_id"] != market_id
-            or result["model_id"] != model_id
-            or result["sandbox_id"]
-        ):
+        if result is None:
             raise PreflightError(
                 f"COMPLETED Direct task {market_id}/{model_id} has no matching PIT result"
+            )
+        mismatched_fields: list[str] = []
+        for field, matches in (
+            (
+                "source_job_id",
+                result["source_job_id"] == expectation["source_job_id"],
+            ),
+            ("market_id", result["market_id"] == market_id),
+            (
+                "condition_id",
+                result["condition_id"] == expectation["condition_id"],
+            ),
+            ("model", result["model_id"] == model_id),
+            ("sandbox_id", not result["sandbox_id"]),
+            (
+                "prediction_as_of",
+                result["prediction_as_of"] == expectation["prediction_as_of"],
+            ),
+            (
+                "outcomes",
+                result["outcome_identity"] == expectation["outcome_identity"],
+            ),
+            (
+                "result_available_at",
+                result["available_at"] == expectation["result_available_at"],
+            ),
+        ):
+            if not matches:
+                mismatched_fields.append(field)
+        if mismatched_fields:
+            raise PreflightError(
+                f"COMPLETED Direct task {market_id}/{model_id} result differs from "
+                f"its immutable manifest: {', '.join(mismatched_fields)}"
             )
         effective = selected.get((market_id, model_id))
         if effective is None or effective["prediction_id"] != prediction_id:

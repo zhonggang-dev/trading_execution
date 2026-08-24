@@ -124,6 +124,7 @@ def complete_snapshot(decision_at: dt.datetime, snapshot_id: str) -> dict[str, o
             sandbox_id="sandbox-gemini",
         ),
     ]
+    predictions[0]["source_job_id"] = "pm-direct:1"
     return {
         "data": {
             "snapshot_id": snapshot_id,
@@ -1249,8 +1250,164 @@ class SnapshotManifestTests(unittest.TestCase):
             self.validate(), 1
         )
 
+    def test_direct_identity_uses_go_trim_and_utc_instant_semantics(self) -> None:
+        expectation = self.snapshot["data"]["expected_predictions"][0]
+        expectation["condition_id"] = " condition-1 "
+        expectation["outcomes"][0]["name"] = " Yes "
+        expectation["outcomes"][0]["token_id"] = " yes-token "
+        prediction_as_of = self.decision_at - dt.timedelta(minutes=12)
+        expectation["prediction_as_of"] = prediction_as_of.astimezone(
+            dt.timezone(dt.timedelta(hours=1))
+        ).isoformat()
+        result_available_at = self.decision_at - dt.timedelta(minutes=1)
+        expectation["result_available_at"] = result_available_at.astimezone(
+            dt.timezone(dt.timedelta(hours=-1))
+        ).isoformat()
+        self.assertEqual(self.validate(self.active_bindings), 1)
+
+    def test_rejects_each_direct_result_identity_tamper(self) -> None:
+        def mutate_outcome_name(result: dict[str, object]) -> None:
+            result["outcomes"][0]["name"] = "Maybe"
+
+        def mutate_outcome_token(result: dict[str, object]) -> None:
+            result["outcomes"][0]["token_id"] = "other-token"
+
+        cases = (
+            (
+                "source_job_id",
+                lambda result: result.__setitem__(
+                    "source_job_id", " pm-direct:1 "
+                ),
+            ),
+            (
+                "market_id",
+                lambda result: result.__setitem__("market_id", "other-market"),
+            ),
+            (
+                "condition_id",
+                lambda result: result.__setitem__(
+                    "condition_id", "other-condition"
+                ),
+            ),
+            (
+                "model",
+                lambda result: result["model"].__setitem__(
+                    "name", "other-direct-model"
+                ),
+            ),
+            (
+                "sandbox_id",
+                lambda result: result.__setitem__("sandbox_id", "sandbox-echo"),
+            ),
+            (
+                "prediction_as_of",
+                lambda result: result.__setitem__(
+                    "prediction_as_of",
+                    iso(self.decision_at - dt.timedelta(minutes=13)),
+                ),
+            ),
+            ("outcomes", mutate_outcome_name),
+            ("outcomes", mutate_outcome_token),
+            (
+                "result_available_at",
+                lambda result: result.__setitem__(
+                    "available_at",
+                    iso(self.decision_at - dt.timedelta(seconds=30)),
+                ),
+            ),
+        )
+        for expected_field, mutate in cases:
+            with self.subTest(expected_field=expected_field):
+                self.snapshot = complete_snapshot(self.decision_at, "snapshot-1")
+                direct_result = self.snapshot["data"]["predictions"][0]
+                mutate(direct_result)
+                with self.assertRaisesRegex(
+                    preflight.PreflightError, expected_field
+                ):
+                    self.validate(self.active_bindings)
+
+    def test_rejects_malformed_direct_expectation_fields(self) -> None:
+        def set_one_outcome(expectation: dict[str, object]) -> None:
+            expectation["outcomes"] = expectation["outcomes"][:1]
+
+        def set_duplicate_token(expectation: dict[str, object]) -> None:
+            expectation["outcomes"][1]["token_id"] = " yes-token "
+
+        def set_invalid_index(expectation: dict[str, object]) -> None:
+            expectation["outcomes"][0]["index"] = "0"
+
+        def set_task_before_prediction(expectation: dict[str, object]) -> None:
+            expectation["task_available_at"] = iso(
+                self.decision_at - dt.timedelta(minutes=13)
+            )
+
+        def set_result_before_task(expectation: dict[str, object]) -> None:
+            expectation["result_available_at"] = iso(
+                self.decision_at - dt.timedelta(minutes=11, seconds=30)
+            )
+
+        cases = (
+            (
+                "source_job_id",
+                lambda expectation: expectation.__setitem__("source_job_id", ""),
+            ),
+            (
+                "prediction_model_id",
+                lambda expectation: expectation.__setitem__(
+                    "prediction_model_id", ""
+                ),
+            ),
+            (
+                "market_id",
+                lambda expectation: expectation.__setitem__("market_id", ""),
+            ),
+            (
+                "condition_id",
+                lambda expectation: expectation.__setitem__("condition_id", ""),
+            ),
+            (
+                "selection identity",
+                lambda expectation: expectation.__setitem__("selection_id", True),
+            ),
+            (
+                "selection identity",
+                lambda expectation: expectation.__setitem__(
+                    "selection_run_id", 0
+                ),
+            ),
+            ("exactly two outcomes", set_one_outcome),
+            ("invalid index", set_invalid_index),
+            (
+                "invalid name",
+                lambda expectation: expectation["outcomes"][0].__setitem__(
+                    "name", ""
+                ),
+            ),
+            (
+                "invalid token_id",
+                lambda expectation: expectation["outcomes"][0].__setitem__(
+                    "token_id", ""
+                ),
+            ),
+            ("duplicate token ids", set_duplicate_token),
+            ("before prediction_as_of", set_task_before_prediction),
+            ("before its task", set_result_before_task),
+        )
+        for expected_message, mutate in cases:
+            with self.subTest(expected_message=expected_message):
+                self.snapshot = complete_snapshot(self.decision_at, "snapshot-1")
+                expectation = self.snapshot["data"]["expected_predictions"][0]
+                mutate(expectation)
+                with self.assertRaisesRegex(
+                    preflight.PreflightError, expected_message
+                ):
+                    self.validate(self.active_bindings)
+
     def test_rejects_pending_direct_task(self) -> None:
         self.snapshot["data"]["expected_predictions"][0]["status"] = "PENDING"
+        self.snapshot["data"]["expected_predictions"][0].pop(
+            "result_available_at"
+        )
         with self.assertRaisesRegex(preflight.PreflightError, "not COMPLETED"):
             self.validate()
 
@@ -1270,7 +1427,7 @@ class SnapshotManifestTests(unittest.TestCase):
 
     def test_rejects_sandbox_result_for_direct_manifest(self) -> None:
         self.snapshot["data"]["predictions"][0]["sandbox_id"] = "sandbox-echo"
-        with self.assertRaisesRegex(preflight.PreflightError, "no matching PIT result"):
+        with self.assertRaisesRegex(preflight.PreflightError, "sandbox_id"):
             self.validate()
 
     def test_rejects_missing_or_stale_sandbox_result(self) -> None:
