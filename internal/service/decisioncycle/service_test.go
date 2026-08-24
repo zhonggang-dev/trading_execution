@@ -351,6 +351,59 @@ func (executor fixedResultExecutor) Submit(context.Context, domain.OrderIntent) 
 	return executor.result, executor.err
 }
 
+func TestAlignBooksIsolatesInvalidMinimumOrderSize(t *testing.T) {
+	observedAt := time.Date(2026, 8, 24, 9, 40, 1, 0, time.UTC)
+	target := domain.BookTarget{
+		MarketID: "market-1", ConditionID: "condition-1", OutcomeIndex: 0, TokenID: "token-1",
+	}
+	books, err := alignBooks([]domain.BookTarget{target}, []domain.OrderBookSnapshot{{
+		MarketID: target.MarketID, ConditionID: target.ConditionID,
+		OutcomeIndex: target.OutcomeIndex, TokenID: target.TokenID,
+		Status: domain.OrderBookStatusOK, SourceAt: observedAt.Add(-time.Second),
+		ObservedAt: observedAt, DepthLimit: domain.StrategyOrderBookDepth,
+		TickSize: "0.01", MinOrderSize: "0",
+		Bids: []domain.PriceLevel{{Price: "0.49", Size: "5"}},
+		Asks: []domain.PriceLevel{{Price: "0.51", Size: "5"}},
+	}}, observedAt)
+	if err != nil {
+		t.Fatalf("alignBooks: %v", err)
+	}
+	if len(books) != 1 {
+		t.Fatalf("book count = %d, want 1", len(books))
+	}
+	book := books[0]
+	if book.Status != domain.OrderBookStatusError || book.ErrorCode != "INVALID_MIN_ORDER_SIZE" {
+		t.Fatalf("book status/error = %q/%q", book.Status, book.ErrorCode)
+	}
+	if !book.MinOrderSize.IsEmpty() || !book.BestBid.IsEmpty() || !book.BestAsk.IsEmpty() ||
+		len(book.Bids) != 0 || len(book.Asks) != 0 {
+		t.Fatalf("invalid market retained tradable metadata: %+v", book)
+	}
+}
+
+func TestAlignBooksPreservesPositiveMinimumOrderSize(t *testing.T) {
+	observedAt := time.Date(2026, 8, 24, 9, 40, 1, 0, time.UTC)
+	target := domain.BookTarget{
+		MarketID: "market-1", ConditionID: "condition-1", OutcomeIndex: 0, TokenID: "token-1",
+	}
+	books, err := alignBooks([]domain.BookTarget{target}, []domain.OrderBookSnapshot{{
+		MarketID: target.MarketID, ConditionID: target.ConditionID,
+		OutcomeIndex: target.OutcomeIndex, TokenID: target.TokenID,
+		Status: domain.OrderBookStatusOK, SourceAt: observedAt.Add(-time.Second),
+		ObservedAt: observedAt, DepthLimit: domain.StrategyOrderBookDepth,
+		TickSize: "0.01", MinOrderSize: "5",
+		Bids: []domain.PriceLevel{{Price: "0.49", Size: "5"}},
+		Asks: []domain.PriceLevel{{Price: "0.51", Size: "5"}},
+	}}, observedAt)
+	if err != nil {
+		t.Fatalf("alignBooks: %v", err)
+	}
+	if books[0].Status != domain.OrderBookStatusOK || books[0].MinOrderSize != "5" ||
+		books[0].BestBid != "0.49" || books[0].BestAsk != "0.51" {
+		t.Fatalf("valid market changed: %+v", books[0])
+	}
+}
+
 // TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput 验证 Run Builds Frozen Input And Executes Recorded Strategy Output 场景下的行为。
 func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)

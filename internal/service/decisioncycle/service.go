@@ -1133,6 +1133,7 @@ func alignBooks(targets []domain.BookTarget, books []domain.OrderBookSnapshot, o
 		} else if book.MarketID != target.MarketID || book.ConditionID != target.ConditionID || book.OutcomeIndex != target.OutcomeIndex {
 			return nil, fmt.Errorf("orderbook token %q has mismatched market identity", target.TokenID)
 		}
+		book = failClosedInvalidMinimumOrderSize(book)
 		if len(book.Bids) > 0 {
 			book.BestBid = book.Bids[0].Price
 		}
@@ -1149,6 +1150,28 @@ func alignBooks(targets []domain.BookTarget, books []domain.OrderBookSnapshot, o
 		return nil, fmt.Errorf("orderbook source returned an unexpected token")
 	}
 	return result, nil
+}
+
+// failClosedInvalidMinimumOrderSize isolates one upstream market whose minimum
+// size metadata is unusable. The ERROR book remains visible to the strategy,
+// while the execution path rejects every intent against a non-OK book. This
+// prevents one malformed market from aborting the complete account cycle.
+func failClosedInvalidMinimumOrderSize(book domain.OrderBookSnapshot) domain.OrderBookSnapshot {
+	if book.MinOrderSize.IsEmpty() {
+		return book
+	}
+	sign, err := book.MinOrderSize.Sign()
+	if err == nil && sign > 0 {
+		return book
+	}
+	book.Status = domain.OrderBookStatusError
+	book.MinOrderSize = ""
+	book.BestBid = ""
+	book.BestAsk = ""
+	book.Bids = []domain.PriceLevel{}
+	book.Asks = []domain.PriceLevel{}
+	book.ErrorCode = "INVALID_MIN_ORDER_SIZE"
+	return book
 }
 
 // alignMidPriceHistoriesParams 收拢中间价历史对齐所需的目标和时间窗口。
