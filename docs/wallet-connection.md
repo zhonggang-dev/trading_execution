@@ -104,6 +104,36 @@ go run ./cmd/walletcheck
 与旧 Python `create_or_derive_api_key()` 一致。创建 API key 会改变 Polymarket 远端凭证状态，因此
 默认关闭；生产更推荐提前生成并由 secrets 系统注入。
 
+## wallet-6 / wallet-7 固定 pUSD approval 工具
+
+`cmd/walletapprove` 只接受当前发布固定的两个 EOA：`wallet-6` 对应
+`0x0aefd80df02cc35e81aede40b34e2e961bb4593f`，`wallet-7` 对应
+`0xc9ba353781f13ec9507bc0677156814d805fe6d9`。它只在 Polygon `137` 上向 pUSD
+`0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb` 写入 Standard V2 与 NegRisk V2
+两个 spender 的 `200000000` base units allowance。地址、资产、金额和 spender 都不能通过参数覆盖。
+
+默认命令是只读 dry-run：校验 chain、EOA/funder 身份、pending/latest nonce、`eth_call`
+模拟、gas 估算与上限、EIP-1559 fee 上限和原生 gas 余额；不会签名、写 journal 或广播。
+
+```bash
+export POLYMARKET_ACCOUNTS_FILE=/run/secrets/trading_execution/wallets.json
+export POLYGON_RPC_URL=https://polygon-rpc.example
+go run ./cmd/walletapprove
+```
+
+只有复核 dry-run 输出后，才可用精确执行令牌和位于私有、非软链接目录中的绝对 journal 路径执行：
+
+```bash
+export WALLET_APPROVE_JOURNAL_FILE=/var/lib/trading-execution/walletapprove-wallet67.json
+go run ./cmd/walletapprove \
+  --execute-token APPROVE_WALLET_6_AND_WALLET_7_PUSD_200000000_POLYGON_137
+```
+
+工具会先把完整 type-2 原始交易原子写入 mode `0600` journal，再广播；未知提交结果只会恢复或
+重发同一 raw transaction，不会替换 nonce。每笔交易必须出现唯一且完全匹配的 pUSD `Approval`
+log、保持稳定 receipt 和 canonical block、达到至少 64 confirmations，并在确认块之后读到恰好
+`200000000` allowance。中断后用同一命令和 journal 恢复，不能删除 journal 后盲目重跑。
+
 ## 从钱包连通到启用实盘
 
 钱包连通只证明 signer 和 CLOB credentials 可用。`cmd/server` 已具备 live composition，但只有

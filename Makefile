@@ -1,4 +1,4 @@
-.PHONY: fmt test test-deploy test-postgres vet run wallet-check check
+.PHONY: fmt test test-deploy test-postgres vet run wallet-check wallet-approve-dry-run check
 
 fmt:
 	go fmt ./...
@@ -22,5 +22,10 @@ run:
 wallet-check:
 	@test -n "$(POLYMARKET_ACCOUNTS_FILE)" || (echo "POLYMARKET_ACCOUNTS_FILE is required" && exit 1)
 	go run ./cmd/walletcheck
+
+wallet-approve-dry-run:
+	@test -n "$(POLYMARKET_ACCOUNTS_FILE)" || (echo "POLYMARKET_ACCOUNTS_FILE is required" && exit 1)
+	@test -n "$(POLYGON_RPC_URL)" || (echo "POLYGON_RPC_URL is required" && exit 1)
+	go run ./cmd/walletapprove
 
 check: fmt test test-deploy vet
