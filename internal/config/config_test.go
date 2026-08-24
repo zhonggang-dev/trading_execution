@@ -229,7 +229,7 @@ func TestLoadAcceptsRequiredWallet67SubmissionDisabledAccounts(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsReviewedQuarantineCohortsOrEmpty(t *testing.T) {
+func TestLoadAcceptsWallet67QuarantineSubsetOrEmpty(t *testing.T) {
 	for _, test := range []struct {
 		name             string
 		disabledAccounts string
@@ -238,7 +238,6 @@ func TestLoadAcceptsReviewedQuarantineCohortsOrEmpty(t *testing.T) {
 		{name: "remove both in shadow", disabledAccounts: `[]`, submitEnabled: "false"},
 		{name: "remove wallet-7 in shadow", disabledAccounts: `["wallet-6"]`, submitEnabled: "false"},
 		{name: "remove wallet-6 with submission enabled", disabledAccounts: `["wallet-7"]`, submitEnabled: "true"},
-		{name: "wallet67 only cohort", disabledAccounts: `["main","wallet-1"]`, submitEnabled: "false"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			clearConfigEnvironment(t)
@@ -267,8 +266,7 @@ func TestLoadRejectsInvalidDecisionSubmissionDisabledAccounts(t *testing.T) {
 		{name: "empty", value: `[" "]`, want: "account 0 is empty"},
 		{name: "duplicate", value: `["wallet-7","wallet-7"]`, want: "duplicate account"},
 		{name: "unbound", value: `["wallet-3"]`, want: "not a configured binding"},
-		{name: "unsupported retained subset", value: `["main"]`, want: "reviewed release cohort"},
-		{name: "unsupported mixed subset", value: `["main","wallet-6"]`, want: "reviewed release cohort"},
+		{name: "retained wallet", value: `["main"]`, want: "permits only wallet-6 and wallet-7"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			clearConfigEnvironment(t)

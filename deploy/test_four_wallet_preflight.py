@@ -543,44 +543,6 @@ class DatabaseStateTests(unittest.TestCase):
                 approved_risk_contracts=contracts,
             )
 
-    def test_accepts_wallet67_only_authorization_partition(self) -> None:
-        state = database_state()
-        quarantine_accounts(state, "main", "wallet-1")
-        activate_accounts(state, "wallet-6", "wallet-7")
-        approved_limits = {
-            "max_order_notional": 20,
-            "max_market_exposure": 40,
-            "max_strategy_exposure": 40,
-            "max_wallet_exposure": 40,
-            "max_daily_traded_notional": 20,
-            "max_price_age_ms": 90_000,
-            "max_signal_age_ms": 30_000,
-            "max_state_age_ms": 600_000,
-            "daily_timezone": "UTC",
-        }
-        for policy in state["risk_policies"]:
-            if policy["execution_account_id"] in {"wallet-6", "wallet-7"}:
-                policy.update(approved_limits)
-                policy["version"] = 2
-        contracts = approved_risk_contracts(state, "wallet-6", "wallet-7")
-        preflight.validate_database_state(
-            state,
-            self.bindings,
-            submission_state="disabled",
-            submission_disabled_accounts=("main", "wallet-1"),
-            approved_risk_contracts=contracts,
-        )
-
-        state["bindings"][0]["enabled"] = True
-        with self.assertRaisesRegex(preflight.PreflightError, "unexpected="):
-            preflight.validate_database_state(
-                state,
-                self.bindings,
-                submission_state="disabled",
-                submission_disabled_accounts=("main", "wallet-1"),
-                approved_risk_contracts=contracts,
-            )
-
     def test_rejects_unapproved_or_invalid_risk_contract(self) -> None:
         drifted = database_state()
         drifted["risk_policies"][0]["max_wallet_exposure"] = 99
@@ -760,18 +722,13 @@ class EnvironmentTests(unittest.TestCase):
                 bindings,
             )
 
-    def test_accepts_reviewed_quarantine_cohorts_or_empty(self) -> None:
+    def test_accepts_wallet67_quarantine_subset_or_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wallet_path = self.write_wallet_file(
                 pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
             )
             environment = self.environment(wallet_path)
-            for value in (
-                '[]',
-                '["wallet-6"]',
-                '["wallet-7"]',
-                '["main","wallet-1"]',
-            ):
+            for value in ('[]', '["wallet-6"]', '["wallet-7"]'):
                 environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = value
                 with self.subTest(value=value):
                     self.assertEqual(
@@ -791,8 +748,7 @@ class EnvironmentTests(unittest.TestCase):
             for value, message in (
                 ('["wallet-7","wallet-7"]', "duplicates"),
                 ('["wallet-missing"]', "unbound accounts"),
-                ('["main"]', "reviewed release cohort"),
-                ('["main","wallet-6"]', "reviewed release cohort"),
+                ('["main"]', "permits only wallet-6 and wallet-7"),
             ):
                 environment = self.environment(wallet_path)
                 environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = value
@@ -1272,9 +1228,6 @@ class SnapshotManifestTests(unittest.TestCase):
         self.active_bindings = preflight.active_rollout_bindings(
             self.bindings, ("wallet-6", "wallet-7")
         )
-        self.wallet67_bindings = preflight.active_rollout_bindings(
-            self.bindings, ("main", "wallet-1")
-        )
         self.dry_run = {
             "decision_at": iso(self.decision_at),
             "prediction_snapshot_id": "snapshot-1",
@@ -1552,11 +1505,6 @@ class SnapshotManifestTests(unittest.TestCase):
     def test_quarantine_does_not_require_sandbox_liveness(self) -> None:
         self.snapshot["data"]["predictions"] = self.snapshot["data"]["predictions"][:1]
         self.assertEqual(self.validate(self.active_bindings), 1)
-
-    def test_wallet67_only_cohort_does_not_require_direct_manifest_liveness(self) -> None:
-        self.snapshot["data"]["expected_predictions"] = []
-        self.snapshot["data"]["predictions"] = self.snapshot["data"]["predictions"][1:]
-        self.assertEqual(self.validate(self.wallet67_bindings), 0)
 
 
 class ConsumerEvidenceTests(unittest.TestCase):

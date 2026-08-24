@@ -504,22 +504,11 @@ def decode_prediction_model_source_modes(
 
 
 def validate_rollout_quarantine(accounts: tuple[str, ...]) -> None:
-    unsupported = set(accounts) - EXPECTED_ACCOUNTS
+    unsupported = set(accounts) - ACTIVATABLE_ACCOUNTS
     if unsupported:
         raise PreflightError(
-            "this release permits only the exact four configured wallets in the submission-disabled "
+            "this release permits only wallet-6 and wallet-7 in the submission-disabled "
             f"set; unsupported={sorted(unsupported)}"
-        )
-    allowed_cohorts = {
-        frozenset(),
-        frozenset({"wallet-6"}),
-        frozenset({"wallet-7"}),
-        frozenset({"wallet-6", "wallet-7"}),
-        frozenset({"main", "wallet-1"}),
-    }
-    if frozenset(accounts) not in allowed_cohorts:
-        raise PreflightError(
-            "submission-disabled accounts do not match a reviewed release cohort"
         )
 
 

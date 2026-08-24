@@ -488,9 +488,7 @@ func validateCurrentLiveWallet67Release(configured, quarantined []string) error 
 	); err != nil {
 		return err
 	}
-	allowedQuarantine := map[string]struct{}{
-		"main": {}, "wallet-1": {}, "wallet-6": {}, "wallet-7": {},
-	}
+	allowedQuarantine := map[string]struct{}{"wallet-6": {}, "wallet-7": {}}
 	seen := make(map[string]struct{}, len(quarantined))
 	for index, raw := range quarantined {
 		accountID := strings.TrimSpace(raw)
@@ -501,19 +499,9 @@ func validateCurrentLiveWallet67Release(configured, quarantined []string) error 
 			return fmt.Errorf("submission-disabled account list contains duplicate execution account %q", accountID)
 		}
 		if _, allowed := allowedQuarantine[accountID]; !allowed {
-			return fmt.Errorf("submission-disabled account list may contain only the exact four configured wallets")
+			return fmt.Errorf("submission-disabled account list may contain only wallet-6 and wallet-7")
 		}
 		seen[accountID] = struct{}{}
-	}
-	_, hasMain := seen["main"]
-	_, hasWallet1 := seen["wallet-1"]
-	_, hasWallet6 := seen["wallet-6"]
-	_, hasWallet7 := seen["wallet-7"]
-	supported := len(seen) == 0 ||
-		(len(seen) == 1 && (hasWallet6 || hasWallet7)) ||
-		(len(seen) == 2 && ((hasWallet6 && hasWallet7) || (hasMain && hasWallet1)))
-	if !supported {
-		return fmt.Errorf("submission-disabled account list does not match a reviewed release cohort")
 	}
 	return nil
 }
