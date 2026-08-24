@@ -108,21 +108,25 @@ func testPlan(now time.Time, source string, recipients ...string) fundingJournal
 }
 
 type fundingRPC struct {
-	store              *memoryJournal
-	source             string
-	baseNonce          uint64
-	sourceBalance      *big.Int
-	recipientBalances  map[string]*big.Int
-	sent               map[string]bool
-	sendErr            error
-	sendCalls          int
-	receiptUnavailable bool
-	transactionHidden  bool
-	latestBlock        uint64
-	blockHash          string
-	receiptBlockHash   string
-	receiptMutator     func(*rpcReceipt)
-	transactionMutator func(*rpcTransaction)
+	store                *memoryJournal
+	source               string
+	baseNonce            uint64
+	sourceBalance        *big.Int
+	recipientBalances    map[string]*big.Int
+	sent                 map[string]bool
+	sendErr              error
+	sendCalls            int
+	receiptUnavailable   bool
+	transactionHidden    bool
+	receiptCalls         int
+	transactionCalls     int
+	hideReceiptAfter     int
+	hideTransactionAfter int
+	latestBlock          uint64
+	blockHash            string
+	receiptBlockHash     string
+	receiptMutator       func(*rpcReceipt)
+	transactionMutator   func(*rpcTransaction)
 }
 
 func newFundingRPC(store *memoryJournal, source string) *fundingRPC {
@@ -145,6 +149,51 @@ func approvedPrestate(rpc *fundingRPC) *fundingPrestate {
 	}
 	return &fundingPrestate{
 		startingNonce: rpc.baseNonce, sourceBalance: new(big.Int).Set(rpc.sourceBalance), targetBalances: targetBalances,
+	}
+}
+
+func mustAddressTopic(address string) string {
+	topic, err := addressTopic(address)
+	if err != nil {
+		panic(err)
+	}
+	return topic
+}
+
+func encodedLogWords(values ...*big.Int) string {
+	var builder strings.Builder
+	builder.WriteString("0x")
+	for _, value := range values {
+		word := value.Text(16)
+		builder.WriteString(strings.Repeat("0", 64-len(word)))
+		builder.WriteString(word)
+	}
+	return builder.String()
+}
+
+func polygonFundingLogs(entry journalEntry, blockHash, blockNumber string) []rpcLog {
+	removed := false
+	valueInput1 := mustDecimalBig("1000000000000000000")
+	valueInput2 := mustDecimalBig("2000000000000000000")
+	valueOutput1 := new(big.Int).Sub(new(big.Int).Set(valueInput1), fundingAmountWei)
+	valueOutput2 := new(big.Int).Add(new(big.Int).Set(valueInput2), fundingAmountWei)
+	priorityFee := mustDecimalBig(entry.MaxPriorityFeePerGas)
+	feeAmount := new(big.Int).Mul(big.NewInt(21_000), priorityFee)
+	return []rpcLog{
+		{
+			Address:   polygonNativeTokenAddress,
+			Topics:    []string{polygonLogTransferTopic, mustAddressTopic(polygonNativeTokenAddress), mustAddressTopic(entry.Source), mustAddressTopic(entry.Recipient)},
+			Data:      encodedLogWords(fundingAmountWei, valueInput1, valueInput2, valueOutput1, valueOutput2),
+			BlockHash: blockHash, BlockNumber: blockNumber, TransactionHash: entry.TransactionHash,
+			LogIndex: "0x1", Removed: &removed,
+		},
+		{
+			Address:   polygonNativeTokenAddress,
+			Topics:    []string{polygonLogFeeTransferTopic, mustAddressTopic(polygonNativeTokenAddress), mustAddressTopic(entry.Source), mustAddressTopic("0x7ee41d8a25641000661b1ef5e6ae8a00400466b0")},
+			Data:      encodedLogWords(feeAmount, big.NewInt(9), big.NewInt(11), big.NewInt(8), big.NewInt(12)),
+			BlockHash: blockHash, BlockNumber: blockNumber, TransactionHash: entry.TransactionHash,
+			LogIndex: "0x2", Removed: &removed,
+		},
 	}
 }
 
@@ -236,9 +285,10 @@ func (rpc *fundingRPC) Call(_ context.Context, method string, params []any) ([]b
 		rpc.sent[hash] = true
 		return json.Marshal(hash)
 	case "eth_getTransactionByHash":
+		rpc.transactionCalls++
 		hash := params[0].(string)
 		entry, ok := rpc.entryByHash(hash)
-		if !ok || !rpc.sent[hash] || rpc.transactionHidden {
+		if !ok || !rpc.sent[hash] || rpc.transactionHidden || (rpc.hideTransactionAfter > 0 && rpc.transactionCalls > rpc.hideTransactionAfter) {
 			return []byte("null"), nil
 		}
 		transaction := rpcTransaction{
@@ -254,16 +304,18 @@ func (rpc *fundingRPC) Call(_ context.Context, method string, params []any) ([]b
 		}
 		return json.Marshal(transaction)
 	case "eth_getTransactionReceipt":
+		rpc.receiptCalls++
 		hash := params[0].(string)
 		entry, ok := rpc.entryByHash(hash)
-		if !ok || !rpc.sent[hash] || rpc.receiptUnavailable {
+		if !ok || !rpc.sent[hash] || rpc.receiptUnavailable || (rpc.hideReceiptAfter > 0 && rpc.receiptCalls > rpc.hideReceiptAfter) {
 			return []byte("null"), nil
 		}
 		receipt := rpcReceipt{
 			TransactionHash: hash, BlockHash: rpc.receiptBlockHash, BlockNumber: "0x64",
 			From: entry.Source, To: entry.Recipient, Type: "0x2", Status: "0x1",
-			GasUsed: "0x5208", EffectiveGasPrice: "0x3b9aca00", Logs: []rpcLog{},
+			GasUsed: "0x5208", EffectiveGasPrice: "0x3b9aca00",
 		}
+		receipt.Logs = polygonFundingLogs(entry, receipt.BlockHash, receipt.BlockNumber)
 		if rpc.receiptMutator != nil {
 			rpc.receiptMutator(&receipt)
 		}
@@ -492,6 +544,72 @@ func TestExecuteSerializesJournalsBeforeSendAndReplaysConfirmed(t *testing.T) {
 	}
 }
 
+func TestBroadcastRecoveryWithVisibleReceiptNeverCallsSigner(t *testing.T) {
+	now := time.Date(2026, 8, 24, 6, 0, 0, 0, time.UTC)
+	account, signer := testAccount(t)
+	store := &memoryJournal{}
+	rpc := newFundingRPC(store, account.address)
+	params := fundingRunParams{rpc: rpc, account: account, journal: store, clock: fixedClock{now: now}, execute: true, prestate: approvedPrestate(rpc)}
+	plan := testPlan(now, account.address, wallet6ExpectedAddress)
+	if _, err := runFundingPlan(context.Background(), params, plan); err != nil {
+		t.Fatal(err)
+	}
+	entry := &store.current.Entries[0]
+	entry.State = journalStateBroadcast
+	entry.ReceiptBlockNumber = 0
+	entry.ReceiptBlockHash = ""
+	entry.Confirmations = 0
+	entry.GasUsed = 0
+	entry.EffectiveGasPrice = ""
+	entry.RecipientBalanceAfter = ""
+	entry.ConfirmedAt = time.Time{}
+	signer.calls = 0
+	signer.before = func(int) error { return fmt.Errorf("signer must not be called during visible broadcast recovery") }
+	beforeSendCalls := rpc.sendCalls
+	result, err := runFundingPlan(context.Background(), params, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signer.calls != 0 || rpc.sendCalls != beforeSendCalls || result.Targets[0].State != journalStateConfirmed {
+		t.Fatalf("visible broadcast recovery signer/send/state = %d/%d/%s", signer.calls, rpc.sendCalls-beforeSendCalls, result.Targets[0].State)
+	}
+}
+
+func TestBroadcastRecoveryVisibilityRaceValidatesRawBeforeAnyRebroadcast(t *testing.T) {
+	now := time.Date(2026, 8, 24, 6, 0, 0, 0, time.UTC)
+	account, signer := testAccount(t)
+	store := &memoryJournal{}
+	rpc := newFundingRPC(store, account.address)
+	params := fundingRunParams{rpc: rpc, account: account, journal: store, clock: fixedClock{now: now}, execute: true, prestate: approvedPrestate(rpc)}
+	plan := testPlan(now, account.address, wallet6ExpectedAddress)
+	if _, err := runFundingPlan(context.Background(), params, plan); err != nil {
+		t.Fatal(err)
+	}
+	entry := &store.current.Entries[0]
+	entry.State = journalStateBroadcast
+	entry.ReceiptBlockNumber = 0
+	entry.ReceiptBlockHash = ""
+	entry.Confirmations = 0
+	entry.GasUsed = 0
+	entry.EffectiveGasPrice = ""
+	entry.RecipientBalanceAfter = ""
+	entry.ConfirmedAt = time.Time{}
+	rpc.receiptCalls = 0
+	rpc.transactionCalls = 0
+	rpc.hideReceiptAfter = 1
+	rpc.hideTransactionAfter = 1
+	signer.calls = 0
+	signer.before = func(int) error { return fmt.Errorf("refuse local raw verification in visibility-race test") }
+	beforeSendCalls := rpc.sendCalls
+	_, err := runFundingPlan(context.Background(), params, plan)
+	if err == nil || !strings.Contains(err.Error(), "visibility-race test") {
+		t.Fatalf("visibility-race recovery error = %v", err)
+	}
+	if signer.calls != 1 || rpc.sendCalls != beforeSendCalls || store.current.Entries[0].State != journalStateBroadcast {
+		t.Fatalf("visibility-race signer/send/state = %d/%d/%s", signer.calls, rpc.sendCalls-beforeSendCalls, store.current.Entries[0].State)
+	}
+}
+
 func TestAmbiguousSendLeavesExactRawSignedAndResumesSameTransaction(t *testing.T) {
 	now := time.Date(2026, 8, 24, 6, 0, 0, 0, time.UTC)
 	account, _ := testAccount(t)
@@ -583,8 +701,9 @@ func TestTransactionAndReceiptValidationFailClosed(t *testing.T) {
 	receipt := rpcReceipt{
 		TransactionHash: entry.TransactionHash, BlockHash: "0x" + strings.Repeat("55", 32), BlockNumber: "0x64",
 		From: entry.Source, To: entry.Recipient, Type: "0x2", Status: "0x1", GasUsed: "0x5208",
-		EffectiveGasPrice: "0x3b9aca00", Logs: []rpcLog{},
+		EffectiveGasPrice: "0x3b9aca00",
 	}
+	receipt.Logs = polygonFundingLogs(entry, receipt.BlockHash, receipt.BlockNumber)
 	if _, err := validateFundingReceipt(receipt, entry); err != nil {
 		t.Fatal(err)
 	}
@@ -593,15 +712,148 @@ func TestTransactionAndReceiptValidationFailClosed(t *testing.T) {
 	if _, err := validateFundingReceipt(reverted, entry); err == nil || !strings.Contains(err.Error(), "reverted") {
 		t.Fatalf("reverted receipt error = %v", err)
 	}
-	withLog := receipt
-	withLog.Logs = []rpcLog{{}}
-	if _, err := validateFundingReceipt(withLog, entry); err == nil || !strings.Contains(err.Error(), "explicit empty array") {
-		t.Fatalf("receipt logs error = %v", err)
+	wrongSignature := receipt
+	wrongSignature.Logs = append([]rpcLog(nil), receipt.Logs...)
+	wrongSignature.Logs[0].Topics = append([]string(nil), receipt.Logs[0].Topics...)
+	wrongSignature.Logs[0].Topics[0] = polygonLogFeeTransferTopic
+	if _, err := validateFundingReceipt(wrongSignature, entry); err == nil || !strings.Contains(err.Error(), "signature") {
+		t.Fatalf("receipt log signature error = %v", err)
 	}
 	missingLogs := receipt
 	missingLogs.Logs = nil
-	if _, err := validateFundingReceipt(missingLogs, entry); err == nil || !strings.Contains(err.Error(), "explicit empty array") {
+	if _, err := validateFundingReceipt(missingLogs, entry); err == nil || !strings.Contains(err.Error(), "exactly two") {
 		t.Fatalf("missing receipt logs error = %v", err)
+	}
+}
+
+func TestPolygonNativeFundingLogsRejectUnknownOrInconsistentShape(t *testing.T) {
+	entry := journalEntry{
+		Source: mainExpectedAddress, Recipient: wallet6ExpectedAddress, Nonce: 63, GasLimit: 25_200,
+		MaxPriorityFeePerGas: "1000000000", MaxFeePerGas: "3000000000", Input: "0x",
+		TransactionHash: "0x" + strings.Repeat("11", 32),
+	}
+	receipt := rpcReceipt{
+		TransactionHash: entry.TransactionHash, BlockHash: "0x" + strings.Repeat("55", 32), BlockNumber: "0x64",
+		From: entry.Source, To: entry.Recipient, Type: "0x2", Status: "0x1", GasUsed: "0x5208",
+		EffectiveGasPrice: "0x3b9aca00",
+	}
+	receipt.Logs = polygonFundingLogs(entry, receipt.BlockHash, receipt.BlockNumber)
+	clone := func() rpcReceipt {
+		payload, err := json.Marshal(receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result rpcReceipt
+		if err := json.Unmarshal(payload, &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	tests := []struct {
+		name   string
+		mutate func(*rpcReceipt)
+		want   string
+	}{
+		{"unknown address", func(value *rpcReceipt) { value.Logs[0].Address = wallet7ExpectedAddress }, "address"},
+		{"wrong topic count", func(value *rpcReceipt) { value.Logs[0].Topics = value.Logs[0].Topics[:3] }, "four topics"},
+		{"wrong data size", func(value *rpcReceipt) { value.Logs[0].Data = "0x00" }, "five uint256"},
+		{"removed", func(value *rpcReceipt) { removed := true; value.Logs[0].Removed = &removed }, "removed"},
+		{"missing removed", func(value *rpcReceipt) { value.Logs[0].Removed = nil }, "removed"},
+		{"wrong block", func(value *rpcReceipt) { value.Logs[0].BlockHash = "0x" + strings.Repeat("66", 32) }, "block hash"},
+		{"wrong block number", func(value *rpcReceipt) { value.Logs[0].BlockNumber = "0x65" }, "block number"},
+		{"wrong second block", func(value *rpcReceipt) { value.Logs[1].BlockHash = "0x" + strings.Repeat("66", 32) }, "block hash"},
+		{"wrong transaction", func(value *rpcReceipt) { value.Logs[0].TransactionHash = "0x" + strings.Repeat("66", 32) }, "transaction hash"},
+		{"wrong second transaction", func(value *rpcReceipt) { value.Logs[1].TransactionHash = "0x" + strings.Repeat("66", 32) }, "transaction hash"},
+		{"nonconsecutive indexes", func(value *rpcReceipt) { value.Logs[1].LogIndex = "0x3" }, "not consecutive"},
+		{"wrong token", func(value *rpcReceipt) { value.Logs[0].Topics[1] = mustAddressTopic(wallet7ExpectedAddress) }, "token"},
+		{"wrong source", func(value *rpcReceipt) { value.Logs[0].Topics[2] = mustAddressTopic(wallet7ExpectedAddress) }, "source"},
+		{"fee recipient is target", func(value *rpcReceipt) { value.Logs[1].Topics[3] = mustAddressTopic(entry.Recipient) }, "independent fee recipient"},
+		{
+			"wrong value amount",
+			func(value *rpcReceipt) {
+				words, _ := polygonLogWords(value.Logs[0].Data, "test value log")
+				words[0] = big.NewInt(1)
+				value.Logs[0].Data = encodedLogWords(words[:]...)
+			},
+			"fixed balance transfer",
+		},
+		{
+			"wrong value source delta",
+			func(value *rpcReceipt) {
+				words, _ := polygonLogWords(value.Logs[0].Data, "test value log")
+				words[3].Add(words[3], big.NewInt(1))
+				value.Logs[0].Data = encodedLogWords(words[:]...)
+			},
+			"fixed balance transfer",
+		},
+		{
+			"wrong value recipient delta",
+			func(value *rpcReceipt) {
+				words, _ := polygonLogWords(value.Logs[0].Data, "test value log")
+				words[4].Sub(words[4], big.NewInt(1))
+				value.Logs[0].Data = encodedLogWords(words[:]...)
+			},
+			"fixed balance transfer",
+		},
+		{
+			"zero fee",
+			func(value *rpcReceipt) {
+				words, _ := polygonLogWords(value.Logs[1].Data, "test fee log")
+				words[0] = new(big.Int)
+				value.Logs[1].Data = encodedLogWords(words[:]...)
+			},
+			"not positive",
+		},
+		{
+			"fee not divisible by gas used",
+			func(value *rpcReceipt) {
+				words, _ := polygonLogWords(value.Logs[1].Data, "test fee log")
+				words[0].Add(words[0], big.NewInt(1))
+				value.Logs[1].Data = encodedLogWords(words[:]...)
+			},
+			"signed EIP-1559 fee",
+		},
+		{
+			"fee exceeds effective gas cost",
+			func(value *rpcReceipt) {
+				words, _ := polygonLogWords(value.Logs[1].Data, "test fee log")
+				words[0] = new(big.Int).Mul(big.NewInt(21_000), big.NewInt(1_000_000_001))
+				value.Logs[1].Data = encodedLogWords(words[:]...)
+			},
+			"signed EIP-1559 fee",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := clone()
+			test.mutate(&candidate)
+			if _, err := validateFundingReceipt(candidate, entry); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateFundingReceipt() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestPolygonNativeFundingLogsAcceptObservedFeeLogAboveSignedPriority(t *testing.T) {
+	entry := journalEntry{
+		Source: mainExpectedAddress, Recipient: wallet6ExpectedAddress, Nonce: 63, GasLimit: 25_200,
+		MaxPriorityFeePerGas: "29711445052", MaxFeePerGas: "517461510098", Input: "0x",
+		TransactionHash: "0x" + strings.Repeat("11", 32),
+	}
+	receipt := rpcReceipt{
+		TransactionHash: entry.TransactionHash, BlockHash: "0x" + strings.Repeat("55", 32), BlockNumber: "0x5846f80",
+		From: entry.Source, To: entry.Recipient, Type: "0x2", Status: "0x1", GasUsed: "0x5208",
+		EffectiveGasPrice: "0x40b7453301",
+	}
+	receipt.Logs = polygonFundingLogs(entry, receipt.BlockHash, receipt.BlockNumber)
+	feeWords, err := polygonLogWords(receipt.Logs[1].Data, "test fee log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	feeWords[0] = new(big.Int).Mul(big.NewInt(21_000), big.NewInt(30_000_000_000))
+	receipt.Logs[1].Data = encodedLogWords(feeWords[:]...)
+	if _, err := validateFundingReceipt(receipt, entry); err != nil {
+		t.Fatalf("validateFundingReceipt() rejected observed Polygon fee-log semantics: %v", err)
 	}
 }
 

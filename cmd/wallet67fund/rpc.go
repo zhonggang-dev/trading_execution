@@ -419,6 +419,136 @@ type validatedReceipt struct {
 	effectiveGasPrice string
 }
 
+const (
+	polygonNativeTokenAddress  = "0x0000000000000000000000000000000000001010"
+	polygonLogTransferTopic    = "0xe6497e3ee548a3372136af2fcb0696db31fc6cf20260707645068bd3fe97f3c4"
+	polygonLogFeeTransferTopic = "0x4dfe1bbbcf077ddc3e01291eea2d5c70c2b422b415d95645b9adcfd678cb1d63"
+)
+
+func topicAddress(topic, field string) (string, error) {
+	normalized, err := normalizeFixedHex(topic, 32, field)
+	if err != nil || normalized[2:26] != strings.Repeat("0", 24) {
+		return "", fmt.Errorf("%s is not a canonical address topic", field)
+	}
+	return normalizeAddress("0x" + normalized[26:])
+}
+
+func polygonLogWords(data, field string) ([5]*big.Int, error) {
+	var result [5]*big.Int
+	normalized, err := normalizeHexData(data, field)
+	if err != nil || len(normalized) != 2+5*64 {
+		return result, fmt.Errorf("%s must contain exactly five uint256 words", field)
+	}
+	for index := range result {
+		word := normalized[2+index*64 : 2+(index+1)*64]
+		value, ok := new(big.Int).SetString(word, 16)
+		if !ok {
+			return result, fmt.Errorf("%s word %d is invalid", field, index)
+		}
+		result[index] = value
+	}
+	return result, nil
+}
+
+func validatePolygonFundingLogs(
+	logs []rpcLog,
+	receiptBlockHash string,
+	receiptBlockNumber uint64,
+	gasUsed uint64,
+	effectiveGasPrice *big.Int,
+	expected journalEntry,
+) error {
+	if len(logs) != 2 {
+		return fmt.Errorf("Polygon native funding receipt must contain exactly two system logs")
+	}
+	logIndexes := [2]uint64{}
+	words := [2][5]*big.Int{}
+	for index, item := range logs {
+		address, err := normalizeAddress(item.Address)
+		if err != nil || address != polygonNativeTokenAddress {
+			return fmt.Errorf("Polygon native funding log %d has an unexpected address", index)
+		}
+		if item.Removed == nil || *item.Removed {
+			return fmt.Errorf("Polygon native funding log %d is removed or lacks an explicit removed flag", index)
+		}
+		blockHash, err := normalizeFixedHex(item.BlockHash, 32, "Polygon funding log block hash")
+		if err != nil || blockHash != receiptBlockHash {
+			return fmt.Errorf("Polygon native funding log %d block hash mismatch", index)
+		}
+		blockNumber, err := parseQuantityUint64(item.BlockNumber, "Polygon funding log block number")
+		if err != nil || blockNumber != receiptBlockNumber {
+			return fmt.Errorf("Polygon native funding log %d block number mismatch", index)
+		}
+		transactionHash, err := normalizeFixedHex(item.TransactionHash, 32, "Polygon funding log transaction hash")
+		if err != nil || transactionHash != expected.TransactionHash {
+			return fmt.Errorf("Polygon native funding log %d transaction hash mismatch", index)
+		}
+		logIndex, err := parseQuantityUint64(item.LogIndex, "Polygon funding log index")
+		if err != nil {
+			return fmt.Errorf("Polygon native funding log %d has an invalid log index", index)
+		}
+		logIndexes[index] = logIndex
+		if len(item.Topics) != 4 {
+			return fmt.Errorf("Polygon native funding log %d must contain exactly four topics", index)
+		}
+		topic0, err := normalizeFixedHex(item.Topics[0], 32, "Polygon funding log signature")
+		if err != nil {
+			return fmt.Errorf("Polygon native funding log %d has an invalid signature", index)
+		}
+		wantSignature := polygonLogTransferTopic
+		if index == 1 {
+			wantSignature = polygonLogFeeTransferTopic
+		}
+		if topic0 != wantSignature {
+			return fmt.Errorf("Polygon native funding log %d has an unexpected signature", index)
+		}
+		token, err := topicAddress(item.Topics[1], "Polygon funding log token")
+		if err != nil || token != polygonNativeTokenAddress {
+			return fmt.Errorf("Polygon native funding log %d token mismatch", index)
+		}
+		source, err := topicAddress(item.Topics[2], "Polygon funding log source")
+		if err != nil || source != expected.Source {
+			return fmt.Errorf("Polygon native funding log %d source mismatch", index)
+		}
+		recipient, err := topicAddress(item.Topics[3], "Polygon funding log recipient")
+		if err != nil || isZeroHex(recipient) {
+			return fmt.Errorf("Polygon native funding log %d recipient is invalid", index)
+		}
+		if index == 0 && recipient != expected.Recipient {
+			return fmt.Errorf("Polygon native value log recipient mismatch")
+		}
+		if index == 1 && (recipient == expected.Source || recipient == expected.Recipient || recipient == polygonNativeTokenAddress) {
+			return fmt.Errorf("Polygon native fee log recipient is not an independent fee recipient")
+		}
+		words[index], err = polygonLogWords(item.Data, fmt.Sprintf("Polygon funding log %d data", index))
+		if err != nil {
+			return err
+		}
+	}
+	if logIndexes[0] == ^uint64(0) || logIndexes[1] != logIndexes[0]+1 {
+		return fmt.Errorf("Polygon native funding log indexes are not consecutive")
+	}
+	valueWords := words[0]
+	if valueWords[0].Cmp(fundingAmountWei) != 0 ||
+		new(big.Int).Sub(valueWords[1], valueWords[3]).Cmp(fundingAmountWei) != 0 ||
+		new(big.Int).Sub(valueWords[4], valueWords[2]).Cmp(fundingAmountWei) != 0 {
+		return fmt.Errorf("Polygon native value log does not encode the fixed balance transfer")
+	}
+	feeWords := words[1]
+	if feeWords[0].Sign() <= 0 || gasUsed == 0 {
+		return fmt.Errorf("Polygon native fee log amount is not positive")
+	}
+	gasUsedBig := new(big.Int).SetUint64(gasUsed)
+	feePerGas := new(big.Int)
+	remainder := new(big.Int)
+	feePerGas.QuoRem(feeWords[0], gasUsedBig, remainder)
+	totalGasCost := new(big.Int).Mul(gasUsedBig, effectiveGasPrice)
+	if remainder.Sign() != 0 || feePerGas.Sign() <= 0 || feeWords[0].Cmp(totalGasCost) > 0 {
+		return fmt.Errorf("Polygon native fee log amount is inconsistent with the signed EIP-1559 fee")
+	}
+	return nil
+}
+
 func validateFundingReceipt(receipt rpcReceipt, expected journalEntry) (validatedReceipt, error) {
 	hash, err := normalizeFixedHex(receipt.TransactionHash, 32, "receipt transaction hash")
 	if err != nil || hash != expected.TransactionHash {
@@ -457,8 +587,10 @@ func validateFundingReceipt(receipt rpcReceipt, expected journalEntry) (validate
 	if err != nil || !maxFeeOK || effectiveGasPrice.Sign() <= 0 || effectiveGasPrice.Cmp(maxFee) > 0 {
 		return validatedReceipt{}, fmt.Errorf("receipt effective gas price is zero or exceeds signed max fee")
 	}
-	if receipt.Logs == nil || len(receipt.Logs) != 0 {
-		return validatedReceipt{}, fmt.Errorf("native EOA funding receipt logs must be an explicit empty array")
+	if err := validatePolygonFundingLogs(
+		receipt.Logs, blockHash, blockNumber, gasUsed, effectiveGasPrice, expected,
+	); err != nil {
+		return validatedReceipt{}, err
 	}
 	return validatedReceipt{
 		blockNumber: blockNumber, blockHash: blockHash, gasUsed: gasUsed,

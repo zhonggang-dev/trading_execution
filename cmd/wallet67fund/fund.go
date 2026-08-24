@@ -357,14 +357,16 @@ func executeJournalEntry(ctx context.Context, params fundingRunParams, journal *
 	if entry.State != journalStateSigned && entry.State != journalStateBroadcast {
 		return fmt.Errorf("unsupported executable journal state %q", entry.State)
 	}
-	if err := verifySignedJournalEntry(ctx, *entry, params.account); err != nil {
+	found, err := recoverSignedTransaction(ctx, params.rpc, *entry)
+	if err != nil {
 		return err
 	}
-	if entry.State == journalStateSigned {
-		found, err := recoverSignedTransaction(ctx, params.rpc, *entry)
-		if err != nil {
+	if entry.State == journalStateSigned && !found {
+		if err := verifySignedJournalEntry(ctx, *entry, params.account); err != nil {
 			return err
 		}
+	}
+	if entry.State == journalStateSigned {
 		if !found {
 			nonce, err := readNonce(ctx, params.rpc, entry.Source)
 			if err != nil {
@@ -656,6 +658,9 @@ func validateFinalBalanceDeltas(ctx context.Context, rpc rpcCaller, journal fund
 }
 
 func rebroadcastMissingTransaction(ctx context.Context, params fundingRunParams, entry journalEntry) error {
+	if err := verifySignedJournalEntry(ctx, entry, params.account); err != nil {
+		return err
+	}
 	nonce, err := readNonce(ctx, params.rpc, entry.Source)
 	if err != nil {
 		return err
