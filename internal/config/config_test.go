@@ -132,7 +132,7 @@ func TestLoadRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsExplicitLiveDecisionSubmission(t *testing.T) {
+func TestLoadAcceptsExplicitShadowDecisionCycle(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
@@ -142,15 +142,15 @@ func TestLoadAcceptsExplicitLiveDecisionSubmission(t *testing.T) {
 		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
 		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
-	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "false")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-producer-current":"DIRECT","masked-producer-current":"SANDBOX"}`)
 	config, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if !config.DecisionCycle.OrderSubmissionEnabled {
-		t.Fatal("decision-cycle order submission was not enabled")
+	if config.DecisionCycle.OrderSubmissionEnabled {
+		t.Fatal("shadow decision-cycle order submission was enabled")
 	}
 }
 
@@ -204,7 +204,7 @@ func TestLoadRejectsRetiredWalletTopology(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsRequiredWallet67SubmissionDisabledAccounts(t *testing.T) {
+func TestLoadAcceptsRequiredMainWallet1EntryDisabledAccounts(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
@@ -214,44 +214,18 @@ func TestLoadAcceptsRequiredWallet67SubmissionDisabledAccounts(t *testing.T) {
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
 		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
-	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[" wallet-7 ","wallet-6"]`)
-	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `[" wallet-1 ","main"]`)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "false")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-producer-v7":"DIRECT","gemini-3.6-flash":"SANDBOX"}`)
 	config, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(config.DecisionCycle.SubmissionDisabledAccounts) != 2 ||
-		config.DecisionCycle.SubmissionDisabledAccounts[0] != "wallet-7" ||
-		config.DecisionCycle.SubmissionDisabledAccounts[1] != "wallet-6" {
-		t.Fatalf("submission-disabled accounts = %#v", config.DecisionCycle.SubmissionDisabledAccounts)
-	}
-}
-
-func TestLoadAcceptsWallet67QuarantineSubsetOrEmpty(t *testing.T) {
-	for _, test := range []struct {
-		name             string
-		disabledAccounts string
-		submitEnabled    string
-	}{
-		{name: "remove both in shadow", disabledAccounts: `[]`, submitEnabled: "false"},
-		{name: "remove wallet-7 in shadow", disabledAccounts: `["wallet-6"]`, submitEnabled: "false"},
-		{name: "remove wallet-6 with submission enabled", disabledAccounts: `["wallet-7"]`, submitEnabled: "true"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			clearConfigEnvironment(t)
-			setCompleteLiveEnvironment(t)
-			setCompleteDecisionCycleEnvironment(t)
-			t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", test.disabledAccounts)
-			t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", test.submitEnabled)
-			if test.submitEnabled == "true" {
-				t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-			}
-			if _, err := Load(); err != nil {
-				t.Fatalf("Load() error = %v, want activation subset accepted", err)
-			}
-		})
+	if len(config.DecisionCycle.EntryDisabledAccounts) != 2 ||
+		config.DecisionCycle.EntryDisabledAccounts[0] != "wallet-1" ||
+		config.DecisionCycle.EntryDisabledAccounts[1] != "main" {
+		t.Fatalf("entry-disabled accounts = %#v", config.DecisionCycle.EntryDisabledAccounts)
 	}
 }
 
@@ -266,7 +240,7 @@ func TestLoadRejectsInvalidDecisionSubmissionDisabledAccounts(t *testing.T) {
 		{name: "empty", value: `[" "]`, want: "account 0 is empty"},
 		{name: "duplicate", value: `["wallet-7","wallet-7"]`, want: "duplicate account"},
 		{name: "unbound", value: `["wallet-3"]`, want: "not a configured binding"},
-		{name: "retained wallet", value: `["main"]`, want: "permits only wallet-6 and wallet-7"},
+		{name: "wallet quarantine", value: `["wallet-6"]`, want: "requires DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON=[]"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			clearConfigEnvironment(t)
@@ -280,17 +254,63 @@ func TestLoadRejectsInvalidDecisionSubmissionDisabledAccounts(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsSellOnlyDecisionSubmission(t *testing.T) {
+func TestLoadRejectsGlobalSellOnlyGateForWallet67ShadowRelease(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
 	t.Setenv("DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED", "true")
-	config, err := Load()
-	if err != nil {
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "requires DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false") {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if !config.DecisionCycle.EntrySubmissionDisabled {
-		t.Fatal("decision-cycle entry submission gate was not disabled")
+}
+
+func TestLoadRejectsInvalidEntryDisabledAccounts(t *testing.T) {
+	for _, value := range []string{`[]`, `["main"]`, `["wallet-6","wallet-7"]`, `["main","main"]`} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() accepted entry-disabled accounts %s", value)
+			}
+		})
+	}
+}
+
+func TestLoadKeepsCurrentLiveAccountEntryGateWhenSchedulerDisabled(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		key   string
+		value string
+		want  string
+	}{
+		{name: "missing entry accounts", key: "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", value: "", want: "main and wallet-1"},
+		{name: "wrong entry accounts", key: "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", value: `["wallet-6","wallet-7"]`, want: "main and wallet-1"},
+		{name: "quarantined account", key: "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", value: `["wallet-6"]`, want: "requires DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON=[]"},
+		{name: "global sell only", key: "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED", value: "true", want: "requires DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			t.Setenv("DECISION_CYCLE_ENABLED", "false")
+			t.Setenv(test.key, test.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsOrderSubmissionForShadowRelease(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "shadow release requires DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false") {
+		t.Fatalf("Load() error = %v, want shadow submission rejection", err)
 	}
 }
 
@@ -510,6 +530,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"DECISION_CYCLE_INTERVAL", "DECISION_CYCLE_STARTUP_DELAY", "DECISION_CYCLE_MAX_START_LATENESS", "DECISION_CYCLE_TIMEOUT",
 		"DECISION_CYCLE_PREDICTION_LOOKBACK", "DECISION_CYCLE_MID_PRICE_LOOKBACK",
 		"DECISION_CYCLE_BINDINGS_JSON", "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
+		"DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON",
 		"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON",
 	} {
 		t.Setenv(key, "")
@@ -536,7 +557,8 @@ func setCompleteDecisionCycleEnvironment(t *testing.T) {
 		{"prediction_model_id":"masked-source","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
 		{"prediction_model_id":"masked-source","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
-	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `["wallet-6","wallet-7"]`)
+	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[]`)
+	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `["main","wallet-1"]`)
 	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-source":"DIRECT","masked-source":"SANDBOX"}`)
 }
 
@@ -557,4 +579,7 @@ func setCompleteLiveEnvironment(t *testing.T) {
 	t.Setenv("POLYGON_ORDER_FILLED_CONFIRMATIONS", "64")
 	t.Setenv("POLYMARKET_ACCOUNTS_FILE", "/run/secrets/trading_execution/wallets.json")
 	t.Setenv("POLYGON_RPC_URL", "https://polygon-rpc.example.invalid")
+	t.Setenv("DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED", "false")
+	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `["main","wallet-1"]`)
+	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[]`)
 }

@@ -37,8 +37,8 @@ EXPECTED_ROUTES = {
     ("gemini_masked", "multfactor_v2"): "wallet-7",
 }
 EXPECTED_ACCOUNTS = frozenset(EXPECTED_ROUTES.values())
-CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS = frozenset({"wallet-6", "wallet-7"})
-ACTIVATABLE_ACCOUNTS = CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS
+CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS = frozenset()
+ACTIVATABLE_ACCOUNTS = frozenset({"wallet-6", "wallet-7"})
 POLICY_LIMIT_FIELDS = (
     "max_order_notional",
     "max_market_exposure",
@@ -102,7 +102,7 @@ CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT = {
 MAX_CONFIG_BYTES = 4 << 20
 DISABLED_EVIDENCE_SCHEMA = "four_wallet.disabled_preflight.v1"
 ACTIVATION_RISK_APPROVAL_SCHEMA = "four_wallet.activation_risk_approval.v1"
-ACTIVATION_RISK_DECISION = "APPROVED_FOR_LIVE_ACTIVATION"
+ACTIVATION_RISK_DECISION = "APPROVED_FOR_SHADOW_OBSERVATION"
 IMMUTABLE_RELEASE_IDENTITY = re.compile(r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})")
 PREDICTION_SOURCE_DIRECT = "DIRECT"
 PREDICTION_SOURCE_SANDBOX = "SANDBOX"
@@ -123,6 +123,7 @@ TRADING_RUNTIME_KEYS = frozenset(
         "DECISION_CYCLE_ENABLED",
         "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED",
         "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
+        "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON",
         "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",
         "DECISION_CYCLE_BINDINGS_JSON",
         "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON",
@@ -316,7 +317,7 @@ SELECT json_build_object(
     'count',(
       SELECT count(*) FROM execution_orders
        WHERE intent->>'side'='BUY'
-         AND execution_account_id IN (SELECT execution_account_id FROM managed_accounts)
+         AND execution_account_id IN ('main','wallet-1')
          AND status NOT IN ('FILLED','CANCELLED','REJECTED','MANUAL_REVIEW')
     ),
     'orders',(
@@ -331,7 +332,7 @@ SELECT json_build_object(
           SELECT order_id,client_order_id,execution_account_id,status,updated_at
             FROM execution_orders
            WHERE intent->>'side'='BUY'
-             AND execution_account_id IN (SELECT execution_account_id FROM managed_accounts)
+             AND execution_account_id IN ('main','wallet-1')
              AND status NOT IN ('FILLED','CANCELLED','REJECTED','MANUAL_REVIEW')
            ORDER BY order_id
            LIMIT 20
@@ -504,12 +505,64 @@ def decode_prediction_model_source_modes(
 
 
 def validate_rollout_quarantine(accounts: tuple[str, ...]) -> None:
-    unsupported = set(accounts) - ACTIVATABLE_ACCOUNTS
-    if unsupported:
+    if accounts:
         raise PreflightError(
-            "this release permits only wallet-6 and wallet-7 in the submission-disabled "
-            f"set; unsupported={sorted(unsupported)}"
+            "this release requires an empty submission-disabled account set"
         )
+
+
+def decode_entry_disabled_accounts(
+    payload: str, bindings: tuple[Binding, ...]
+) -> tuple[str, ...]:
+    try:
+        raw = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise PreflightError(
+            "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON is invalid JSON"
+        ) from error
+    if not isinstance(raw, list):
+        raise PreflightError(
+            "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must be one JSON array"
+        )
+    accounts: list[str] = []
+    for index, value in enumerate(raw):
+        if not isinstance(value, str) or not value.strip():
+            raise PreflightError(
+                "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON contains an empty or non-string "
+                f"account at index {index}"
+            )
+        accounts.append(value.strip())
+    if len(accounts) != len(set(accounts)):
+        raise PreflightError(
+            "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON contains duplicates"
+        )
+    bound_accounts = {binding.execution_account_id for binding in bindings}
+    unknown = set(accounts) - bound_accounts
+    if unknown:
+        raise PreflightError(
+            "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON contains unbound accounts: "
+            f"{sorted(unknown)}"
+        )
+    expected = {"main", "wallet-1"}
+    if set(accounts) != expected:
+        raise PreflightError(
+            "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1"
+        )
+    return tuple(sorted(accounts))
+
+
+def entry_enabled_rollout_bindings(
+    bindings: tuple[Binding, ...], entry_disabled_accounts: tuple[str, ...]
+) -> tuple[Binding, ...]:
+    disabled = set(entry_disabled_accounts)
+    result = tuple(
+        binding
+        for binding in bindings
+        if binding.execution_account_id not in disabled
+    )
+    if not result:
+        raise PreflightError("entry-disabled accounts exclude every decision binding")
+    return result
 
 
 def active_rollout_bindings(
@@ -685,6 +738,11 @@ def _required_static_decimal(
 def validate_environment(
     environment: dict[str, str], *, submission_state: str, entry_submission_state: str = "allowed"
 ) -> tuple[Binding, ...]:
+    if submission_state == "enabled":
+        raise PreflightError(
+            "this release and approval authorize shadow observation only; "
+            "order submission must remain disabled"
+        )
     _required_boolean(environment, "EXECUTION_ALLOW_MARKET_ORDERS", False)
     _required_static_decimal(environment, "EXECUTION_MAX_ORDER_SIZE")
     _required_static_decimal(environment, "EXECUTION_MAX_ORDER_NOTIONAL")
@@ -722,12 +780,12 @@ def validate_environment(
         )
     _required_boolean(environment, "DECISION_CYCLE_ENABLED", True)
     _required_boolean(environment, "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", True)
-    if entry_submission_state not in {"allowed", "blocked"}:
-        raise PreflightError("entry submission state must be allowed or blocked")
+    if entry_submission_state != "allowed":
+        raise PreflightError("this release requires the global entry submission state to be allowed")
     _required_boolean(
         environment,
         "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
-        entry_submission_state == "blocked",
+        False,
     )
     if submission_state != "either":
         _required_boolean(
@@ -744,6 +802,10 @@ def validate_environment(
         bindings,
     )
     validate_rollout_quarantine(quarantined_accounts)
+    decode_entry_disabled_accounts(
+        environment.get("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", ""),
+        bindings,
+    )
     wallet_path = environment.get("POLYMARKET_ACCOUNTS_FILE", "").strip()
     if not wallet_path:
         raise PreflightError("POLYMARKET_ACCOUNTS_FILE is required")
@@ -762,17 +824,29 @@ def validate_prediction_environment(
     bindings: tuple[Binding, ...],
     source_modes: dict[str, str],
 ) -> None:
+    _required_boolean(environment, "TRADING_INPUT_ENABLED", True)
+    _required_boolean(environment, "PREDICTION_RESULT_ENABLED", True)
+    if not environment.get("DATABASE_URL", "").strip():
+        raise PreflightError("Prediction DATABASE_URL must be explicit")
+    known_models = {binding.prediction_model_id for binding in bindings}
+    if set(source_modes) != known_models:
+        raise PreflightError(
+            "normalized prediction source modes differ from configured Trading entry models"
+        )
+    direct_models = {
+        model_id
+        for model_id, mode in source_modes.items()
+        if mode == PREDICTION_SOURCE_DIRECT
+    }
+    if not direct_models:
+        return
     _required_boolean(environment, "REDIS_ENABLED", True)
     _required_boolean(environment, "DIRECT_PREDICTION_ENABLED", True)
-    _required_boolean(environment, "PREDICTION_RESULT_ENABLED", True)
-    _required_boolean(environment, "TRADING_INPUT_ENABLED", True)
     stream_key = environment.get("REDIS_DIRECT_PREDICTION_STREAM_KEY", "").strip()
     if not stream_key:
         raise PreflightError("REDIS_DIRECT_PREDICTION_STREAM_KEY is required")
     if not environment.get("REDIS_ADDRESS", "").strip():
         raise PreflightError("REDIS_ADDRESS must be explicit for Direct consumer verification")
-    if not environment.get("DATABASE_URL", "").strip():
-        raise PreflightError("Prediction DATABASE_URL must be explicit")
     if "REDIS_PASSWORD" not in environment:
         raise PreflightError("REDIS_PASSWORD must be explicit, including an explicit empty value")
     try:
@@ -781,6 +855,9 @@ def validate_prediction_environment(
         raise PreflightError("REDIS_DATABASE must be an explicit integer") from error
     if redis_database < 0 or redis_database > 15:
         raise PreflightError("REDIS_DATABASE must be between 0 and 15")
+def decode_configured_direct_prediction_models(
+    environment: dict[str, str]
+) -> tuple[str, ...]:
     try:
         configured_models = json.loads(
             environment.get("DIRECT_PREDICTION_MODEL_IDS_JSON", "")
@@ -796,23 +873,24 @@ def validate_prediction_environment(
     normalized_models = [value.strip() for value in configured_models]
     if len(normalized_models) != len(set(normalized_models)):
         raise PreflightError("DIRECT_PREDICTION_MODEL_IDS_JSON contains duplicate models")
-    configured_model_set = set(normalized_models)
-    known_models = {binding.prediction_model_id for binding in bindings}
-    if set(source_modes) != known_models:
-        raise PreflightError(
-            "normalized prediction source modes differ from configured Trading models"
-        )
-    direct_models = {
+    return tuple(sorted(normalized_models))
+
+
+def validate_configured_direct_prediction_models(
+    environment: dict[str, str], source_modes: dict[str, str]
+) -> None:
+    configured = set(decode_configured_direct_prediction_models(environment))
+    expected = {
         model_id
         for model_id, mode in source_modes.items()
         if mode == PREDICTION_SOURCE_DIRECT
     }
-    unexpected_models = configured_model_set - direct_models
-    missing_models = direct_models - configured_model_set
-    if unexpected_models or missing_models:
+    unexpected = configured - expected
+    missing = expected - configured
+    if unexpected or missing:
         raise PreflightError(
-            "Prediction Direct model set must equal the Trading DIRECT source-mode subset; "
-            f"missing={sorted(missing_models)}, unexpected={sorted(unexpected_models)}"
+            "Prediction Direct model set must equal the full Trading DIRECT source-mode subset; "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
         )
 
 
@@ -1315,13 +1393,13 @@ def validate_delivery_state(
             "execution orders require explicit UNKNOWN/MANUAL_REVIEW resolution before "
             "cutover: " + ", ".join(identities or [f"unsafe_count={manual_review_count}"])
         )
-    if entry_submission_state == "blocked" and nonterminal_buy_count:
+    if nonterminal_buy_count:
         identities = []
         for row in nonterminal_buy_orders[:20]:
             if isinstance(row, dict):
                 identities.append(f"{row.get('order_id')}:{row.get('status')}")
         raise PreflightError(
-            "sell-only cutover requires zero nonterminal BUY execution orders: "
+            "main/wallet-1 account entry gate requires zero nonterminal BUY execution orders: "
             + ", ".join(identities or [f"unsafe_count={nonterminal_buy_count}"])
         )
 
@@ -1462,14 +1540,15 @@ def validate_dry_run_state(
     bindings: tuple[Binding, ...],
     *,
     submission_disabled_accounts: tuple[str, ...] = (),
+    entry_disabled_accounts: tuple[str, ...] = (),
     not_before: dt.datetime,
     now: dt.datetime,
     max_age: dt.timedelta,
     required: dict[str, object] | None = None,
     entry_submission_state: str = "allowed",
 ) -> dict[str, object]:
-    if entry_submission_state not in {"allowed", "blocked"}:
-        raise PreflightError("entry submission state must be allowed or blocked")
+    if entry_submission_state != "allowed":
+        raise PreflightError("this release requires the global entry submission state to be allowed")
     if not isinstance(state, dict) or not isinstance(state.get("dry_runs"), list):
         raise PreflightError("database preflight did not return dry-run evidence")
     candidates: list[tuple[dt.datetime, dict[str, object]]] = []
@@ -1510,6 +1589,7 @@ def validate_dry_run_state(
     if not isinstance(snapshot_id, str) or not snapshot_id.strip():
         raise PreflightError("dry-run prediction_snapshot_id is missing")
     disabled = set(submission_disabled_accounts)
+    entry_disabled = set(entry_disabled_accounts)
     configured_accounts = {binding.execution_account_id for binding in bindings}
     if not disabled <= configured_accounts:
         raise PreflightError("dry-run quarantine contains an unbound execution account")
@@ -1541,18 +1621,24 @@ def validate_dry_run_state(
             raise PreflightError("latest binding run was not recorded with submission=false")
         if row.get("has_output") is not True:
             raise PreflightError(f"latest binding run {authorization} did not complete")
-        if not isinstance(row.get("prediction_count"), int) or row["prediction_count"] < 1:
-            raise PreflightError(f"latest binding run {authorization} received no predictions")
         policy_enabled = row.get("entry_policy_enabled")
         block_reason = row.get("entry_block_reason")
-        if entry_submission_state == "blocked":
+        account_id = authorization[2]
+        if account_id in entry_disabled:
+            if type(row.get("prediction_count")) is not int or row.get("prediction_count") != 0:
+                raise PreflightError(
+                    f"latest sell-only binding run {authorization} unexpectedly received predictions"
+                )
             if policy_enabled is not False or block_reason != "ENTRY_SUBMISSION_DISABLED":
                 raise PreflightError(
                     f"latest binding run {authorization} does not carry the exact "
                     "sell-only entry policy"
                 )
-        elif (policy_enabled is not None and policy_enabled is not True) or block_reason not in {"", None}:
-            raise PreflightError(f"latest binding run {authorization} has an entry block")
+        else:
+            if type(row.get("prediction_count")) is not int or row["prediction_count"] < 1:
+                raise PreflightError(f"latest binding run {authorization} received no predictions")
+            if policy_enabled is not None or block_reason not in {"", None}:
+                raise PreflightError(f"latest binding run {authorization} has an entry block")
     if actual != expected:
         raise PreflightError(
             f"latest dry-run bindings differ from the atomic configuration; "
@@ -2214,6 +2300,9 @@ def configuration_sha256(
         "prediction": prediction,
         "bindings": [dataclasses.asdict(binding) for binding in bindings],
         "direct_prediction_models": sorted(model_groups),
+        "configured_direct_prediction_models": list(
+            decode_configured_direct_prediction_models(prediction_environment)
+        ),
         "direct_model_groups": model_groups,
         "wallet_file_sha256": wallet_file_sha256,
         "activation_risk_approval_sha256": activation_risk_approval_sha256,
@@ -2311,8 +2400,15 @@ def validate_disabled_evidence(
         )
     if evidence.get("direct_model_groups") != model_groups:
         raise PreflightError("disabled-phase evidence belongs to a different Direct model-group topology")
-    if not isinstance(evidence.get("manifest_markets"), int) or evidence["manifest_markets"] < 1:
-        raise PreflightError("disabled-phase evidence has no completed manifest markets")
+    manifest_markets = evidence.get("manifest_markets")
+    if type(manifest_markets) is not int or manifest_markets < 0:
+        raise PreflightError("disabled-phase evidence has an invalid manifest market count")
+    if model_groups and manifest_markets < 1:
+        raise PreflightError("disabled-phase evidence has no completed Direct manifest markets")
+    if not model_groups and manifest_markets != 0:
+        raise PreflightError(
+            "disabled-phase evidence has Direct manifest markets for a SANDBOX-only entry cohort"
+        )
     if evidence.get("delivery_watermark") != delivery_watermark:
         raise PreflightError(
             "decision delivery state changed after the disabled-phase evidence"
@@ -2437,7 +2533,7 @@ def validate_activation_risk_approval(
             "cannot authorize wallet activation"
         )
     if approval.get("decision") != ACTIVATION_RISK_DECISION:
-        raise PreflightError("activation-risk decision is not approved for live activation")
+        raise PreflightError("activation-risk decision is not approved for shadow observation")
     for field in ("approval_id", "approved_by"):
         value = approval.get(field)
         if not isinstance(value, str) or not value.strip():
@@ -2911,6 +3007,15 @@ def _redis_pairs(value: object) -> dict[str, object]:
 def collect_consumer_state(
     prediction_environment: dict[str, str], model_groups: dict[str, str]
 ) -> dict[str, object]:
+    if not model_groups:
+        return {
+            "observed_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "stream_key": prediction_environment.get(
+                "REDIS_DIRECT_PREDICTION_STREAM_KEY", ""
+            ).strip(),
+            "model_groups": {},
+            "groups": [],
+        }
     address = prediction_environment.get("REDIS_ADDRESS", "").strip()
     parsed = urllib.parse.urlsplit("//" + address)
     if not parsed.hostname:
@@ -3194,9 +3299,11 @@ def main(argv: list[str] | None = None) -> int:
             bindings,
         )
         validate_rollout_quarantine(submission_disabled_accounts)
-        active_wallet67 = frozenset(
-            ACTIVATABLE_ACCOUNTS - set(submission_disabled_accounts)
+        entry_disabled_accounts = decode_entry_disabled_accounts(
+            environment["DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON"],
+            bindings,
         )
+        active_wallet67 = ACTIVATABLE_ACCOUNTS
         activation_risk_approval_sha = (
             args.activation_risk_approval_sha256 or ""
         ).strip()
@@ -3233,20 +3340,30 @@ def main(argv: list[str] | None = None) -> int:
         active_bindings = active_rollout_bindings(
             bindings, submission_disabled_accounts
         )
+        entry_enabled_bindings = entry_enabled_rollout_bindings(
+            active_bindings, entry_disabled_accounts
+        )
+        entry_source_modes = {
+            binding.prediction_model_id: source_modes[binding.prediction_model_id]
+            for binding in entry_enabled_bindings
+        }
         wallet_path = pathlib.Path(environment["POLYMARKET_ACCOUNTS_FILE"])
         wallet_file_sha = hashlib.sha256(
             _read_bounded_regular_file(wallet_path, "wallet")
         ).hexdigest()
         validate_prediction_environment(
             prediction_environment,
-            bindings,
-            source_modes,
+            entry_enabled_bindings,
+            entry_source_modes,
+        )
+        validate_configured_direct_prediction_models(
+            prediction_environment, source_modes
         )
         validate_cross_service_credentials(environment, prediction_environment)
         model_groups = decode_model_groups(
             args.direct_model_groups_json,
-            bindings,
-            source_modes,
+            entry_enabled_bindings,
+            entry_source_modes,
         )
         configuration_sha = configuration_sha256(
             environment,
@@ -3324,6 +3441,7 @@ def main(argv: list[str] | None = None) -> int:
             state,
             bindings,
             submission_disabled_accounts=submission_disabled_accounts,
+            entry_disabled_accounts=entry_disabled_accounts,
             not_before=(
                 process_started_at
                 if args.submission_state == "disabled"
@@ -3344,8 +3462,8 @@ def main(argv: list[str] | None = None) -> int:
         manifest_markets = validate_snapshot_manifest(
             snapshot,
             dry_run,
-            active_bindings,
-            source_modes,
+            entry_enabled_bindings,
+            entry_source_modes,
             dt.timedelta(
                 seconds=_whole_duration_seconds(
                     environment["DECISION_CYCLE_PREDICTION_LOOKBACK"],
@@ -3487,6 +3605,7 @@ def main(argv: list[str] | None = None) -> int:
                 final_state,
                 bindings,
                 submission_disabled_accounts=submission_disabled_accounts,
+                entry_disabled_accounts=entry_disabled_accounts,
                 not_before=final_dry_run_now - dry_run_age,
                 now=final_dry_run_now,
                 max_age=dry_run_age,

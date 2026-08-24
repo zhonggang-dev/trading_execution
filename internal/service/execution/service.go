@@ -51,6 +51,10 @@ type Params struct {
 	// here, below every caller (HTTP, decision cycle, and crash recovery), so a
 	// BUY can never reach Venue.Place while the operator is exiting positions.
 	EntrySubmissionDisabled bool
+	// EntryDisabledAccounts applies the sell-only gate to selected active
+	// accounts. It is enforced together with the process-wide gate below every
+	// submission and recovery caller.
+	EntryDisabledAccounts []string
 	// RequirePreparedPlacement is mandatory for live composition. Paper and
 	// legacy in-memory tests may keep the one-step Venue contract.
 	RequirePreparedPlacement bool
@@ -73,6 +77,7 @@ type Service struct {
 	maxReconcileAttempts     int
 	accountScope             port.ExecutionAccountScope
 	entrySubmissionDisabled  bool
+	entryDisabledAccountSet  map[string]struct{}
 	requirePreparedPlacement bool
 	now                      func() time.Time
 	newID                    func() string
@@ -121,6 +126,10 @@ func New(params Params) (*Service, error) {
 	if params.NewID == nil {
 		params.NewID = newOrderID
 	}
+	entryDisabledAccountSet, err := normalizeEntryDisabledAccounts(params.EntryDisabledAccounts)
+	if err != nil {
+		return nil, err
+	}
 	return &Service{
 		repository:               params.Repository,
 		venue:                    params.Venue,
@@ -135,6 +144,7 @@ func New(params Params) (*Service, error) {
 		maxReconcileAttempts:     params.MaxReconcileAttempts,
 		accountScope:             params.AccountScope,
 		entrySubmissionDisabled:  params.EntrySubmissionDisabled,
+		entryDisabledAccountSet:  entryDisabledAccountSet,
 		requirePreparedPlacement: params.RequirePreparedPlacement,
 		now:                      params.Now,
 		newID:                    params.NewID,
@@ -161,7 +171,7 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 	} else if !errors.Is(err, port.ErrOrderNotFound) {
 		return SubmitResult{}, fmt.Errorf("look up order intent: %w", err)
 	}
-	if service.entrySubmissionDisabled && intent.Side == domain.SideBuy {
+	if service.entrySubmissionBlocked(intent.ExecutionAccountID, intent.Side) {
 		return SubmitResult{}, entrySubmissionDisabledError()
 	}
 
@@ -216,7 +226,7 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 	if err := service.requireActiveAccount(stored.Intent.ExecutionAccountID); err != nil {
 		return SubmitResult{Order: stored, Created: created}, err
 	}
-	if service.entrySubmissionDisabled && stored.Intent.Side == domain.SideBuy {
+	if service.entrySubmissionBlocked(stored.Intent.ExecutionAccountID, stored.Intent.Side) {
 		cause := entrySubmissionDisabledError()
 		if err := service.reject(ctx, &stored, cause.Code, cause); err != nil {
 			uncertainErr := service.reservations.MarkUncertain(ctx, stored, "ENTRY_SUBMISSION_DISABLED_REJECTION_PERSIST_FAILED: "+err.Error())
@@ -353,6 +363,32 @@ func entrySubmissionDisabledError() *port.Rejection {
 		Code:   domain.StrategyEntryBlockSubmissionDisabled,
 		Reason: "BUY submission is disabled while the operator-owned sell-only gate is active",
 	}
+}
+
+func normalizeEntryDisabledAccounts(accounts []string) (map[string]struct{}, error) {
+	result := make(map[string]struct{}, len(accounts))
+	for index, rawAccountID := range accounts {
+		accountID := strings.TrimSpace(rawAccountID)
+		if accountID == "" {
+			return nil, fmt.Errorf("entry-disabled execution account %d is empty", index)
+		}
+		if _, duplicate := result[accountID]; duplicate {
+			return nil, fmt.Errorf("entry-disabled execution account %q is duplicated", accountID)
+		}
+		result[accountID] = struct{}{}
+	}
+	return result, nil
+}
+
+func (service *Service) entrySubmissionBlocked(accountID string, side domain.Side) bool {
+	if side != domain.SideBuy {
+		return false
+	}
+	if service.entrySubmissionDisabled {
+		return true
+	}
+	_, blocked := service.entryDisabledAccountSet[strings.TrimSpace(accountID)]
+	return blocked
 }
 
 // finishPrepareError handles only failures that occur before a venue POST is

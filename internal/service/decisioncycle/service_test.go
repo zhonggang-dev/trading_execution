@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -159,6 +160,8 @@ type fakeRecorder struct {
 	requeueCalls             int
 	claimAccountCalls        [][]string
 	requeueAccountCalls      [][]string
+	claimSideCalls           []domain.Side
+	requeueSideCalls         []domain.Side
 	claimedOutputs           []domain.StrategyDecisionResponse
 	claimedIntents           []domain.OrderIntent
 	claimedSubmissionEnabled []bool
@@ -255,6 +258,7 @@ func (strategy *coverageBuyExitStrategy) Decide(_ context.Context, request domai
 
 func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, activeAccountIDs []string, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
 	recorder.claimAccountCalls = append(recorder.claimAccountCalls, append([]string(nil), activeAccountIDs...))
+	recorder.claimSideCalls = append(recorder.claimSideCalls, side)
 	active := make(map[string]struct{}, len(activeAccountIDs))
 	for _, accountID := range activeAccountIDs {
 		active[accountID] = struct{}{}
@@ -279,6 +283,7 @@ func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, activeAccou
 func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, activeAccountIDs []string, _ time.Time, side domain.Side, limit int) (int, error) {
 	recorder.requeueCalls++
 	recorder.requeueAccountCalls = append(recorder.requeueAccountCalls, append([]string(nil), activeAccountIDs...))
+	recorder.requeueSideCalls = append(recorder.requeueSideCalls, side)
 	active := make(map[string]struct{}, len(activeAccountIDs))
 	for _, accountID := range activeAccountIDs {
 		active[accountID] = struct{}{}
@@ -833,7 +838,7 @@ func TestSourceModeMismatchSubmitsExitButNeverBuy(t *testing.T) {
 	}
 }
 
-func TestOperatorSellOnlyGateSubmitsExitButNeverBuy(t *testing.T) {
+func TestAccountEntryGateCallsMainStrategyWithPositionAndSubmitsExitButNeverBuy(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
 	prediction.Model.Name = "echo-producer-v7"
@@ -849,8 +854,8 @@ func TestOperatorSellOnlyGateSubmitsExitButNeverBuy(t *testing.T) {
 			OpenedAt: decisionAt.Add(-49 * time.Hour),
 		}},
 	}
-	books := make([]domain.OrderBookSnapshot, 0, 2)
-	for _, outcome := range prediction.Outcomes {
+	books := make([]domain.OrderBookSnapshot, 0, 1)
+	for _, outcome := range prediction.Outcomes[:1] {
 		books = append(books, domain.OrderBookSnapshot{
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
 			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, Status: domain.OrderBookStatusOK,
@@ -873,7 +878,7 @@ func TestOperatorSellOnlyGateSubmitsExitButNeverBuy(t *testing.T) {
 		}},
 		PositionSource: positions, OrderBookSource: &fakeOrderBookSource{books: books},
 		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: recorder,
-		Executor: executor, SubmitEnabled: true, EntrySubmissionDisabled: true,
+		Executor: executor, SubmitEnabled: true, EntryDisabledAccounts: []string{"main"},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{{
 			PredictionModelID: "echo-producer-v7", ModelID: "echo",
@@ -902,6 +907,71 @@ func TestOperatorSellOnlyGateSubmitsExitButNeverBuy(t *testing.T) {
 	if len(recorder.claimedOutputs) != 1 || recorder.claimedOutputs[0].EntryPolicy == nil ||
 		recorder.claimedOutputs[0].EntryPolicy.BlockReason != domain.StrategyEntryBlockSubmissionDisabled {
 		t.Fatalf("recorded output policy = %#v", recorder.claimedOutputs)
+	}
+	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 0 ||
+		len(strategy.requests[0].Positions) != 1 || strategy.requests[0].Positions[0].LotID != "lot-main-1" {
+		t.Fatalf("main sell-only strategy request = %#v", strategy.requests)
+	}
+}
+
+func TestAccountEntryGateRoutesOnlyGeminiPredictionsToWallet6AndWallet7(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	maskedPrediction := validPrediction(decisionAt)
+	maskedPrediction.PredictionID = "pred-masked-entry"
+	maskedPrediction.SourceJobID = "job-masked-entry"
+	maskedPrediction.SandboxID = "sandbox-gemini"
+	maskedPrediction.Model.Name = "gemini-3.6-flash"
+	bindings := []domain.StrategyExecutionBinding{
+		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main"},
+		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-1"},
+		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
+		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+	}
+	strategy := &matrixStrategy{}
+	service, err := newTestService(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
+			SnapshotID:    "predsnap-wallet67-entry",
+			DecisionAt:    decisionAt,
+			Predictions:   []domain.Prediction{maskedPrediction},
+		}},
+		PositionSource:               fakePositionSource{},
+		OrderBookSource:              &fakeOrderBookSource{},
+		MidPriceSource:               &fakeMidPriceHistorySource{},
+		Strategy:                     strategy,
+		Recorder:                     &fakeRecorder{},
+		Executor:                     &fakeExecutor{},
+		SubmitEnabled:                true,
+		EntryDisabledAccounts:        []string{"main", "wallet-1"},
+		RequireCompleteModelCoverage: true,
+		Bindings:                     bindings,
+		Venue:                        "polymarket-paper",
+		Now:                          func() time.Time { return decisionAt.Add(2 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error=%v", err)
+	}
+	result, runErr := service.Run(context.Background(), decisionAt)
+	if runErr != nil {
+		t.Fatalf("Run() error=%v", runErr)
+	}
+	if len(result.Runs) != 4 || len(strategy.requests) != 4 {
+		t.Fatalf("runs/requests=%d/%d", len(result.Runs), len(strategy.requests))
+	}
+	for index, request := range strategy.requests {
+		run := result.Runs[index]
+		switch request.Context.ExecutionAccountID {
+		case "main", "wallet-1":
+			if len(request.Predictions) != 0 || run.EntrySubmissionEnabled || run.EntryBlockReason != domain.StrategyEntryBlockSubmissionDisabled {
+				t.Fatalf("sell-only retained request/run=%#v/%#v", request, run)
+			}
+		case "wallet-6", "wallet-7":
+			if len(request.Predictions) != 1 || !run.EntrySubmissionEnabled || run.EntryBlockReason != "" || request.Predictions[0].Model.Name != "gemini_masked" {
+				t.Fatalf("wallet67 entry request/run=%#v/%#v", request, run)
+			}
+		default:
+			t.Fatalf("unexpected account %q", request.Context.ExecutionAccountID)
+		}
 	}
 }
 
@@ -1860,7 +1930,7 @@ func TestDeliverPendingSurfacesReplayedRejectedAndUnknownOrders(t *testing.T) {
 			}}}
 			service := &Service{recorder: recorder, executor: fixedResultExecutor{result: port.OrderSubmitResult{
 				Order: domain.Order{ID: "order-1", Status: status},
-			}}, activeExecutionAccountIDs: []string{"account-active"}}
+			}}, activeExecutionAccountIDs: []string{"account-active"}, entryEnabledExecutionAccountIDs: []string{"account-active"}}
 			results, err := service.deliverPending(context.Background(), "cycle-1")
 			if err == nil || len(results) != 1 || results[0].Error == nil {
 				t.Fatalf("deliverPending() results=%#v error=%v", results, err)
@@ -1882,7 +1952,7 @@ func TestDeliverPendingLeavesMissingOrderOwnershipLeasedAndUnhealthy(t *testing.
 		CycleID: "cycle-1", ClientOrderID: intent.ClientOrderID,
 		Intent: intent, Status: domain.DecisionIntentPending,
 	}}}
-	service := &Service{recorder: recorder, executor: fixedResultExecutor{}, activeExecutionAccountIDs: []string{"account-active"}}
+	service := &Service{recorder: recorder, executor: fixedResultExecutor{}, activeExecutionAccountIDs: []string{"account-active"}, entryEnabledExecutionAccountIDs: []string{"account-active"}}
 	results, err := service.deliverPending(context.Background(), "cycle-1")
 	if err == nil || len(results) != 1 || results[0].Error == nil ||
 		recorder.deliveries[0].Status != domain.DecisionIntentSubmitting {
@@ -1907,8 +1977,9 @@ func TestRecoverStartupDrainsMoreThanOneClaimBatchBeforeNewSchedule(t *testing.T
 	executor := &fakeExecutor{}
 	service := &Service{
 		recorder: recorder, executor: executor, submitEnabled: true,
-		activeExecutionAccountIDs: []string{"account-active"},
-		now:                       func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
+		activeExecutionAccountIDs:       []string{"account-active"},
+		entryEnabledExecutionAccountIDs: []string{"account-active"},
+		now:                             func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
 	}
 	if err := service.RecoverStartup(context.Background()); err != nil {
 		t.Fatalf("RecoverStartup() error = %v", err)
@@ -1944,8 +2015,9 @@ func TestRecoverStartupLeavesRetiredDeliveriesUntouched(t *testing.T) {
 	executor := &fakeExecutor{}
 	service := &Service{
 		recorder: recorder, executor: executor, submitEnabled: true,
-		activeExecutionAccountIDs: []string{"account-active"},
-		now:                       func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
+		activeExecutionAccountIDs:       []string{"account-active"},
+		entryEnabledExecutionAccountIDs: []string{"account-active"},
+		now:                             func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
 	}
 	if err := service.RecoverStartup(context.Background()); err != nil {
 		t.Fatal(err)
@@ -2032,6 +2104,46 @@ func TestSellOnlyRecoveryNeverClaimsOrRequeuesBuy(t *testing.T) {
 		recorder.deliveries[1].Status != domain.DecisionIntentPending ||
 		recorder.deliveries[2].Status != domain.DecisionIntentSubmitted {
 		t.Fatalf("stored delivery statuses = %s/%s/%s", recorder.deliveries[0].Status, recorder.deliveries[1].Status, recorder.deliveries[2].Status)
+	}
+}
+
+func TestAccountEntryGateRecoveryClaimsMainWallet1OnlyForSellAndWallet67ForBothSides(t *testing.T) {
+	deliveries := []domain.DecisionIntentDelivery{
+		{CycleID: "old", ClientOrderID: "main-buy-submitting", Intent: domain.OrderIntent{ClientOrderID: "main-buy-submitting", ExecutionAccountID: "main", Side: domain.SideBuy}, Status: domain.DecisionIntentSubmitting, Attempt: 1},
+		{CycleID: "old", ClientOrderID: "wallet1-buy-pending", Intent: domain.OrderIntent{ClientOrderID: "wallet1-buy-pending", ExecutionAccountID: "wallet-1", Side: domain.SideBuy}, Status: domain.DecisionIntentPending},
+		{CycleID: "old", ClientOrderID: "main-sell-submitting", Intent: domain.OrderIntent{ClientOrderID: "main-sell-submitting", ExecutionAccountID: "main", Side: domain.SideSell}, Status: domain.DecisionIntentSubmitting, Attempt: 1},
+		{CycleID: "old", ClientOrderID: "wallet6-buy-submitting", Intent: domain.OrderIntent{ClientOrderID: "wallet6-buy-submitting", ExecutionAccountID: "wallet-6", Side: domain.SideBuy}, Status: domain.DecisionIntentSubmitting, Attempt: 1},
+		{CycleID: "old", ClientOrderID: "wallet7-sell-pending", Intent: domain.OrderIntent{ClientOrderID: "wallet7-sell-pending", ExecutionAccountID: "wallet-7", Side: domain.SideSell}, Status: domain.DecisionIntentPending},
+	}
+	recorder := &fakeRecorder{deliveries: deliveries}
+	executor := &fakeExecutor{}
+	service := &Service{
+		recorder: recorder, executor: executor, submitEnabled: true,
+		activeExecutionAccountIDs:        []string{"main", "wallet-1", "wallet-6", "wallet-7"},
+		entryEnabledExecutionAccountIDs:  []string{"wallet-6", "wallet-7"},
+		entryDisabledExecutionAccountIDs: []string{"main", "wallet-1"},
+		now:                              func() time.Time { return time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC) },
+	}
+	if err := service.RecoverStartup(context.Background()); err != nil {
+		t.Fatalf("RecoverStartup() error=%v", err)
+	}
+	if len(recorder.requeueAccountCalls) != 2 || len(recorder.claimAccountCalls) != 2 ||
+		!reflect.DeepEqual(recorder.requeueAccountCalls[0], []string{"wallet-6", "wallet-7"}) || recorder.requeueSideCalls[0] != "" ||
+		!reflect.DeepEqual(recorder.requeueAccountCalls[1], []string{"main", "wallet-1"}) || recorder.requeueSideCalls[1] != domain.SideSell ||
+		!reflect.DeepEqual(recorder.claimAccountCalls[0], []string{"wallet-6", "wallet-7"}) || recorder.claimSideCalls[0] != "" ||
+		!reflect.DeepEqual(recorder.claimAccountCalls[1], []string{"main", "wallet-1"}) || recorder.claimSideCalls[1] != domain.SideSell {
+		t.Fatalf("recovery cohorts accounts=%#v/%#v sides=%#v/%#v", recorder.requeueAccountCalls, recorder.claimAccountCalls, recorder.requeueSideCalls, recorder.claimSideCalls)
+	}
+	if len(executor.intents) != 3 {
+		t.Fatalf("submitted intents=%#v, want wallet6 BUY, wallet7 SELL, main SELL", executor.intents)
+	}
+	if recorder.deliveries[0].Status != domain.DecisionIntentSubmitting || recorder.deliveries[1].Status != domain.DecisionIntentPending {
+		t.Fatalf("blocked BUY deliveries changed: %#v/%#v", recorder.deliveries[0], recorder.deliveries[1])
+	}
+	for _, index := range []int{2, 3, 4} {
+		if recorder.deliveries[index].Status != domain.DecisionIntentSubmitted {
+			t.Fatalf("allowed delivery %d status=%s", index, recorder.deliveries[index].Status)
+		}
 	}
 }
 

@@ -66,7 +66,11 @@ type DecisionCycle struct {
 	SubmissionDisabledAccounts []string
 	// EntrySubmissionDisabled is an operator-owned sell-only gate. It blocks
 	// BUY intents without blocking validated exits from managed position lots.
-	EntrySubmissionDisabled      bool
+	EntrySubmissionDisabled bool
+	// EntryDisabledAccounts applies the same sell-only rule to an exact account
+	// subset while keeping those accounts active for strategy exits and
+	// reconciliation.
+	EntryDisabledAccounts        []string
 	RequireCompleteModelCoverage bool
 	PredictionInfraBaseURL       string
 	PredictionInfraToken         string
@@ -484,13 +488,33 @@ func (config Config) Validate() error {
 		); err != nil {
 			return err
 		}
-		if err := validateCurrentWallet67Quarantine(config.DecisionCycle.SubmissionDisabledAccounts); err != nil {
-			return err
+		if err := validateDecisionSubmissionDisabledAccounts(
+			config.DecisionCycle.Bindings,
+			config.DecisionCycle.EntryDisabledAccounts,
+		); err != nil {
+			return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON: %w", err)
 		}
 		if err := validateDecisionPredictionSourceModes(
 			config.DecisionCycle.Bindings,
 			config.DecisionCycle.PredictionSourceModes,
 		); err != nil {
+			return err
+		}
+	}
+	if config.Execution.Mode == "live" {
+		// These release pins protect the live execution API independently of the
+		// scheduler. Disabling the decision cycle must never remove the
+		// account-scoped BUY gate from direct Submit/Resume paths.
+		if err := validateCurrentWallet67Quarantine(config.DecisionCycle.SubmissionDisabledAccounts); err != nil {
+			return err
+		}
+		if config.DecisionCycle.EntrySubmissionDisabled {
+			return fmt.Errorf("this release requires DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false and uses the exact account entry gate")
+		}
+		if config.DecisionCycle.OrderSubmissionEnabled {
+			return fmt.Errorf("this shadow release requires DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false")
+		}
+		if err := validateCurrentWallet67EntryDisabledAccounts(config.DecisionCycle.EntryDisabledAccounts); err != nil {
 			return err
 		}
 	}
@@ -554,10 +578,17 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	entryDisabledAccounts, err := decodeDecisionEntryDisabledAccounts(
+		os.Getenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON"),
+	)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	return DecisionCycle{
 		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
 		SubmissionDisabledAccounts:   submissionDisabledAccounts,
 		EntrySubmissionDisabled:      entrySubmissionDisabled,
+		EntryDisabledAccounts:        entryDisabledAccounts,
 		RequireCompleteModelCoverage: requireCompleteModelCoverage,
 		PredictionInfraBaseURL:       strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_URL")),
 		PredictionInfraToken:         strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_TOKEN")),
@@ -568,6 +599,26 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		PredictionLookback: predictionLookback, MidPriceLookback: midPriceLookback,
 		Bindings: bindings, PredictionSourceModes: predictionSourceModes,
 	}, nil
+}
+
+func decodeDecisionEntryDisabledAccounts(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+	var accounts []string
+	if err := decoder.Decode(&accounts); err != nil {
+		return nil, fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly one JSON array")
+	}
+	for index := range accounts {
+		accounts[index] = strings.TrimSpace(accounts[index])
+	}
+	return accounts, nil
 }
 
 func decodeDecisionPredictionSourceModes(value string) (map[string]domain.PredictionSourceMode, error) {
@@ -756,19 +807,32 @@ func validateDecisionSubmissionDisabledAccounts(
 	return nil
 }
 
-// validateCurrentWallet67Quarantine keeps the release quarantine boundary
-// limited to the two newly managed wallets. Either wallet may be activated by
-// removing it explicitly from this list, but retained main/wallet-1 routes may
-// never be hidden behind the onboarding quarantine.
+// validateCurrentWallet67Quarantine pins this shadow release to all four
+// active accounts. Account-level BUY gating preserves main/wallet-1 exits and
+// reconciliation without using the broader quarantine mechanism.
 func validateCurrentWallet67Quarantine(accounts []string) error {
-	allowed := map[string]struct{}{"wallet-6": {}, "wallet-7": {}}
+	if len(accounts) != 0 {
+		return fmt.Errorf("this release requires DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON=[]")
+	}
+	return nil
+}
+
+// validateCurrentWallet67EntryDisabledAccounts pins this release to the
+// reviewed wallet-6/wallet-7 shadow cohort. Retained main/wallet-1 stay active
+// for exits and reconciliation, but cannot create a new BUY.
+func validateCurrentWallet67EntryDisabledAccounts(accounts []string) error {
+	if len(accounts) != 2 {
+		return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1")
+	}
+	seen := make(map[string]struct{}, len(accounts))
 	for _, accountID := range accounts {
-		accountID = strings.TrimSpace(accountID)
-		if _, exists := allowed[accountID]; !exists {
-			return fmt.Errorf(
-				"this release permits only wallet-6 and wallet-7 in DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
-			)
-		}
+		seen[strings.TrimSpace(accountID)] = struct{}{}
+	}
+	if _, exists := seen["main"]; !exists {
+		return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1")
+	}
+	if _, exists := seen["wallet-1"]; !exists {
+		return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1")
 	}
 	return nil
 }

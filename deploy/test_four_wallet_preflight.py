@@ -54,6 +54,7 @@ STATIC_TRADING_ENVIRONMENT = {
     "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON": json.dumps(
         SOURCE_MODES, separators=(",", ":")
     ),
+    "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON": '["main","wallet-1"]',
 }
 STATIC_TRADING_DRIFT = {
     "EXECUTION_ALLOW_MARKET_ORDERS": "true",
@@ -65,6 +66,7 @@ STATIC_TRADING_DRIFT = {
     "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON": (
         '{"echo-producer-v7":"SANDBOX","gemini-3.6-flash":"DIRECT"}'
     ),
+    "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON": '["main","wallet-6"]',
 }
 
 
@@ -73,19 +75,28 @@ def iso(value: dt.datetime) -> str:
 
 
 def dry_run_rows(entry_policy_enabled: object = None, block_reason: str = "") -> list[dict[str, object]]:
-    return [
-        {
+    rows = []
+    account_specific_default = entry_policy_enabled is None and block_reason == ""
+    for item in VALID_BINDINGS:
+        account_id = str(item["execution_account_id"])
+        blocked = account_id in {"main", "wallet-1"}
+        rows.append({
             "model_id": item["model_id"],
             "strategy_id": item["strategy_id"],
-            "execution_account_id": item["execution_account_id"],
+            "execution_account_id": account_id,
             "order_submission_enabled": False,
             "has_output": True,
-            "prediction_count": 1,
-            "entry_policy_enabled": entry_policy_enabled,
-            "entry_block_reason": block_reason,
-        }
-        for item in VALID_BINDINGS
-    ]
+            "prediction_count": 0 if account_specific_default and blocked else 1,
+            "entry_policy_enabled": (
+                False if account_specific_default and blocked else entry_policy_enabled
+            ),
+            "entry_block_reason": (
+                "ENTRY_SUBMISSION_DISABLED"
+                if account_specific_default and blocked
+                else block_reason
+            ),
+        })
+    return rows
 
 
 def complete_snapshot(decision_at: dt.datetime, snapshot_id: str) -> dict[str, object]:
@@ -207,7 +218,6 @@ def database_state(bindings: list[dict[str, object]] | None = None) -> dict[str,
         "manual_review_orders": [],
         "nonterminal_buy_orders": [],
     }
-    quarantine_accounts(state, "wallet-6", "wallet-7")
     return state
 
 
@@ -391,17 +401,27 @@ class DatabaseStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
         self.active_bindings = preflight.active_rollout_bindings(
-            self.bindings, ("wallet-6", "wallet-7")
+            self.bindings, ()
+        )
+
+    def validate(self, state: dict[str, object], **kwargs: object) -> str:
+        kwargs.setdefault("submission_disabled_accounts", ())
+        kwargs.setdefault(
+            "approved_risk_contracts",
+            approved_risk_contracts(state, "wallet-6", "wallet-7"),
+        )
+        return preflight.validate_database_state(
+            state, self.bindings, **kwargs  # type: ignore[arg-type]
         )
 
     def test_accepts_exact_active_and_quarantined_authorization_set(self) -> None:
-        preflight.validate_database_state(database_state(), self.bindings)
+        self.validate(database_state())
 
     def test_rejects_missing_authorization(self) -> None:
         state = database_state()
         state["bindings"] = state["bindings"][:-1]
         with self.assertRaisesRegex(preflight.PreflightError, "missing configured"):
-            preflight.validate_database_state(state, self.bindings)
+            self.validate(state)
 
     def test_rejects_unexpected_enabled_authorization(self) -> None:
         state = database_state()
@@ -414,124 +434,75 @@ class DatabaseStateTests(unittest.TestCase):
             }
         )
         with self.assertRaisesRegex(preflight.PreflightError, "unexpected="):
-            preflight.validate_database_state(state, self.bindings)
+            self.validate(state)
 
     def test_rejects_open_global_kill_switch(self) -> None:
         state = database_state()
         state["global_kill_switch"] = False
         with self.assertRaisesRegex(preflight.PreflightError, "kill switch"):
-            preflight.validate_database_state(state, self.bindings)
+            self.validate(state)
 
     def test_rejects_missing_or_disabled_expected_risk_policy(self) -> None:
         missing = database_state()
         missing["risk_policies"] = missing["risk_policies"][:-1]
         with self.assertRaisesRegex(preflight.PreflightError, "missing risk policy"):
-            preflight.validate_database_state(missing, self.bindings)
+            self.validate(missing)
 
         disabled = database_state()
         disabled["risk_policies"][0]["enabled"] = False
         with self.assertRaisesRegex(preflight.PreflightError, "enabled=True"):
-            preflight.validate_database_state(disabled, self.bindings)
+            self.validate(disabled)
 
     def test_rejects_missing_or_duplicate_account_control(self) -> None:
         missing = database_state()
         missing["account_controls"] = missing["account_controls"][:-1]
         with self.assertRaisesRegex(preflight.PreflightError, "missing ACCOUNT control"):
-            preflight.validate_database_state(missing, self.bindings)
+            self.validate(missing)
 
         duplicate = database_state()
         duplicate["account_controls"].append(dict(duplicate["account_controls"][0]))
         with self.assertRaisesRegex(preflight.PreflightError, "duplicate or invalid ACCOUNT"):
-            preflight.validate_database_state(duplicate, self.bindings)
+            self.validate(duplicate)
 
     def test_disabled_phase_rejects_paused_active_control(self) -> None:
         state = database_state()
         state["account_controls"][0]["paused"] = True
         state["account_controls"][0]["reason"] = "CUTOVER_NOT_ARMED"
         with self.assertRaisesRegex(preflight.PreflightError, "to be unpaused"):
-            preflight.validate_database_state(
-                state, self.bindings, submission_state="disabled"
-            )
+            self.validate(state, submission_state="disabled")
 
     def test_enabled_phase_requires_active_controls_unpaused(self) -> None:
         state = database_state()
         state["account_controls"][0]["paused"] = True
         state["account_controls"][0]["reason"] = "CUTOVER_NOT_ARMED"
         with self.assertRaisesRegex(preflight.PreflightError, "to be unpaused"):
-            preflight.validate_database_state(
-                state, self.bindings, submission_state="enabled"
-            )
+            self.validate(state, submission_state="enabled")
 
-    def test_enabled_phase_requires_quarantined_control_paused(self) -> None:
+    def test_rejects_any_submission_quarantine(self) -> None:
         state = database_state()
-        preflight.validate_database_state(
-            state,
-            self.bindings,
-            submission_state="enabled",
-            submission_disabled_accounts=("wallet-6", "wallet-7"),
-        )
-
-        for control in state["account_controls"]:
-            if control["execution_account_id"] == "wallet-7":
-                control["paused"] = False
-        with self.assertRaisesRegex(preflight.PreflightError, "to be paused"):
-            preflight.validate_database_state(
-                state,
-                self.bindings,
-                submission_state="enabled",
-                submission_disabled_accounts=("wallet-6", "wallet-7"),
-            )
-
-    def test_accepts_initial_wallet6_wallet7_quarantine_contract(self) -> None:
-        state = database_state()
-        preflight.validate_database_state(
-            state,
-            self.bindings,
-            submission_state="disabled",
-            submission_disabled_accounts=("wallet-6", "wallet-7"),
-        )
-
-    def test_rejects_enabled_binding_or_policy_for_quarantined_account(self) -> None:
-        state = database_state()
-        wallet7_binding = next(
-            row for row in state["bindings"] if row["execution_account_id"] == "wallet-7"
-        )
-        wallet7_binding["enabled"] = True
-        with self.assertRaisesRegex(preflight.PreflightError, "active managed-wallet set"):
-            preflight.validate_database_state(
-                state,
-                self.bindings,
-                submission_disabled_accounts=("wallet-6", "wallet-7"),
-            )
-
-        wallet7_binding["enabled"] = False
-        wallet7_policy = next(
-            row
-            for row in state["risk_policies"]
-            if row["execution_account_id"] == "wallet-7"
-        )
-        wallet7_policy["enabled"] = True
-        with self.assertRaisesRegex(preflight.PreflightError, "enabled=False"):
-            preflight.validate_database_state(
-                state,
-                self.bindings,
-                submission_disabled_accounts=("wallet-6", "wallet-7"),
-            )
-
-    def test_active_wallet67_requires_matching_approved_risk_contract(self) -> None:
-        state = database_state()
-        activate_accounts(state, "wallet-6")
-        with self.assertRaisesRegex(preflight.PreflightError, "risk approvals"):
+        with self.assertRaisesRegex(preflight.PreflightError, "empty submission-disabled"):
             preflight.validate_database_state(
                 state,
                 self.bindings,
                 submission_disabled_accounts=("wallet-7",),
+                approved_risk_contracts=approved_risk_contracts(
+                    state, "wallet-6", "wallet-7"
+                ),
             )
-        contracts = approved_risk_contracts(state, "wallet-6")
+
+    def test_active_wallet67_requires_matching_approved_risk_contract(self) -> None:
+        state = database_state()
+        with self.assertRaisesRegex(preflight.PreflightError, "risk approvals"):
+            preflight.validate_database_state(
+                state,
+                self.bindings,
+                submission_disabled_accounts=(),
+            )
+        contracts = approved_risk_contracts(state, "wallet-6", "wallet-7")
         preflight.validate_database_state(
             state,
             self.bindings,
-            submission_disabled_accounts=("wallet-7",),
+            submission_disabled_accounts=(),
             approved_risk_contracts=contracts,
         )
         contracts["wallet-6"]["policy_id"] = "disabled-template"
@@ -539,7 +510,7 @@ class DatabaseStateTests(unittest.TestCase):
             preflight.validate_database_state(
                 state,
                 self.bindings,
-                submission_disabled_accounts=("wallet-7",),
+                submission_disabled_accounts=(),
                 approved_risk_contracts=contracts,
             )
 
@@ -547,17 +518,17 @@ class DatabaseStateTests(unittest.TestCase):
         drifted = database_state()
         drifted["risk_policies"][0]["max_wallet_exposure"] = 99
         with self.assertRaisesRegex(preflight.PreflightError, "reviewed current-rollout"):
-            preflight.validate_database_state(drifted, self.bindings)
+            self.validate(drifted)
 
         invalid = database_state()
         invalid["risk_policies"][0]["max_order_notional"] = 0
         with self.assertRaisesRegex(preflight.PreflightError, "invalid max_order_notional"):
-            preflight.validate_database_state(invalid, self.bindings)
+            self.validate(invalid)
 
         timezone = database_state()
         timezone["risk_policies"][0]["daily_timezone"] = "Asia/Shanghai"
         with self.assertRaisesRegex(preflight.PreflightError, "daily_timezone UTC"):
-            preflight.validate_database_state(timezone, self.bindings)
+            self.validate(timezone)
 
     def test_retired_rows_remain_auditable_without_blocking_managed_scope(self) -> None:
         state = database_state()
@@ -590,7 +561,7 @@ class DatabaseStateTests(unittest.TestCase):
                 "version": 9,
             }
         )
-        preflight.validate_database_state(state, self.bindings)
+        self.validate(state)
 
     def test_database_query_scopes_mutating_history_checks_to_managed_accounts(self) -> None:
         sql = preflight.DATABASE_STATE_SQL
@@ -606,26 +577,26 @@ class DatabaseStateTests(unittest.TestCase):
 
     def test_account_identity_hash_changes_with_wallet_address(self) -> None:
         state = database_state()
-        original = preflight.validate_database_state(state, self.bindings)
+        original = self.validate(state)
         state["accounts"][0]["wallet_address"] = "0x11"
         self.assertNotEqual(
-            preflight.validate_database_state(state, self.bindings), original
+            self.validate(state), original
         )
 
     def test_database_identity_hash_covers_policy_and_control_identity(self) -> None:
         state = database_state()
-        original = preflight.validate_database_state(state, self.bindings)
+        original = self.validate(state)
 
         changed_policy = database_state()
         changed_policy["risk_policies"][0]["version"] = 2
         self.assertNotEqual(
-            preflight.validate_database_state(changed_policy, self.bindings), original
+            self.validate(changed_policy), original
         )
 
         changed_control = database_state()
         changed_control["account_controls"][0]["reason"] = "REVIEWED_READY"
         self.assertNotEqual(
-            preflight.validate_database_state(changed_control, self.bindings), original
+            self.validate(changed_control), original
         )
 
 
@@ -653,8 +624,9 @@ class EnvironmentTests(unittest.TestCase):
             "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE": "true",
             "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED": "false",
             "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "false",
+            "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON": '["main","wallet-1"]',
             "DECISION_CYCLE_BINDINGS_JSON": json.dumps(VALID_BINDINGS),
-            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON": '["wallet-6","wallet-7"]',
+            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON": '[]',
             "POLYMARKET_ACCOUNTS_FILE": str(wallet_path),
             "TRADING_EXECUTION_DATABASE_URL": "postgres://user:secret@db/trading",
             "DECISION_CYCLE_PREDICTION_LOOKBACK": "3h",
@@ -669,6 +641,18 @@ class EnvironmentTests(unittest.TestCase):
                 self.environment(wallet_path), submission_state="disabled"
             )
         self.assertEqual(len(bindings), 4)
+
+    def test_rejects_enabled_submission_for_shadow_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
+            )
+            environment = self.environment(wallet_path)
+            environment["DECISION_CYCLE_ORDER_SUBMISSION_ENABLED"] = "true"
+            with self.assertRaisesRegex(preflight.PreflightError, "shadow observation only"):
+                preflight.validate_environment(
+                    environment, submission_state="enabled"
+                )
 
     def test_source_modes_require_exact_models_and_rollout_modes(self) -> None:
         bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
@@ -722,23 +706,21 @@ class EnvironmentTests(unittest.TestCase):
                 bindings,
             )
 
-    def test_accepts_wallet67_quarantine_subset_or_empty(self) -> None:
+    def test_accepts_only_empty_submission_quarantine(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wallet_path = self.write_wallet_file(
                 pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
             )
             environment = self.environment(wallet_path)
-            for value in ('[]', '["wallet-6"]', '["wallet-7"]'):
-                environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = value
-                with self.subTest(value=value):
-                    self.assertEqual(
-                        len(
-                            preflight.validate_environment(
-                                environment, submission_state="disabled"
-                            )
-                        ),
-                        4,
+            environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = '[]'
+            self.assertEqual(
+                len(
+                    preflight.validate_environment(
+                        environment, submission_state="disabled"
                     )
+                ),
+                4,
+            )
 
     def test_rejects_invalid_submission_disabled_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -748,7 +730,7 @@ class EnvironmentTests(unittest.TestCase):
             for value, message in (
                 ('["wallet-7","wallet-7"]', "duplicates"),
                 ('["wallet-missing"]', "unbound accounts"),
-                ('["main"]', "permits only wallet-6 and wallet-7"),
+                ('["main"]', "empty submission-disabled"),
             ):
                 environment = self.environment(wallet_path)
                 environment["DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"] = value
@@ -759,25 +741,39 @@ class EnvironmentTests(unittest.TestCase):
                         environment, submission_state="disabled"
                     )
 
-    def test_sell_only_preflight_requires_entry_submission_blocked(self) -> None:
+    def test_rejects_global_sell_only_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wallet_path = self.write_wallet_file(
                 pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
             )
             environment = self.environment(wallet_path)
-            with self.assertRaisesRegex(preflight.PreflightError, "ENTRY_SUBMISSION_DISABLED"):
+            with self.assertRaisesRegex(preflight.PreflightError, "global entry submission state"):
                 preflight.validate_environment(
                     environment,
                     submission_state="disabled",
                     entry_submission_state="blocked",
                 )
             environment["DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED"] = "true"
-            bindings = preflight.validate_environment(
-                environment,
-                submission_state="disabled",
-                entry_submission_state="blocked",
+            with self.assertRaisesRegex(preflight.PreflightError, "ENTRY_SUBMISSION_DISABLED"):
+                preflight.validate_environment(
+                    environment,
+                    submission_state="disabled",
+                )
+
+    def test_requires_exact_main_wallet1_entry_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
             )
-        self.assertEqual(len(bindings), 4)
+            for value in ('[]', '["main"]', '["wallet-6","wallet-7"]'):
+                environment = self.environment(wallet_path)
+                environment["DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON"] = value
+                with self.subTest(value=value), self.assertRaisesRegex(
+                    preflight.PreflightError, "exactly main and wallet-1"
+                ):
+                    preflight.validate_environment(
+                        environment, submission_state="disabled"
+                    )
 
     def test_rejects_disabled_complete_model_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -875,6 +871,18 @@ class ActivationRiskApprovalTests(unittest.TestCase):
                 max_age=dt.timedelta(hours=1),
             )
 
+    def test_rejects_old_live_activation_decision_for_shadow(self) -> None:
+        reused = dict(self.approval)
+        reused["decision"] = "APPROVED_FOR_LIVE_ACTIVATION"
+        with self.assertRaisesRegex(preflight.PreflightError, "shadow observation"):
+            preflight.validate_activation_risk_approval(
+                reused,
+                active_accounts=frozenset({"wallet-6"}),
+                expected_trading_commit=TRADING_COMMIT,
+                now=self.now,
+                max_age=dt.timedelta(hours=1),
+            )
+
     def test_rejects_wrong_account_or_stale_approval(self) -> None:
         with self.assertRaisesRegex(preflight.PreflightError, "account set differs"):
             preflight.validate_activation_risk_approval(
@@ -929,6 +937,9 @@ class PredictionEnvironmentTests(unittest.TestCase):
         preflight.validate_prediction_environment(
             self.environment, self.bindings, SOURCE_MODES
         )
+        preflight.validate_configured_direct_prediction_models(
+            self.environment, SOURCE_MODES
+        )
 
     def test_accepts_exact_direct_source_mode_subset(self) -> None:
         self.validate()
@@ -954,6 +965,28 @@ class PredictionEnvironmentTests(unittest.TestCase):
         self.environment["PREDICTION_RESULT_ENABLED"] = "false"
         with self.assertRaisesRegex(preflight.PreflightError, "PREDICTION_RESULT_ENABLED"):
             self.validate()
+
+    def test_sandbox_only_entry_skips_redis_but_keeps_full_direct_identity(self) -> None:
+        entry_bindings = preflight.entry_enabled_rollout_bindings(
+            self.bindings, ("main", "wallet-1")
+        )
+        entry_modes = {"gemini-3.6-flash": "SANDBOX"}
+        sandbox_environment = dict(self.environment)
+        for key in (
+            "REDIS_ENABLED",
+            "REDIS_ADDRESS",
+            "REDIS_DATABASE",
+            "REDIS_PASSWORD",
+            "DIRECT_PREDICTION_ENABLED",
+            "REDIS_DIRECT_PREDICTION_STREAM_KEY",
+        ):
+            sandbox_environment.pop(key, None)
+        preflight.validate_prediction_environment(
+            sandbox_environment, entry_bindings, entry_modes
+        )
+        preflight.validate_configured_direct_prediction_models(
+            sandbox_environment, SOURCE_MODES
+        )
 
 
 class RuntimeEvidenceTests(unittest.TestCase):
@@ -1128,95 +1161,53 @@ class DryRunEvidenceTests(unittest.TestCase):
         return preflight.validate_dry_run_state(
             self.state,
             self.bindings,
+            entry_disabled_accounts=("main", "wallet-1"),
             not_before=self.now - dt.timedelta(minutes=20),
             now=self.now,
             max_age=dt.timedelta(minutes=30),
         )
 
-    def validate_sell_only(self) -> dict[str, object]:
-        return preflight.validate_dry_run_state(
-            self.state,
-            self.bindings,
-            not_before=self.now - dt.timedelta(minutes=20),
-            now=self.now,
-            max_age=dt.timedelta(minutes=30),
-            entry_submission_state="blocked",
-        )
-
-    def validate_wallet7_quarantine(self) -> dict[str, object]:
-        return preflight.validate_dry_run_state(
-            self.state,
-            self.bindings,
-            submission_disabled_accounts=("wallet-7",),
-            not_before=self.now - dt.timedelta(minutes=20),
-            now=self.now,
-            max_age=dt.timedelta(minutes=30),
-        )
-
-    def test_accepts_legacy_healthy_output_without_entry_policy(self) -> None:
+    def test_accepts_exact_account_entry_policy(self) -> None:
         self.assertEqual(self.validate()["prediction_snapshot_id"], "snapshot-1")
 
-    def test_accepts_exact_three_active_rows_when_wallet7_is_quarantined(self) -> None:
+    def test_rejects_missing_active_row(self) -> None:
         self.state["dry_runs"][0]["bindings"] = [
             row
             for row in dry_run_rows()
             if row["execution_account_id"] != "wallet-7"
         ]
-        self.assertEqual(
-            self.validate_wallet7_quarantine()["prediction_snapshot_id"],
-            "snapshot-1",
-        )
+        with self.assertRaisesRegex(preflight.PreflightError, "exactly 4 active"):
+            self.validate()
 
-    def test_rejects_quarantined_wallet_row_in_dry_run(self) -> None:
-        with self.assertRaisesRegex(preflight.PreflightError, "exactly 3 active"):
-            self.validate_wallet7_quarantine()
-
-    def test_rejects_missing_active_row_when_wallet7_is_quarantined(self) -> None:
-        self.state["dry_runs"][0]["bindings"] = [
-            row
-            for row in dry_run_rows()
-            if row["execution_account_id"] not in {"wallet-6", "wallet-7"}
-        ]
-        with self.assertRaisesRegex(preflight.PreflightError, "exactly 3 active"):
-            self.validate_wallet7_quarantine()
-
-    def test_accepts_explicit_enabled_entry_policy(self) -> None:
-        self.state["dry_runs"][0]["bindings"] = dry_run_rows(True, "")
-        self.validate()
+    def test_rejects_explicit_enabled_policy_for_wallet67(self) -> None:
+        self.state["dry_runs"][0]["bindings"][2]["entry_policy_enabled"] = True
+        with self.assertRaisesRegex(preflight.PreflightError, "entry block"):
+            self.validate()
 
     def test_rejects_explicit_disabled_policy_even_without_reason(self) -> None:
-        self.state["dry_runs"][0]["bindings"] = dry_run_rows(False, "")
+        self.state["dry_runs"][0]["bindings"][2]["entry_policy_enabled"] = False
         with self.assertRaisesRegex(preflight.PreflightError, "entry block"):
             self.validate()
 
     def test_rejects_coverage_block_reason(self) -> None:
-        self.state["dry_runs"][0]["bindings"] = dry_run_rows(
-            False, "INCOMPLETE_MODEL_COVERAGE"
-        )
+        self.state["dry_runs"][0]["bindings"][2]["entry_policy_enabled"] = False
+        self.state["dry_runs"][0]["bindings"][2]["entry_block_reason"] = "INCOMPLETE_MODEL_COVERAGE"
         with self.assertRaisesRegex(preflight.PreflightError, "entry block"):
             self.validate()
 
-    def test_accepts_exact_operator_policy_in_sell_only_mode(self) -> None:
-        self.state["dry_runs"][0]["bindings"] = dry_run_rows(
-            False, "ENTRY_SUBMISSION_DISABLED"
-        )
-        self.assertEqual(
-            self.validate_sell_only()["prediction_snapshot_id"], "snapshot-1"
-        )
-
-    def test_rejects_missing_operator_policy_in_sell_only_mode(self) -> None:
+    def test_rejects_missing_main_operator_policy(self) -> None:
+        self.state["dry_runs"][0]["bindings"][0]["entry_policy_enabled"] = None
+        self.state["dry_runs"][0]["bindings"][0]["entry_block_reason"] = ""
         with self.assertRaisesRegex(preflight.PreflightError, "exact sell-only"):
-            self.validate_sell_only()
+            self.validate()
 
-    def test_rejects_wrong_operator_reason_in_sell_only_mode(self) -> None:
-        self.state["dry_runs"][0]["bindings"] = dry_run_rows(
-            False, "INCOMPLETE_MODEL_COVERAGE"
-        )
+    def test_rejects_wrong_main_operator_reason(self) -> None:
+        self.state["dry_runs"][0]["bindings"][0]["entry_block_reason"] = "INCOMPLETE_MODEL_COVERAGE"
         with self.assertRaisesRegex(preflight.PreflightError, "exact sell-only"):
-            self.validate_sell_only()
+            self.validate()
 
     def test_rejects_invalid_entry_policy_type_in_allowed_mode(self) -> None:
-        self.state["dry_runs"][0]["bindings"] = dry_run_rows("true", "")
+        self.state["dry_runs"][0]["bindings"][2]["entry_policy_enabled"] = "true"
         with self.assertRaisesRegex(preflight.PreflightError, "entry block"):
             self.validate()
 
@@ -1227,6 +1218,9 @@ class SnapshotManifestTests(unittest.TestCase):
         self.bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
         self.active_bindings = preflight.active_rollout_bindings(
             self.bindings, ("wallet-6", "wallet-7")
+        )
+        self.entry_bindings = preflight.entry_enabled_rollout_bindings(
+            self.bindings, ("main", "wallet-1")
         )
         self.dry_run = {
             "decision_at": iso(self.decision_at),
@@ -1248,6 +1242,22 @@ class SnapshotManifestTests(unittest.TestCase):
     def test_accepts_direct_manifest_and_fresh_sandbox_result(self) -> None:
         self.assertEqual(
             self.validate(), 1
+        )
+
+    def test_sandbox_only_entry_cohort_needs_no_direct_manifest(self) -> None:
+        direct_expectation = self.snapshot["data"]["expected_predictions"][0]
+        direct_expectation["status"] = "PENDING"
+        direct_expectation.pop("result_available_at")
+        entry_source_modes = {"gemini-3.6-flash": "SANDBOX"}
+        self.assertEqual(
+            preflight.validate_snapshot_manifest(
+                self.snapshot,
+                self.dry_run,
+                self.entry_bindings,
+                entry_source_modes,
+                dt.timedelta(hours=3),
+            ),
+            0,
         )
 
     def test_direct_identity_uses_go_trim_and_utc_instant_semantics(self) -> None:
@@ -1536,6 +1546,34 @@ class ConsumerEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "every configured model"):
             self.validate()
 
+    def test_accepts_empty_consumer_evidence_for_sandbox_only_entry(self) -> None:
+        state = {
+            "observed_at": iso(self.now),
+            "stream_key": "prediction_pm_directprediction",
+            "model_groups": {},
+            "groups": [],
+        }
+        preflight.validate_consumer_state(
+            state,
+            self.environment,
+            model_groups={},
+            now=self.now,
+            max_age=dt.timedelta(minutes=2),
+            max_idle=dt.timedelta(minutes=15),
+        )
+
+    def test_decodes_empty_groups_for_sandbox_only_entry(self) -> None:
+        bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        entry_bindings = preflight.entry_enabled_rollout_bindings(
+            bindings, ("main", "wallet-1")
+        )
+        self.assertEqual(
+            preflight.decode_model_groups(
+                "{}", entry_bindings, {"gemini-3.6-flash": "SANDBOX"}
+            ),
+            {},
+        )
+
     def test_rejects_pending_consumer_detail(self) -> None:
         self.state["groups"][0]["consumer_details"][0]["pending"] = 1
         with self.assertRaisesRegex(preflight.PreflightError, "pending tasks"):
@@ -1663,18 +1701,16 @@ class DeliveryStateTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "zero nonterminal BUY"):
             preflight.validate_delivery_state(state, entry_submission_state="blocked")
 
-    def test_allows_nonterminal_buy_execution_order_outside_sell_only_mode(self) -> None:
+    def test_rejects_main_wallet1_nonterminal_buy_even_with_global_gate_allowed(self) -> None:
         state = self.aggregate_state()
         state["nonterminal_buy_state"] = {
             "count": 1,
             "orders": [{"order_id": "buy-1", "status": "LIVE"}],
         }
-        watermark = preflight.validate_delivery_state(
-            state, entry_submission_state="allowed"
-        )
-        self.assertEqual(
-            watermark["non_terminal_counts"]["NONTERMINAL_BUY_EXECUTION_ORDER"], 1
-        )
+        with self.assertRaisesRegex(preflight.PreflightError, "main/wallet-1"):
+            preflight.validate_delivery_state(
+                state, entry_submission_state="allowed"
+            )
 
     def test_rejects_inconsistent_count_or_missing_nonempty_watermark(self) -> None:
         state = self.aggregate_state()
@@ -1703,6 +1739,7 @@ class CredentialAndConfigurationTests(unittest.TestCase):
         }
         self.prediction = {
             "DATABASE_URL": "postgres://prediction:secret@db/prediction",
+            "DIRECT_PREDICTION_MODEL_IDS_JSON": '["echo-producer-v7"]',
             "REDIS_PASSWORD": "redis-secret",
             "TRADING_INPUT_TOKEN": "snapshot-token",
             "PREDICTION_RESULT_TOKEN": "result-token",
@@ -1942,9 +1979,10 @@ class MainWiringTests(unittest.TestCase):
                 "DECISION_CYCLE_ENABLED": "true",
                 "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED": "false",
                 "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "false",
+                "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON": '["main","wallet-1"]',
                 "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE": "true",
                 "DECISION_CYCLE_BINDINGS_JSON": compact_bindings,
-                "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON": '["wallet-6","wallet-7"]',
+                "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON": '[]',
                 "POLYMARKET_ACCOUNTS_FILE": str(wallet_path),
                 "TRADING_EXECUTION_DATABASE_URL": "postgres://user:secret@db/trading",
                 "EXECUTION_API_TOKEN": "execution-token",
@@ -2017,18 +2055,15 @@ class MainWiringTests(unittest.TestCase):
                     "decision_at": iso(decision_at),
                     "created_at": iso(decision_at + dt.timedelta(minutes=1)),
                     "prediction_snapshot_id": "snapshot-1",
-                    "bindings": [
-                        row
-                        for row in dry_run_rows()
-                        if row["execution_account_id"] in {"main", "wallet-1"}
-                    ],
+                    "bindings": dry_run_rows(),
                 }
             ]
-            direct_consumer_state = consumer_state(now - dt.timedelta(seconds=1))
-            direct_consumer_state["model_groups"] = {
-                "echo-producer-v7": "predict-echo-v1"
+            direct_consumer_state = {
+                "observed_at": iso(now - dt.timedelta(seconds=1)),
+                "stream_key": "prediction_pm_directprediction",
+                "model_groups": {},
+                "groups": [],
             }
-            direct_consumer_state["groups"] = [direct_consumer_state["groups"][0]]
             runtime_path = self.write_json(directory, "runtime.json", runtime_state)
             database_path = self.write_json(directory, "database.json", state)
             snapshot_path = self.write_json(
@@ -2037,6 +2072,13 @@ class MainWiringTests(unittest.TestCase):
                 complete_snapshot(decision_at, "snapshot-1"),
             )
             consumer_path = self.write_json(directory, "consumer.json", direct_consumer_state)
+            approval_path = self.write_json(
+                directory,
+                "risk-approval.json",
+                activation_risk_approval(now, state, "wallet-6", "wallet-7"),
+            )
+            approval_path.chmod(0o600)
+            approval_sha = preflight.hashlib.sha256(approval_path.read_bytes()).hexdigest()
             disabled_evidence_path = directory / "disabled-evidence.json"
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
@@ -2059,13 +2101,17 @@ class MainWiringTests(unittest.TestCase):
                         "--expected-prediction-version",
                         prediction_commit,
                         "--direct-model-groups-json",
-                        json.dumps(MODEL_GROUPS),
+                        "{}",
+                        "--activation-risk-approval-json",
+                        str(approval_path),
+                        "--activation-risk-approval-sha256",
+                        approval_sha,
                         "--write-disabled-evidence",
                         str(disabled_evidence_path),
                     ]
                 )
             self.assertEqual(result, 0)
-            self.assertIn("manifest_markets=1", output.getvalue())
+            self.assertIn("manifest_markets=0", output.getvalue())
             self.assertEqual(disabled_evidence_path.stat().st_mode & 0o777, 0o600)
 
             trading_environment["DECISION_CYCLE_ORDER_SUBMISSION_ENABLED"] = "true"
@@ -2112,22 +2158,17 @@ class MainWiringTests(unittest.TestCase):
                 "--expected-prediction-version",
                 prediction_commit,
                 "--direct-model-groups-json",
-                json.dumps(MODEL_GROUPS),
+                "{}",
+                "--activation-risk-approval-json",
+                str(approval_path),
+                "--activation-risk-approval-sha256",
+                approval_sha,
             ]
-            enabled_output = io.StringIO()
-            with contextlib.redirect_stdout(enabled_output):
+            enabled_error = io.StringIO()
+            with contextlib.redirect_stderr(enabled_error):
                 enabled_result = preflight.main(enabled_args)
-            self.assertEqual(enabled_result, 0)
-            self.assertIn("submission_state=enabled", enabled_output.getvalue())
-
-            final_state["observed_at"] = iso(dt.datetime.now(dt.timezone.utc))
-            final_state["dry_runs"] = []
-            self.write_json(directory, "final-database.json", final_state)
-            deleted_error = io.StringIO()
-            with contextlib.redirect_stderr(deleted_error):
-                deleted_result = preflight.main(enabled_args)
-            self.assertEqual(deleted_result, 1)
-            self.assertIn("no qualifying submission=false", deleted_error.getvalue())
+            self.assertEqual(enabled_result, 1)
+            self.assertIn("shadow observation only", enabled_error.getvalue())
 
 
 class DisabledPhaseEvidenceTests(unittest.TestCase):
@@ -2170,6 +2211,47 @@ class DisabledPhaseEvidenceTests(unittest.TestCase):
 
     def test_accepts_checksum_and_same_non_submission_configuration(self) -> None:
         self.assertEqual(self.validate(), self.dry_run)
+
+    def test_accepts_zero_manifest_for_sandbox_only_entry(self) -> None:
+        evidence = preflight.build_disabled_evidence(
+            now=self.now,
+            expected_trading_commit=TRADING_COMMIT,
+            expected_prediction_version=PREDICTION_COMMIT,
+            model_groups={},
+            configuration_sha="c" * 64,
+            dry_run=self.dry_run,
+            manifest_markets=0,
+            delivery_watermark=delivery_watermark(),
+            database_account_identity_sha256="e" * 64,
+            runtime_state={
+                "trading": {
+                    "pid": 101,
+                    "started_at": iso(self.now - dt.timedelta(minutes=20)),
+                }
+            },
+        )
+        self.assertEqual(
+            preflight.validate_disabled_evidence(
+                evidence,
+                now=self.now,
+                max_age=dt.timedelta(minutes=30),
+                expected_trading_commit=TRADING_COMMIT,
+                expected_prediction_version=PREDICTION_COMMIT,
+                model_groups={},
+                configuration_sha="c" * 64,
+                delivery_watermark=delivery_watermark(),
+                database_account_identity_sha256="e" * 64,
+            ),
+            self.dry_run,
+        )
+
+    def test_rejects_boolean_manifest_count_even_with_valid_checksum(self) -> None:
+        self.evidence["manifest_markets"] = True
+        unsigned = dict(self.evidence)
+        unsigned.pop("evidence_sha256")
+        self.evidence["evidence_sha256"] = preflight._canonical_sha256(unsigned)
+        with self.assertRaisesRegex(preflight.PreflightError, "manifest market count"):
+            self.validate()
 
     def test_rejects_configuration_change_between_phases(self) -> None:
         with self.assertRaisesRegex(preflight.PreflightError, "configuration differs"):

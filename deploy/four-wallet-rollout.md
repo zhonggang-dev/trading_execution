@@ -14,6 +14,8 @@ both durable gates closed:
 ```text
 DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false
 DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false
+DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON=["main","wallet-1"]
+DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON=[]
 DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true
 POSITION_EXIT_JOB_TOKEN=DEDICATED_32_BYTE_OR_LONGER_SECRET
 execution_risk_global_control.kill_switch=true
@@ -32,8 +34,9 @@ DECISION_CYCLE_MID_PRICE_LOOKBACK=EXACT_REVIEWED_DURATION
 DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON={"EXACT_ECHO_SNAPSHOT_MODEL_NAME":"DIRECT","gemini-3.6-flash":"SANDBOX"}
 ```
 
-The preflight binds all seven values into the configuration SHA and verifies
-the running process has the same values. The Go runtime also enforces the
+The preflight binds these values into the configuration SHA and verifies the
+running process has the same values. The account entry list is also hashed and
+must be exactly `main,wallet-1`. The Go runtime also enforces the
 source-mode map on every cycle: `DIRECT` accepts only an empty `sandbox_id`,
 while `SANDBOX` requires a non-empty `sandbox_id`. The map must exactly cover
 all configured upstream models; the current release pins echo to `DIRECT` and
@@ -41,21 +44,21 @@ all configured upstream models; the current release pins echo to `DIRECT` and
 four-wallet activation; changing any other value invalidates disabled-pass
 evidence and requires a new review.
 
-For an explicitly approved exit-only maintenance window, set
-`DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=true` before enabling order
-submission. Run the preflight with `--entry-submission-state blocked`; it also
-requires zero non-terminal BUY orders. The execution service enforces this
-gate for HTTP submissions, decision delivery, and crash recovery, not only in
-the Python decision-cycle path.
+This release requires the process-wide entry gate to remain `false`. The exact
+account gate makes main/wallet-1 sell-only: they keep position-bearing strategy
+requests and may submit SELL exits, but receive no entry predictions.
+wallet-6/wallet-7 receive the reviewed Sandbox predictions. The execution
+service enforces main/wallet-1 BUY rejection for direct HTTP Submit, reserved
+Resume, decision delivery, and crash recovery.
 
 The `DECISION_CYCLE_BINDINGS_JSON` array must be replaced atomically as one
 environment-file value. The routes are exact: `echo/multfactor_v2 -> main`,
 `echo/multfactor_v1 -> wallet-1`, `gemini_masked/multfactor_v1 -> wallet-6`,
 and `gemini_masked/multfactor_v2 -> wallet-7`. The database must contain the
 same four `(model_id, strategy_id, execution_account_id)` authorization rows.
-Initially only the `main` and `wallet-1` rows are enabled; the `wallet-6` and
-`wallet-7` rows are present but disabled because those accounts are listed in
-`DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON`. Source
+All four authorization rows are enabled in shadow. main/wallet-1 remain active
+so their existing OPEN lots can be reconciled and exited; new BUY entries are
+blocked by the account gate. Source
 `prediction_model_id` values never belong in the database authorization table.
 
 Apply `migrations/0017_enabled_strategy_binding_uniqueness.sql` while the
@@ -65,18 +68,17 @@ enabled rows only. During cutover, preserve the retired route rows for audit:
 in one reviewed transaction, set the wallet-2/wallet-3 rows to
 `enabled=false` with `version=version+1`, then insert new wallet-6/wallet-7
 rows. Do not `UPDATE execution_account_id` on an old row, and do not delete it.
-The transaction must leave wallet-2/wallet-3 disabled, main/wallet-1 enabled,
-and wallet-6/wallet-7 present but disabled for the initial quarantine.
+The transaction must leave wallet-2/wallet-3 disabled and all four current
+wallet bindings enabled.
 
 Every configured account must also have one live-risk policy and one unique
 ACCOUNT control. The current-rollout policy caps are pinned per account in the
 preflight code:
 `1.10/2.10/2.10/2.10/1.10` for order/market/strategy/wallet/daily notional,
 `90000/30000/600000` milliseconds for price/signal/state age, and timezone
-`UTC`. Initially main/wallet-1 policies are enabled and controls unpaused;
-wallet-6/wallet-7 policies and bindings are disabled and controls paused.
-That state must exactly match
-`DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON` in both preflight phases.
+`UTC` for the retained accounts; wallet-6/wallet-7 use the separately approved
+v2 limits. All four policies and bindings are enabled and all four ACCOUNT
+controls are unpaused in shadow. The submission quarantine is exactly empty.
 These wallet-6/wallet-7 template values are not approval to activate either
 wallet. An active wallet-6 or wallet-7 requires a separate mode-`0600`
 `four_wallet.activation_risk_approval.v1` artifact and its externally reviewed
@@ -88,14 +90,10 @@ rollout must not modify the existing main/wallet-1 policies.
 Retired wallet rows stay in PostgreSQL for audit, but their strategy bindings
 must not remain enabled and they must not appear in the runtime wallet file.
 
-The quarantine list may be the exact pair, either one-wallet subset, or empty;
-main/wallet-1 may never be added. Removing wallet-6 or wallet-7 requires a
-reviewed stopped-service cutover that atomically enables the exact
-policy/binding, unpauses the ACCOUNT control with an increasing version, and
-changes the runtime quarantine list while the global kill switch stays closed.
-Retained quarantined wallets keep the original semantics: identity/open-order
-preflight only, mandatory durable ACCOUNT pause, no funding/placement probe,
-heartbeat, automatic reconciliation, decision delivery, or new submission.
+The quarantine list is pinned to the exact empty array. Never quarantine
+main/wallet-1: both have managed OPEN lots and must remain eligible for
+reconciliation and SELL exits. wallet-6/wallet-7 activation is a reviewed
+stopped-service CAS change while the global kill switch stays closed.
 
 Prediction must publish the same source-model set, not the logical aliases.
 The following values are mandatory in `/etc/prediction-infra/env` and must be
@@ -124,11 +122,11 @@ enabled. `TRADING_INPUT_TOKEN` must equal Trading's
 `DECISION_CYCLE_PREDICTION_INFRA_TOKEN`; both Prediction tokens and Trading's
 strategy token must be non-empty, and the result/input tokens must be distinct.
 
-Use one distinct Redis group per configured `DIRECT` source model. The exact
-mapping for this release contains only the echo group used by main/wallet-1;
-a Gemini group is rejected because Gemini is `SANDBOX`. Preflight runs `XINFO`
-for echo and requires a recent consumer, zero
-pending consumer messages, zero group pending, and zero lag.
+Direct model identity remains statically pinned in Prediction configuration,
+but the entry-enabled cohort is wallet-6/wallet-7 and is Sandbox-only.
+Therefore shadow preflight uses an empty Direct group mapping, performs no
+Redis `XINFO`, and requires zero Direct manifest markets. main/wallet-1 do not
+receive Echo entry predictions while their account BUY gate is active.
 
 Run the read-only preflight while submission is still disabled:
 
@@ -139,14 +137,14 @@ python3 deploy/four_wallet_preflight.py \
   --submission-state disabled \
   --expected-trading-commit APPROVED_FULL_TRADING_COMMIT \
   --expected-prediction-version APPROVED_IMMUTABLE_PREDICTION_BUILD_ID \
-  --direct-model-groups-json \
-  '{"EXACT_ECHO_SNAPSHOT_MODEL_NAME":"predict-echo-v1"}' \
+  --direct-model-groups-json '{}' \
   --write-disabled-evidence /var/lib/trading-execution/four-wallet-disabled-evidence.json
 ```
 
 When either onboarding wallet is active, add both of the following to this
-command and the enabled-phase command. The SHA must come from the reviewed
-change record, not be calculated ad hoc during deployment:
+shadow command. The decision in the protected artifact must be exactly
+`APPROVED_FOR_SHADOW_OBSERVATION`. The SHA must come from the reviewed change
+record, not be calculated ad hoc during deployment:
 
 ```text
 --activation-risk-approval-json /var/lib/trading-execution/wallet67-risk-approval.json
@@ -161,10 +159,10 @@ The preflight exits non-zero if any of these invariants is false:
 - the wallet secret is not a protected regular file containing exactly the
   four configured account IDs;
 - any configured execution account or database authorization row is missing,
-  or enabled binding state differs from the active/quarantined partition;
+  or enabled binding state differs from the exact four-active-wallet state;
 - any configured account lacks its reviewed current-rollout risk policy or
   a unique ACCOUNT control, or policy/control state disagrees with account
-  quarantine;
+  activation state;
 - the actual systemd processes do not expose the approved health identity or
   do not contain the audited non-secret environment. This includes Trading's
   static size/notional/fee/finality limits, disabled market-order policy, PIT
@@ -184,19 +182,16 @@ The preflight exits non-zero if any of these invariants is false:
   position-exit job endpoints accept only `POSITION_EXIT_JOB_TOKEN`; they
   never fall back to the execution API token;
 - there is no recent, completed `submission=false` decision boundary from the
-  current disabled Trading process with exactly one output row for each active
-  (non-quarantined) binding and the same Prediction snapshot;
-- any active binding received zero predictions, failed before persisting output, or
-  carries `entry_policy.enabled=false` or a non-empty model-coverage block
-  reason. Older compatible healthy output may omit `entry_policy`; omission is
-  accepted, while explicit `false` is never treated as omission;
-- the PIT snapshot used by that dry run does not contain an effective Direct
-  task manifest where every Market has the active echo source model in
-  `COMPLETED` state and each task has its exact matching non-Sandbox result;
-  each active Sandbox model must independently have at least one fresh,
-  PIT-visible effective result with a non-empty `sandbox_id`, and a Sandbox
-  model must not appear in the Direct task manifest;
-- the active echo Redis consumer group is missing, inactive, pending, or lagging;
+  current disabled Trading process with exactly one output row for each of the
+  four active bindings and the same Prediction snapshot;
+- main/wallet-1 do not have exactly zero predictions with the explicit
+  `ENTRY_SUBMISSION_DISABLED` account policy, or wallet-6/wallet-7 do not have
+  at least one prediction with no entry block;
+- the PIT snapshot does not contain at least one fresh, PIT-visible effective
+  Gemini Sandbox result with a non-empty `sandbox_id`, or contains an
+  ambiguous equally-timed result. The Direct manifest market count must be
+  zero for this Sandbox-only entry cohort;
+- any Direct consumer group is supplied for the Sandbox-only entry cohort;
 - any managed-account decision intent delivery remains `PENDING`, `SUBMITTING`, or
   `UNKNOWN`, any delivery's order status is `UNKNOWN`/`MANUAL_REVIEW`, or any
   managed execution order remains `UNKNOWN`/`MANUAL_REVIEW`. Retired
@@ -211,7 +206,8 @@ By default these checks are collected directly and read-only: `systemctl` plus
 `/proc` for the actual process and environment, both liveness endpoints for
 release identity, `psql` for authorization and dry-run rows, the exact PIT
 snapshot HTTP endpoint for the recorded decision boundary, and Redis `XINFO`
-for the Direct consumer. No credential is printed; PostgreSQL uses a protected
+only when the entry-enabled cohort contains a Direct model. This Sandbox-only
+cohort skips Redis consumer liveness. No credential is printed; PostgreSQL uses a protected
 temporary passfile and Redis authentication remains in process memory.
 
 If the deployment host deliberately prevents one of those reads, the operator
@@ -222,74 +218,39 @@ skip switches: the same invariants and freshness limits are applied, and a
 missing or stale artifact fails closed. The default runtime/consumer evidence
 age is 120 seconds; the default accepted dry-run age is 30 minutes.
 
-Enabled offline mode additionally requires a separate
-`--final-runtime-state-json` and `--final-database-state-json`. They must be
-different files from the initial artifacts. Final runtime evidence must follow
-the consumer evidence and prove both service PIDs/start times are unchanged;
-final DB evidence must be collected after that and must still contain the exact
-active-binding dry run. Reusing initial JSON as a fake final reread is rejected. Normal
-production operation should omit these JSON flags so the script re-reads
-systemd, `/proc`, both health endpoints, and then PostgreSQL live.
+Normal production operation should omit evidence JSON flags so the script
+re-reads systemd, `/proc`, both health endpoints, and PostgreSQL live.
 
 The disabled pass creates a new mode-`0600` evidence file without overwriting an
-existing path. It binds the immutable releases, all audited configuration
-except the submission flag, one-way credential fingerprints, protected wallet
+existing path. It binds the immutable releases, audited configuration,
+one-way credential fingerprints, protected wallet
 file content digest, four database wallet-address identities, exact dry-run
 cycle/snapshot, manifest Market count, model-to-group mapping, and the global
 delivery count/status/high-watermark. Terminal delivery history is aggregated
 inside PostgreSQL; it is not copied into a growing JSON artifact. Preserve this
-file unchanged.
+file unchanged. The legacy schema excludes the submission flag from its digest,
+but both Go and preflight independently pin that flag to `false` in this release.
 
-Choose an explicit no-trading maintenance window immediately after a decision
-boundary. Only after the disabled pass should the environment submission flag
-be staged as `true` and the service restarted. Keep the database kill switch
-on, then run the full preflight again, replacing the write option with the
-saved evidence:
+This release stops at shadow observation. It hard-requires
+`DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false`, the preflight rejects
+`--submission-state enabled`, and the database global kill switch must remain
+`true`. A shadow PASS proves that wallet-6/v1 and wallet-7/v2 successfully
+called the strategy API with fresh Sandbox inputs and recorded valid outputs;
+it is not permission to create or deliver orders.
 
-```bash
-python3 deploy/four_wallet_preflight.py \
-  --env-file /etc/trading-execution/env \
-  --prediction-env-file /etc/prediction-infra/env \
-  --submission-state enabled \
-  --expected-trading-commit APPROVED_FULL_TRADING_COMMIT \
-  --expected-prediction-version APPROVED_IMMUTABLE_PREDICTION_BUILD_ID \
-  --direct-model-groups-json \
-  '{"EXACT_ECHO_SNAPSHOT_MODEL_NAME":"predict-echo-v1"}' \
-  --disabled-evidence-json /var/lib/trading-execution/four-wallet-disabled-evidence.json
-```
+Real order submission requires a new reviewed release plus a distinct,
+non-reusable LIVE approval after the user explicitly authorizes that step.
+Do not edit the shadow artifact, reuse its SHA, stage submission `true`, or open
+the kill switch. Never auto-cancel historical intents.
 
-The enabled pass requires the newly running process to have the same approved
-release identity, wallet/database identities, credential fingerprints, and
-audited configuration hash; only `DECISION_CYCLE_ORDER_SUBMISSION_ENABLED` may
-differ. It then revalidates the saved `submission=false` cycle and
-content-addressed PIT snapshot. It does not
-require that row to be newer than the enabled process PID, which would be
-impossible after restart. If any `submission=true` decision cycle has occurred
-after the saved evidence, activation fails: keep the kill switch closed,
-discard that attempt, return to `submission=false`, and produce a new dry-run
-artifact. Never use a `submission=true` cycle as a dry run because its durable
-intents are real and retryable even while downstream risk rejects placement.
-
-At enabled-preflight entry, the script captures the next scheduler due time
-once; it never rolls that value forward if checks cross the boundary. The
-running Trading process's first possible due is also derived from its actual
-start time; if that due could already have begun, activation fails. The enabled
-pass rechecks both unchanged processes, then rereads PostgreSQL as its final
-evidence step and rejects any
-delivery watermark change or any cycle after the disabled evidence. It also
-prints `activation_deadline`, which is the next scheduler due time minus the
-configured safety margin (60 seconds by default). Open the database kill switch
-only after this PASS and strictly before that deadline. Do **not** wait for
-decision-cycle readiness first: readiness requires a successful cycle, while a
-BUY/SELL cycle with the kill switch still closed can create a rejected,
-recoverable delivery and make readiness fail. Before opening the switch, check
-only liveness/release identity and the enabled preflight. After opening it,
-wait for the first successful cycle and normal readiness.
-
-If the deadline is missed, a cycle appears, or any delivery watermark changes,
-keep the kill switch closed, restore submission to `false`, and investigate the
-delivery rows manually before producing new disabled evidence. Never simply
-retry enabled mode and never auto-cancel historical intents.
+Rollback to a binary that does not understand the account entry gate is a
+stopped-service operation. First keep/set the database kill switch to `true`,
+set order submission to `false`, and set the legacy process-wide entry gate to
+`true`. Then atomically restore the legacy wallet-6/wallet-7 disabled policies,
+bindings and paused ACCOUNT controls together with their legacy quarantine
+before starting the old binary. Never start an old binary with all four
+accounts active and only the new per-account gate in its environment; that
+would reopen main/wallet-1 BUY entries.
 
 Apart from creating the explicitly requested disabled-phase evidence file, the
 preflight never edits configuration, restarts a service, acknowledges a Redis

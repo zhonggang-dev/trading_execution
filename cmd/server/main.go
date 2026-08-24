@@ -224,6 +224,7 @@ func buildPaperRuntime(cfg config.Config, database *sql.DB, guard port.Guard) (p
 		MarketValidator:         paper.NewMarketValidator(),
 		Reservations:            reservations,
 		EntrySubmissionDisabled: cfg.DecisionCycle.EntrySubmissionDisabled,
+		EntryDisabledAccounts:   cfg.DecisionCycle.EntryDisabledAccounts,
 		// 模拟交易所同步返回结果，不会产生延迟出现的外部成交。
 		ImmediateCancelFinality: true,
 	})

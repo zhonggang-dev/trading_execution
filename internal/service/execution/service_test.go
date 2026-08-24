@@ -277,6 +277,93 @@ func TestSellOnlyGateBlocksDirectBuyButAllowsSell(t *testing.T) {
 	}
 }
 
+func TestAccountEntryGateBlocksMainBuyBeforeWriteAndAllowsWallet6BuyAndMainSell(t *testing.T) {
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		EntryDisabledAccounts: []string{"main", "wallet-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocked := validIntent("main-account-entry-blocked")
+	blocked.ExecutionAccountID = "main"
+	var rejection *port.Rejection
+	if _, submitErr := service.Submit(context.Background(), blocked); !errors.As(submitErr, &rejection) || rejection.Code != domain.StrategyEntryBlockSubmissionDisabled {
+		t.Fatalf("blocked main BUY error=%v rejection=%#v", submitErr, rejection)
+	}
+	if _, getErr := repository.GetByClientOrderID(context.Background(), blocked.ClientOrderID); !errors.Is(getErr, port.ErrOrderNotFound) {
+		t.Fatalf("blocked main BUY wrote order: %v", getErr)
+	}
+	if venue.placeCalls.Load() != 0 || reservations.reserveCalls.Load() != 0 {
+		t.Fatalf("blocked main BUY side effects: venue=%d reserve=%d", venue.placeCalls.Load(), reservations.reserveCalls.Load())
+	}
+
+	wallet6Buy := validIntent("wallet6-account-entry-allowed")
+	wallet6Buy.ExecutionAccountID = "wallet-6"
+	if _, submitErr := service.Submit(context.Background(), wallet6Buy); submitErr != nil {
+		t.Fatalf("wallet-6 BUY Submit() error=%v", submitErr)
+	}
+	mainSell := validIntent("main-account-exit-allowed")
+	mainSell.ExecutionAccountID = "main"
+	mainSell.Side = domain.SideSell
+	mainSell.TargetLotID = "lot-main"
+	mainSell.WorstPrice = mainSell.Price
+	mainSell.TimeInForce = domain.TimeInForceFOK
+	if _, submitErr := service.Submit(context.Background(), mainSell); submitErr != nil {
+		t.Fatalf("main SELL Submit() error=%v", submitErr)
+	}
+	if venue.placeCalls.Load() != 2 {
+		t.Fatalf("allowed venue calls=%d, want wallet-6 BUY + main SELL", venue.placeCalls.Load())
+	}
+}
+
+func TestExecutionRejectsInvalidEntryDisabledAccountList(t *testing.T) {
+	for _, accounts := range [][]string{{""}, {"main", " main "}} {
+		_, err := execution.New(execution.Params{
+			Repository: memory.NewOrderRepository(), Venue: &fakeVenue{}, Guard: allowGuard{},
+			MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+			EntryDisabledAccounts: accounts,
+		})
+		if err == nil {
+			t.Fatalf("New() accepted invalid entry-disabled accounts %#v", accounts)
+		}
+	}
+}
+
+func TestLiveAccountEntryGateBlocksMainBuyBeforePrepareOrPlace(t *testing.T) {
+	repository := memory.NewOrderRepository()
+	venue := &preparedTestVenue{expectedHash: "expected-order", repository: repository}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		AccountScope: fixedAccountScope{
+			active:  map[string]struct{}{"main": {}, "wallet-6": {}},
+			managed: map[string]struct{}{"main": {}, "wallet-6": {}},
+		},
+		EntryDisabledAccounts:    []string{"main", "wallet-1"},
+		RequirePreparedPlacement: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validIntent("live-main-account-entry-blocked")
+	intent.ExecutionAccountID = "main"
+	if _, submitErr := service.Submit(context.Background(), intent); submitErr == nil {
+		t.Fatal("live main BUY unexpectedly passed account entry gate")
+	}
+	if venue.prepareCalls.Load() != 0 || venue.preparedPlaceCalls.Load() != 0 ||
+		venue.legacyPlaceCalls.Load() != 0 || reservations.reserveCalls.Load() != 0 {
+		t.Fatalf("blocked live BUY side effects: prepare=%d prepared=%d legacy=%d reserve=%d",
+			venue.prepareCalls.Load(), venue.preparedPlaceCalls.Load(), venue.legacyPlaceCalls.Load(), reservations.reserveCalls.Load())
+	}
+}
+
 func TestSellOnlyGatePreservesIdempotentReplayOfExistingBuy(t *testing.T) {
 	repository := memory.NewOrderRepository()
 	venue := &fakeVenue{}
@@ -713,6 +800,48 @@ func TestSellOnlyGateRejectsReservedBuyDuringResumeWithoutVenueCall(t *testing.T
 	reservation, ok := reservations.Get(result.Order.ID)
 	if !ok || reservation.Status != domain.ReservationStatusReleased {
 		t.Fatalf("reservation = %#v, found=%v; want RELEASED", reservation, ok)
+	}
+}
+
+func TestAccountEntryGateRejectsReservedMainBuyDuringResumeAndReleasesReservation(t *testing.T) {
+	baseRepository := memory.NewOrderRepository()
+	repository := &failFirstStartRepository{OrderRepository: baseRepository}
+	venue := &fakeVenue{}
+	reservations := paper.NewReservationManager()
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	initialService, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		Now: func() time.Time { return now }, NewID: func() string { return "ord-account-entry-resume" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validIntent("client-account-entry-resume")
+	intent.ExecutionAccountID = "main"
+	result, submitErr := initialService.Submit(context.Background(), intent)
+	if submitErr == nil || result.Order.Status != domain.OrderStatusReserved || venue.placeCalls.Load() != 0 {
+		t.Fatalf("initial Submit()=%#v error=%v calls=%d", result, submitErr, venue.placeCalls.Load())
+	}
+
+	gatedService, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		EntryDisabledAccounts: []string{"main", "wallet-1"},
+		Now:                   func() time.Time { return now.Add(time.Second) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, resumeErr := gatedService.Resume(context.Background(), result.Order.ID)
+	var rejection *port.Rejection
+	if !errors.As(resumeErr, &rejection) || rejection.Code != domain.StrategyEntryBlockSubmissionDisabled ||
+		resumed.Status != domain.OrderStatusRejected || venue.placeCalls.Load() != 0 {
+		t.Fatalf("Resume()=%#v error=%v rejection=%#v calls=%d", resumed, resumeErr, rejection, venue.placeCalls.Load())
+	}
+	reservation, ok := reservations.Get(result.Order.ID)
+	if !ok || reservation.Status != domain.ReservationStatusReleased {
+		t.Fatalf("reservation=%#v found=%v; want RELEASED", reservation, ok)
 	}
 }
 
@@ -1664,6 +1793,7 @@ type preparedTestVenue struct {
 	placeErr             error
 	getOrder             *port.VenueOrder
 	legacyPlaceCalls     atomic.Int64
+	prepareCalls         atomic.Int64
 	preparedPlaceCalls   atomic.Int64
 	observedDurableStart atomic.Bool
 	getCalls             atomic.Int64
@@ -1672,6 +1802,7 @@ type preparedTestVenue struct {
 func (*preparedTestVenue) Name() string { return "polymarket-paper" }
 
 func (venue *preparedTestVenue) PreparePlace(context.Context, domain.Order) (port.PreparedPlacement, error) {
+	venue.prepareCalls.Add(1)
 	return preparedTestPlacement{expectedHash: venue.expectedHash}, nil
 }
 

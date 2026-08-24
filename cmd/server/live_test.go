@@ -132,10 +132,10 @@ func TestCurrentLiveReleaseRejectsRetiredWalletOrUnsupportedQuarantineBeforePref
 			want:        "wallet file must contain exactly",
 		},
 		{
-			name:        "retained wallet placed in quarantine",
+			name:        "wallet remains quarantined",
 			configured:  []string{"main", "wallet-1", "wallet-6", "wallet-7"},
-			quarantined: []string{"main"},
-			want:        "may contain only wallet-6 and wallet-7",
+			quarantined: []string{"wallet-6"},
+			want:        "empty submission-disabled account list",
 		},
 	}
 	for _, test := range tests {
@@ -152,17 +152,10 @@ func TestCurrentLiveReleaseRejectsRetiredWalletOrUnsupportedQuarantineBeforePref
 	}
 }
 
-func TestCurrentLiveReleaseAcceptsWallet67QuarantineSubsetOrEmpty(t *testing.T) {
+func TestCurrentLiveReleaseAcceptsOnlyEmptyQuarantine(t *testing.T) {
 	configured := []string{"main", "wallet-1", "wallet-6", "wallet-7"}
-	for _, quarantined := range [][]string{
-		{"wallet-6", "wallet-7"},
-		{"wallet-6"},
-		{"wallet-7"},
-		{},
-	} {
-		if err := validateCurrentLiveWallet67Release(configured, quarantined); err != nil {
-			t.Fatalf("validateCurrentLiveWallet67Release(%v) error = %v", quarantined, err)
-		}
+	if err := validateCurrentLiveWallet67Release(configured, nil); err != nil {
+		t.Fatalf("validateCurrentLiveWallet67Release() error = %v", err)
 	}
 }
 
@@ -187,9 +180,9 @@ func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
 	}
 }
 
-func TestCurrentLiveReleaseSelectsOnlyMainAndWallet1ForAutomaticOperations(t *testing.T) {
+func TestCurrentLiveReleaseKeepsAllFourAccountsActive(t *testing.T) {
 	configured := []string{"main", "wallet-1", "wallet-6", "wallet-7"}
-	quarantined := []string{"wallet-6", "wallet-7"}
+	var quarantined []string
 	if err := validateCurrentLiveWallet67Release(configured, quarantined); err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +190,7 @@ func TestCurrentLiveReleaseSelectsOnlyMainAndWallet1ForAutomaticOperations(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"main", "wallet-1"}; !reflect.DeepEqual(active, want) {
+	if want := []string{"main", "wallet-1", "wallet-6", "wallet-7"}; !reflect.DeepEqual(active, want) {
 		t.Fatalf("automatic operations accounts = %#v, want %#v", active, want)
 	}
 }

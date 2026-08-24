@@ -333,6 +333,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		AccountScope:             executionAccountScope,
 		RequirePreparedPlacement: true,
 		EntrySubmissionDisabled:  cfg.DecisionCycle.EntrySubmissionDisabled,
+		EntryDisabledAccounts:    cfg.DecisionCycle.EntryDisabledAccounts,
 	})
 	if err != nil {
 		return nil, err
@@ -488,20 +489,8 @@ func validateCurrentLiveWallet67Release(configured, quarantined []string) error 
 	); err != nil {
 		return err
 	}
-	allowedQuarantine := map[string]struct{}{"wallet-6": {}, "wallet-7": {}}
-	seen := make(map[string]struct{}, len(quarantined))
-	for index, raw := range quarantined {
-		accountID := strings.TrimSpace(raw)
-		if accountID == "" {
-			return fmt.Errorf("submission-disabled account list execution account %d is empty", index)
-		}
-		if _, duplicate := seen[accountID]; duplicate {
-			return fmt.Errorf("submission-disabled account list contains duplicate execution account %q", accountID)
-		}
-		if _, allowed := allowedQuarantine[accountID]; !allowed {
-			return fmt.Errorf("submission-disabled account list may contain only wallet-6 and wallet-7")
-		}
-		seen[accountID] = struct{}{}
+	if len(quarantined) != 0 {
+		return fmt.Errorf("this release requires an empty submission-disabled account list")
 	}
 	return nil
 }

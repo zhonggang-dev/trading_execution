@@ -48,6 +48,9 @@ type Params struct {
 	// EntrySubmissionDisabled keeps validated exits executable while
 	// suppressing every BUY intent.
 	EntrySubmissionDisabled bool
+	// EntryDisabledAccounts keeps selected active bindings sell-only while the
+	// remaining bindings may emit and deliver BUY intents.
+	EntryDisabledAccounts []string
 	// RequireCompleteModelCoverage keeps live BUY submission fail closed for a
 	// binding that has no fresh probability. Coverage is evaluated independently
 	// per configured source model; a Market is never required to have results
@@ -64,27 +67,32 @@ type Params struct {
 
 // Service 表示后端使用的 Service 类型。
 type Service struct {
-	predictionSource             port.PredictionSource
-	positionSource               port.StrategyPositionSource
-	orderBookSource              port.OrderBookSource
-	midPriceSource               port.MidPriceHistorySource
-	strategy                     port.StrategyClient
-	recorder                     port.DecisionRecorder
-	executor                     port.OrderExecutor
-	submitEnabled                bool
-	submissionDisabledAccounts   []string
-	submissionDisabledAccountSet map[string]struct{}
-	entrySubmissionDisabled      bool
-	requireCompleteModelCoverage bool
-	bindings                     []domain.StrategyExecutionBinding
-	predictionSourceModes        map[string]domain.PredictionSourceMode
-	activeBindings               []domain.StrategyExecutionBinding
-	activeExecutionAccountIDs    []string
-	venue                        string
-	predictionLookback           time.Duration
-	midPriceLookback             time.Duration
-	deliveryStaleAge             time.Duration
-	now                          func() time.Time
+	predictionSource                 port.PredictionSource
+	positionSource                   port.StrategyPositionSource
+	orderBookSource                  port.OrderBookSource
+	midPriceSource                   port.MidPriceHistorySource
+	strategy                         port.StrategyClient
+	recorder                         port.DecisionRecorder
+	executor                         port.OrderExecutor
+	submitEnabled                    bool
+	submissionDisabledAccounts       []string
+	submissionDisabledAccountSet     map[string]struct{}
+	entrySubmissionDisabled          bool
+	entryDisabledAccounts            []string
+	entryDisabledAccountSet          map[string]struct{}
+	requireCompleteModelCoverage     bool
+	bindings                         []domain.StrategyExecutionBinding
+	predictionSourceModes            map[string]domain.PredictionSourceMode
+	activeBindings                   []domain.StrategyExecutionBinding
+	entryEnabledBindings             []domain.StrategyExecutionBinding
+	activeExecutionAccountIDs        []string
+	entryEnabledExecutionAccountIDs  []string
+	entryDisabledExecutionAccountIDs []string
+	venue                            string
+	predictionLookback               time.Duration
+	midPriceLookback                 time.Duration
+	deliveryStaleAge                 time.Duration
+	now                              func() time.Time
 }
 
 // IntentResult 表示后端使用的 IntentResult 类型。
@@ -148,9 +156,21 @@ func New(params Params) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	entryDisabledAccounts, entryDisabledAccountSet, err := normalizeEntryDisabledAccounts(
+		bindings,
+		params.EntryDisabledAccounts,
+	)
+	if err != nil {
+		return nil, err
+	}
 	activeBindings := filterSubmissionEnabledBindings(bindings, disabledAccountSet)
 	if len(activeBindings) == 0 {
 		return nil, fmt.Errorf("submission-disabled accounts cannot exclude every decision binding")
+	}
+	entryEnabledBindings := filterSubmissionEnabledBindings(activeBindings, entryDisabledAccountSet)
+	entryDisabledBindings := filterEntryDisabledBindings(activeBindings, entryDisabledAccountSet)
+	if len(entryEnabledBindings)+len(entryDisabledBindings) != len(activeBindings) {
+		return nil, fmt.Errorf("entry-disabled accounts do not partition every active decision binding")
 	}
 	if params.Venue == "" {
 		return nil, fmt.Errorf("execution venue is required")
@@ -177,27 +197,32 @@ func New(params Params) (*Service, error) {
 		params.Now = time.Now
 	}
 	return &Service{
-		predictionSource:             params.PredictionSource,
-		positionSource:               params.PositionSource,
-		orderBookSource:              params.OrderBookSource,
-		midPriceSource:               params.MidPriceSource,
-		strategy:                     params.Strategy,
-		recorder:                     params.Recorder,
-		executor:                     params.Executor,
-		submitEnabled:                params.SubmitEnabled,
-		submissionDisabledAccounts:   disabledAccounts,
-		submissionDisabledAccountSet: disabledAccountSet,
-		entrySubmissionDisabled:      params.EntrySubmissionDisabled,
-		requireCompleteModelCoverage: params.RequireCompleteModelCoverage,
-		bindings:                     bindings,
-		predictionSourceModes:        predictionSourceModes,
-		activeBindings:               activeBindings,
-		activeExecutionAccountIDs:    executionAccountIDs(activeBindings),
-		venue:                        params.Venue,
-		predictionLookback:           params.PredictionLookback,
-		midPriceLookback:             params.MidPriceLookback,
-		deliveryStaleAge:             params.DeliveryStaleAge,
-		now:                          params.Now,
+		predictionSource:                 params.PredictionSource,
+		positionSource:                   params.PositionSource,
+		orderBookSource:                  params.OrderBookSource,
+		midPriceSource:                   params.MidPriceSource,
+		strategy:                         params.Strategy,
+		recorder:                         params.Recorder,
+		executor:                         params.Executor,
+		submitEnabled:                    params.SubmitEnabled,
+		submissionDisabledAccounts:       disabledAccounts,
+		submissionDisabledAccountSet:     disabledAccountSet,
+		entrySubmissionDisabled:          params.EntrySubmissionDisabled,
+		entryDisabledAccounts:            entryDisabledAccounts,
+		entryDisabledAccountSet:          entryDisabledAccountSet,
+		requireCompleteModelCoverage:     params.RequireCompleteModelCoverage,
+		bindings:                         bindings,
+		predictionSourceModes:            predictionSourceModes,
+		activeBindings:                   activeBindings,
+		entryEnabledBindings:             entryEnabledBindings,
+		activeExecutionAccountIDs:        executionAccountIDs(activeBindings),
+		entryEnabledExecutionAccountIDs:  executionAccountIDs(entryEnabledBindings),
+		entryDisabledExecutionAccountIDs: executionAccountIDs(entryDisabledBindings),
+		venue:                            params.Venue,
+		predictionLookback:               params.PredictionLookback,
+		midPriceLookback:                 params.MidPriceLookback,
+		deliveryStaleAge:                 params.DeliveryStaleAge,
+		now:                              params.Now,
 	}, nil
 }
 
@@ -217,7 +242,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err := snapshot.Validate(decisionAt); err != nil {
 		return RunResult{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}
-	modelIDs := configuredPredictionModels(service.activeBindings)
+	modelIDs := configuredPredictionModels(service.entryEnabledBindings)
 	selectedPredictions, err := selectAvailablePredictions(
 		snapshot.Predictions, modelIDs, service.predictionSourceModes,
 		decisionAt.Add(-service.predictionLookback),
@@ -272,7 +297,12 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			continue
 		}
 		bindingSubmissionEnabled := service.submitEnabled
-		predictions := predictionsForBinding(selectedPredictions, binding)
+		_, accountEntryDisabled := service.entryDisabledAccountSet[binding.ExecutionAccountID]
+		accountEntryDisabled = accountEntryDisabled || service.entrySubmissionDisabled
+		predictions := make([]domain.Prediction, 0)
+		if !accountEntryDisabled {
+			predictions = predictionsForBinding(selectedPredictions, binding)
+		}
 		var bindingCoverageErr error
 		if service.requireCompleteModelCoverage && len(predictions) == 0 {
 			bindingCoverageErr = fmt.Errorf(
@@ -337,8 +367,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		run, runErr := service.runBinding(ctx, runBindingParams{
 			decisionAt: decisionAt, predictionSnapshotID: snapshot.SnapshotID, binding: executionContext,
 			predictions: predictions, positions: positions, books: bindingBooks, histories: bindingHistories,
-			allowEntries:     bindingCoverageErr == nil && !service.entrySubmissionDisabled,
-			entryBlockReason: entryBlockReason(bindingCoverageErr, service.entrySubmissionDisabled),
+			allowEntries:     bindingCoverageErr == nil && !accountEntryDisabled,
+			entryBlockReason: entryBlockReason(bindingCoverageErr, accountEntryDisabled),
 			submitEnabled:    bindingSubmissionEnabled,
 		})
 		run.PredictionModelID = binding.PredictionModelID
@@ -640,19 +670,17 @@ func (service *Service) guardDisabledAccountRecovery(ctx context.Context) error 
 }
 
 func (service *Service) recoverDeliveries(ctx context.Context, cutoff time.Time) error {
-	side := domain.Side("")
-	if service.entrySubmissionDisabled {
-		side = domain.SideSell
-	}
-	for {
-		requeued, err := service.recorder.RequeueStaleSubmitting(
-			ctx, service.activeExecutionAccountIDs, cutoff, side, defaultDeliveryBatch,
-		)
-		if err != nil {
-			return fmt.Errorf("requeue stale strategy intents: %w", err)
-		}
-		if requeued < defaultDeliveryBatch {
-			break
+	for _, cohort := range service.deliveryCohorts() {
+		for {
+			requeued, err := service.recorder.RequeueStaleSubmitting(
+				ctx, cohort.executionAccountIDs, cutoff, cohort.side, defaultDeliveryBatch,
+			)
+			if err != nil {
+				return fmt.Errorf("requeue stale strategy intents: %w", err)
+			}
+			if requeued < defaultDeliveryBatch {
+				break
+			}
 		}
 	}
 	_, err := service.deliverPending(ctx, "")
@@ -660,53 +688,73 @@ func (service *Service) recoverDeliveries(ctx context.Context, cutoff time.Time)
 }
 
 func (service *Service) deliverPending(ctx context.Context, cycleID string) ([]IntentResult, error) {
-	side := domain.Side("")
-	if service.entrySubmissionDisabled {
-		side = domain.SideSell
-	}
 	results := make([]IntentResult, 0)
 	deliveryErrors := make([]error, 0)
-	for {
-		deliveries, err := service.recorder.ClaimPendingIntents(
-			ctx, service.activeExecutionAccountIDs, cycleID, side, defaultDeliveryBatch,
-		)
-		if err != nil {
-			return results, errors.Join(errors.Join(deliveryErrors...), fmt.Errorf("claim strategy intents: %w", err))
-		}
-		if len(deliveries) == 0 {
-			break
-		}
-		for _, delivery := range deliveries {
-			result := IntentResult{
-				Intent: delivery.Intent, DeliveryStatus: delivery.Status, DeliveryAttempt: delivery.Attempt,
+	for _, cohort := range service.deliveryCohorts() {
+		for {
+			deliveries, err := service.recorder.ClaimPendingIntents(
+				ctx, cohort.executionAccountIDs, cycleID, cohort.side, defaultDeliveryBatch,
+			)
+			if err != nil {
+				return results, errors.Join(errors.Join(deliveryErrors...), fmt.Errorf("claim strategy intents: %w", err))
 			}
-			result.Result, result.Error = service.executor.Submit(ctx, delivery.Intent)
-			completion, complete := decisionIntentCompletion(result.Result, result.Error)
-			if complete {
-				if completeErr := service.recorder.CompleteIntent(ctx, delivery.ClientOrderID, delivery.Attempt, completion); completeErr != nil {
-					result.Error = errors.Join(result.Error, fmt.Errorf("complete durable strategy intent: %w", completeErr))
-				} else {
-					result.DeliveryStatus = completion.Status
-					if completion.Status == domain.DecisionIntentFailed || completion.Status == domain.DecisionIntentUnknown {
-						result.Error = errors.Join(result.Error, fmt.Errorf(
-							"execution order %s completed durable delivery as %s (%s)",
-							completion.OrderID, completion.Status, completion.OrderStatus,
-						))
-					}
+			if len(deliveries) == 0 {
+				break
+			}
+			for _, delivery := range deliveries {
+				result := IntentResult{
+					Intent: delivery.Intent, DeliveryStatus: delivery.Status, DeliveryAttempt: delivery.Attempt,
 				}
-			} else if result.Error == nil {
-				result.Error = fmt.Errorf("execution did not return a durable order id; delivery remains leased for recovery")
+				result.Result, result.Error = service.executor.Submit(ctx, delivery.Intent)
+				completion, complete := decisionIntentCompletion(result.Result, result.Error)
+				if complete {
+					if completeErr := service.recorder.CompleteIntent(ctx, delivery.ClientOrderID, delivery.Attempt, completion); completeErr != nil {
+						result.Error = errors.Join(result.Error, fmt.Errorf("complete durable strategy intent: %w", completeErr))
+					} else {
+						result.DeliveryStatus = completion.Status
+						if completion.Status == domain.DecisionIntentFailed || completion.Status == domain.DecisionIntentUnknown {
+							result.Error = errors.Join(result.Error, fmt.Errorf(
+								"execution order %s completed durable delivery as %s (%s)",
+								completion.OrderID, completion.Status, completion.OrderStatus,
+							))
+						}
+					}
+				} else if result.Error == nil {
+					result.Error = fmt.Errorf("execution did not return a durable order id; delivery remains leased for recovery")
+				}
+				if result.Error != nil {
+					deliveryErrors = append(deliveryErrors, fmt.Errorf("submit %s: %w", delivery.ClientOrderID, result.Error))
+				}
+				results = append(results, result)
 			}
-			if result.Error != nil {
-				deliveryErrors = append(deliveryErrors, fmt.Errorf("submit %s: %w", delivery.ClientOrderID, result.Error))
+			if len(deliveries) < defaultDeliveryBatch {
+				break
 			}
-			results = append(results, result)
-		}
-		if len(deliveries) < defaultDeliveryBatch {
-			break
 		}
 	}
 	return results, errors.Join(deliveryErrors...)
+}
+
+type deliveryCohort struct {
+	executionAccountIDs []string
+	side                domain.Side
+}
+
+func (service *Service) deliveryCohorts() []deliveryCohort {
+	if service.entrySubmissionDisabled {
+		return []deliveryCohort{{executionAccountIDs: service.activeExecutionAccountIDs, side: domain.SideSell}}
+	}
+	result := make([]deliveryCohort, 0, 2)
+	if len(service.entryEnabledExecutionAccountIDs) > 0 {
+		result = append(result, deliveryCohort{executionAccountIDs: service.entryEnabledExecutionAccountIDs})
+	}
+	if len(service.entryDisabledExecutionAccountIDs) > 0 {
+		result = append(result, deliveryCohort{
+			executionAccountIDs: service.entryDisabledExecutionAccountIDs,
+			side:                domain.SideSell,
+		})
+	}
+	return result
 }
 
 // decisionIntentCompletion marks a delivery terminal only after execution has
@@ -807,6 +855,34 @@ func normalizeSubmissionDisabledAccounts(
 	return result, seen, nil
 }
 
+func normalizeEntryDisabledAccounts(
+	bindings []domain.StrategyExecutionBinding,
+	accounts []string,
+) ([]string, map[string]struct{}, error) {
+	bound := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		bound[binding.ExecutionAccountID] = struct{}{}
+	}
+	result := make([]string, 0, len(accounts))
+	seen := make(map[string]struct{}, len(accounts))
+	for index, rawAccountID := range accounts {
+		accountID := strings.TrimSpace(rawAccountID)
+		if accountID == "" {
+			return nil, nil, fmt.Errorf("entry-disabled account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return nil, nil, fmt.Errorf("duplicate entry-disabled account %q", accountID)
+		}
+		if _, exists := bound[accountID]; !exists {
+			return nil, nil, fmt.Errorf("entry-disabled account %q is not a configured binding", accountID)
+		}
+		seen[accountID] = struct{}{}
+		result = append(result, accountID)
+	}
+	sort.Strings(result)
+	return result, seen, nil
+}
+
 func filterSubmissionEnabledBindings(
 	bindings []domain.StrategyExecutionBinding,
 	disabledAccounts map[string]struct{},
@@ -817,6 +893,19 @@ func filterSubmissionEnabledBindings(
 			continue
 		}
 		result = append(result, binding)
+	}
+	return result
+}
+
+func filterEntryDisabledBindings(
+	bindings []domain.StrategyExecutionBinding,
+	disabledAccounts map[string]struct{},
+) []domain.StrategyExecutionBinding {
+	result := make([]domain.StrategyExecutionBinding, 0, len(disabledAccounts))
+	for _, binding := range bindings {
+		if _, disabled := disabledAccounts[binding.ExecutionAccountID]; disabled {
+			result = append(result, binding)
+		}
 	}
 	return result
 }
