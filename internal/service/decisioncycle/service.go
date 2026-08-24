@@ -54,6 +54,7 @@ type Params struct {
 	// from any other model.
 	RequireCompleteModelCoverage bool
 	Bindings                     []domain.StrategyExecutionBinding
+	PredictionSourceModes        map[string]domain.PredictionSourceMode
 	Venue                        string
 	PredictionLookback           time.Duration
 	MidPriceLookback             time.Duration
@@ -76,6 +77,7 @@ type Service struct {
 	entrySubmissionDisabled      bool
 	requireCompleteModelCoverage bool
 	bindings                     []domain.StrategyExecutionBinding
+	predictionSourceModes        map[string]domain.PredictionSourceMode
 	activeBindings               []domain.StrategyExecutionBinding
 	activeExecutionAccountIDs    []string
 	venue                        string
@@ -135,6 +137,10 @@ func New(params Params) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	predictionSourceModes, err := normalizePredictionSourceModes(bindings, params.PredictionSourceModes)
+	if err != nil {
+		return nil, err
+	}
 	disabledAccounts, disabledAccountSet, err := normalizeSubmissionDisabledAccounts(
 		bindings,
 		params.SubmissionDisabledAccounts,
@@ -184,6 +190,7 @@ func New(params Params) (*Service, error) {
 		entrySubmissionDisabled:      params.EntrySubmissionDisabled,
 		requireCompleteModelCoverage: params.RequireCompleteModelCoverage,
 		bindings:                     bindings,
+		predictionSourceModes:        predictionSourceModes,
 		activeBindings:               activeBindings,
 		activeExecutionAccountIDs:    executionAccountIDs(activeBindings),
 		venue:                        params.Venue,
@@ -212,7 +219,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	}
 	modelIDs := configuredPredictionModels(service.activeBindings)
 	selectedPredictions, err := selectAvailablePredictions(
-		snapshot.Predictions, modelIDs, decisionAt.Add(-service.predictionLookback),
+		snapshot.Predictions, modelIDs, service.predictionSourceModes,
+		decisionAt.Add(-service.predictionLookback),
 	)
 	if err != nil {
 		return RunResult{}, err
@@ -836,24 +844,68 @@ func configuredPredictionModels(bindings []domain.StrategyExecutionBinding) []st
 	return result
 }
 
-// selectAvailablePredictions routes the completed result table directly. Both
-// Sandbox and Direct rows are valid production algorithm results; SandboxID is
-// lineage for audit, not an exclusion flag. Each (Market, source model) is
-// independent, and the newest fresh PIT row for each configured pair wins
-// deterministically.
+// selectAvailablePredictions first enforces each model's configured result
+// channel, then applies freshness and deterministic PIT selection. A result
+// from the other channel can never shadow or satisfy the configured source.
 func selectAvailablePredictions(
 	predictions []domain.Prediction,
 	modelIDs []string,
+	sourceModes map[string]domain.PredictionSourceMode,
 	freshAfter time.Time,
 ) ([]domain.Prediction, error) {
+	configuredModes := make(map[string]domain.PredictionSourceMode, len(modelIDs))
+	for _, rawModelID := range modelIDs {
+		modelID := strings.TrimSpace(rawModelID)
+		mode, exists := sourceModes[modelID]
+		if !exists {
+			return nil, fmt.Errorf("prediction source mode is missing for configured model %q", modelID)
+		}
+		if !mode.Valid() {
+			return nil, fmt.Errorf("prediction source mode for configured model %q is unknown: %q", modelID, mode)
+		}
+		configuredModes[modelID] = mode
+	}
 	fresh := make([]domain.Prediction, 0, len(predictions))
 	for _, prediction := range predictions {
+		mode, configured := configuredModes[strings.TrimSpace(prediction.Model.Name)]
+		if !configured {
+			continue
+		}
+		hasSandboxID := strings.TrimSpace(prediction.SandboxID) != ""
+		if (mode == domain.PredictionSourceModeDirect && hasSandboxID) ||
+			(mode == domain.PredictionSourceModeSandbox && !hasSandboxID) {
+			continue
+		}
 		if prediction.PredictionAsOf.Before(freshAfter) || prediction.CompletedAt.Before(freshAfter) {
 			continue
 		}
 		fresh = append(fresh, prediction)
 	}
 	return domain.SelectEffectivePredictions(fresh, modelIDs)
+}
+
+func normalizePredictionSourceModes(
+	bindings []domain.StrategyExecutionBinding,
+	modes map[string]domain.PredictionSourceMode,
+) (map[string]domain.PredictionSourceMode, error) {
+	configured := configuredPredictionModels(bindings)
+	result := make(map[string]domain.PredictionSourceMode, len(configured))
+	for _, modelID := range configured {
+		mode, exists := modes[modelID]
+		if !exists {
+			return nil, fmt.Errorf("prediction source mode is missing for configured model %q", modelID)
+		}
+		if !mode.Valid() {
+			return nil, fmt.Errorf("prediction source mode for configured model %q is unknown: %q", modelID, mode)
+		}
+		result[modelID] = mode
+	}
+	for modelID := range modes {
+		if _, exists := result[modelID]; !exists {
+			return nil, fmt.Errorf("prediction source mode is configured for unknown model %q", modelID)
+		}
+	}
+	return result, nil
 }
 
 // predictionsForBinding 选择一个上游预测模型的 Market，再投影为 Python 和执行层使用的稳定业务模型。

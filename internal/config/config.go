@@ -79,6 +79,7 @@ type DecisionCycle struct {
 	PredictionLookback           time.Duration
 	MidPriceLookback             time.Duration
 	Bindings                     []domain.StrategyExecutionBinding
+	PredictionSourceModes        map[string]domain.PredictionSourceMode
 }
 
 // Database 表示后端使用的 Database 类型。
@@ -486,6 +487,12 @@ func (config Config) Validate() error {
 		if err := validateCurrentWallet67Quarantine(config.DecisionCycle.SubmissionDisabledAccounts); err != nil {
 			return err
 		}
+		if err := validateDecisionPredictionSourceModes(
+			config.DecisionCycle.Bindings,
+			config.DecisionCycle.PredictionSourceModes,
+		); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -535,6 +542,12 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	predictionSourceModes, err := decodeDecisionPredictionSourceModes(
+		os.Getenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON"),
+	)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	submissionDisabledAccounts, err := decodeDecisionSubmissionDisabledAccounts(
 		os.Getenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"),
 	)
@@ -553,8 +566,52 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		Interval:                     interval, StartupDelay: startupDelay,
 		MaxStartLateness: maxStartLateness, Timeout: timeout,
 		PredictionLookback: predictionLookback, MidPriceLookback: midPriceLookback,
-		Bindings: bindings,
+		Bindings: bindings, PredictionSourceModes: predictionSourceModes,
 	}, nil
+}
+
+func decodeDecisionPredictionSourceModes(value string) (map[string]domain.PredictionSourceMode, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(value))
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON: %w", err)
+	}
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+		return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON must be a JSON object")
+	}
+	modes := make(map[string]domain.PredictionSourceMode)
+	for decoder.More() {
+		keyToken, tokenErr := decoder.Token()
+		if tokenErr != nil {
+			return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON: %w", tokenErr)
+		}
+		predictionModelID, ok := keyToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON keys must be strings")
+		}
+		if _, duplicate := modes[predictionModelID]; duplicate {
+			return nil, fmt.Errorf(
+				"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON contains duplicate prediction model %q",
+				predictionModelID,
+			)
+		}
+		var mode domain.PredictionSourceMode
+		if decodeErr := decoder.Decode(&mode); decodeErr != nil {
+			return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON: %w", decodeErr)
+		}
+		modes[predictionModelID] = mode
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON must contain exactly one JSON object")
+	}
+	return modes, nil
 }
 
 func decodeDecisionSubmissionDisabledAccounts(value string) ([]string, error) {
@@ -625,6 +682,51 @@ func validateDecisionBindings(bindings []domain.StrategyExecutionBinding) error 
 		logicalModelSources[binding.ModelID] = binding.PredictionModelID
 		sourceModelTargets[binding.PredictionModelID] = binding.ModelID
 		bindings[index] = binding
+	}
+	return nil
+}
+
+func validateDecisionPredictionSourceModes(
+	bindings []domain.StrategyExecutionBinding,
+	modes map[string]domain.PredictionSourceMode,
+) error {
+	expected := make(map[string]string, len(bindings))
+	for _, rawBinding := range bindings {
+		binding := rawBinding.Normalize()
+		expected[binding.PredictionModelID] = binding.ModelID
+	}
+	for predictionModelID, logicalModelID := range expected {
+		mode, exists := modes[predictionModelID]
+		if !exists {
+			return fmt.Errorf(
+				"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON is missing configured prediction model %q",
+				predictionModelID,
+			)
+		}
+		if !mode.Valid() {
+			return fmt.Errorf(
+				"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON model %q must be exactly DIRECT or SANDBOX",
+				predictionModelID,
+			)
+		}
+		switch logicalModelID {
+		case "echo":
+			if mode != domain.PredictionSourceModeDirect {
+				return fmt.Errorf("this release requires logical model echo to use DIRECT prediction source mode")
+			}
+		case "gemini_masked":
+			if mode != domain.PredictionSourceModeSandbox {
+				return fmt.Errorf("this release requires logical model gemini_masked to use SANDBOX prediction source mode")
+			}
+		}
+	}
+	for predictionModelID := range modes {
+		if _, exists := expected[predictionModelID]; !exists {
+			return fmt.Errorf(
+				"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON contains unconfigured prediction model %q",
+				predictionModelID,
+			)
+		}
 	}
 	return nil
 }

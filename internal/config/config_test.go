@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/UniPat-AI/trading_execution/internal/domain"
 )
 
 // TestLoadSafeDefaults 验证 Load Safe Defaults 场景下的行为。
@@ -34,8 +36,59 @@ func TestLoadAcceptsDecisionCycleWithSubmissionDisabled(t *testing.T) {
 	}
 	if !config.DecisionCycle.Enabled || config.DecisionCycle.OrderSubmissionEnabled ||
 		len(config.DecisionCycle.Bindings) != 4 || config.DecisionCycle.Interval != 10*time.Minute ||
-		config.DecisionCycle.Bindings[0].PredictionModelID != "echo-source" {
+		config.DecisionCycle.Bindings[0].PredictionModelID != "echo-source" ||
+		config.DecisionCycle.PredictionSourceModes["echo-source"] != domain.PredictionSourceModeDirect ||
+		config.DecisionCycle.PredictionSourceModes["masked-source"] != domain.PredictionSourceModeSandbox {
 		t.Fatalf("decision cycle config = %#v", config.DecisionCycle)
+	}
+}
+
+func TestLoadRejectsInvalidDecisionPredictionSourceModes(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{
+			name:  "missing configured model",
+			value: `{"echo-source":"DIRECT"}`,
+			want:  `missing configured prediction model "masked-source"`,
+		},
+		{
+			name:  "extra model",
+			value: `{"echo-source":"DIRECT","masked-source":"SANDBOX","other":"DIRECT"}`,
+			want:  `contains unconfigured prediction model "other"`,
+		},
+		{
+			name:  "unknown exact value",
+			value: `{"echo-source":"direct","masked-source":"SANDBOX"}`,
+			want:  "must be exactly DIRECT or SANDBOX",
+		},
+		{
+			name:  "wrong echo release mode",
+			value: `{"echo-source":"SANDBOX","masked-source":"SANDBOX"}`,
+			want:  "logical model echo to use DIRECT",
+		},
+		{
+			name:  "wrong masked release mode",
+			value: `{"echo-source":"DIRECT","masked-source":"DIRECT"}`,
+			want:  "logical model gemini_masked to use SANDBOX",
+		},
+		{
+			name:  "duplicate model key",
+			value: `{"echo-source":"DIRECT","echo-source":"DIRECT","masked-source":"SANDBOX"}`,
+			want:  `duplicate prediction model "echo-source"`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", test.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -50,6 +103,7 @@ func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
 		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-producer-current":"DIRECT","masked-producer-current":"SANDBOX"}`)
 	config, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -90,6 +144,7 @@ func TestLoadAcceptsExplicitLiveDecisionSubmission(t *testing.T) {
 	]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-producer-current":"DIRECT","masked-producer-current":"SANDBOX"}`)
 	config, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -162,6 +217,7 @@ func TestLoadAcceptsRequiredWallet67SubmissionDisabledAccounts(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[" wallet-7 ","wallet-6"]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-producer-v7":"DIRECT","gemini-3.6-flash":"SANDBOX"}`)
 	config, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -454,6 +510,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"DECISION_CYCLE_INTERVAL", "DECISION_CYCLE_STARTUP_DELAY", "DECISION_CYCLE_MAX_START_LATENESS", "DECISION_CYCLE_TIMEOUT",
 		"DECISION_CYCLE_PREDICTION_LOOKBACK", "DECISION_CYCLE_MID_PRICE_LOOKBACK",
 		"DECISION_CYCLE_BINDINGS_JSON", "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
+		"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON",
 	} {
 		t.Setenv(key, "")
 	}
@@ -480,6 +537,7 @@ func setCompleteDecisionCycleEnvironment(t *testing.T) {
 		{"prediction_model_id":"masked-source","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `["wallet-6","wallet-7"]`)
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-source":"DIRECT","masked-source":"SANDBOX"}`)
 }
 
 func setCompleteLiveEnvironment(t *testing.T) {

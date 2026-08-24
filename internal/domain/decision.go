@@ -59,6 +59,21 @@ type Prediction struct {
 	Model          PredictionModel     `json:"model"`
 }
 
+// PredictionSourceMode fixes the trusted result channel for one upstream
+// prediction model. DIRECT rows have no SandboxID; SANDBOX rows must have one.
+type PredictionSourceMode string
+
+const (
+	PredictionSourceModeDirect  PredictionSourceMode = "DIRECT"
+	PredictionSourceModeSandbox PredictionSourceMode = "SANDBOX"
+)
+
+// Valid reports whether mode is one of the two deliberately supported source
+// channels. Values are exact and are never whitespace- or case-normalized.
+func (mode PredictionSourceMode) Valid() bool {
+	return mode == PredictionSourceModeDirect || mode == PredictionSourceModeSandbox
+}
+
 type PredictionExpectationStatus string
 
 const (

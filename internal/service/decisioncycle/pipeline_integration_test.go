@@ -219,7 +219,7 @@ func newPipelineFixture(t *testing.T, maxNotional domain.Decimal, submitEnabled 
 	if len(submitEnabled) != 0 {
 		enabled = submitEnabled[0]
 	}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-pipeline-1",
 			DecisionAt: decisionAt, CompletedAfter: decisionAt.Add(-3 * time.Hour),

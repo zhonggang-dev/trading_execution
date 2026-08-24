@@ -29,11 +29,16 @@ EXECUTION_MAX_ORDER_NOTIONAL=EXACT_REVIEWED_POSITIVE_DECIMAL
 POLYMARKET_MAX_BUY_FEE_RATE_BPS=EXACT_REVIEWED_NON_NEGATIVE_DECIMAL
 POLYGON_ORDER_FILLED_CONFIRMATIONS=EXACT_REVIEWED_POSITIVE_INTEGER
 DECISION_CYCLE_MID_PRICE_LOOKBACK=EXACT_REVIEWED_DURATION
+DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON={"EXACT_ECHO_SNAPSHOT_MODEL_NAME":"DIRECT","gemini-3.6-flash":"SANDBOX"}
 ```
 
-The preflight binds all six values into the configuration SHA and verifies the
-running process has the same values. Market orders must remain disabled for
-the four-wallet activation; changing any other value invalidates disabled-pass
+The preflight binds all seven values into the configuration SHA and verifies
+the running process has the same values. The Go runtime also enforces the
+source-mode map on every cycle: `DIRECT` accepts only an empty `sandbox_id`,
+while `SANDBOX` requires a non-empty `sandbox_id`. The map must exactly cover
+all configured upstream models; the current release pins echo to `DIRECT` and
+`gemini_masked` to `SANDBOX`. Market orders must remain disabled for the
+four-wallet activation; changing any other value invalidates disabled-pass
 evidence and requires a new review.
 
 For an explicitly approved exit-only maintenance window, set
@@ -102,7 +107,7 @@ REDIS_ADDRESS=APPROVED_REDIS_HOST:6379
 REDIS_DATABASE=APPROVED_REDIS_DATABASE
 DIRECT_PREDICTION_ENABLED=true
 REDIS_DIRECT_PREDICTION_STREAM_KEY=prediction_pm_directprediction
-DIRECT_PREDICTION_MODEL_IDS_JSON=["EXACT_ECHO_SNAPSHOT_MODEL_NAME","gemini-3.6-flash"]
+DIRECT_PREDICTION_MODEL_IDS_JSON=["EXACT_ECHO_SNAPSHOT_MODEL_NAME"]
 PREDICTION_RESULT_ENABLED=true
 TRADING_INPUT_ENABLED=true
 DATABASE_URL=postgresql://...
@@ -111,18 +116,18 @@ TRADING_INPUT_TOKEN=...
 PREDICTION_RESULT_TOKEN=...
 ```
 
-`DIRECT_PREDICTION_MODEL_IDS_JSON` must contain the active echo source model.
-It may also retain the configured quarantined Gemini source, but unknown,
-blank, or duplicated models fail preflight. Gemini availability is not a hard
-gate in this release. Prediction result callbacks and Trading input must both
-be enabled. `TRADING_INPUT_TOKEN` must equal Trading's
+`DIRECT_PREDICTION_MODEL_IDS_JSON` must equal the `DIRECT` subset in Trading's
+source-mode map, so it contains the echo source model and must not contain the
+Sandbox Gemini source. Unknown, blank, duplicated, missing, or extra models
+fail preflight. Prediction result callbacks and Trading input must both be
+enabled. `TRADING_INPUT_TOKEN` must equal Trading's
 `DECISION_CYCLE_PREDICTION_INFRA_TOKEN`; both Prediction tokens and Trading's
 strategy token must be non-empty, and the result/input tokens must be distinct.
 
-Use one distinct Redis group per active source model. The current hard gate is
-only the echo group used by main/wallet-1. A Gemini mapping may be supplied as
-non-blocking onboarding metadata, but this release ignores its consumer health.
-Preflight runs `XINFO` for active echo and requires a recent consumer, zero
+Use one distinct Redis group per configured `DIRECT` source model. The exact
+mapping for this release contains only the echo group used by main/wallet-1;
+a Gemini group is rejected because Gemini is `SANDBOX`. Preflight runs `XINFO`
+for echo and requires a recent consumer, zero
 pending consumer messages, zero group pending, and zero lag.
 
 Run the read-only preflight while submission is still disabled:
@@ -163,7 +168,8 @@ The preflight exits non-zero if any of these invariants is false:
 - the actual systemd processes do not expose the approved health identity or
   do not contain the audited non-secret environment. This includes Trading's
   static size/notional/fee/finality limits, disabled market-order policy, PIT
-  and midpoint lookbacks, and Prediction's Redis address/database, so the
+  and midpoint lookbacks, prediction source-mode contract, and Prediction's
+  Redis address/database, so the
   preflight cannot inspect one configuration while the processes use another;
 - Prediction's health version is not an immutable lowercase 40-character Git
   SHA or `sha256:<64 lowercase hex>` image digest. Reusable values such as
@@ -186,7 +192,10 @@ The preflight exits non-zero if any of these invariants is false:
   accepted, while explicit `false` is never treated as omission;
 - the PIT snapshot used by that dry run does not contain an effective Direct
   task manifest where every Market has the active echo source model in
-  `COMPLETED` state and each task has its exact matching result;
+  `COMPLETED` state and each task has its exact matching non-Sandbox result;
+  each active Sandbox model must independently have at least one fresh,
+  PIT-visible effective result with a non-empty `sandbox_id`, and a Sandbox
+  model must not appear in the Direct task manifest;
 - the active echo Redis consumer group is missing, inactive, pending, or lagging;
 - any managed-account decision intent delivery remains `PENDING`, `SUBMITTING`, or
   `UNKNOWN`, any delivery's order status is `UNKNOWN`/`MANUAL_REVIEW`, or any

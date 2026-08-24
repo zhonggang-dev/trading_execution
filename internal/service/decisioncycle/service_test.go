@@ -406,7 +406,7 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 	}}
 	recorder := &fakeRecorder{}
 	executor := &fakeExecutor{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion:  domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:     "predsnap-1",
@@ -518,7 +518,7 @@ func TestRunSkipsQuarantinedBindingWhileOtherBindingSubmits(t *testing.T) {
 	executor := &fakeExecutor{}
 	positionSource := &quarantinePositionSource{rejectedAccount: "account-quarantined"}
 	midPriceSource := &fakeMidPriceHistorySource{histories: histories}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "snapshot-quarantine",
 			DecisionAt: decisionAt, GeneratedAt: decisionAt.Add(time.Second),
@@ -594,7 +594,7 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 	bookSource := &fakeOrderBookSource{}
 	midPriceSource := &fakeMidPriceHistorySource{}
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-matrix",
@@ -660,7 +660,7 @@ func TestRunStillCallsAllFourWalletsWhenOneModelHasNoMarket(t *testing.T) {
 	prediction := validPrediction(decisionAt)
 	prediction.Model.Name = "echo-producer-v7"
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-one-model",
@@ -714,7 +714,7 @@ func TestRunRoutesAvailableModelWithoutBlockingOnMissingOtherModel(t *testing.T)
 		pendingPredictionExpectation(missingModel, 1, 1),
 	}
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion:       domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:          "predsnap-incomplete-model-matrix",
@@ -758,14 +758,12 @@ func TestRunRoutesAvailableModelWithoutBlockingOnMissingOtherModel(t *testing.T)
 	}
 }
 
-func TestEmptyModelRouteSubmitsExitButNeverBuy(t *testing.T) {
+func TestSourceModeMismatchSubmitsExitButNeverBuy(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
-	prediction.Model.Name = "echo-producer-v7"
-	missingModel := prediction
-	missingModel.PredictionID = "pred-gemini-pending"
-	missingModel.SourceJobID = "job-gemini-pending"
-	missingModel.Model.Name = "gemini-3.6-flash"
+	// This is a Direct row for a model configured as SANDBOX below. It must not
+	// satisfy model coverage even though every other prediction field is valid.
+	prediction.Model.Name = "gemini-3.6-flash"
 	bindings := []domain.StrategyExecutionBinding{
 		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2"},
 	}
@@ -795,13 +793,12 @@ func TestEmptyModelRouteSubmitsExitButNeverBuy(t *testing.T) {
 	recorder := &fakeRecorder{}
 	executor := &fakeExecutor{}
 	strategy := &coverageBuyExitStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-entry-gate",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{prediction},
 			ExpectedPredictions: []domain.PredictionExpectation{
 				completedPredictionExpectation(prediction, 1, 1),
-				pendingPredictionExpectation(missingModel, 1, 1),
 			},
 		}},
 		PositionSource: positions, OrderBookSource: &fakeOrderBookSource{books: books},
@@ -866,7 +863,7 @@ func TestOperatorSellOnlyGateSubmitsExitButNeverBuy(t *testing.T) {
 	recorder := &fakeRecorder{}
 	executor := &fakeExecutor{}
 	strategy := &coverageBuyExitStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-sell-only",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{prediction},
@@ -922,7 +919,7 @@ func TestRunSelectsLatestPITProbabilityForSameMarketAndModel(t *testing.T) {
 	second.Outcomes[0].Probability = 0.8
 	second.Outcomes[1].Probability = 0.2
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-duplicate-market-model",
@@ -972,7 +969,7 @@ func TestRunRoutesLatestCompletedResultWithoutManifestDependency(t *testing.T) {
 	newerResult.Outcomes[0].Probability = 0.9
 	newerResult.Outcomes[1].Probability = 0.1
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-manifest-authority",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{newerResult, expected},
@@ -999,7 +996,7 @@ func TestRunRoutesLatestCompletedResultWithoutManifestDependency(t *testing.T) {
 	}
 }
 
-func TestRunNewerSandboxResultReplacesOlderDirectResult(t *testing.T) {
+func TestRunDirectModeIgnoresNewerSandboxResult(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	direct := validPrediction(decisionAt)
 	direct.Model.Name = "echo-producer-v7"
@@ -1014,7 +1011,7 @@ func TestRunNewerSandboxResultReplacesOlderDirectResult(t *testing.T) {
 	sandbox.Outcomes[0].Probability = 0.9
 	sandbox.Outcomes[1].Probability = 0.1
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-ignore-sandbox",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{direct, sandbox},
@@ -1036,17 +1033,17 @@ func TestRunNewerSandboxResultReplacesOlderDirectResult(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
-		strategy.requests[0].Predictions[0].PredictionID != sandbox.PredictionID ||
-		strategy.requests[0].Predictions[0].Outcomes[0].Probability != 0.9 ||
+		strategy.requests[0].Predictions[0].PredictionID != direct.PredictionID ||
+		strategy.requests[0].Predictions[0].Outcomes[0].Probability != 0.7 ||
 		len(result.Runs) != 1 || !result.Runs[0].EntrySubmissionEnabled {
-		t.Fatalf("newest Sandbox result = %#v, requests = %#v", result, strategy.requests)
+		t.Fatalf("DIRECT-filtered result = %#v, requests = %#v", result, strategy.requests)
 	}
 }
 
-func TestRunNewerDirectResultReplacesOlderSandboxResult(t *testing.T) {
+func TestRunSandboxModeIgnoresNewerDirectResult(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	sandbox := validPrediction(decisionAt)
-	sandbox.Model.Name = "echo-producer-v7"
+	sandbox.Model.Name = "gemini-3.6-flash"
 	sandbox.SandboxID = "sandbox-1"
 	direct := sandbox
 	direct.Outcomes = append([]domain.PredictionOutcome(nil), sandbox.Outcomes...)
@@ -1059,7 +1056,7 @@ func TestRunNewerDirectResultReplacesOlderSandboxResult(t *testing.T) {
 	direct.Outcomes[0].Probability = 0.85
 	direct.Outcomes[1].Probability = 0.15
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-direct-newer",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{sandbox, direct},
@@ -1068,9 +1065,12 @@ func TestRunNewerDirectResultReplacesOlderSandboxResult(t *testing.T) {
 		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{{
-			PredictionModelID: "echo-producer-v7", ModelID: "echo",
-			StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main",
+			PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked",
+			StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2",
 		}},
+		PredictionSourceModes: map[string]domain.PredictionSourceMode{
+			"gemini-3.6-flash": domain.PredictionSourceModeSandbox,
+		},
 		Venue: "polymarket-paper",
 	})
 	if err != nil {
@@ -1081,20 +1081,20 @@ func TestRunNewerDirectResultReplacesOlderSandboxResult(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
-		strategy.requests[0].Predictions[0].PredictionID != direct.PredictionID ||
-		strategy.requests[0].Predictions[0].Outcomes[0].Probability != 0.85 ||
+		strategy.requests[0].Predictions[0].PredictionID != sandbox.PredictionID ||
+		strategy.requests[0].Predictions[0].Outcomes[0].Probability != 0.7 ||
 		len(result.Runs) != 1 || !result.Runs[0].EntrySubmissionEnabled {
-		t.Fatalf("newest Direct result = %#v, requests = %#v", result, strategy.requests)
+		t.Fatalf("SANDBOX-filtered result = %#v, requests = %#v", result, strategy.requests)
 	}
 }
 
-func TestRunSandboxOnlyResultIsRoutedAndAllowsBindingEntry(t *testing.T) {
+func TestRunDirectModeSandboxOnlyResultBlocksEntryForCoverage(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	sandbox := validPrediction(decisionAt)
 	sandbox.Model.Name = "echo-producer-v7"
 	sandbox.SandboxID = "sandbox-1"
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-sandbox-only",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{sandbox},
@@ -1115,11 +1115,32 @@ func TestRunSandboxOnlyResultIsRoutedAndAllowsBindingEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
-		strategy.requests[0].Predictions[0].PredictionID != sandbox.PredictionID ||
-		len(result.Runs) != 1 || !result.Runs[0].EntrySubmissionEnabled ||
-		result.Runs[0].EntryBlockReason != "" {
-		t.Fatalf("sandbox-only result = %#v, requests = %#v", result, strategy.requests)
+	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 0 ||
+		len(result.Runs) != 1 || result.Runs[0].EntrySubmissionEnabled ||
+		result.Runs[0].EntryBlockReason != domain.StrategyEntryBlockIncompleteModelCoverage {
+		t.Fatalf("DIRECT coverage block = %#v, requests = %#v", result, strategy.requests)
+	}
+}
+
+func TestSelectAvailablePredictionsRejectsMissingOrUnknownSourceMode(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		modes map[string]domain.PredictionSourceMode
+		want  string
+	}{
+		{name: "missing", modes: nil, want: `missing for configured model "producer-a"`},
+		{
+			name: "unknown", modes: map[string]domain.PredictionSourceMode{
+				"producer-a": "BOTH",
+			}, want: `configured model "producer-a" is unknown`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := selectAvailablePredictions(nil, []string{"producer-a"}, test.modes, time.Time{})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("selectAvailablePredictions() error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -1132,11 +1153,12 @@ func TestRunRoutesCompletedResultsForDifferentModelsWithoutSyntheticPairs(t *tes
 	oldUnmanifested.PredictionID = "pred-gemini-old-unmanifested"
 	oldUnmanifested.SourceJobID = "job-gemini-old-unmanifested"
 	oldUnmanifested.Model.Name = "gemini-3.6-flash"
+	oldUnmanifested.SandboxID = "sandbox-gemini-old"
 	oldUnmanifested.PredictionAsOf = decisionAt.Add(-2 * time.Hour)
 	oldUnmanifested.Outcomes[0].Probability = 0.9
 	oldUnmanifested.Outcomes[1].Probability = 0.1
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-missing-current-task",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{current, oldUnmanifested},
@@ -1193,7 +1215,7 @@ func TestRunUsesCompletedResultWhileNewerTaskIsPending(t *testing.T) {
 	newTask.SourceJobID = "job-current-pending"
 	newTask.PredictionAsOf = decisionAt.Add(-5 * time.Minute)
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-stale-mask",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{old},
@@ -1235,9 +1257,10 @@ func TestRunRoutesIndependentCompletedGenerations(t *testing.T) {
 	oldOther.PredictionID = "pred-gemini-old"
 	oldOther.SourceJobID = "job-gemini-old"
 	oldOther.Model.Name = "gemini-3.6-flash"
+	oldOther.SandboxID = "sandbox-gemini-old"
 	oldOther.PredictionAsOf = decisionAt.Add(-2 * time.Hour)
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-mixed-generation",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{current, oldOther},
@@ -1279,7 +1302,7 @@ func TestRunCompletedTaskOlderThanPredictionLookbackCannotAuthorizeEntry(t *test
 	stale.SandboxID = "sandbox-stale"
 	stale.PredictionAsOf = decisionAt.Add(-4 * time.Hour)
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-stale-completed",
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{stale},
@@ -1314,7 +1337,7 @@ func TestRunFailsClosedWhenInputCannotBeRecorded(t *testing.T) {
 	recorder := &fakeRecorder{inputError: errors.New("disk unavailable")}
 	strategy := &fakeStrategy{}
 	executor := &fakeExecutor{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-1",
@@ -1364,7 +1387,7 @@ func TestRunRejectsStrategyResponseThatOmitsAnOutcome(t *testing.T) {
 	}}
 	recorder := &fakeRecorder{}
 	executor := &fakeExecutor{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-1",
@@ -1396,7 +1419,7 @@ func TestRunRejectsStrategyResponseThatOmitsAnOutcome(t *testing.T) {
 // TestRunRejectsStrategyResponseThatChangesExecutionAccount 验证 Run Rejects Strategy Response That Changes Execution Account 场景下的行为。
 func TestRunRejectsStrategyResponseThatChangesExecutionAccount(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-empty",
@@ -1431,7 +1454,7 @@ func TestRunRejectsFutureStrategyDecisionTime(t *testing.T) {
 		Exits:         []domain.StrategyExit{},
 	}}
 	recorder := &fakeRecorder{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-empty",
@@ -1466,7 +1489,7 @@ func TestNewRejectsDuplicateAccountBinding(t *testing.T) {
 	first := testExecutionBinding()
 	second := first
 	second.ModelID = "another-model"
-	_, err := New(Params{
+	_, err := newTestService(Params{
 		PredictionSource:             fakePredictionSource{},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
@@ -1485,7 +1508,7 @@ func TestNewRejectsDuplicateAccountBinding(t *testing.T) {
 }
 
 func TestNewRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
-	_, err := New(Params{
+	_, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{},
 		PositionSource:   fakePositionSource{},
 		OrderBookSource:  &fakeOrderBookSource{},
@@ -1504,7 +1527,7 @@ func TestNewRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
 }
 
 func TestNewRejectsSubmissionWithoutCompleteModelCoverage(t *testing.T) {
-	_, err := New(Params{
+	_, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{},
 		PositionSource:   fakePositionSource{},
 		OrderBookSource:  &fakeOrderBookSource{},
@@ -1521,9 +1544,48 @@ func TestNewRejectsSubmissionWithoutCompleteModelCoverage(t *testing.T) {
 	}
 }
 
+func TestNewRejectsInvalidPredictionSourceModes(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		modes map[string]domain.PredictionSourceMode
+		want  string
+	}{
+		{name: "missing", modes: nil, want: `missing for configured model "test"`},
+		{
+			name:  "unknown mode",
+			modes: map[string]domain.PredictionSourceMode{"test": "BOTH"},
+			want:  `configured model "test" is unknown`,
+		},
+		{
+			name: "extra model",
+			modes: map[string]domain.PredictionSourceMode{
+				"test": domain.PredictionSourceModeDirect, "other": domain.PredictionSourceModeDirect,
+			},
+			want: `configured for unknown model "other"`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := New(Params{
+				PredictionSource:      fakePredictionSource{},
+				PositionSource:        fakePositionSource{},
+				OrderBookSource:       &fakeOrderBookSource{},
+				MidPriceSource:        &fakeMidPriceHistorySource{},
+				Strategy:              &fakeStrategy{},
+				Recorder:              &fakeRecorder{},
+				Bindings:              []domain.StrategyExecutionBinding{testExecutionBinding()},
+				PredictionSourceModes: test.modes,
+				Venue:                 "polymarket-paper",
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("New() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestNewRejectsQuarantiningEveryBinding(t *testing.T) {
 	binding := testExecutionBinding()
-	_, err := New(Params{
+	_, err := newTestService(Params{
 		PredictionSource:             fakePredictionSource{},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
@@ -1544,7 +1606,7 @@ func TestNewRejectsQuarantiningEveryBinding(t *testing.T) {
 
 // TestRunRejectsNonBoundaryTime 验证 Run Rejects Non Boundary Time 场景下的行为。
 func TestRunRejectsNonBoundaryTime(t *testing.T) {
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource:             fakePredictionSource{},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
@@ -1639,7 +1701,7 @@ func TestV1OnlyCycleDoesNotCallMidPriceSource(t *testing.T) {
 	prediction := validPrediction(decisionAt)
 	historySource := &fakeMidPriceHistorySource{err: errors.New("history source must not be called")}
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-v1", DecisionAt: decisionAt,
@@ -1674,7 +1736,7 @@ func TestMixedCycleHistoryFailureDoesNotBlockV1Binding(t *testing.T) {
 	prediction := validPrediction(decisionAt)
 	historySource := &fakeMidPriceHistorySource{err: errors.New("history unavailable")}
 	strategy := &matrixStrategy{}
-	service, err := New(Params{
+	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-mixed", DecisionAt: decisionAt,
@@ -2187,4 +2249,19 @@ func fourWalletBindings() []domain.StrategyExecutionBinding {
 		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2"},
 		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-3"},
 	}
+}
+
+func newTestService(params Params) (*Service, error) {
+	if params.PredictionSourceModes == nil {
+		params.PredictionSourceModes = make(map[string]domain.PredictionSourceMode)
+		for _, rawBinding := range params.Bindings {
+			binding := rawBinding.Normalize()
+			mode := domain.PredictionSourceModeDirect
+			if binding.ModelID == "gemini_masked" {
+				mode = domain.PredictionSourceModeSandbox
+			}
+			params.PredictionSourceModes[binding.PredictionModelID] = mode
+		}
+	}
+	return New(params)
 }

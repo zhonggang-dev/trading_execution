@@ -104,6 +104,11 @@ DISABLED_EVIDENCE_SCHEMA = "four_wallet.disabled_preflight.v1"
 ACTIVATION_RISK_APPROVAL_SCHEMA = "four_wallet.activation_risk_approval.v1"
 ACTIVATION_RISK_DECISION = "APPROVED_FOR_LIVE_ACTIVATION"
 IMMUTABLE_RELEASE_IDENTITY = re.compile(r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})")
+PREDICTION_SOURCE_DIRECT = "DIRECT"
+PREDICTION_SOURCE_SANDBOX = "SANDBOX"
+PREDICTION_SOURCE_MODES = frozenset(
+    {PREDICTION_SOURCE_DIRECT, PREDICTION_SOURCE_SANDBOX}
+)
 
 TRADING_RUNTIME_KEYS = frozenset(
     {
@@ -120,6 +125,7 @@ TRADING_RUNTIME_KEYS = frozenset(
         "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
         "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",
         "DECISION_CYCLE_BINDINGS_JSON",
+        "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON",
         "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
         "POLYMARKET_ACCOUNTS_FILE",
         "DECISION_CYCLE_PREDICTION_INFRA_URL",
@@ -438,6 +444,65 @@ def decode_submission_disabled_accounts(
     return tuple(sorted(accounts))
 
 
+def decode_prediction_model_source_modes(
+    payload: str, bindings: tuple[Binding, ...]
+) -> dict[str, str]:
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise PreflightError(
+                    "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON contains duplicate "
+                    f"model {key!r}"
+                )
+            result[key] = value
+        return result
+
+    try:
+        raw = json.loads(payload, object_pairs_hook=reject_duplicate_keys)
+    except json.JSONDecodeError as error:
+        raise PreflightError(
+            "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON is invalid JSON: "
+            f"{error.msg}"
+        ) from error
+    if not isinstance(raw, dict):
+        raise PreflightError(
+            "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON must be one JSON object"
+        )
+    expected_models = {binding.prediction_model_id for binding in bindings}
+    configured_models = set(raw)
+    missing_models = expected_models - configured_models
+    unknown_models = configured_models - expected_models
+    if missing_models or unknown_models:
+        raise PreflightError(
+            "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON must map every configured "
+            "prediction model exactly; "
+            f"missing={sorted(missing_models)}, unknown={sorted(unknown_models)}"
+        )
+    result: dict[str, str] = {}
+    for model_id, mode in raw.items():
+        if not isinstance(mode, str) or mode not in PREDICTION_SOURCE_MODES:
+            raise PreflightError(
+                f"prediction source mode for {model_id!r} must be exactly DIRECT or SANDBOX"
+            )
+        result[model_id] = mode
+
+    logical_modes: dict[str, set[str]] = {}
+    for binding in bindings:
+        logical_modes.setdefault(binding.model_id, set()).add(
+            result[binding.prediction_model_id]
+        )
+    if logical_modes.get("echo") != {PREDICTION_SOURCE_DIRECT}:
+        raise PreflightError("current rollout requires the echo source model to be DIRECT")
+    if logical_modes.get("gemini_masked") != {PREDICTION_SOURCE_SANDBOX}:
+        raise PreflightError(
+            "current rollout requires the gemini_masked source model to be SANDBOX"
+        )
+    return dict(sorted(result.items()))
+
+
 def validate_rollout_quarantine(accounts: tuple[str, ...]) -> None:
     unsupported = set(accounts) - ACTIVATABLE_ACCOUNTS
     if unsupported:
@@ -671,6 +736,9 @@ def validate_environment(
             submission_state == "enabled",
         )
     bindings = decode_bindings(environment.get("DECISION_CYCLE_BINDINGS_JSON", ""))
+    decode_prediction_model_source_modes(
+        environment.get("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", ""), bindings
+    )
     quarantined_accounts = decode_submission_disabled_accounts(
         environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
         bindings,
@@ -692,8 +760,7 @@ def validate_environment(
 def validate_prediction_environment(
     environment: dict[str, str],
     bindings: tuple[Binding, ...],
-    *,
-    required_bindings: tuple[Binding, ...] | None = None,
+    source_modes: dict[str, str],
 ) -> None:
     _required_boolean(environment, "REDIS_ENABLED", True)
     _required_boolean(environment, "DIRECT_PREDICTION_ENABLED", True)
@@ -722,7 +789,7 @@ def validate_prediction_environment(
         raise PreflightError(
             f"DIRECT_PREDICTION_MODEL_IDS_JSON is invalid JSON: {error.msg}"
         ) from error
-    if not isinstance(configured_models, list) or any(
+    if not isinstance(configured_models, list) or not configured_models or any(
         not isinstance(value, str) or not value.strip() for value in configured_models
     ):
         raise PreflightError("DIRECT_PREDICTION_MODEL_IDS_JSON must be a non-empty string array")
@@ -731,17 +798,21 @@ def validate_prediction_environment(
         raise PreflightError("DIRECT_PREDICTION_MODEL_IDS_JSON contains duplicate models")
     configured_model_set = set(normalized_models)
     known_models = {binding.prediction_model_id for binding in bindings}
-    required_models = {
-        binding.prediction_model_id
-        for binding in (bindings if required_bindings is None else required_bindings)
-    }
-    unknown_models = configured_model_set - known_models
-    missing_models = required_models - configured_model_set
-    if unknown_models or missing_models:
+    if set(source_modes) != known_models:
         raise PreflightError(
-            "Prediction Direct model set must include every active Trading prediction model "
-            "and no unconfigured model; "
-            f"missing={sorted(missing_models)}, unknown={sorted(unknown_models)}"
+            "normalized prediction source modes differ from configured Trading models"
+        )
+    direct_models = {
+        model_id
+        for model_id, mode in source_modes.items()
+        if mode == PREDICTION_SOURCE_DIRECT
+    }
+    unexpected_models = configured_model_set - direct_models
+    missing_models = direct_models - configured_model_set
+    if unexpected_models or missing_models:
+        raise PreflightError(
+            "Prediction Direct model set must equal the Trading DIRECT source-mode subset; "
+            f"missing={sorted(missing_models)}, unexpected={sorted(unexpected_models)}"
         )
 
 
@@ -796,34 +867,48 @@ def validate_cross_service_credentials(
 def decode_model_groups(
     payload: str,
     bindings: tuple[Binding, ...],
-    *,
-    required_bindings: tuple[Binding, ...] | None = None,
+    source_modes: dict[str, str],
 ) -> dict[str, str]:
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise PreflightError(
+                    f"Direct model-group mapping duplicates model {key!r}"
+                )
+            result[key] = value
+        return result
+
     try:
-        raw = json.loads(payload)
+        raw = json.loads(payload, object_pairs_hook=reject_duplicate_keys)
     except json.JSONDecodeError as error:
         raise PreflightError(f"Direct model-group mapping is invalid JSON: {error.msg}") from error
     if not isinstance(raw, dict):
         raise PreflightError("Direct model-group mapping must be one JSON object")
     known_models = {binding.prediction_model_id for binding in bindings}
-    required_models = {
-        binding.prediction_model_id
-        for binding in (bindings if required_bindings is None else required_bindings)
-    }
-    unknown_models = set(raw) - known_models
-    missing_models = required_models - set(raw)
-    if unknown_models or missing_models:
+    if set(source_modes) != known_models:
         raise PreflightError(
-            "Direct model-group mapping must include every active Trading prediction model "
-            "and no unconfigured model; "
-            f"missing={sorted(missing_models)}, unknown={sorted(unknown_models)}"
+            "normalized prediction source modes differ from configured Trading models"
+        )
+    direct_models = {
+        model_id
+        for model_id, mode in source_modes.items()
+        if mode == PREDICTION_SOURCE_DIRECT
+    }
+    unexpected_models = set(raw) - direct_models
+    missing_models = direct_models - set(raw)
+    if unexpected_models or missing_models:
+        raise PreflightError(
+            "Direct model-group mapping must equal the Trading DIRECT source-mode subset; "
+            f"missing={sorted(missing_models)}, unexpected={sorted(unexpected_models)}"
         )
     result: dict[str, str] = {}
     for model_id, group in raw.items():
         if not isinstance(group, str) or not group.strip():
             raise PreflightError(f"Direct consumer group is empty for model {model_id!r}")
-        if model_id in required_models:
-            result[model_id] = group.strip()
+        result[model_id] = group.strip()
     if len(set(result.values())) != len(result):
         raise PreflightError(
             "per-model Direct consumer groups must be distinct; consumers for different "
@@ -1497,8 +1582,227 @@ def _expectation_recency(item: dict[str, object]) -> tuple[dt.datetime, dt.datet
     )
 
 
+def _snapshot_prediction(
+    item: object, decision_at: dt.datetime
+) -> dict[str, object]:
+    if not isinstance(item, dict):
+        raise PreflightError("Prediction snapshot contains an invalid result")
+
+    def required_string(field: str) -> str:
+        value = item.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise PreflightError(f"Prediction snapshot result has an invalid {field}")
+        return value
+
+    prediction_id = required_string("prediction_id")
+    market_id = required_string("market_id")
+    condition_id = required_string("condition_id")
+    model = item.get("model")
+    if not isinstance(model, dict):
+        raise PreflightError("Prediction snapshot result has an invalid model")
+    model_name = model.get("name")
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise PreflightError("Prediction snapshot result has an invalid model name")
+    for field in ("predictor_version", "prompt_version"):
+        value = model.get(field, "")
+        if not isinstance(value, str):
+            raise PreflightError(f"Prediction snapshot result has an invalid model {field}")
+
+    for field in ("source_job_id", "sandbox_id", "event_id", "question", "event_slug", "market_slug"):
+        value = item.get(field, "")
+        if not isinstance(value, str):
+            raise PreflightError(f"Prediction snapshot result has an invalid {field}")
+    neg_risk = item.get("neg_risk")
+    if not isinstance(neg_risk, bool):
+        raise PreflightError("Prediction snapshot result has an invalid neg_risk")
+    domains = item.get("domains")
+    if domains is not None and (
+        not isinstance(domains, list)
+        or any(not isinstance(domain, str) for domain in domains)
+    ):
+        raise PreflightError("Prediction snapshot result has invalid domains")
+    end_at = item.get("end_at")
+    if end_at is not None:
+        _utc_timestamp(end_at, "prediction end_at")
+
+    outcomes = item.get("outcomes")
+    if not isinstance(outcomes, list) or len(outcomes) != 2:
+        raise PreflightError("Prediction snapshot result must contain exactly two outcomes")
+    canonical_outcomes: list[dict[str, object]] = []
+    token_ids: set[str] = set()
+    probability_sum = 0.0
+    for index, outcome in enumerate(outcomes):
+        if not isinstance(outcome, dict) or outcome.get("index") != index:
+            raise PreflightError(
+                f"Prediction snapshot result outcome {index} has an invalid index"
+            )
+        name = outcome.get("name")
+        token_id = outcome.get("token_id")
+        probability = outcome.get("probability")
+        if not isinstance(name, str) or not name.strip():
+            raise PreflightError(
+                f"Prediction snapshot result outcome {index} has an invalid name"
+            )
+        if not isinstance(token_id, str) or not token_id.strip():
+            raise PreflightError(
+                f"Prediction snapshot result outcome {index} has an invalid token_id"
+            )
+        if token_id in token_ids:
+            raise PreflightError("Prediction snapshot result contains duplicate token ids")
+        token_ids.add(token_id)
+        if (
+            isinstance(probability, bool)
+            or not isinstance(probability, (int, float))
+            or not math.isfinite(float(probability))
+            or not 0 <= float(probability) <= 1
+        ):
+            raise PreflightError(
+                f"Prediction snapshot result outcome {index} probability is outside [0,1]"
+            )
+        probability_sum += float(probability)
+        canonical_outcomes.append(
+            {
+                "index": index,
+                "name": name,
+                "token_id": token_id,
+                "probability": float(probability),
+            }
+        )
+    if not 0.999999 <= probability_sum <= 1.000001:
+        raise PreflightError(
+            "Prediction snapshot result outcome probabilities must sum to one"
+        )
+
+    prediction_as_of = _utc_timestamp(
+        item.get("prediction_as_of"), "prediction prediction_as_of"
+    )
+    completed_at = _utc_timestamp(item.get("completed_at"), "prediction completed_at")
+    available_at = _utc_timestamp(item.get("available_at"), "prediction available_at")
+    if max(prediction_as_of, completed_at, available_at) > decision_at:
+        raise PreflightError("Prediction snapshot result is not PIT-visible")
+    if completed_at < prediction_as_of or available_at < completed_at:
+        raise PreflightError(
+            "Prediction snapshot result completion and availability timestamps are out of order"
+        )
+
+    payload_identity = {
+        "market_id": market_id,
+        "condition_id": condition_id,
+        "event_id": item.get("event_id", ""),
+        "question": item.get("question", ""),
+        "event_slug": item.get("event_slug", ""),
+        "market_slug": item.get("market_slug", ""),
+        "domains": domains,
+        "end_at": end_at,
+        "neg_risk": neg_risk,
+        "outcomes": canonical_outcomes,
+        "prediction_as_of": item.get("prediction_as_of"),
+        "model": {
+            "name": model_name,
+            "predictor_version": model.get("predictor_version", ""),
+            "prompt_version": model.get("prompt_version", ""),
+        },
+    }
+    return {
+        "raw": item,
+        "prediction_id": prediction_id,
+        "market_id": market_id.strip(),
+        "condition_id": condition_id.strip(),
+        "model_id": model_name.strip(),
+        "sandbox_id": str(item.get("sandbox_id", "")).strip(),
+        "prediction_as_of": prediction_as_of,
+        "completed_at": completed_at,
+        "available_at": available_at,
+        "payload_identity": payload_identity,
+        "identity": (
+            condition_id.strip(),
+            neg_risk,
+            tuple(
+                (outcome["index"], str(outcome["name"]).strip(), str(outcome["token_id"]).strip())
+                for outcome in canonical_outcomes
+            ),
+        ),
+    }
+
+
+def _select_effective_snapshot_predictions(
+    predictions: list[object],
+    model_ids: set[str],
+    source_modes: dict[str, str],
+    *,
+    decision_at: dt.datetime,
+    fresh_after: dt.datetime,
+) -> tuple[dict[tuple[str, str], dict[str, object]], dict[str, dict[str, object]]]:
+    selected: dict[tuple[str, str], dict[str, object]] = {}
+    by_prediction_id: dict[str, dict[str, object]] = {}
+    for item in predictions:
+        prediction = _snapshot_prediction(item, decision_at)
+        prediction_id = str(prediction["prediction_id"])
+        if prediction_id in by_prediction_id:
+            raise PreflightError(
+                f"Prediction snapshot contains duplicate result {prediction_id}"
+            )
+        by_prediction_id[prediction_id] = prediction
+        model_id = str(prediction["model_id"])
+        if model_id not in model_ids:
+            continue
+        has_sandbox_id = bool(prediction["sandbox_id"])
+        mode = source_modes[model_id]
+        if (
+            mode == PREDICTION_SOURCE_DIRECT and has_sandbox_id
+        ) or (
+            mode == PREDICTION_SOURCE_SANDBOX and not has_sandbox_id
+        ):
+            continue
+        if (
+            prediction["prediction_as_of"] < fresh_after
+            or prediction["completed_at"] < fresh_after
+        ):
+            continue
+        key = (str(prediction["market_id"]), model_id)
+        current = selected.get(key)
+        if current is None:
+            selected[key] = prediction
+            continue
+        candidate_recency = (
+            prediction["prediction_as_of"],
+            prediction["available_at"],
+            prediction["completed_at"],
+        )
+        current_recency = (
+            current["prediction_as_of"],
+            current["available_at"],
+            current["completed_at"],
+        )
+        if candidate_recency == current_recency:
+            if prediction["payload_identity"] != current["payload_identity"]:
+                raise PreflightError(
+                    "Prediction snapshot has ambiguous revisions for "
+                    f"{key[0]}/{key[1]}"
+                )
+            if prediction_id > str(current["prediction_id"]):
+                selected[key] = prediction
+        elif candidate_recency > current_recency:
+            selected[key] = prediction
+    identities: dict[str, tuple[object, ...]] = {}
+    for prediction in selected.values():
+        market_id = str(prediction["market_id"])
+        identity = prediction["identity"]
+        if market_id in identities and identities[market_id] != identity:
+            raise PreflightError(
+                "Prediction snapshot has conflicting market identity across models "
+                f"for market {market_id!r}"
+            )
+        identities[market_id] = identity  # type: ignore[assignment]
+    return selected, by_prediction_id
+
+
 def validate_snapshot_manifest(
-    payload: object, dry_run: dict[str, object], bindings: tuple[Binding, ...]
+    payload: object,
+    dry_run: dict[str, object],
+    bindings: tuple[Binding, ...],
+    source_modes: dict[str, str],
+    prediction_lookback: dt.timedelta,
 ) -> int:
     if not isinstance(payload, dict):
         raise PreflightError("Prediction snapshot evidence must be a JSON object")
@@ -1515,14 +1819,35 @@ def validate_snapshot_manifest(
     predictions = snapshot.get("predictions")
     if not isinstance(expectations, list) or not isinstance(predictions, list):
         raise PreflightError("Prediction snapshot must contain manifest and result arrays")
-    expected_models = {binding.prediction_model_id for binding in bindings}
+    active_models = {binding.prediction_model_id for binding in bindings}
+    if not active_models <= set(source_modes):
+        raise PreflightError("active prediction models are missing source-mode configuration")
+    direct_models = {
+        model_id
+        for model_id in active_models
+        if source_modes[model_id] == PREDICTION_SOURCE_DIRECT
+    }
+    sandbox_models = {
+        model_id
+        for model_id in active_models
+        if source_modes[model_id] == PREDICTION_SOURCE_SANDBOX
+    }
+    configured_sandbox_models = {
+        model_id
+        for model_id, mode in source_modes.items()
+        if mode == PREDICTION_SOURCE_SANDBOX
+    }
     latest: dict[tuple[str, str], dict[str, object]] = {}
     latest_recency: dict[tuple[str, str], tuple[dt.datetime, dt.datetime, int, int, str]] = {}
     for item in expectations:
         if not isinstance(item, dict):
             raise PreflightError("Prediction snapshot manifest contains an invalid task")
         model_id = item.get("prediction_model_id")
-        if model_id not in expected_models:
+        if model_id in configured_sandbox_models:
+            raise PreflightError(
+                f"SANDBOX model {model_id!r} must not have a Direct task expectation"
+            )
+        if model_id not in direct_models:
             continue
         market_id = item.get("market_id")
         if not isinstance(market_id, str) or not market_id.strip():
@@ -1534,24 +1859,16 @@ def validate_snapshot_manifest(
         if key not in latest or recency > latest_recency[key]:
             latest[key] = item
             latest_recency[key] = recency
-    if not latest:
+    if direct_models and not latest:
         raise PreflightError("Prediction snapshot has no configured Direct task manifest")
 
-    results: dict[str, tuple[str, str]] = {}
-    for result in predictions:
-        if not isinstance(result, dict):
-            raise PreflightError("Prediction snapshot contains an invalid result")
-        prediction_id = result.get("prediction_id")
-        model = result.get("model")
-        if isinstance(prediction_id, str) and isinstance(model, dict):
-            model_name = model.get("name")
-            market_id = result.get("market_id")
-            if isinstance(model_name, str) and isinstance(market_id, str):
-                if prediction_id in results:
-                    raise PreflightError(
-                        f"Prediction snapshot contains duplicate result {prediction_id}"
-                    )
-                results[prediction_id] = (market_id.strip(), model_name.strip())
+    selected, results = _select_effective_snapshot_predictions(
+        predictions,
+        active_models,
+        source_modes,
+        decision_at=snapshot_decision_at,
+        fresh_after=snapshot_decision_at - prediction_lookback,
+    )
 
     market_models: dict[str, set[str]] = {}
     market_runs: dict[str, set[int]] = {}
@@ -1579,15 +1896,26 @@ def validate_snapshot_manifest(
                 f"COMPLETED Direct task is not PIT-visible for {market_id}/{model_id}"
             )
         prediction_id = str(expectation.get("prediction_id", ""))
-        if results.get(prediction_id) != (market_id, model_id):
+        result = results.get(prediction_id)
+        if (
+            result is None
+            or result["market_id"] != market_id
+            or result["model_id"] != model_id
+            or result["sandbox_id"]
+        ):
             raise PreflightError(
                 f"COMPLETED Direct task {market_id}/{model_id} has no matching PIT result"
             )
+        effective = selected.get((market_id, model_id))
+        if effective is None or effective["prediction_id"] != prediction_id:
+            raise PreflightError(
+                f"Direct task manifest is not the fresh effective result for {market_id}/{model_id}"
+            )
     for market_id, model_ids in market_models.items():
-        if model_ids != expected_models:
+        if model_ids != direct_models:
             raise PreflightError(
                 f"Direct task manifest has incomplete same-market models for {market_id}; "
-                f"expected={sorted(expected_models)}, actual={sorted(model_ids)}"
+                f"expected={sorted(direct_models)}, actual={sorted(model_ids)}"
             )
         if (
             len(market_runs[market_id]) != 1
@@ -1600,6 +1928,26 @@ def validate_snapshot_manifest(
         if len(market_conditions[market_id]) != 1:
             raise PreflightError(
                 f"Direct task manifest has conflicting market identity for {market_id}"
+            )
+    if {
+        key for key in selected if key[1] in direct_models
+    } != set(latest):
+        raise PreflightError(
+            "fresh effective Direct results differ from the exact Direct task manifest"
+        )
+    for model_id in sandbox_models:
+        effective = [
+            prediction
+            for key, prediction in selected.items()
+            if key[1] == model_id
+        ]
+        if not effective:
+            raise PreflightError(
+                f"Prediction snapshot has no fresh effective SANDBOX result for {model_id!r}"
+            )
+        if any(not prediction["sandbox_id"] for prediction in effective):
+            raise PreflightError(
+                f"fresh effective SANDBOX result for {model_id!r} has an empty sandbox_id"
             )
     return len(market_models)
 
@@ -2567,7 +2915,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--direct-model-groups-json",
         required=True,
-        help="JSON object mapping every source prediction_model_id to one distinct Redis group",
+        help="JSON object mapping every DIRECT source prediction_model_id to one distinct Redis group",
     )
     parser.add_argument(
         "--trading-health-url", default="http://127.0.0.1:14000/health/live"
@@ -2672,6 +3020,9 @@ def main(argv: list[str] | None = None) -> int:
             submission_state=args.submission_state,
             entry_submission_state=args.entry_submission_state,
         )
+        source_modes = decode_prediction_model_source_modes(
+            environment["DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON"], bindings
+        )
         submission_disabled_accounts = decode_submission_disabled_accounts(
             environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
             bindings,
@@ -2723,13 +3074,13 @@ def main(argv: list[str] | None = None) -> int:
         validate_prediction_environment(
             prediction_environment,
             bindings,
-            required_bindings=active_bindings,
+            source_modes,
         )
         validate_cross_service_credentials(environment, prediction_environment)
         model_groups = decode_model_groups(
             args.direct_model_groups_json,
             bindings,
-            required_bindings=active_bindings,
+            source_modes,
         )
         configuration_sha = configuration_sha256(
             environment,
@@ -2825,7 +3176,16 @@ def main(argv: list[str] | None = None) -> int:
                 _read_bounded_regular_file(args.prediction_snapshot_json, "Prediction snapshot")
             )
         manifest_markets = validate_snapshot_manifest(
-            snapshot, dry_run, active_bindings
+            snapshot,
+            dry_run,
+            active_bindings,
+            source_modes,
+            dt.timedelta(
+                seconds=_whole_duration_seconds(
+                    environment["DECISION_CYCLE_PREDICTION_LOOKBACK"],
+                    "DECISION_CYCLE_PREDICTION_LOOKBACK",
+                )
+            ),
         )
 
         if args.consumer_state_json is None:

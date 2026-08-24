@@ -78,6 +78,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		EntrySubmissionDisabled:      cycleConfig.EntrySubmissionDisabled,
 		RequireCompleteModelCoverage: cycleConfig.RequireCompleteModelCoverage,
 		Bindings:                     cycleConfig.Bindings,
+		PredictionSourceModes:        cycleConfig.PredictionSourceModes,
 		Venue:                        params.cfg.Execution.Venue,
 		PredictionLookback:           cycleConfig.PredictionLookback,
 		MidPriceLookback:             cycleConfig.MidPriceLookback,

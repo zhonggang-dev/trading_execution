@@ -33,8 +33,8 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 ```text
 10-minute UTC boundary T
   -> GET prediction_infra snapshot(as_of=T)
-  -> reduce expected_predictions to the current Market/model task generation
-  -> match only the exact completed result named by each current task
+  -> filter each source model by its configured DIRECT/SANDBOX provenance
+  -> select the newest fresh PIT result per Market/source model
   -> load every binding's OPEN position lots
   -> capture CLOB books and [T-48h,T] midpoint histories once for the prediction/position token union
   -> normalize bids DESC / asks ASC / top 15 each side
@@ -90,24 +90,22 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 
 `predictions` 每个周期发送当前 binding 所属模型的全部当前有效 Market。一条 Market/Model 预测仍包含两个按原始
 Outcome 顺序对齐且和为 1 的概率和 token，而不是只传一个脱离 Outcome 的 `prob`。
-Prediction snapshot 保留 lookback 内的 immutable 结果，同时携带由持久化 Direct Prediction task
-生成的 `expected_predictions[]`。这个 manifest 即使模型尚未回调也会保留 `PENDING` 行，所以 Trading
-不再从“成功 prob 行的并集”猜测本轮应有哪些 Market。严格覆盖模式会为每个
-`(market_id, prediction_model_id)` 选择最新 task，要求同一 Market 的所有模型具有相同
-`selection_id + selection_run_id + prediction_as_of`、状态均为 `COMPLETED`，再按
-`prediction_id + source_job_id + model + Market + prediction_as_of + outcome/token identity`
-精确匹配结果，同时要求 `prediction_as_of >= decision_at - DECISION_CYCLE_PREDICTION_LOOKBACK`。
-只有这些 manifest 命名且满足 freshness SLA 的结果会被路由；延迟完成的过期 task、旧概率、Sandbox 行和其他
-非 manifest 行都不能补齐当前轮。
-非严格兼容模式才会按 `prediction_as_of`、`available_at`、`completed_at` 选择最新结果；三类时间戳完全相同但
-概率不同的 revision 会因歧义直接失败，不按随机 ID 猜“更新”。不同模型对同一 Market 的 Condition、Outcome
-顺序和 token 必须完全一致。
-`DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true` 时，每个当前 task Market 必须同时具有
-全部配置上游模型的概率。任一 task `PENDING`、缺失或精确结果不匹配都会使周期返回错误，并由 Go 硬门禁
-阻止本轮所有 BUY evaluation 生成 OrderIntent；冻结请求仍保留真实 PIT predictions 和
-`ALL_EFFECTIVE_AT_DECISION_AT` 语义，同时继续处理 OPEN lots 的合法 SELL exit，避免上游数据故障阻断退出。
-降级请求只保留当前 manifest 中同代、fresh、已完成且精确匹配的结果；若同一 Market 的模型 task 混用不同
-selection generation，该 Market 的全部 probabilities 都会从降级请求移除，旧代概率不能影响 SELL/HOLD 判断。
+Prediction snapshot 保留 lookback 内的 immutable 结果，同时携带由 Direct Prediction task
+生成的 `expected_predictions[]`。Trading 的运行时来源契约由
+`DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON` 固定：`DIRECT` 模型只接受空
+`sandbox_id`，`SANDBOX` 模型只接受非空 `sandbox_id`；配置必须精确覆盖所有 binding 的
+上游 `prediction_model_id`。来源过滤在 freshness 与 effective selection 之前执行，因此错误来源中更新的
+revision 不会覆盖正确来源。候选结果要求 `prediction_as_of` 和 `completed_at` 均不早于
+`decision_at - DECISION_CYCLE_PREDICTION_LOOKBACK`，再按 `prediction_as_of`、
+`available_at`、`completed_at` 选择每个 `(market_id, prediction_model_id)` 的最新结果；三类时间戳
+完全相同但 payload 不同的 revision 会因歧义直接失败，等价 delivery duplicate 才按 prediction ID
+确定性择一。不同模型对同一 Market 的 Condition、Outcome 顺序和 token 必须完全一致。
+四钱包部署 preflight 另外对当前 dry-run snapshot 做更严格的来源证据检查：Direct echo 必须有最新
+`COMPLETED` manifest task 及其精确、非 Sandbox 结果；每个 active Sandbox 模型必须至少有一条 fresh、
+PIT-visible 且 `sandbox_id` 非空的 effective 结果，Sandbox 模型不得伪装成 Direct expectation。
+`DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true` 时，每个 active binding 的上游模型至少要有一条
+符合来源与 freshness 契约的结果；缺失模型只关闭该 binding 的 BUY entry，并继续允许其 OPEN lots 走合法
+SELL exit。该门禁不要求不同模型覆盖完全相同的 Market 集合。
 Order submission 打开时该覆盖开关是强制项；四钱包生产拓扑必须开启它，dry-run 也建议开启以便先观察完整矩阵。
 发往 Python 前已确保 `prediction.model.name == context.model_id`。不同策略处理同一模型时复用完全相同的冻结
 prob 和盘口，但使用不同 `strategy_id`、`execution_account_id`、`cycle_id` 和 `input_id`。
