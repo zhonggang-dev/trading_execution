@@ -108,7 +108,12 @@ TRADING_RUNTIME_KEYS = frozenset(
     {
         "EXECUTION_MODE",
         "EXECUTION_VENUE",
+        "EXECUTION_ALLOW_MARKET_ORDERS",
+        "EXECUTION_MAX_ORDER_SIZE",
+        "EXECUTION_MAX_ORDER_NOTIONAL",
         "POLYMARKET_LIVE_TRADING_ENABLED",
+        "POLYMARKET_MAX_BUY_FEE_RATE_BPS",
+        "POLYGON_ORDER_FILLED_CONFIRMATIONS",
         "DECISION_CYCLE_ENABLED",
         "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED",
         "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
@@ -118,6 +123,7 @@ TRADING_RUNTIME_KEYS = frozenset(
         "POLYMARKET_ACCOUNTS_FILE",
         "DECISION_CYCLE_PREDICTION_INFRA_URL",
         "DECISION_CYCLE_PREDICTION_LOOKBACK",
+        "DECISION_CYCLE_MID_PRICE_LOOKBACK",
         "DECISION_CYCLE_STRATEGY_URL",
         "DECISION_CYCLE_INTERVAL",
         "DECISION_CYCLE_STARTUP_DELAY",
@@ -594,9 +600,59 @@ def _explicit_boolean(environment: dict[str, str], key: str) -> None:
         raise PreflightError(f"{key} must be explicitly true or false")
 
 
+def _required_static_decimal(
+    environment: dict[str, str], key: str, *, allow_zero: bool = False
+) -> None:
+    value = environment.get(key, "").strip()
+    if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value):
+        raise PreflightError(f"{key} must be an explicit base-10 decimal")
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise PreflightError(f"{key} must be an explicit base-10 decimal") from error
+    if not math.isfinite(parsed) or parsed < 0 or (parsed == 0 and not allow_zero):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise PreflightError(f"{key} must be an explicit {qualifier} base-10 decimal")
+
+
 def validate_environment(
     environment: dict[str, str], *, submission_state: str, entry_submission_state: str = "allowed"
 ) -> tuple[Binding, ...]:
+    _required_boolean(environment, "EXECUTION_ALLOW_MARKET_ORDERS", False)
+    _required_static_decimal(environment, "EXECUTION_MAX_ORDER_SIZE")
+    _required_static_decimal(environment, "EXECUTION_MAX_ORDER_NOTIONAL")
+    _required_static_decimal(
+        environment, "POLYMARKET_MAX_BUY_FEE_RATE_BPS", allow_zero=True
+    )
+    if float(environment["POLYMARKET_MAX_BUY_FEE_RATE_BPS"].strip()) > 10_000:
+        raise PreflightError("POLYMARKET_MAX_BUY_FEE_RATE_BPS must not exceed 10000")
+    confirmations = environment.get("POLYGON_ORDER_FILLED_CONFIRMATIONS", "").strip()
+    if not re.fullmatch(r"[+-]?\d+", confirmations):
+        raise PreflightError(
+            "POLYGON_ORDER_FILLED_CONFIRMATIONS must be an explicit integer"
+        )
+    try:
+        confirmation_count = int(confirmations)
+    except ValueError as error:
+        raise PreflightError(
+            "POLYGON_ORDER_FILLED_CONFIRMATIONS must be an explicit integer"
+        ) from error
+    if confirmation_count < 1 or confirmation_count > 10_000:
+        raise PreflightError(
+            "POLYGON_ORDER_FILLED_CONFIRMATIONS must be between 1 and 10000"
+        )
+    mid_price_lookback = environment.get(
+        "DECISION_CYCLE_MID_PRICE_LOOKBACK", ""
+    ).strip()
+    mid_price_lookback_seconds = _duration_seconds(
+        mid_price_lookback,
+        "DECISION_CYCLE_MID_PRICE_LOOKBACK",
+        max_seconds=7 * 24 * 60 * 60,
+    )
+    if not 2 * 60 * 60 <= mid_price_lookback_seconds <= 7 * 24 * 60 * 60:
+        raise PreflightError(
+            "DECISION_CYCLE_MID_PRICE_LOOKBACK must be between 2h and 168h"
+        )
     _required_boolean(environment, "DECISION_CYCLE_ENABLED", True)
     _required_boolean(environment, "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", True)
     if entry_submission_state not in {"allowed", "blocked"}:
@@ -2167,7 +2223,13 @@ def collect_runtime_state(
     return result
 
 
-def _duration_seconds(value: str, field: str, *, allow_zero: bool = False) -> float:
+def _duration_seconds(
+    value: str,
+    field: str,
+    *,
+    allow_zero: bool = False,
+    max_seconds: float = 24 * 60 * 60,
+) -> float:
     value = value.strip()
     if not value:
         raise PreflightError(f"{field} is required")
@@ -2183,7 +2245,7 @@ def _duration_seconds(value: str, field: str, *, allow_zero: bool = False) -> fl
         cursor != len(value)
         or total < 0
         or (total == 0 and not allow_zero)
-        or total > 24 * 60 * 60
+        or total > max_seconds
     ):
         raise PreflightError(f"{field} has an unsupported duration")
     return total

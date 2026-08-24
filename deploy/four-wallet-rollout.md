@@ -19,6 +19,23 @@ POSITION_EXIT_JOB_TOKEN=DEDICATED_32_BYTE_OR_LONGER_SECRET
 execution_risk_global_control.kill_switch=true
 ```
 
+The same reviewed environment must explicitly pin every process-local order
+limit and v2 history window; no Go default is accepted by this rollout:
+
+```text
+EXECUTION_ALLOW_MARKET_ORDERS=false
+EXECUTION_MAX_ORDER_SIZE=EXACT_REVIEWED_POSITIVE_DECIMAL
+EXECUTION_MAX_ORDER_NOTIONAL=EXACT_REVIEWED_POSITIVE_DECIMAL
+POLYMARKET_MAX_BUY_FEE_RATE_BPS=EXACT_REVIEWED_NON_NEGATIVE_DECIMAL
+POLYGON_ORDER_FILLED_CONFIRMATIONS=EXACT_REVIEWED_POSITIVE_INTEGER
+DECISION_CYCLE_MID_PRICE_LOOKBACK=EXACT_REVIEWED_DURATION
+```
+
+The preflight binds all six values into the configuration SHA and verifies the
+running process has the same values. Market orders must remain disabled for
+the four-wallet activation; changing any other value invalidates disabled-pass
+evidence and requires a new review.
+
 For an explicitly approved exit-only maintenance window, set
 `DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=true` before enabling order
 submission. Run the preflight with `--entry-submission-state blocked`; it also
@@ -145,8 +162,9 @@ The preflight exits non-zero if any of these invariants is false:
   quarantine;
 - the actual systemd processes do not expose the approved health identity or
   do not contain the audited non-secret environment. This includes Trading's
-  PIT lookback and Prediction's Redis address/database, so the preflight cannot
-  inspect Redis A while the running publisher uses Redis B;
+  static size/notional/fee/finality limits, disabled market-order policy, PIT
+  and midpoint lookbacks, and Prediction's Redis address/database, so the
+  preflight cannot inspect one configuration while the processes use another;
 - Prediction's health version is not an immutable lowercase 40-character Git
   SHA or `sha256:<64 lowercase hex>` image digest. Reusable values such as
   `dev`, a branch, or a semantic version are rejected. The Prediction build

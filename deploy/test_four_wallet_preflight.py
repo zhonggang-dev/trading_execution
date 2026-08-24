@@ -43,6 +43,22 @@ MODEL_GROUPS = {
 }
 TRADING_COMMIT = "a" * 40
 PREDICTION_COMMIT = "b" * 40
+STATIC_TRADING_ENVIRONMENT = {
+    "EXECUTION_ALLOW_MARKET_ORDERS": "false",
+    "EXECUTION_MAX_ORDER_SIZE": "20",
+    "EXECUTION_MAX_ORDER_NOTIONAL": "40",
+    "POLYMARKET_MAX_BUY_FEE_RATE_BPS": "10000",
+    "POLYGON_ORDER_FILLED_CONFIRMATIONS": "64",
+    "DECISION_CYCLE_MID_PRICE_LOOKBACK": "48h",
+}
+STATIC_TRADING_DRIFT = {
+    "EXECUTION_ALLOW_MARKET_ORDERS": "true",
+    "EXECUTION_MAX_ORDER_SIZE": "21",
+    "EXECUTION_MAX_ORDER_NOTIONAL": "41",
+    "POLYMARKET_MAX_BUY_FEE_RATE_BPS": "9999",
+    "POLYGON_ORDER_FILLED_CONFIRMATIONS": "65",
+    "DECISION_CYCLE_MID_PRICE_LOOKBACK": "47h",
+}
 
 
 def iso(value: dt.datetime) -> str:
@@ -586,6 +602,7 @@ class EnvironmentTests(unittest.TestCase):
 
     def environment(self, wallet_path: pathlib.Path) -> dict[str, str]:
         return {
+            **STATIC_TRADING_ENVIRONMENT,
             "DECISION_CYCLE_ENABLED": "true",
             "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE": "true",
             "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED": "false",
@@ -673,6 +690,35 @@ class EnvironmentTests(unittest.TestCase):
             environment["DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE"] = "false"
             with self.assertRaisesRegex(preflight.PreflightError, "COMPLETE_MODEL_COVERAGE"):
                 preflight.validate_environment(environment, submission_state="disabled")
+
+    def test_requires_explicit_static_risk_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
+            )
+            for key in STATIC_TRADING_ENVIRONMENT:
+                environment = self.environment(wallet_path)
+                environment.pop(key)
+                with self.subTest(key=key), self.assertRaisesRegex(
+                    preflight.PreflightError, key
+                ):
+                    preflight.validate_environment(
+                        environment, submission_state="disabled"
+                    )
+
+    def test_rejects_enabled_static_market_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
+            )
+            environment = self.environment(wallet_path)
+            environment["EXECUTION_ALLOW_MARKET_ORDERS"] = "true"
+            with self.assertRaisesRegex(
+                preflight.PreflightError, "EXECUTION_ALLOW_MARKET_ORDERS"
+            ):
+                preflight.validate_environment(
+                    environment, submission_state="disabled"
+                )
 
     def test_rejects_wallet_subset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -812,6 +858,7 @@ class RuntimeEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.now = dt.datetime.now(dt.timezone.utc)
         self.trading_environment = {
+            **STATIC_TRADING_ENVIRONMENT,
             "DECISION_CYCLE_ENABLED": "true",
             "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED": "false",
             "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE": "true",
@@ -904,6 +951,16 @@ class RuntimeEvidenceTests(unittest.TestCase):
         self.state["trading"]["environment"]["DECISION_CYCLE_PREDICTION_LOOKBACK"] = "1h"
         with self.assertRaisesRegex(preflight.PreflightError, "PREDICTION_LOOKBACK"):
             self.validate()
+
+    def test_rejects_static_risk_runtime_drift(self) -> None:
+        for key, drifted_value in STATIC_TRADING_DRIFT.items():
+            original = self.state["trading"]["environment"][key]
+            self.state["trading"]["environment"][key] = drifted_value
+            with self.subTest(key=key), self.assertRaisesRegex(
+                preflight.PreflightError, key
+            ):
+                self.validate()
+            self.state["trading"]["environment"][key] = original
 
     def test_rejects_trading_database_fingerprint_mismatch_without_url(self) -> None:
         self.state["trading"]["secret_sha256"]["TRADING_EXECUTION_DATABASE_URL"] = (
@@ -1279,6 +1336,7 @@ class CredentialAndConfigurationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
         self.trading = {
+            **STATIC_TRADING_ENVIRONMENT,
             "TRADING_EXECUTION_DATABASE_URL": "postgres://trading:secret@db/trading",
             "EXECUTION_API_TOKEN": "execution-token",
             "POSITION_EXIT_JOB_TOKEN": "job-token",
@@ -1350,6 +1408,15 @@ class CredentialAndConfigurationTests(unittest.TestCase):
         original = self.configuration_hash()
         self.trading["POSITION_EXIT_JOB_TOKEN"] = "rotated-job-token"
         self.assertNotEqual(self.configuration_hash(), original)
+
+    def test_configuration_hash_binds_static_risk_environment(self) -> None:
+        original = self.configuration_hash()
+        for key, drifted_value in STATIC_TRADING_DRIFT.items():
+            original_value = self.trading[key]
+            self.trading[key] = drifted_value
+            with self.subTest(key=key):
+                self.assertNotEqual(self.configuration_hash(), original)
+            self.trading[key] = original_value
 
     def test_subsecond_redis_timeout_is_not_truncated_to_zero(self) -> None:
         self.assertEqual(preflight._duration_seconds("500ms", "timeout"), 0.5)
@@ -1509,6 +1576,7 @@ class MainWiringTests(unittest.TestCase):
             wallet_path.chmod(0o600)
             compact_bindings = json.dumps(VALID_BINDINGS, separators=(",", ":"))
             trading_environment = {
+                **STATIC_TRADING_ENVIRONMENT,
                 "DECISION_CYCLE_ENABLED": "true",
                 "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED": "false",
                 "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED": "false",
