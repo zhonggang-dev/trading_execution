@@ -88,8 +88,11 @@ rollout must not modify the existing main/wallet-1 policies.
 Retired wallet rows stay in PostgreSQL for audit, but their strategy bindings
 must not remain enabled and they must not appear in the runtime wallet file.
 
-The quarantine list may be the exact pair, either one-wallet subset, or empty;
-main/wallet-1 may never be added. Removing wallet-6 or wallet-7 requires a
+The quarantine list may contain any explicit subset of the exact four bound
+accounts, but it may not exclude every account. The wallet-6/wallet-7-only
+cohort uses exactly `main,wallet-1`; its stopped-service transaction must
+disable/pause those two accounts while enabling wallet-6/wallet-7 atomically.
+Removing wallet-6 or wallet-7 requires a
 reviewed stopped-service cutover that atomically enables the exact
 policy/binding, unpauses the ACCOUNT control with an increasing version, and
 changes the runtime quarantine list while the global kill switch stays closed.

@@ -757,18 +757,33 @@ func validateDecisionSubmissionDisabledAccounts(
 }
 
 // validateCurrentWallet67Quarantine keeps the release quarantine boundary
-// limited to the two newly managed wallets. Either wallet may be activated by
-// removing it explicitly from this list, but retained main/wallet-1 routes may
-// never be hidden behind the onboarding quarantine.
+// limited to the exact four configured wallets. This permits a reviewed
+// wallet-6/wallet-7-only cohort by quarantining main and wallet-1; the database
+// authorization gate still requires the enabled binding/policy/control set to
+// equal the non-quarantined accounts exactly.
 func validateCurrentWallet67Quarantine(accounts []string) error {
-	allowed := map[string]struct{}{"wallet-6": {}, "wallet-7": {}}
+	allowed := map[string]struct{}{
+		"main": {}, "wallet-1": {}, "wallet-6": {}, "wallet-7": {},
+	}
+	configured := make(map[string]struct{}, len(accounts))
 	for _, accountID := range accounts {
 		accountID = strings.TrimSpace(accountID)
 		if _, exists := allowed[accountID]; !exists {
 			return fmt.Errorf(
-				"this release permits only wallet-6 and wallet-7 in DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
+				"this release permits only main, wallet-1, wallet-6, and wallet-7 in DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
 			)
 		}
+		configured[accountID] = struct{}{}
+	}
+	_, hasMain := configured["main"]
+	_, hasWallet1 := configured["wallet-1"]
+	_, hasWallet6 := configured["wallet-6"]
+	_, hasWallet7 := configured["wallet-7"]
+	supported := len(configured) == 0 ||
+		(len(configured) == 1 && (hasWallet6 || hasWallet7)) ||
+		(len(configured) == 2 && ((hasWallet6 && hasWallet7) || (hasMain && hasWallet1)))
+	if !supported {
+		return fmt.Errorf("submission-disabled accounts do not match a reviewed release cohort")
 	}
 	return nil
 }

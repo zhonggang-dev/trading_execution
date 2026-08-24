@@ -118,7 +118,7 @@ func TestPartitionReconciliationAccountsQuarantinesOneOfFour(t *testing.T) {
 	}
 }
 
-func TestCurrentLiveReleaseRejectsRetiredWalletOrUnsupportedQuarantineBeforePreflight(t *testing.T) {
+func TestCurrentLiveReleaseRejectsRetiredWalletBeforePreflight(t *testing.T) {
 	tests := []struct {
 		name        string
 		configured  []string
@@ -132,10 +132,10 @@ func TestCurrentLiveReleaseRejectsRetiredWalletOrUnsupportedQuarantineBeforePref
 			want:        "wallet file must contain exactly",
 		},
 		{
-			name:        "retained wallet placed in quarantine",
+			name:        "unsupported mixed quarantine cohort",
 			configured:  []string{"main", "wallet-1", "wallet-6", "wallet-7"},
-			quarantined: []string{"main"},
-			want:        "may contain only wallet-6 and wallet-7",
+			quarantined: []string{"main", "wallet-6"},
+			want:        "reviewed release cohort",
 		},
 	}
 	for _, test := range tests {
@@ -152,12 +152,13 @@ func TestCurrentLiveReleaseRejectsRetiredWalletOrUnsupportedQuarantineBeforePref
 	}
 }
 
-func TestCurrentLiveReleaseAcceptsWallet67QuarantineSubsetOrEmpty(t *testing.T) {
+func TestCurrentLiveReleaseAcceptsReviewedQuarantineCohortsOrEmpty(t *testing.T) {
 	configured := []string{"main", "wallet-1", "wallet-6", "wallet-7"}
 	for _, quarantined := range [][]string{
 		{"wallet-6", "wallet-7"},
 		{"wallet-6"},
 		{"wallet-7"},
+		{"main", "wallet-1"},
 		{},
 	} {
 		if err := validateCurrentLiveWallet67Release(configured, quarantined); err != nil {
