@@ -303,14 +303,18 @@ func TestLoadKeepsCurrentLiveAccountEntryGateWhenSchedulerDisabled(t *testing.T)
 	}
 }
 
-func TestLoadRejectsOrderSubmissionForShadowRelease(t *testing.T) {
+func TestLoadAcceptsOrderSubmissionForWallet67LiveRelease(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
 	setCompleteDecisionCycleEnvironment(t)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "shadow release requires DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false") {
-		t.Fatalf("Load() error = %v, want shadow submission rejection", err)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !config.DecisionCycle.OrderSubmissionEnabled {
+		t.Fatal("live decision-cycle order submission was not enabled")
 	}
 }
 

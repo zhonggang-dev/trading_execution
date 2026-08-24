@@ -142,8 +142,8 @@ python3 deploy/four_wallet_preflight.py \
 ```
 
 When either onboarding wallet is active, add both of the following to this
-shadow command. The decision in the protected artifact must be exactly
-`APPROVED_FOR_SHADOW_OBSERVATION`. The SHA must come from the reviewed change
+rollout command. The decision in the protected artifact must be exactly
+`APPROVED_FOR_LIVE_ACTIVATION`. The SHA must come from the reviewed change
 record, not be calculated ad hoc during deployment:
 
 ```text
@@ -228,20 +228,15 @@ file content digest, four database wallet-address identities, exact dry-run
 cycle/snapshot, manifest Market count, model-to-group mapping, and the global
 delivery count/status/high-watermark. Terminal delivery history is aggregated
 inside PostgreSQL; it is not copied into a growing JSON artifact. Preserve this
-file unchanged. The legacy schema excludes the submission flag from its digest,
-but both Go and preflight independently pin that flag to `false` in this release.
+file unchanged. The evidence excludes only the submission flag so the same
+immutable configuration can be verified in two phases.
 
-This release stops at shadow observation. It hard-requires
-`DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false`, the preflight rejects
-`--submission-state enabled`, and the database global kill switch must remain
-`true`. A shadow PASS proves that wallet-6/v1 and wallet-7/v2 successfully
-called the strategy API with fresh Sandbox inputs and recorded valid outputs;
-it is not permission to create or deliver orders.
-
-Real order submission requires a new reviewed release plus a distinct,
-non-reusable LIVE approval after the user explicitly authorizes that step.
-Do not edit the shadow artifact, reuse its SHA, stage submission `true`, or open
-the kill switch. Never auto-cancel historical intents.
+First run with `DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false` and the database
+global kill switch `true`. Then restart the same release with submission
+`true`, keep the kill switch `true`, and run `--submission-state enabled`
+against the exact disabled evidence and the independent LIVE approval. Only an
+enabled PASS permits the separate CAS that opens the global kill switch. Never
+reuse a shadow approval or auto-cancel historical intents.
 
 Rollback to a binary that does not understand the account entry gate is a
 stopped-service operation. First keep/set the database kill switch to `true`,

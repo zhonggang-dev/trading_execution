@@ -511,9 +511,6 @@ func (config Config) Validate() error {
 		if config.DecisionCycle.EntrySubmissionDisabled {
 			return fmt.Errorf("this release requires DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false and uses the exact account entry gate")
 		}
-		if config.DecisionCycle.OrderSubmissionEnabled {
-			return fmt.Errorf("this shadow release requires DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false")
-		}
 		if err := validateCurrentWallet67EntryDisabledAccounts(config.DecisionCycle.EntryDisabledAccounts); err != nil {
 			return err
 		}

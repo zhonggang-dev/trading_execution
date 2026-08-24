@@ -642,17 +642,17 @@ class EnvironmentTests(unittest.TestCase):
             )
         self.assertEqual(len(bindings), 4)
 
-    def test_rejects_enabled_submission_for_shadow_release(self) -> None:
+    def test_accepts_enabled_submission_for_live_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wallet_path = self.write_wallet_file(
                 pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
             )
             environment = self.environment(wallet_path)
             environment["DECISION_CYCLE_ORDER_SUBMISSION_ENABLED"] = "true"
-            with self.assertRaisesRegex(preflight.PreflightError, "shadow observation only"):
-                preflight.validate_environment(
-                    environment, submission_state="enabled"
-                )
+            bindings = preflight.validate_environment(
+                environment, submission_state="enabled"
+            )
+        self.assertEqual(len(bindings), 4)
 
     def test_source_modes_require_exact_models_and_rollout_modes(self) -> None:
         bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
@@ -871,10 +871,10 @@ class ActivationRiskApprovalTests(unittest.TestCase):
                 max_age=dt.timedelta(hours=1),
             )
 
-    def test_rejects_old_live_activation_decision_for_shadow(self) -> None:
+    def test_rejects_shadow_decision_for_live_activation(self) -> None:
         reused = dict(self.approval)
-        reused["decision"] = "APPROVED_FOR_LIVE_ACTIVATION"
-        with self.assertRaisesRegex(preflight.PreflightError, "shadow observation"):
+        reused["decision"] = "APPROVED_FOR_SHADOW_OBSERVATION"
+        with self.assertRaisesRegex(preflight.PreflightError, "live activation"):
             preflight.validate_activation_risk_approval(
                 reused,
                 active_accounts=frozenset({"wallet-6"}),
@@ -2164,11 +2164,11 @@ class MainWiringTests(unittest.TestCase):
                 "--activation-risk-approval-sha256",
                 approval_sha,
             ]
-            enabled_error = io.StringIO()
-            with contextlib.redirect_stderr(enabled_error):
+            enabled_output = io.StringIO()
+            with contextlib.redirect_stdout(enabled_output):
                 enabled_result = preflight.main(enabled_args)
-            self.assertEqual(enabled_result, 1)
-            self.assertIn("shadow observation only", enabled_error.getvalue())
+            self.assertEqual(enabled_result, 0)
+            self.assertIn("submission_state=enabled", enabled_output.getvalue())
 
 
 class DisabledPhaseEvidenceTests(unittest.TestCase):

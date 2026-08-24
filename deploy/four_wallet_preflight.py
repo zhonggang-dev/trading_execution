@@ -102,7 +102,7 @@ CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT = {
 MAX_CONFIG_BYTES = 4 << 20
 DISABLED_EVIDENCE_SCHEMA = "four_wallet.disabled_preflight.v1"
 ACTIVATION_RISK_APPROVAL_SCHEMA = "four_wallet.activation_risk_approval.v1"
-ACTIVATION_RISK_DECISION = "APPROVED_FOR_SHADOW_OBSERVATION"
+ACTIVATION_RISK_DECISION = "APPROVED_FOR_LIVE_ACTIVATION"
 IMMUTABLE_RELEASE_IDENTITY = re.compile(r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})")
 PREDICTION_SOURCE_DIRECT = "DIRECT"
 PREDICTION_SOURCE_SANDBOX = "SANDBOX"
@@ -738,11 +738,6 @@ def _required_static_decimal(
 def validate_environment(
     environment: dict[str, str], *, submission_state: str, entry_submission_state: str = "allowed"
 ) -> tuple[Binding, ...]:
-    if submission_state == "enabled":
-        raise PreflightError(
-            "this release and approval authorize shadow observation only; "
-            "order submission must remain disabled"
-        )
     _required_boolean(environment, "EXECUTION_ALLOW_MARKET_ORDERS", False)
     _required_static_decimal(environment, "EXECUTION_MAX_ORDER_SIZE")
     _required_static_decimal(environment, "EXECUTION_MAX_ORDER_NOTIONAL")
@@ -2533,7 +2528,7 @@ def validate_activation_risk_approval(
             "cannot authorize wallet activation"
         )
     if approval.get("decision") != ACTIVATION_RISK_DECISION:
-        raise PreflightError("activation-risk decision is not approved for shadow observation")
+        raise PreflightError("activation-risk decision is not approved for live activation")
     for field in ("approval_id", "approved_by"):
         value = approval.get(field)
         if not isinstance(value, str) or not value.strip():
