@@ -1072,6 +1072,57 @@ class RuntimeEvidenceTests(unittest.TestCase):
     def test_accepts_actual_process_identity_and_environment(self) -> None:
         self.assertEqual(self.validate(), self.now - dt.timedelta(minutes=20))
 
+    def test_accepts_audited_abbreviated_prediction_health_identity(self) -> None:
+        executable_sha = "a" * 64
+        self.state["prediction"]["health"]["version"] = PREDICTION_COMMIT[:7]
+        self.state["prediction"]["executable_sha256"] = executable_sha
+        self.assertEqual(
+            preflight.validate_runtime_state(
+                self.state,
+                self.trading_environment,
+                self.prediction_environment,
+                expected_trading_commit=TRADING_COMMIT,
+                expected_prediction_version=PREDICTION_COMMIT,
+                now=self.now,
+                max_age=dt.timedelta(minutes=2),
+                expected_prediction_health_version=PREDICTION_COMMIT[:7],
+                expected_prediction_executable_sha256=executable_sha,
+            ),
+            self.now - dt.timedelta(minutes=20),
+        )
+
+    def test_rejects_abbreviated_prediction_health_with_wrong_executable(self) -> None:
+        self.state["prediction"]["health"]["version"] = PREDICTION_COMMIT[:7]
+        self.state["prediction"]["executable_sha256"] = "b" * 64
+        with self.assertRaisesRegex(preflight.PreflightError, "executable"):
+            preflight.validate_runtime_state(
+                self.state,
+                self.trading_environment,
+                self.prediction_environment,
+                expected_trading_commit=TRADING_COMMIT,
+                expected_prediction_version=PREDICTION_COMMIT,
+                now=self.now,
+                max_age=dt.timedelta(minutes=2),
+                expected_prediction_health_version=PREDICTION_COMMIT[:7],
+                expected_prediction_executable_sha256="a" * 64,
+            )
+
+    def test_rejects_abbreviated_prediction_health_that_is_not_commit_prefix(self) -> None:
+        self.state["prediction"]["health"]["version"] = "abcdef0"
+        self.state["prediction"]["executable_sha256"] = "a" * 64
+        with self.assertRaisesRegex(preflight.PreflightError, "prefix"):
+            preflight.validate_runtime_state(
+                self.state,
+                self.trading_environment,
+                self.prediction_environment,
+                expected_trading_commit=TRADING_COMMIT,
+                expected_prediction_version=PREDICTION_COMMIT,
+                now=self.now,
+                max_age=dt.timedelta(minutes=2),
+                expected_prediction_health_version="abcdef0",
+                expected_prediction_executable_sha256="a" * 64,
+            )
+
     def test_rejects_prediction_redis_address_mismatch(self) -> None:
         self.state["prediction"]["environment"]["REDIS_ADDRESS"] = "other-redis:6379"
         with self.assertRaisesRegex(preflight.PreflightError, "REDIS_ADDRESS"):
@@ -1795,6 +1846,18 @@ class CredentialAndConfigurationTests(unittest.TestCase):
             wallet_file_sha256="f" * 64,
         )
         self.assertNotEqual(changed_release, original)
+        changed_prediction_executable = preflight.configuration_sha256(
+            self.trading,
+            self.prediction,
+            self.bindings,
+            MODEL_GROUPS,
+            approved_trading_commit=TRADING_COMMIT,
+            approved_prediction_version=PREDICTION_COMMIT,
+            wallet_file_sha256="f" * 64,
+            approved_prediction_health_version=PREDICTION_COMMIT[:7],
+            approved_prediction_executable_sha256="a" * 64,
+        )
+        self.assertNotEqual(changed_prediction_executable, original)
 
     def test_configuration_hash_binds_dedicated_job_token(self) -> None:
         original = self.configuration_hash()

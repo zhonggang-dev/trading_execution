@@ -151,6 +151,16 @@ record, not be calculated ad hoc during deployment:
 --activation-risk-approval-sha256 REVIEWED_64_LOWERCASE_HEX_SHA256
 ```
 
+If the reviewed Prediction binary exposes only an abbreviated Git prefix in
+`/health/live`, keep `--expected-prediction-version` set to the full 40-byte
+commit identity and additionally provide both
+`--expected-prediction-health-version` and
+`--expected-prediction-executable-sha256`. The abbreviated value must be a
+7..39 character prefix of the full commit, and the executable SHA must come
+from a byte-identical reproducible build of that exact commit. The preflight
+hashes `/proc/<pid>/exe` itself and binds both identities into the two-phase
+configuration digest; a short health value alone is never accepted.
+
 The preflight exits non-zero if any of these invariants is false:
 
 - binding JSON is malformed, duplicated, contains a placeholder, or is not the

@@ -1454,6 +1454,8 @@ def validate_runtime_state(
     expected_prediction_version: str,
     now: dt.datetime,
     max_age: dt.timedelta,
+    expected_prediction_health_version: str | None = None,
+    expected_prediction_executable_sha256: str | None = None,
 ) -> dt.datetime:
     if not isinstance(state, dict):
         raise PreflightError("runtime evidence must be a JSON object")
@@ -1508,8 +1510,34 @@ def validate_runtime_state(
     prediction_health = state["prediction"].get("health")
     if not isinstance(prediction_health, dict) or prediction_health.get("status") != "up":
         raise PreflightError("Prediction runtime liveness is not up")
-    if prediction_health.get("version") != expected_prediction_version:
+    approved_health_version = (
+        expected_prediction_health_version or expected_prediction_version
+    )
+    if prediction_health.get("version") != approved_health_version:
         raise PreflightError("Prediction runtime version does not match the approved release")
+    if approved_health_version != expected_prediction_version:
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", expected_prediction_version)
+            or not re.fullmatch(r"[0-9a-f]{7,39}", approved_health_version)
+            or not expected_prediction_version.startswith(approved_health_version)
+        ):
+            raise PreflightError(
+                "Prediction abbreviated health version is not a prefix of the approved full commit"
+            )
+        if not expected_prediction_executable_sha256:
+            raise PreflightError(
+                "Prediction abbreviated health version requires an approved executable SHA-256"
+            )
+    if expected_prediction_executable_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_prediction_executable_sha256):
+            raise PreflightError("approved Prediction executable SHA-256 is invalid")
+        if (
+            state["prediction"].get("executable_sha256")
+            != expected_prediction_executable_sha256
+        ):
+            raise PreflightError(
+                "Prediction runtime executable does not match the approved SHA-256"
+            )
     return starts["trading"]
 
 
@@ -2279,6 +2307,8 @@ def configuration_sha256(
     approved_prediction_version: str,
     wallet_file_sha256: str,
     activation_risk_approval_sha256: str | None = None,
+    approved_prediction_health_version: str | None = None,
+    approved_prediction_executable_sha256: str | None = None,
 ) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", wallet_file_sha256):
         raise PreflightError("wallet file SHA-256 identity is invalid")
@@ -2304,6 +2334,10 @@ def configuration_sha256(
         "approved_release_identity": {
             "trading_commit": approved_trading_commit,
             "prediction_version": approved_prediction_version,
+            "prediction_health_version": (
+                approved_prediction_health_version or approved_prediction_version
+            ),
+            "prediction_executable_sha256": approved_prediction_executable_sha256,
         },
         "credential_sha256": {
             key: _credential_sha256(
@@ -2786,6 +2820,19 @@ def _process_environment(pid: int, keys: set[str]) -> dict[str, str]:
     return result
 
 
+def _process_executable_sha256(pid: int) -> str:
+    digest = hashlib.sha256()
+    try:
+        with pathlib.Path(f"/proc/{pid}/exe").open("rb") as executable:
+            while chunk := executable.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as error:
+        raise PreflightError(
+            f"cannot hash executable for runtime pid {pid}"
+        ) from error
+    return digest.hexdigest()
+
+
 def collect_runtime_state(
     trading_health_url: str, prediction_health_url: str
 ) -> dict[str, object]:
@@ -2826,7 +2873,10 @@ def collect_runtime_state(
                 if key in process_environment
             },
             "health": _get_json(health_url),
+            "executable_sha256": _process_executable_sha256(pid),
         }
+        if _service_pid(unit) != pid:
+            raise PreflightError(f"runtime {name} process changed during evidence capture")
     return result
 
 
@@ -3179,6 +3229,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--expected-trading-commit", required=True)
     parser.add_argument("--expected-prediction-version", required=True)
     parser.add_argument(
+        "--expected-prediction-health-version",
+        help=(
+            "exact health version when an audited Prediction build exposes an abbreviated "
+            "prefix of --expected-prediction-version"
+        ),
+    )
+    parser.add_argument(
+        "--expected-prediction-executable-sha256",
+        help=(
+            "approved SHA-256 of the running Prediction executable; mandatory when "
+            "the health version is abbreviated"
+        ),
+    )
+    parser.add_argument(
         "--direct-model-groups-json",
         required=True,
         help="JSON object mapping every DIRECT source prediction_model_id to one distinct Redis group",
@@ -3252,11 +3316,19 @@ def main(argv: list[str] | None = None) -> int:
                 )
         expected_trading_commit = args.expected_trading_commit.strip()
         expected_prediction_version = args.expected_prediction_version.strip()
+        expected_prediction_health_version = (
+            args.expected_prediction_health_version or expected_prediction_version
+        ).strip()
+        expected_prediction_executable_sha256 = (
+            args.expected_prediction_executable_sha256 or ""
+        ).strip()
         if not expected_trading_commit or not expected_prediction_version:
             raise PreflightError("approved runtime identities are required")
         unresolved_identity = (
             expected_trading_commit
             + expected_prediction_version
+            + expected_prediction_health_version
+            + expected_prediction_executable_sha256
             + args.direct_model_groups_json
         ).upper()
         if any(marker in unresolved_identity for marker in ("PLACEHOLDER", "APPROVED_", "EXACT_")):
@@ -3268,6 +3340,29 @@ def main(argv: list[str] | None = None) -> int:
                 "approved Prediction version must be an immutable lowercase full Git SHA "
                 "or sha256 image digest"
             )
+        if expected_prediction_health_version != expected_prediction_version:
+            if (
+                not re.fullmatch(r"[0-9a-f]{40}", expected_prediction_version)
+                or not re.fullmatch(r"[0-9a-f]{7,39}", expected_prediction_health_version)
+                or not expected_prediction_version.startswith(
+                    expected_prediction_health_version
+                )
+            ):
+                raise PreflightError(
+                    "approved abbreviated Prediction health version must be a 7..39 "
+                    "character prefix of the approved full Git SHA"
+                )
+            if not re.fullmatch(
+                r"[0-9a-f]{64}", expected_prediction_executable_sha256
+            ):
+                raise PreflightError(
+                    "abbreviated Prediction health version requires an approved "
+                    "executable SHA-256"
+                )
+        elif expected_prediction_executable_sha256 and not re.fullmatch(
+            r"[0-9a-f]{64}", expected_prediction_executable_sha256
+        ):
+            raise PreflightError("approved Prediction executable SHA-256 is invalid")
 
         evidence_age = dt.timedelta(seconds=args.max_evidence_age_seconds)
         dry_run_age = dt.timedelta(seconds=args.max_dry_run_age_seconds)
@@ -3371,6 +3466,10 @@ def main(argv: list[str] | None = None) -> int:
             activation_risk_approval_sha256=(
                 activation_risk_approval_sha or None
             ),
+            approved_prediction_health_version=expected_prediction_health_version,
+            approved_prediction_executable_sha256=(
+                expected_prediction_executable_sha256 or None
+            ),
         )
 
         if args.runtime_state_json is None:
@@ -3389,6 +3488,10 @@ def main(argv: list[str] | None = None) -> int:
             expected_prediction_version=expected_prediction_version,
             now=dt.datetime.now(dt.timezone.utc),
             max_age=evidence_age,
+            expected_prediction_health_version=expected_prediction_health_version,
+            expected_prediction_executable_sha256=(
+                expected_prediction_executable_sha256 or None
+            ),
         )
         if args.submission_state == "enabled":
             if captured_next_due is None:
@@ -3515,6 +3618,10 @@ def main(argv: list[str] | None = None) -> int:
                 expected_prediction_version=expected_prediction_version,
                 now=final_runtime_validation_now,
                 max_age=evidence_age,
+                expected_prediction_health_version=expected_prediction_health_version,
+                expected_prediction_executable_sha256=(
+                    expected_prediction_executable_sha256 or None
+                ),
             )
             validate_runtime_processes_unchanged(runtime_state, final_runtime_state)
             initial_runtime_observed_at = _utc_timestamp(
