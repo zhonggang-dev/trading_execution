@@ -175,6 +175,7 @@ func (service *Service) composeSnapshot(params composeParams) (domain.LiveOperat
 	quality.add("ledger", "事件账本", domain.LiveHealthHealthy, "PostgreSQL 可重复读快照已完成")
 	quality.add("clob", "CLOB 订单与成交", domain.LiveHealthHealthy, "CLOB 订单和成交读取成功")
 	quality.add("positions", "链上持仓", domain.LiveHealthHealthy, "Data API 持仓已读取")
+	quality.add("wallet-performance", "钱包累计绩效", domain.LiveHealthHealthy, "仅统计 trading_execution 管理并已进入事件账本的仓位")
 	quality.add("reconcile", "链上对账", domain.LiveHealthHealthy, "最近对账未发现未关闭问题")
 
 	exposureLimit, presetName, riskState := summarizeRiskPolicies(params.local.RiskPolicies, quality)
@@ -185,6 +186,10 @@ func (service *Service) composeSnapshot(params composeParams) (domain.LiveOperat
 	})
 	if err != nil {
 		return domain.LiveOperationsSnapshot{}, fmt.Errorf("build live positions: %w", err)
+	}
+	wallets, err := buildWallets(params.local.Accounts, params.local.WalletAccounting, positions, params.local.Positions)
+	if err != nil {
+		return domain.LiveOperationsSnapshot{}, fmt.Errorf("build live wallet performance: %w", err)
 	}
 	orders, err := buildOrders(params.observedAt, params.local.Orders, params.observations, quality)
 	if err != nil {
@@ -246,7 +251,7 @@ func (service *Service) composeSnapshot(params composeParams) (domain.LiveOperat
 			VenueStatus: venueHealth, LedgerStatus: domain.LiveHealthHealthy,
 			ReconciliationStatus: reconciliationHealth,
 		},
-		Capital: capital, Workers: workers, Funnel: funnel, Risks: risks,
+		Capital: capital, Wallets: wallets, Workers: workers, Funnel: funnel, Risks: risks,
 		Orders: orders, Positions: positions, Events: nonNilEvents(params.local.Events),
 		DataQuality: quality.list(),
 	}

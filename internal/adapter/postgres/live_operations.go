@@ -49,6 +49,12 @@ func (repository *LiveOperationsRepository) LoadLiveOperations(ctx context.Conte
 	if len(state.Accounts) != len(query.ExecutionAccountIDs) {
 		return state, fmt.Errorf("loaded %d execution accounts, want %d", len(state.Accounts), len(query.ExecutionAccountIDs))
 	}
+	if state.WalletAccounting, err = loadLiveWalletAccounting(ctx, tx, accountClause, accountArgs, query.ObservedAt); err != nil {
+		return state, err
+	}
+	if len(state.WalletAccounting) != len(query.ExecutionAccountIDs) {
+		return state, fmt.Errorf("loaded %d wallet accounting rows, want %d", len(state.WalletAccounting), len(query.ExecutionAccountIDs))
+	}
 	if state.Positions, err = loadLivePositions(ctx, tx, accountClause, accountArgs); err != nil {
 		return state, err
 	}
@@ -81,6 +87,73 @@ func (repository *LiveOperationsRepository) LoadLiveOperations(ctx context.Conte
 	}
 	state.DatabaseObservedAt = state.DatabaseObservedAt.UTC()
 	return state, nil
+}
+
+// loadLiveWalletAccounting 以不可变仓位事件重放每个账户的累计投入、成本占用峰值和已实现收益。
+// 峰值是 managed portfolio 历史同时占用的最大成本，累计投入则包含每次开仓、接管和外部 BUY
+// 导入的正向成本。两者均包含已经进入成本账本的买入手续费。
+func loadLiveWalletAccounting(
+	ctx context.Context,
+	tx *sql.Tx,
+	clause string,
+	accountArgs []any,
+	observedAt time.Time,
+) ([]domain.LiveWalletAccountingState, error) {
+	args := append(append([]any{}, accountArgs...), observedAt.UTC())
+	observedAtIndex := len(args)
+	statement := fmt.Sprintf(`
+		WITH scoped_events AS (
+			SELECT event.execution_account_id, event.position_event_id, event.occurred_at,
+			       event.event_type, event.cost_basis_delta, event.realized_pnl_delta
+			FROM position_events AS event
+			WHERE event.execution_account_id IN %s AND event.occurred_at <= $%d
+		), running AS (
+			SELECT execution_account_id, position_event_id, occurred_at,
+			       event_type, cost_basis_delta, realized_pnl_delta,
+			       SUM(cost_basis_delta) OVER (
+			           PARTITION BY execution_account_id
+			           ORDER BY occurred_at, position_event_id
+			           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+			       ) AS deployed_cost
+			FROM scoped_events
+		), accounting AS (
+			SELECT execution_account_id,
+			       COALESCE(MAX(GREATEST(deployed_cost, 0)), 0) AS peak_cash_used,
+			       COALESCE(SUM(CASE
+			           WHEN event_type IN ('BOUGHT','ADOPTED','EXTERNAL_BUY_IMPORTED')
+			                AND cost_basis_delta > 0 THEN cost_basis_delta ELSE 0 END), 0)
+			           AS cumulative_invested_cost,
+			       COALESCE(SUM(realized_pnl_delta), 0) AS realized_pnl
+			FROM running GROUP BY execution_account_id
+		)
+		SELECT account_row.execution_account_id,
+		       COALESCE(accounting.peak_cash_used, 0)::text,
+		       COALESCE(accounting.cumulative_invested_cost, 0)::text,
+		       COALESCE(accounting.realized_pnl, 0)::text
+		FROM execution_accounts AS account_row
+		LEFT JOIN accounting USING (execution_account_id)
+		WHERE account_row.execution_account_id IN %s
+		ORDER BY account_row.execution_account_id`, clause, observedAtIndex, clause)
+	rows, err := tx.QueryContext(ctx, statement, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query live wallet accounting: %w", err)
+	}
+	defer rows.Close()
+	result := make([]domain.LiveWalletAccountingState, 0, len(accountArgs))
+	for rows.Next() {
+		var item domain.LiveWalletAccountingState
+		if err := rows.Scan(
+			&item.ExecutionAccountID, &item.PeakCashUsed,
+			&item.CumulativeInvestedCost, &item.RealizedPnL,
+		); err != nil {
+			return nil, fmt.Errorf("scan live wallet accounting: %w", err)
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate live wallet accounting: %w", err)
+	}
+	return result, nil
 }
 
 // normalizeLiveOperationsQuery 校验并规范化运维查询范围。

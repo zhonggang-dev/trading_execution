@@ -58,7 +58,10 @@ func TestLiveOperationsEndpointUsesDedicatedReadOnlyPermission(t *testing.T) {
 		t.Fatalf("forbidden status=%d body=%s", forbidden.Code, forbidden.Body.String())
 	}
 	response := performRequest(t, server, http.MethodGet, "/api/v1/live-operations", "", "readonly-secret")
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"equity":1.25`) || !strings.Contains(response.Body.String(), `"positions":[]`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"equity":1.25`) ||
+		!strings.Contains(response.Body.String(), `"executionAccountId":"wallet-1"`) ||
+		!strings.Contains(response.Body.String(), `"return":null`) ||
+		!strings.Contains(response.Body.String(), `"positions":[]`) {
 		t.Fatalf("response status=%d body=%s", response.Code, response.Body.String())
 	}
 }
@@ -93,6 +96,11 @@ func testLiveOperationsSnapshot() domain.LiveOperationsSnapshot {
 			Equity: "1.25", AvailableCash: "1.25", GrossExposure: "0", ExposureLimit: "10",
 			RealizedPnLToday: "0", UnrealizedPnL: "0", FeeToday: "0",
 		},
+		Wallets: []domain.LiveWallet{{
+			ExecutionAccountID: "wallet-1", PositionCount: 0,
+			PeakCashUsed: "0", CumulativeInvestedCost: "0",
+			RealizedPnL: "0", UnrealizedPnL: "0", TotalPnL: "0", ReturnRate: nil,
+		}},
 		Workers: []domain.LiveWorker{}, Funnel: []domain.LiveFunnelStage{}, Risks: []domain.LiveRisk{},
 		Orders: []domain.LiveOrder{}, Positions: []domain.LivePosition{}, Events: []domain.LiveEvent{},
 		DataQuality: []domain.LiveDataQuality{},

@@ -83,6 +83,7 @@ type LiveOperationsSnapshot struct {
 	DataFreshnessSeconds int64             `json:"dataFreshnessSeconds"`
 	Engine               LiveEngine        `json:"engine"`
 	Capital              LiveCapital       `json:"capital"`
+	Wallets              []LiveWallet      `json:"wallets"`
 	Workers              []LiveWorker      `json:"workers"`
 	Funnel               []LiveFunnelStage `json:"funnel"`
 	Risks                []LiveRisk        `json:"risks"`
@@ -91,6 +92,19 @@ type LiveOperationsSnapshot struct {
 	Events               []LiveEvent       `json:"events"`
 	DataQuality          []LiveDataQuality `json:"dataQuality"`
 	SourceObservedAt     time.Time         `json:"-"`
+}
+
+// LiveWallet 表示一个执行账户从事件账本与当前链上持仓合成的累计绩效。
+// ReturnRate 在没有历史峰值资金占用时为 null，避免把未定义收益率伪装成 0。
+type LiveWallet struct {
+	ExecutionAccountID     string      `json:"executionAccountId"`
+	PositionCount          int         `json:"positionCount"`
+	PeakCashUsed           LiveNumber  `json:"peakCashUsed"`
+	CumulativeInvestedCost LiveNumber  `json:"cumulativeInvestedCost"`
+	RealizedPnL            LiveNumber  `json:"realizedPnl"`
+	UnrealizedPnL          LiveNumber  `json:"unrealizedPnl"`
+	TotalPnL               LiveNumber  `json:"totalPnl"`
+	ReturnRate             *LiveNumber `json:"return"`
 }
 
 // LiveEngine 表示实盘进程、交易所、账本和对账的总体状态。
@@ -189,6 +203,7 @@ type LiveOrder struct {
 type LivePosition struct {
 	PositionID           string     `json:"positionId"`
 	ExecutionAccountID   string     `json:"executionAccountId"`
+	Managed              bool       `json:"managed"`
 	MarketID             string     `json:"marketId"`
 	ConditionID          string     `json:"conditionId"`
 	TokenID              string     `json:"tokenId"`
@@ -239,6 +254,7 @@ type LiveOperationsQuery struct {
 // LiveOperationsLocalState 表示一个 PostgreSQL 可重复读事务内得到的本地权威状态。
 type LiveOperationsLocalState struct {
 	Accounts            []LiveAccountState
+	WalletAccounting    []LiveWalletAccountingState
 	Positions           []LiveLedgerPosition
 	Orders              []LiveLedgerOrder
 	RiskPolicies        []LiveRiskPolicyState
@@ -251,6 +267,14 @@ type LiveOperationsLocalState struct {
 	FeeToday            Decimal
 	DailyTradedNotional Decimal
 	DatabaseObservedAt  time.Time
+}
+
+// LiveWalletAccountingState 是 PostgreSQL 事件账本按执行账户计算的累计现金与收益口径。
+type LiveWalletAccountingState struct {
+	ExecutionAccountID     string
+	PeakCashUsed           Decimal
+	CumulativeInvestedCost Decimal
+	RealizedPnL            Decimal
 }
 
 // LiveAccountState 表示内部聚合使用的账户账本身份，钱包地址不会进入 HTTP 响应。

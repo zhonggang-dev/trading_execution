@@ -249,7 +249,7 @@ func makeLivePosition(params makeLivePositionParams) (domain.LivePosition, error
 	}
 	result := domain.LivePosition{
 		PositionID:         params.accountID + ":" + marketID + ":" + params.external.TokenID,
-		ExecutionAccountID: params.accountID, MarketID: marketID,
+		ExecutionAccountID: params.accountID, Managed: params.found, MarketID: marketID,
 		ConditionID: params.external.ConditionID, TokenID: params.external.TokenID,
 		MarketLabel: marketLabel, OutcomeName: params.external.OutcomeName,
 		Shares: shares, AveragePrice: average, MarkPrice: mark, Cost: costNumber,

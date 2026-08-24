@@ -97,8 +97,15 @@ func TestRefreshBuildsAuthoritativeSnapshot(t *testing.T) {
 	if snapshot.Capital.AvailableCash != "100" || snapshot.Capital.GrossExposure != "4" || snapshot.Capital.Equity != "105.5" {
 		t.Fatalf("capital = %#v", snapshot.Capital)
 	}
-	if len(snapshot.Positions) != 1 || snapshot.Positions[0].MarkPrice != "0.55" || snapshot.Positions[0].UnrealizedPnL != "1.5" {
+	if len(snapshot.Positions) != 1 || !snapshot.Positions[0].Managed || snapshot.Positions[0].MarkPrice != "0.55" || snapshot.Positions[0].UnrealizedPnL != "1.5" {
 		t.Fatalf("positions = %#v", snapshot.Positions)
+	}
+	if len(snapshot.Wallets) != 1 || snapshot.Wallets[0].ExecutionAccountID != "account-1" ||
+		snapshot.Wallets[0].PositionCount != 1 || snapshot.Wallets[0].PeakCashUsed != "12" ||
+		snapshot.Wallets[0].CumulativeInvestedCost != "20" || snapshot.Wallets[0].RealizedPnL != "2" ||
+		snapshot.Wallets[0].UnrealizedPnL != "1.5" || snapshot.Wallets[0].TotalPnL != "3.5" ||
+		snapshot.Wallets[0].ReturnRate == nil || *snapshot.Wallets[0].ReturnRate != "0.291666666667" {
+		t.Fatalf("wallets = %#v", snapshot.Wallets)
 	}
 	if snapshot.DataFreshnessSeconds != 2 || snapshot.Engine.Health != domain.LiveHealthHealthy {
 		t.Fatalf("freshness=%d engine=%#v", snapshot.DataFreshnessSeconds, snapshot.Engine)
@@ -197,6 +204,30 @@ func TestExternalPositionBaselineOnlyIsExcludedFromManagedOperations(t *testing.
 	}
 }
 
+func TestExternalOnlyPositionIsVisibleButExcludedFromWalletPerformance(t *testing.T) {
+	now := time.Date(2026, 8, 19, 8, 0, 10, 0, time.UTC)
+	service, _, repository := newTestService(t, &now)
+	repository.state.Positions = nil
+
+	if err := service.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	snapshot, err := service.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Positions) != 1 || snapshot.Positions[0].Managed {
+		t.Fatalf("external-only positions = %#v", snapshot.Positions)
+	}
+	if len(snapshot.Wallets) != 1 || snapshot.Wallets[0].PositionCount != 0 ||
+		snapshot.Wallets[0].UnrealizedPnL != "0" || snapshot.Wallets[0].TotalPnL != "2" {
+		t.Fatalf("external-only position leaked into managed performance: %#v", snapshot.Wallets)
+	}
+	if dataQualityStatus(snapshot.DataQuality, "positions") != domain.LiveHealthDegraded {
+		t.Fatalf("external-only position did not degrade position quality: %#v", snapshot.DataQuality)
+	}
+}
+
 func TestExternalPositionBaselineProjectsRemoteTotalToManagedShares(t *testing.T) {
 	now := time.Date(2026, 8, 19, 8, 0, 10, 0, time.UTC)
 	service, _, _ := newTestService(t, &now)
@@ -271,6 +302,10 @@ func newTestService(t *testing.T, now *time.Time) (*Service, *fakeBalanceSource,
 	signalAt := now.Add(-time.Minute)
 	local := domain.LiveOperationsLocalState{
 		Accounts: []domain.LiveAccountState{{ExecutionAccountID: "account-1", WalletAddress: "0xwallet", CollateralAsset: "pUSD"}},
+		WalletAccounting: []domain.LiveWalletAccountingState{{
+			ExecutionAccountID: "account-1", PeakCashUsed: "12",
+			CumulativeInvestedCost: "20", RealizedPnL: "2",
+		}},
 		Positions: []domain.LiveLedgerPosition{{Position: domain.Position{
 			ExecutionAccountID: "account-1", MarketID: "market-1", ConditionID: "condition-1",
 			TokenID: "token-yes", OutcomeIndex: intPointer(0), OutcomeName: "YES",
