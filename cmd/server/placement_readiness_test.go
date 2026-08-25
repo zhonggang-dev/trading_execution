@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
@@ -63,6 +64,9 @@ func TestPlacementReadinessVenueGatesOnlyPlace(t *testing.T) {
 	}
 	placed, placeErr = venue.Place(context.Background(), order)
 	assertReconciliationGate(t, placed, placeErr)
+	if !strings.Contains(placeErr.Error(), readinessErr.Error()) {
+		t.Fatalf("Place() error = %v, want account-local readiness cause", placeErr)
+	}
 	if underlying.places != 0 {
 		t.Fatalf("unhealthy gate delegated %d placements, want 0", underlying.places)
 	}

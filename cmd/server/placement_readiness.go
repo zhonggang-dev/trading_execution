@@ -138,10 +138,17 @@ func (venue *placementReadinessVenue) Get(ctx context.Context, order domain.Orde
 }
 
 func reconciliationNotReadyError(cause error) error {
+	message := "new order rejected locally because account reconciliation is not healthy"
+	if cause != nil {
+		// The cause contains only server-owned account/status/timing diagnostics.
+		// Preserve it in the durable rejection reason so an account-local gate
+		// can be distinguished from an unrelated global-readiness failure.
+		message += ": " + cause.Error()
+	}
 	return &port.VenueError{
 		Kind:    port.VenueErrorRejected,
 		Code:    "RECONCILIATION_NOT_READY",
-		Message: "new order rejected locally because account reconciliation is not healthy",
+		Message: message,
 		Cause:   cause,
 	}
 }
