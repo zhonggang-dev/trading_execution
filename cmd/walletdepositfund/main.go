@@ -27,10 +27,9 @@ import (
 
 const (
 	polygonChainID             = uint64(137)
-	transferAmountBaseUnits    = uint64(20_000_000)
 	requiredConfirmations      = uint64(64)
-	journalSchema              = "trading.wallet_deposit_funding.v1"
-	exactExecuteToken          = "FUND_WALLET_6_AND_WALLET_7_DEPOSIT_WALLETS_PUSD_20000000_POLYGON_137"
+	journalSchema              = "trading.wallet_deposit_funding.v2"
+	exactExecuteToken          = "FUND_WALLET_6_REMAINING_181_AND_WALLET_7_REMAINING_201_PUSD_TO_DEPOSIT_WALLETS_POLYGON_137"
 	defaultCommandTimeout      = 20 * time.Minute
 	defaultRequestTimeout      = 10 * time.Second
 	defaultReceiptPollInterval = 2 * time.Second
@@ -49,13 +48,14 @@ const (
 	wallet7Deposit             = "0xdd9275d3b1d2c423e19724fcd09c19abb20aa167"
 )
 
-var transferAmount = new(big.Int).SetUint64(transferAmountBaseUnits)
-
-type fixedTarget struct{ accountID, source, recipient string }
+type fixedTarget struct {
+	accountID, source, recipient string
+	amountBaseUnits              uint64
+}
 
 var fixedTargets = []fixedTarget{
-	{wallet6AccountID, wallet6EOA, wallet6Deposit},
-	{wallet7AccountID, wallet7EOA, wallet7Deposit},
+	{wallet6AccountID, wallet6EOA, wallet6Deposit, 181_000_000},
+	{wallet7AccountID, wallet7EOA, wallet7Deposit, 201_000_000},
 }
 
 type options struct {
@@ -93,6 +93,7 @@ type fundingEntry struct {
 	ExecutionAccountID     string    `json:"execution_account_id"`
 	Source                 string    `json:"source"`
 	Recipient              string    `json:"recipient"`
+	AmountBaseUnits        string    `json:"amount_base_units"`
 	SourceBalanceBefore    string    `json:"source_balance_before"`
 	RecipientBalanceBefore string    `json:"recipient_balance_before"`
 	Nonce                  uint64    `json:"nonce"`
@@ -122,6 +123,7 @@ type publicEntryResult struct {
 	ExecutionAccountID     string `json:"execution_account_id"`
 	Source                 string `json:"source"`
 	Recipient              string `json:"recipient"`
+	AmountBaseUnits        string `json:"amount_base_units"`
 	SourceBalanceBefore    string `json:"source_balance_before"`
 	RecipientBalanceBefore string `json:"recipient_balance_before"`
 	Nonce                  uint64 `json:"nonce"`
@@ -185,7 +187,7 @@ func parseOptions(arguments []string) (options, error) {
 	}
 	opts.expected[wallet6AccountID], opts.expected[wallet7AccountID] = w6, w7
 	if opts.executeToken != "" && opts.executeToken != exactExecuteToken {
-		return options{}, fmt.Errorf("execute token does not exactly match the fixed 20 pUSD deposit-wallet plan")
+		return options{}, fmt.Errorf("execute token does not exactly match the fixed remaining-balance deposit-wallet plan")
 	}
 	if opts.executeToken == exactExecuteToken {
 		if strings.TrimSpace(opts.journalFile) == "" {
@@ -278,8 +280,9 @@ func selectAccounts(accounts []polymarket.TradingAccount) (map[string]fundingAcc
 
 func prepareJournal(ctx context.Context, rpc *rpcClient, accounts map[string]fundingAccount, opts options, execute bool) (fundingJournal, error) {
 	now := time.Now().UTC()
-	journal := fundingJournal{Schema: journalSchema, ChainID: polygonChainID, Token: polygonPUSDAddress, AmountBaseUnits: transferAmount.String(), RequiredConfirmations: requiredConfirmations, CreatedAt: now, UpdatedAt: now}
+	journal := fundingJournal{Schema: journalSchema, ChainID: polygonChainID, Token: polygonPUSDAddress, AmountBaseUnits: "wallet-6=181000000,wallet-7=201000000", RequiredConfirmations: requiredConfirmations, CreatedAt: now, UpdatedAt: now}
 	for _, target := range fixedTargets {
+		amount := new(big.Int).SetUint64(target.amountBaseUnits)
 		sourceBalance, err := readTokenBalance(ctx, rpc, target.source, "latest")
 		if err != nil {
 			return fundingJournal{}, err
@@ -292,8 +295,8 @@ func prepareJournal(ctx context.Context, rpc *rpcClient, accounts map[string]fun
 		if err != nil {
 			return fundingJournal{}, err
 		}
-		if sourceBalance.Cmp(transferAmount) < 0 {
-			return fundingJournal{}, fmt.Errorf("%s pUSD balance is below 20 pUSD", target.accountID)
+		if sourceBalance.Cmp(amount) < 0 {
+			return fundingJournal{}, fmt.Errorf("%s pUSD balance is below the fixed remaining migration amount", target.accountID)
 		}
 		if execute {
 			expected := opts.expected[target.accountID]
@@ -301,7 +304,7 @@ func prepareJournal(ctx context.Context, rpc *rpcClient, accounts map[string]fun
 				return fundingJournal{}, fmt.Errorf("%s live prestate differs from approved exact assertions", target.accountID)
 			}
 		}
-		data, err := buildTransferCallData(target.recipient, transferAmount)
+		data, err := buildTransferCallData(target.recipient, amount)
 		if err != nil {
 			return fundingJournal{}, err
 		}
@@ -319,7 +322,7 @@ func prepareJournal(ctx context.Context, rpc *rpcClient, accounts map[string]fun
 		if err := requireGasBalance(ctx, rpc, target.source, gasLimit, maxFee); err != nil {
 			return fundingJournal{}, err
 		}
-		transaction, err := newTransferTransaction(nonce, gasLimit, priority, maxFee, target.recipient)
+		transaction, err := newTransferTransaction(nonce, gasLimit, priority, maxFee, target.recipient, amount)
 		if err != nil {
 			return fundingJournal{}, err
 		}
@@ -328,7 +331,7 @@ func prepareJournal(ctx context.Context, rpc *rpcClient, accounts map[string]fun
 			return fundingJournal{}, err
 		}
 		journal.Entries = append(journal.Entries, fundingEntry{
-			ExecutionAccountID: target.accountID, Source: target.source, Recipient: target.recipient,
+			ExecutionAccountID: target.accountID, Source: target.source, Recipient: target.recipient, AmountBaseUnits: amount.String(),
 			SourceBalanceBefore: sourceBalance.String(), RecipientBalanceBefore: recipientBalance.String(),
 			Nonce: nonce, GasLimit: gasLimit, MaxPriorityFee: priority.String(), MaxFee: maxFee.String(),
 			CallData: "0x" + hex.EncodeToString(transaction.data), SigningDigest: signed.digest,
@@ -400,7 +403,11 @@ func reproduceEntry(ctx context.Context, account fundingAccount, entry fundingEn
 	if !ok {
 		return fmt.Errorf("journal max fee is invalid")
 	}
-	transaction, err := newTransferTransaction(entry.Nonce, entry.GasLimit, priority, maxFee, entry.Recipient)
+	amount, err := entryAmount(entry)
+	if err != nil {
+		return err
+	}
+	transaction, err := newTransferTransaction(entry.Nonce, entry.GasLimit, priority, maxFee, entry.Recipient, amount)
 	if err != nil {
 		return err
 	}
@@ -699,10 +706,11 @@ func waitForConfirmedReceipt(ctx context.Context, rpc *rpcClient, entry fundingE
 }
 
 func validateReceipt(raw rpcReceipt, entry fundingEntry) (validatedReceipt, error) {
+	expectedAmount, amountErr := entryAmount(entry)
 	block, err := parseQuantityUint64(raw.BlockNumber, "receipt block")
 	typeID, typeErr := parseQuantityUint64(raw.Type, "receipt type")
 	status, statusErr := parseQuantityUint64(raw.Status, "receipt status")
-	if err != nil || typeErr != nil || statusErr != nil || block == 0 || typeID != 2 || status != 1 || strings.ToLower(raw.TransactionHash) != entry.TransactionHash || strings.ToLower(raw.From) != entry.Source || strings.ToLower(raw.To) != polygonPUSDAddress {
+	if err != nil || typeErr != nil || statusErr != nil || amountErr != nil || block == 0 || typeID != 2 || status != 1 || strings.ToLower(raw.TransactionHash) != entry.TransactionHash || strings.ToLower(raw.From) != entry.Source || strings.ToLower(raw.To) != polygonPUSDAddress {
 		return validatedReceipt{}, fmt.Errorf("receipt identity or success status is invalid")
 	}
 	blockHash := strings.ToLower(raw.BlockHash)
@@ -716,7 +724,7 @@ func validateReceipt(raw rpcReceipt, entry fundingEntry) (validatedReceipt, erro
 	for _, log := range raw.Logs {
 		if strings.ToLower(log.Address) == polygonPUSDAddress && len(log.Topics) == 3 && strings.ToLower(log.Topics[0]) == transferTopic && strings.ToLower(log.Topics[1]) == fromTopic && strings.ToLower(log.Topics[2]) == toTopic {
 			amount, ok := new(big.Int).SetString(strings.TrimPrefix(log.Data, "0x"), 16)
-			if ok && amount.Cmp(transferAmount) == 0 && strings.ToLower(log.TransactionHash) == entry.TransactionHash && strings.ToLower(log.BlockHash) == blockHash && log.Removed != nil && !*log.Removed {
+			if ok && amount.Cmp(expectedAmount) == 0 && strings.ToLower(log.TransactionHash) == entry.TransactionHash && strings.ToLower(log.BlockHash) == blockHash && log.Removed != nil && !*log.Removed {
 				matches++
 			}
 		}
@@ -728,18 +736,22 @@ func validateReceipt(raw rpcReceipt, entry fundingEntry) (validatedReceipt, erro
 }
 
 func verifyConfirmedBalances(ctx context.Context, rpc *rpcClient, entry fundingEntry, block uint64) error {
+	amount, err := entryAmount(entry)
+	if err != nil {
+		return err
+	}
 	sourceBefore, _ := new(big.Int).SetString(entry.SourceBalanceBefore, 10)
 	recipientBefore, _ := new(big.Int).SetString(entry.RecipientBalanceBefore, 10)
-	wantSource := new(big.Int).Sub(sourceBefore, transferAmount)
-	wantRecipient := new(big.Int).Add(recipientBefore, transferAmount)
+	wantSource := new(big.Int).Sub(sourceBefore, amount)
+	wantRecipient := new(big.Int).Add(recipientBefore, amount)
 	tag := fmt.Sprintf("0x%x", block)
 	source, err := readTokenBalance(ctx, rpc, entry.Source, tag)
 	if err != nil || source.Cmp(wantSource) != 0 {
-		return fmt.Errorf("confirmed source balance is not the exact pre-balance minus 20 pUSD: %w", err)
+		return fmt.Errorf("confirmed source balance is not the exact pre-balance minus the fixed migration amount: %w", err)
 	}
 	recipient, err := readTokenBalance(ctx, rpc, entry.Recipient, tag)
 	if err != nil || recipient.Cmp(wantRecipient) != 0 {
-		return fmt.Errorf("confirmed recipient balance is not the exact pre-balance plus 20 pUSD: %w", err)
+		return fmt.Errorf("confirmed recipient balance is not the exact pre-balance plus the fixed migration amount: %w", err)
 	}
 	return nil
 }
@@ -842,14 +854,22 @@ func canonicalUint64(value string) bool {
 	return err == nil && strconv.FormatUint(parsed, 10) == value
 }
 
+func entryAmount(entry fundingEntry) (*big.Int, error) {
+	if !canonicalUint(entry.AmountBaseUnits) || entry.AmountBaseUnits == "0" {
+		return nil, fmt.Errorf("journal transfer amount is invalid")
+	}
+	amount, _ := new(big.Int).SetString(entry.AmountBaseUnits, 10)
+	return amount, nil
+}
+
 func validateJournal(journal fundingJournal, opts options) error {
-	if journal.Schema != journalSchema || journal.ChainID != polygonChainID || journal.Token != polygonPUSDAddress || journal.AmountBaseUnits != transferAmount.String() || journal.RequiredConfirmations != requiredConfirmations || len(journal.Entries) != len(fixedTargets) {
+	if journal.Schema != journalSchema || journal.ChainID != polygonChainID || journal.Token != polygonPUSDAddress || journal.AmountBaseUnits != "wallet-6=181000000,wallet-7=201000000" || journal.RequiredConfirmations != requiredConfirmations || len(journal.Entries) != len(fixedTargets) {
 		return fmt.Errorf("existing journal does not match the fixed transfer plan")
 	}
 	for index, entry := range journal.Entries {
 		target := fixedTargets[index]
 		expected := opts.expected[target.accountID]
-		if entry.ExecutionAccountID != target.accountID || entry.Source != target.source || entry.Recipient != target.recipient || entry.SourceBalanceBefore != expected.sourceBalance || entry.RecipientBalanceBefore != expected.recipientBalance || strconv.FormatUint(entry.Nonce, 10) != expected.nonce || (entry.State != "SIGNED" && entry.State != "BROADCAST" && entry.State != "CONFIRMED") {
+		if entry.ExecutionAccountID != target.accountID || entry.Source != target.source || entry.Recipient != target.recipient || entry.AmountBaseUnits != strconv.FormatUint(target.amountBaseUnits, 10) || entry.SourceBalanceBefore != expected.sourceBalance || entry.RecipientBalanceBefore != expected.recipientBalance || strconv.FormatUint(entry.Nonce, 10) != expected.nonce || (entry.State != "SIGNED" && entry.State != "BROADCAST" && entry.State != "CONFIRMED") {
 			return fmt.Errorf("journal entry %d differs from the approved exact plan", index)
 		}
 	}
@@ -931,10 +951,11 @@ func saveJournal(path string, journal fundingJournal) error {
 }
 
 func publicView(journal fundingJournal, dryRun bool) publicResult {
-	result := publicResult{DryRun: dryRun, ChainID: polygonChainID, Token: polygonPUSDAddress, AmountBaseUnits: transferAmount.String()}
+	result := publicResult{DryRun: dryRun, ChainID: polygonChainID, Token: polygonPUSDAddress, AmountBaseUnits: journal.AmountBaseUnits}
 	for _, entry := range journal.Entries {
 		result.Entries = append(result.Entries, publicEntryResult{
 			ExecutionAccountID: entry.ExecutionAccountID, Source: entry.Source, Recipient: entry.Recipient,
+			AmountBaseUnits:     entry.AmountBaseUnits,
 			SourceBalanceBefore: entry.SourceBalanceBefore, RecipientBalanceBefore: entry.RecipientBalanceBefore,
 			Nonce: entry.Nonce, GasLimit: entry.GasLimit, State: entry.State,
 			TransactionHash: entry.TransactionHash, ReceiptBlockNumber: entry.ReceiptBlockNumber, Confirmations: entry.Confirmations,

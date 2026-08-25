@@ -59,7 +59,7 @@ func buildBalanceOfCallData(owner string) ([]byte, error) {
 	return data, nil
 }
 
-func newTransferTransaction(nonce, gasLimit uint64, priorityFee, maxFee *big.Int, recipient string) (type2Transaction, error) {
+func newTransferTransaction(nonce, gasLimit uint64, priorityFee, maxFee *big.Int, recipient string, amount *big.Int) (type2Transaction, error) {
 	if gasLimit < minimumTransferGasEstimate || gasLimit > maximumTransferGasLimit {
 		return type2Transaction{}, fmt.Errorf("transfer gas limit %d is outside [%d,%d]", gasLimit, minimumTransferGasEstimate, maximumTransferGasLimit)
 	}
@@ -69,7 +69,7 @@ func newTransferTransaction(nonce, gasLimit uint64, priorityFee, maxFee *big.Int
 	if priorityFee.Cmp(new(big.Int).SetUint64(maximumPriorityFeeWei)) > 0 || maxFee.Cmp(new(big.Int).SetUint64(maximumMaxFeePerGasWei)) > 0 {
 		return type2Transaction{}, fmt.Errorf("transfer EIP-1559 fees exceed fixed caps")
 	}
-	data, err := buildTransferCallData(recipient, transferAmount)
+	data, err := buildTransferCallData(recipient, amount)
 	if err != nil {
 		return type2Transaction{}, err
 	}

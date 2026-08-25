@@ -10,7 +10,7 @@ import (
 )
 
 func TestBuildTransferCallData(t *testing.T) {
-	data, err := buildTransferCallData(wallet6Deposit, transferAmount)
+	data, err := buildTransferCallData(wallet6Deposit, big.NewInt(20_000_000))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +25,7 @@ func TestSignFixedTransferIsDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	transaction, err := newTransferTransaction(9, 70_000, big.NewInt(30_000_000_000), big.NewInt(70_000_000_000), wallet6Deposit)
+	transaction, err := newTransferTransaction(9, 70_000, big.NewInt(30_000_000_000), big.NewInt(70_000_000_000), wallet6Deposit, big.NewInt(20_000_000))
 	if err != nil {
 		t.Fatal(err)
 	}
