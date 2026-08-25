@@ -469,7 +469,6 @@ func testServer(t *testing.T, token string) *Server {
 func baseExecutionService(t *testing.T) *execution.Service {
 	t.Helper()
 	guard, err := risk.NewStaticGuard(risk.StaticGuardParams{
-		MaxOrderSize:     "100",
 		MaxOrderNotional: "100",
 	})
 	if err != nil {

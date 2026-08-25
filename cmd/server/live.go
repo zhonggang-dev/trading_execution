@@ -393,15 +393,9 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
-	var placementReconciliationReadiness readiness.Checker = runner
-	if quarantineChecker != nil {
-		placementReconciliationReadiness, err = readiness.NewAll(
-			readiness.NamedChecker{Name: "reconciliation", Checker: runner},
-			readiness.NamedChecker{Name: "account_quarantine", Checker: quarantineChecker},
-		)
-		if err != nil {
-			return nil, err
-		}
+	placementReconciliationReadiness, err := newPlacementAccountReadiness(runner, quarantineChecker)
+	if err != nil {
+		return nil, err
 	}
 	if err := reconciliationVenue.Bind(placementReconciliationReadiness); err != nil {
 		return nil, err

@@ -12,7 +12,6 @@ import (
 // TestStaticGuardHardLimits 验证 Static Guard Hard Limits 场景下的行为。
 func TestStaticGuardHardLimits(t *testing.T) {
 	guard, err := NewStaticGuard(StaticGuardParams{
-		MaxOrderSize:     "100",
 		MaxOrderNotional: "25",
 	})
 	if err != nil {
@@ -28,7 +27,6 @@ func TestStaticGuardHardLimits(t *testing.T) {
 			intent.Price = ""
 			intent.TimeInForce = domain.TimeInForceIOC
 		}, code: "MARKET_ORDERS_DISABLED"},
-		{name: "size", edit: func(intent *domain.OrderIntent) { intent.Size = "101" }, code: "ORDER_SIZE_LIMIT"},
 		{name: "notional", edit: func(intent *domain.OrderIntent) {
 			intent.Price = "0.51"
 			intent.Size = "50"
@@ -54,7 +52,6 @@ func TestStaticGuardHardLimits(t *testing.T) {
 func TestStaticGuardUsesWorstPriceForMarketOrderNotional(t *testing.T) {
 	guard, err := NewStaticGuard(StaticGuardParams{
 		AllowMarketOrders: true,
-		MaxOrderSize:      "100",
 		MaxOrderNotional:  "25",
 	})
 	if err != nil {
@@ -71,6 +68,19 @@ func TestStaticGuardUsesWorstPriceForMarketOrderNotional(t *testing.T) {
 	intent.WorstPrice = "0.51"
 	if err := guard.Check(context.Background(), intent); !errors.As(err, &rejection) || rejection.Code != "ORDER_NOTIONAL_LIMIT" {
 		t.Fatalf("Check() error = %v, want ORDER_NOTIONAL_LIMIT", err)
+	}
+}
+
+func TestStaticGuardDoesNotSecondGuessStrategyShareSize(t *testing.T) {
+	guard, err := NewStaticGuard(StaticGuardParams{MaxOrderNotional: "20"})
+	if err != nil {
+		t.Fatalf("NewStaticGuard() error = %v", err)
+	}
+	intent := guardIntent()
+	intent.Price = "0.12"
+	intent.Size = "83.33"
+	if err := guard.Check(context.Background(), intent); err != nil {
+		t.Fatalf("strategy-sized order Check() error = %v", err)
 	}
 }
 

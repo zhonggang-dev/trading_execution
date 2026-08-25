@@ -97,7 +97,6 @@ type Execution struct {
 	Mode                 string
 	Venue                string
 	AllowMarketOrders    bool
-	MaxOrderSize         domain.Decimal
 	MaxOrderNotional     domain.Decimal
 	CoordinatorInterval  time.Duration
 	CoordinatorBatchSize int
@@ -167,10 +166,6 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	maxOrderSize, err := decimal("EXECUTION_MAX_ORDER_SIZE", "1000")
-	if err != nil {
-		return Config{}, err
-	}
 	maxOrderNotional, err := decimal("EXECUTION_MAX_ORDER_NOTIONAL", "500")
 	if err != nil {
 		return Config{}, err
@@ -189,7 +184,6 @@ func Load() (Config, error) {
 	}
 	if executionMode == "live" && liveTradingEnabled {
 		for _, key := range []string{
-			"EXECUTION_MAX_ORDER_SIZE",
 			"EXECUTION_MAX_ORDER_NOTIONAL",
 			"POLYMARKET_MAX_BUY_FEE_RATE_BPS",
 			"POLYGON_ORDER_FILLED_CONFIRMATIONS",
@@ -300,7 +294,6 @@ func Load() (Config, error) {
 			Mode:                 executionMode,
 			Venue:                strings.ToLower(env("EXECUTION_VENUE", "polymarket-paper")),
 			AllowMarketOrders:    allowMarketOrders,
-			MaxOrderSize:         maxOrderSize,
 			MaxOrderNotional:     maxOrderNotional,
 			CoordinatorInterval:  coordinatorInterval,
 			CoordinatorBatchSize: coordinatorBatchSize,

@@ -115,7 +115,6 @@ TRADING_RUNTIME_KEYS = frozenset(
         "EXECUTION_MODE",
         "EXECUTION_VENUE",
         "EXECUTION_ALLOW_MARKET_ORDERS",
-        "EXECUTION_MAX_ORDER_SIZE",
         "EXECUTION_MAX_ORDER_NOTIONAL",
         "POLYMARKET_LIVE_TRADING_ENABLED",
         "POLYMARKET_MAX_BUY_FEE_RATE_BPS",
@@ -739,7 +738,6 @@ def validate_environment(
     environment: dict[str, str], *, submission_state: str, entry_submission_state: str = "allowed"
 ) -> tuple[Binding, ...]:
     _required_boolean(environment, "EXECUTION_ALLOW_MARKET_ORDERS", False)
-    _required_static_decimal(environment, "EXECUTION_MAX_ORDER_SIZE")
     _required_static_decimal(environment, "EXECUTION_MAX_ORDER_NOTIONAL")
     max_buy_fee_rate_bps = _required_static_decimal(
         environment, "POLYMARKET_MAX_BUY_FEE_RATE_BPS", allow_zero=True

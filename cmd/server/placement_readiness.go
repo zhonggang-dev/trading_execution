@@ -17,7 +17,38 @@ type placementReadinessVenue struct {
 	venue port.Venue
 
 	mu      sync.RWMutex
-	checker readinessChecker
+	checker placementAccountReadinessChecker
+}
+
+type placementAccountReadinessChecker interface {
+	CheckAccount(context.Context, string) error
+}
+
+type placementAccountReadiness struct {
+	reconciliation placementAccountReadinessChecker
+	global         readinessChecker
+}
+
+func newPlacementAccountReadiness(
+	reconciliation placementAccountReadinessChecker,
+	global readinessChecker,
+) (*placementAccountReadiness, error) {
+	if reconciliation == nil {
+		return nil, fmt.Errorf("account reconciliation readiness is required")
+	}
+	return &placementAccountReadiness{reconciliation: reconciliation, global: global}, nil
+}
+
+func (checker *placementAccountReadiness) CheckAccount(ctx context.Context, accountID string) error {
+	if err := checker.reconciliation.CheckAccount(ctx, accountID); err != nil {
+		return fmt.Errorf("reconciliation: %w", err)
+	}
+	if checker.global != nil {
+		if err := checker.global.Check(ctx); err != nil {
+			return fmt.Errorf("account authorization: %w", err)
+		}
+	}
+	return nil
 }
 
 func newPlacementReadinessVenue(venue port.Venue) (*placementReadinessVenue, error) {
@@ -27,7 +58,7 @@ func newPlacementReadinessVenue(venue port.Venue) (*placementReadinessVenue, err
 	return &placementReadinessVenue{venue: venue}, nil
 }
 
-func (venue *placementReadinessVenue) Bind(checker readinessChecker) error {
+func (venue *placementReadinessVenue) Bind(checker placementAccountReadinessChecker) error {
 	if checker == nil {
 		return fmt.Errorf("placement readiness checker is required")
 	}
@@ -43,20 +74,20 @@ func (venue *placementReadinessVenue) Bind(checker readinessChecker) error {
 func (venue *placementReadinessVenue) Name() string { return venue.venue.Name() }
 
 func (venue *placementReadinessVenue) Place(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
-	if err := venue.checkPlace(ctx); err != nil {
+	if err := venue.checkPlace(ctx, order.Intent.ExecutionAccountID); err != nil {
 		return port.VenueOrder{}, err
 	}
 	return venue.venue.Place(ctx, order)
 }
 
-func (venue *placementReadinessVenue) checkPlace(ctx context.Context) error {
+func (venue *placementReadinessVenue) checkPlace(ctx context.Context, accountID string) error {
 	venue.mu.RLock()
 	checker := venue.checker
 	venue.mu.RUnlock()
 	if checker == nil {
 		return reconciliationNotReadyError(fmt.Errorf("reconciliation readiness is not bound"))
 	}
-	if err := checker.Check(ctx); err != nil {
+	if err := checker.CheckAccount(ctx, strings.TrimSpace(accountID)); err != nil {
 		return reconciliationNotReadyError(err)
 	}
 	return nil
@@ -72,7 +103,7 @@ func (prepared placementReadinessPrepared) ExpectedVenueOrderID() string {
 }
 
 func (venue *placementReadinessVenue) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {
-	if err := venue.checkPlace(ctx); err != nil {
+	if err := venue.checkPlace(ctx, order.Intent.ExecutionAccountID); err != nil {
 		return nil, err
 	}
 	underlying, ok := venue.venue.(port.PreparedVenue)
@@ -92,7 +123,7 @@ func (venue *placementReadinessVenue) PlacePrepared(ctx context.Context, order d
 	if !ok || !supported || prepared.inner == nil {
 		return port.VenueOrder{}, reconciliationNotReadyError(fmt.Errorf("placement readiness prepared placement is invalid"))
 	}
-	if err := venue.checkPlace(ctx); err != nil {
+	if err := venue.checkPlace(ctx, order.Intent.ExecutionAccountID); err != nil {
 		return port.VenueOrder{}, err
 	}
 	return underlying.PlacePrepared(ctx, order, prepared.inner)

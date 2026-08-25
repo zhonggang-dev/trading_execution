@@ -201,7 +201,7 @@ func newPipelineFixture(t *testing.T, maxNotional domain.Decimal, submitEnabled 
 	reservations := paper.NewReservationManager()
 	venue := &countingVenue{delegate: paper.NewVenue("polymarket-paper")}
 	guard, err := adapterrisk.NewStaticGuard(adapterrisk.StaticGuardParams{
-		MaxOrderSize: "100", MaxOrderNotional: maxNotional,
+		MaxOrderNotional: maxNotional,
 	})
 	if err != nil {
 		t.Fatal(err)
