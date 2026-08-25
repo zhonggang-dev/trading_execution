@@ -668,7 +668,10 @@ func noRedirectHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
-// validateStartupReconciliation 确认所有配置账户均成功完成启动对账。
+// validateStartupReconciliation confirms that every configured account was
+// observed during startup. ATTENTION_REQUIRED is a durable, account-local
+// state: global readiness remains degraded and CheckAccount blocks placement
+// for that wallet, while unrelated reconciled wallets may continue trading.
 func validateStartupReconciliation(result reconciliation.SweepResult, expectedAccounts int) error {
 	if len(result.Runs) != expectedAccounts {
 		return fmt.Errorf("live startup reconciliation returned %d account run(s), want %d", len(result.Runs), expectedAccounts)
@@ -677,9 +680,12 @@ func validateStartupReconciliation(result reconciliation.SweepResult, expectedAc
 		return fmt.Errorf("live startup reconciliation failed: %w", err)
 	}
 	for _, run := range result.Runs {
-		if run.Run.Status != domain.ReconciliationRunCompleted {
+		switch run.Run.Status {
+		case domain.ReconciliationRunCompleted, domain.ReconciliationRunAttentionRequired:
+			continue
+		default:
 			return fmt.Errorf(
-				"execution account %q startup reconciliation requires attention (status %s, issues %d)",
+				"execution account %q startup reconciliation failed closed (status %s, issues %d)",
 				run.Run.ExecutionAccountID, run.Run.Status, len(run.Issues),
 			)
 		}

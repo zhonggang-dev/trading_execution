@@ -51,7 +51,7 @@ func (checker *livePreflightEligibility) Check(
 	return checker.result, checker.err
 }
 
-func TestValidateStartupReconciliationRequiresEveryAccountCompleted(t *testing.T) {
+func TestValidateStartupReconciliationAllowsAccountLocalAttention(t *testing.T) {
 	completed := reconciliation.SweepResult{Runs: []reconciliation.Result{{
 		Run: domain.ReconciliationRun{
 			ExecutionAccountID: "wallet-1",
@@ -60,6 +60,16 @@ func TestValidateStartupReconciliationRequiresEveryAccountCompleted(t *testing.T
 	}}}
 	if err := validateStartupReconciliation(completed, 1); err != nil {
 		t.Fatalf("validate completed startup reconciliation: %v", err)
+	}
+	attention := reconciliation.SweepResult{Runs: []reconciliation.Result{{
+		Run: domain.ReconciliationRun{
+			ExecutionAccountID: "main",
+			Status:             domain.ReconciliationRunAttentionRequired,
+		},
+		Issues: []domain.ReconciliationIssue{{}},
+	}}}
+	if err := validateStartupReconciliation(attention, 1); err != nil {
+		t.Fatalf("validate account-local attention startup reconciliation: %v", err)
 	}
 
 	tests := []struct {
@@ -81,15 +91,15 @@ func TestValidateStartupReconciliationRequiresEveryAccountCompleted(t *testing.T
 			want: "position source unavailable",
 		},
 		{
-			name: "attention required",
+			name: "failed run",
 			result: reconciliation.SweepResult{Runs: []reconciliation.Result{{
 				Run: domain.ReconciliationRun{
 					ExecutionAccountID: "wallet-1",
-					Status:             domain.ReconciliationRunAttentionRequired,
+					Status:             domain.ReconciliationRunFailed,
 				},
 				Issues: []domain.ReconciliationIssue{{}},
 			}}},
-			want: "requires attention",
+			want: "failed closed",
 		},
 	}
 	for _, test := range tests {
