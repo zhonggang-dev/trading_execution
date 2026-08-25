@@ -155,24 +155,46 @@ func TestCheckRejectsBrokenBalanceInvariant(t *testing.T) {
 	}
 }
 
-// TestCheckDoesNotApplyMonetaryAllocationCaps 验证金额与曝口分配由上游策略决定。
-func TestCheckDoesNotApplyMonetaryAllocationCaps(t *testing.T) {
-	now, intent, snapshot := validRiskFixtures()
-	snapshot.Limits.MaxOrderNotional = "1"
-	snapshot.Limits.MaxMarketExposure = "1"
-	snapshot.Limits.MaxStrategyExposure = "1"
-	snapshot.Limits.MaxWalletExposure = "10"
-	snapshot.Limits.MaxDailyTradedNotional = "1"
-	snapshot.DailyTradedNotional = "1000000"
-	snapshot.Positions = []domain.RiskPosition{
-		position("strategy-v1", "market-1", "other-token", "1", "1000000"),
+// TestCheckEnforcesMonetaryHardLimits 验证每类金额硬上限都能独立拒绝新增风险。
+func TestCheckEnforcesMonetaryHardLimits(t *testing.T) {
+	tests := []struct {
+		name   string
+		code   string
+		mutate func(*domain.HardRiskSnapshot)
+	}{
+		{name: "order", code: "MAX_ORDER_NOTIONAL_EXCEEDED", mutate: func(snapshot *domain.HardRiskSnapshot) {
+			snapshot.Limits.MaxOrderNotional = "4"
+		}},
+		{name: "daily", code: "DAILY_TRADED_NOTIONAL_EXCEEDED", mutate: func(snapshot *domain.HardRiskSnapshot) {
+			snapshot.Limits.MaxDailyTradedNotional = "14"
+		}},
+		{name: "market", code: "MAX_MARKET_EXPOSURE_EXCEEDED", mutate: func(snapshot *domain.HardRiskSnapshot) {
+			snapshot.OpenOrders = []domain.RiskOpenOrder{
+				openOrder(domain.SideBuy, "other-token", "other-strategy", "market-1", "92", "0.5"),
+			}
+		}},
+		{name: "strategy", code: "MAX_STRATEGY_EXPOSURE_EXCEEDED", mutate: func(snapshot *domain.HardRiskSnapshot) {
+			snapshot.Positions = []domain.RiskPosition{
+				position("strategy-v1", "other-market", "other-token", "1", "66"),
+			}
+		}},
+		{name: "wallet", code: "MAX_WALLET_EXPOSURE_EXCEEDED", mutate: func(snapshot *domain.HardRiskSnapshot) {
+			snapshot.Positions = []domain.RiskPosition{
+				position("other-strategy", "other-market", "other-token", "1", "96"),
+			}
+		}},
 	}
-	snapshot.OpenOrders = []domain.RiskOpenOrder{
-		openOrder(domain.SideBuy, "other-token", "other-strategy", "other-market", "11", "0.5"),
-	}
-	service := newRiskService(t, now, &fakeRiskSource{snapshot: snapshot})
-	if err := service.Check(context.Background(), intent); err != nil {
-		t.Fatalf("Check() error = %v, monetary allocation caps must not be enforced", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now, intent, snapshot := validRiskFixtures()
+			test.mutate(&snapshot)
+			service := newRiskService(t, now, &fakeRiskSource{snapshot: snapshot})
+			err := service.Check(context.Background(), intent)
+			var rejection *port.Rejection
+			if !errors.As(err, &rejection) || rejection.Code != test.code {
+				t.Fatalf("Check() error = %v, want %s", err, test.code)
+			}
+		})
 	}
 }
 

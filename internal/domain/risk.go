@@ -2,9 +2,7 @@ package domain
 
 import "time"
 
-// HardRiskLimits keeps policy identity and execution-data freshness limits.
-// Monetary fields remain only for backward-compatible audit decoding and are
-// not order-authorization inputs; allocation limits belong to the AI layer.
+// HardRiskLimits 保存账户级资金上限和执行数据新鲜度限制。
 type HardRiskLimits struct {
 	PolicyID               string        `json:"policy_id"`
 	MaxOrderNotional       Decimal       `json:"max_order_notional"`
