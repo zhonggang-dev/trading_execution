@@ -191,7 +191,7 @@ type pipelineFixture struct {
 }
 
 // newPipelineFixture 组装算法决策到真实执行服务的完整纸交易测试链路。
-func newPipelineFixture(t *testing.T, maxNotional domain.Decimal, submitEnabled ...bool) *pipelineFixture {
+func newPipelineFixture(t *testing.T, submitEnabled ...bool) *pipelineFixture {
 	t.Helper()
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
@@ -200,9 +200,7 @@ func newPipelineFixture(t *testing.T, maxNotional domain.Decimal, submitEnabled 
 	repository := memory.NewOrderRepository()
 	reservations := paper.NewReservationManager()
 	venue := &countingVenue{delegate: paper.NewVenue("polymarket-paper")}
-	guard, err := adapterrisk.NewStaticGuard(adapterrisk.StaticGuardParams{
-		MaxOrderSize: "100", MaxOrderNotional: maxNotional,
-	})
+	guard, err := adapterrisk.NewStaticGuard(adapterrisk.StaticGuardParams{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +288,7 @@ func validSubmitResponse(decisionAt time.Time, prediction domain.Prediction) dom
 
 // TestAlgorithmToExecutionPaperPipelineAndReplay 验证算法下单可贯通执行链路且周期重放不会重复触达交易所。
 func TestAlgorithmToExecutionPaperPipelineAndReplay(t *testing.T) {
-	fixture := newPipelineFixture(t, "100")
+	fixture := newPipelineFixture(t)
 	result, err := fixture.service.Run(context.Background(), fixture.decisionAt)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -350,26 +348,26 @@ func TestAlgorithmToExecutionPaperPipelineAndReplay(t *testing.T) {
 	}
 }
 
-// TestAlgorithmOrderRejectedByHardRiskBeforeVenue 验证算法合法下单超过硬风控时被拒绝且不会预占或触达交易所。
-func TestAlgorithmOrderRejectedByHardRiskBeforeVenue(t *testing.T) {
-	fixture := newPipelineFixture(t, "5")
+// TestAlgorithmOrderNotionalIsOwnedByStrategy 验证 Go 不再对策略返回的金额施加额外上限。
+func TestAlgorithmOrderNotionalIsOwnedByStrategy(t *testing.T) {
+	fixture := newPipelineFixture(t)
+	fixture.strategy.response.Evaluations[0].Order.Size = "20"
 	result, err := fixture.service.Run(context.Background(), fixture.decisionAt)
-	var rejection *port.Rejection
-	if !errors.As(err, &rejection) || rejection.Code != "ORDER_NOTIONAL_LIMIT" {
-		t.Fatalf("Run() error = %v, rejection = %#v", err, rejection)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 	if len(result.Runs) != 1 || len(result.Runs[0].Intents) != 1 {
 		t.Fatalf("pipeline result = %#v", result)
 	}
 	order := result.Runs[0].Intents[0].Result.Order
-	if order.Status != domain.OrderStatusRejected || order.FailureCode != "ORDER_NOTIONAL_LIMIT" {
-		t.Fatalf("rejected order = %#v", order)
+	if order.Status != domain.OrderStatusLive {
+		t.Fatalf("submitted order = %#v", order)
 	}
-	if fixture.venue.placeCalls != 0 {
-		t.Fatalf("hard-risk rejection reached venue %d times", fixture.venue.placeCalls)
+	if fixture.venue.placeCalls != 1 {
+		t.Fatalf("strategy SUBMIT reached venue %d times, want 1", fixture.venue.placeCalls)
 	}
-	if _, ok := fixture.reservations.Get(order.ID); ok {
-		t.Fatal("hard-risk rejection unexpectedly created a reservation")
+	if _, ok := fixture.reservations.Get(order.ID); !ok {
+		t.Fatal("strategy SUBMIT did not create a reservation")
 	}
 }
 
@@ -377,7 +375,7 @@ func TestAlgorithmOrderRejectedByHardRiskBeforeVenue(t *testing.T) {
 // that the independent production gate still exercises the complete upstream
 // decision path while preventing any call into execution.Submit.
 func TestDecisionCycleSubmissionGateRecordsOutputWithoutCreatingAnOrder(t *testing.T) {
-	fixture := newPipelineFixture(t, "100", false)
+	fixture := newPipelineFixture(t, false)
 	result, err := fixture.service.Run(context.Background(), fixture.decisionAt)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)

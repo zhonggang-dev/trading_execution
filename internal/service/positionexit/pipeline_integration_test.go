@@ -17,9 +17,7 @@ func TestAlgorithmSellToExecutionPaperPipelineAndReplay(t *testing.T) {
 	fixture := newFixture(t)
 	repository := memory.NewOrderRepository()
 	reservations := paper.NewReservationManager()
-	guard, err := adapterrisk.NewStaticGuard(adapterrisk.StaticGuardParams{
-		MaxOrderSize: "100", MaxOrderNotional: "100",
-	})
+	guard, err := adapterrisk.NewStaticGuard(adapterrisk.StaticGuardParams{})
 	if err != nil {
 		t.Fatal(err)
 	}

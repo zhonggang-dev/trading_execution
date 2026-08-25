@@ -3,6 +3,7 @@ package polymarket
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,12 +17,20 @@ import (
 )
 
 const (
-	ctfExchangeDomainName    = "Polymarket CTF Exchange"
-	ctfExchangeDomainVersion = "2"
-	zeroBytes32              = "0x0000000000000000000000000000000000000000000000000000000000000000"
-	polygonChainID           = int64(137)
-	polygonExchangeV2        = "0xE111180000d2663C0091e4f400237545B87B996B"
-	polygonNegRiskExchangeV2 = "0xe2222d279d744050d28e00520010520000310F59"
+	ctfExchangeDomainName      = "Polymarket CTF Exchange"
+	ctfExchangeDomainVersion   = "2"
+	depositWalletDomainName    = "DepositWallet"
+	depositWalletDomainVersion = "1"
+	zeroBytes32                = "0x0000000000000000000000000000000000000000000000000000000000000000"
+	polygonChainID             = int64(137)
+	polygonExchangeV2          = "0xE111180000d2663C0091e4f400237545B87B996B"
+	polygonNegRiskExchangeV2   = "0xe2222d279d744050d28e00520010520000310F59"
+)
+
+const (
+	eip712DomainType  = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+	orderTypeString   = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)"
+	typedDataSignType = "TypedDataSign(Order contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)" + orderTypeString
 )
 
 // signedOrderV2 表示后端使用的 signedOrderV2 类型。
@@ -65,9 +74,6 @@ func (builder orderBuilder) build(ctx context.Context, order domain.Order, accou
 	if order.MarketValidation == nil {
 		return postOrderPayload{}, "", newInvalidError("MARKET_VALIDATION_REQUIRED", "persisted market validation is required before signing")
 	}
-	if account.SignatureType == SignatureTypePolyEIP1271 {
-		return postOrderPayload{}, "", newInvalidError("SIGNATURE_TYPE_UNSUPPORTED", "POLY_1271 wrapped signatures are disabled")
-	}
 	amounts, err := buildRawAmounts(
 		order.Intent,
 		order.MarketValidation.TickSize,
@@ -99,11 +105,16 @@ func (builder orderBuilder) build(ctx context.Context, order domain.Order, accou
 		return postOrderPayload{}, "", newInvalidError("INVALID_BYTES32", "metadata and builder code must be 32-byte hex values")
 	}
 	signerAddress := account.Signer.Address()
+	if account.SignatureType == SignatureTypePolyEIP1271 {
+		// Deposit Wallet orders are authored by the contract wallet. The EOA
+		// controls it by signing the outer ERC-7739 TypedDataSign envelope.
+		signerAddress = account.FunderAddress
+	}
 	exchange := polygonExchangeV2
 	if order.MarketValidation.NegRisk {
 		exchange = polygonNegRiskExchangeV2
 	}
-	digest, err := orderDigest(orderDigestInput{
+	digestInput := orderDigestInput{
 		ChainID:       builder.chainID,
 		Exchange:      exchange,
 		Salt:          salt,
@@ -117,16 +128,29 @@ func (builder orderBuilder) build(ctx context.Context, order domain.Order, accou
 		Timestamp:     timestamp,
 		Metadata:      metadata,
 		Builder:       builderCode,
-	})
+	}
+	orderIDDigest, err := orderDigest(digestInput)
 	if err != nil {
 		return postOrderPayload{}, "", fmt.Errorf("build order EIP-712 digest: %w", err)
 	}
-	signature, err := account.Signer.SignDigest(ctx, digest)
+	signatureDigest := orderIDDigest
+	var depositEnvelope *poly1271OrderEnvelope
+	if account.SignatureType == SignatureTypePolyEIP1271 {
+		depositEnvelope, err = buildPoly1271OrderEnvelope(digestInput)
+		if err != nil {
+			return postOrderPayload{}, "", fmt.Errorf("build deposit-wallet order envelope: %w", err)
+		}
+		signatureDigest = depositEnvelope.digest
+	}
+	signature, err := account.Signer.SignDigest(ctx, signatureDigest)
 	if err != nil {
 		return postOrderPayload{}, "", fmt.Errorf("sign order: %w", err)
 	}
 	if len(signature) != 65 {
 		return postOrderPayload{}, "", fmt.Errorf("order signer returned %d bytes, want 65", len(signature))
+	}
+	if depositEnvelope != nil {
+		signature = depositEnvelope.wrap(signature)
 	}
 	side := "BUY"
 	if amounts.Side == 1 {
@@ -152,7 +176,7 @@ func (builder orderBuilder) build(ctx context.Context, order domain.Order, accou
 		OrderType: orderType,
 		DeferExec: false,
 		PostOnly:  false,
-	}, "0x" + hex.EncodeToString(digest), nil
+	}, "0x" + hex.EncodeToString(orderIDDigest), nil
 }
 
 // orderDigestInput 表示后端使用的 orderDigestInput 类型。
@@ -174,17 +198,29 @@ type orderDigestInput struct {
 
 // orderDigest 构建订单签名或鉴权所需的规范化字节数据。
 func orderDigest(input orderDigestInput) ([]byte, error) {
-	const domainType = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
-	const orderType = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)"
-	if input.ChainID <= 0 || input.Timestamp < 0 || input.Salt == nil || input.Salt.Sign() < 0 || input.Salt.BitLen() > 256 {
-		return nil, fmt.Errorf("chain id, timestamp, and salt must form valid unsigned values")
-	}
-	domainAddress, err := addressWord(input.Exchange)
+	hashes, err := buildOrderHashes(input)
 	if err != nil {
 		return nil, err
 	}
+	return hashes.digest, nil
+}
+
+type orderHashes struct {
+	domainSeparator []byte
+	contentsHash    []byte
+	digest          []byte
+}
+
+func buildOrderHashes(input orderDigestInput) (orderHashes, error) {
+	if input.ChainID <= 0 || input.Timestamp < 0 || input.Salt == nil || input.Salt.Sign() < 0 || input.Salt.BitLen() > 256 {
+		return orderHashes{}, fmt.Errorf("chain id, timestamp, and salt must form valid unsigned values")
+	}
+	domainAddress, err := addressWord(input.Exchange)
+	if err != nil {
+		return orderHashes{}, err
+	}
 	domainSeparator := keccak256(concatWords(
-		keccak256([]byte(domainType)),
+		keccak256([]byte(eip712DomainType)),
 		keccak256([]byte(ctfExchangeDomainName)),
 		keccak256([]byte(ctfExchangeDomainVersion)),
 		uint256Word(big.NewInt(input.ChainID)),
@@ -192,41 +228,91 @@ func orderDigest(input orderDigestInput) ([]byte, error) {
 	))
 	maker, err := addressWord(input.Maker)
 	if err != nil {
-		return nil, err
+		return orderHashes{}, err
 	}
 	signer, err := addressWord(input.Signer)
 	if err != nil {
-		return nil, err
+		return orderHashes{}, err
 	}
 	tokenID, err := parseUint256(input.TokenID)
 	if err != nil {
-		return nil, fmt.Errorf("token id: %w", err)
+		return orderHashes{}, fmt.Errorf("token id: %w", err)
 	}
 	makerAmount, err := parseUint256(input.MakerAmount)
 	if err != nil {
-		return nil, fmt.Errorf("maker amount: %w", err)
+		return orderHashes{}, fmt.Errorf("maker amount: %w", err)
 	}
 	takerAmount, err := parseUint256(input.TakerAmount)
 	if err != nil {
-		return nil, fmt.Errorf("taker amount: %w", err)
+		return orderHashes{}, fmt.Errorf("taker amount: %w", err)
 	}
 	metadata, err := bytes32Word(input.Metadata)
 	if err != nil {
-		return nil, fmt.Errorf("metadata: %w", err)
+		return orderHashes{}, fmt.Errorf("metadata: %w", err)
 	}
 	builder, err := bytes32Word(input.Builder)
 	if err != nil {
-		return nil, fmt.Errorf("builder: %w", err)
+		return orderHashes{}, fmt.Errorf("builder: %w", err)
 	}
 	orderHash := keccak256(concatWords(
-		keccak256([]byte(orderType)),
+		keccak256([]byte(orderTypeString)),
 		uint256Word(input.Salt), maker, signer,
 		uint256Word(tokenID), uint256Word(makerAmount), uint256Word(takerAmount),
 		uint256Word(new(big.Int).SetUint64(uint64(input.Side))),
 		uint256Word(new(big.Int).SetUint64(uint64(input.SignatureType))),
 		uint256Word(big.NewInt(input.Timestamp)), metadata, builder,
 	))
-	return keccak256([]byte{0x19, 0x01}, domainSeparator, orderHash), nil
+	return orderHashes{
+		domainSeparator: domainSeparator,
+		contentsHash:    orderHash,
+		digest:          keccak256([]byte{0x19, 0x01}, domainSeparator, orderHash),
+	}, nil
+}
+
+type poly1271OrderEnvelope struct {
+	digest          []byte
+	domainSeparator []byte
+	contentsHash    []byte
+}
+
+func buildPoly1271OrderEnvelope(input orderDigestInput) (*poly1271OrderEnvelope, error) {
+	if input.SignatureType != uint8(SignatureTypePolyEIP1271) {
+		return nil, fmt.Errorf("deposit-wallet envelope requires signature type %d", SignatureTypePolyEIP1271)
+	}
+	hashes, err := buildOrderHashes(input)
+	if err != nil {
+		return nil, err
+	}
+	depositWallet, err := addressWord(input.Signer)
+	if err != nil {
+		return nil, fmt.Errorf("deposit wallet signer: %w", err)
+	}
+	outerHash := keccak256(concatWords(
+		keccak256([]byte(typedDataSignType)),
+		hashes.contentsHash,
+		keccak256([]byte(depositWalletDomainName)),
+		keccak256([]byte(depositWalletDomainVersion)),
+		uint256Word(big.NewInt(input.ChainID)),
+		depositWallet,
+		make([]byte, 32),
+	))
+	return &poly1271OrderEnvelope{
+		digest:          keccak256([]byte{0x19, 0x01}, hashes.domainSeparator, outerHash),
+		domainSeparator: hashes.domainSeparator,
+		contentsHash:    hashes.contentsHash,
+	}, nil
+}
+
+func (envelope *poly1271OrderEnvelope) wrap(signature []byte) []byte {
+	length := make([]byte, 2)
+	binary.BigEndian.PutUint16(length, uint16(len(orderTypeString)))
+	wrapped := make([]byte, 0, len(signature)+64+len(orderTypeString)+2)
+	wrapped = append(wrapped, signature...)
+	wrapped = append(wrapped, envelope.domainSeparator...)
+	wrapped = append(wrapped, envelope.contentsHash...)
+	wrapped = append(wrapped, []byte(orderTypeString)...)
+	wrapped = append(wrapped, length...)
+	return wrapped
 }
 
 // concatWords 构建订单签名或鉴权所需的规范化字节数据。

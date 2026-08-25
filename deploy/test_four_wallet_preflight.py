@@ -46,8 +46,6 @@ TRADING_COMMIT = "a" * 40
 PREDICTION_COMMIT = "b" * 40
 STATIC_TRADING_ENVIRONMENT = {
     "EXECUTION_ALLOW_MARKET_ORDERS": "false",
-    "EXECUTION_MAX_ORDER_SIZE": "20",
-    "EXECUTION_MAX_ORDER_NOTIONAL": "40",
     "POLYMARKET_MAX_BUY_FEE_RATE_BPS": "10000",
     "POLYGON_ORDER_FILLED_CONFIRMATIONS": "64",
     "DECISION_CYCLE_MID_PRICE_LOOKBACK": "48h",
@@ -58,8 +56,6 @@ STATIC_TRADING_ENVIRONMENT = {
 }
 STATIC_TRADING_DRIFT = {
     "EXECUTION_ALLOW_MARKET_ORDERS": "true",
-    "EXECUTION_MAX_ORDER_SIZE": "21",
-    "EXECUTION_MAX_ORDER_NOTIONAL": "41",
     "POLYMARKET_MAX_BUY_FEE_RATE_BPS": "9999",
     "POLYGON_ORDER_FILLED_CONFIRMATIONS": "65",
     "DECISION_CYCLE_MID_PRICE_LOOKBACK": "47h",
@@ -263,7 +259,7 @@ def approved_risk_contracts(
         row["execution_account_id"]: {
             "policy_id": row["policy_id"],
             "version": row["version"],
-            **{field: row[field] for field in preflight.POLICY_LIMIT_FIELDS},
+            **{field: row[field] for field in preflight.POLICY_FRESHNESS_FIELDS},
             "daily_timezone": row["daily_timezone"],
         }
         for row in state["risk_policies"]
@@ -514,17 +510,19 @@ class DatabaseStateTests(unittest.TestCase):
                 approved_risk_contracts=contracts,
             )
 
-    def test_rejects_unapproved_or_invalid_risk_contract(self) -> None:
+    def test_legacy_monetary_fields_do_not_gate_preflight(self) -> None:
         drifted = database_state()
         drifted["risk_policies"][0]["max_wallet_exposure"] = 99
-        with self.assertRaisesRegex(preflight.PreflightError, "reviewed current-rollout"):
-            self.validate(drifted)
+        drifted["risk_policies"][0]["max_order_notional"] = 0
+        self.validate(drifted)
 
+    def test_rejects_invalid_freshness_contract(self) -> None:
         invalid = database_state()
-        invalid["risk_policies"][0]["max_order_notional"] = 0
-        with self.assertRaisesRegex(preflight.PreflightError, "invalid max_order_notional"):
+        invalid["risk_policies"][0]["max_state_age_ms"] = 0
+        with self.assertRaisesRegex(preflight.PreflightError, "invalid max_state_age_ms"):
             self.validate(invalid)
 
+    def test_rejects_non_utc_policy_timezone(self) -> None:
         timezone = database_state()
         timezone["risk_policies"][0]["daily_timezone"] = "Asia/Shanghai"
         with self.assertRaisesRegex(preflight.PreflightError, "daily_timezone UTC"):
@@ -823,10 +821,6 @@ class EnvironmentTests(unittest.TestCase):
             environment["POLYMARKET_MAX_BUY_FEE_RATE_BPS"] = "10000.0000000000000001"
             with self.assertRaisesRegex(preflight.PreflightError, "must not exceed 10000"):
                 preflight.validate_environment(environment, submission_state="disabled")
-
-            environment = self.environment(wallet_path)
-            environment["EXECUTION_MAX_ORDER_SIZE"] = "0.0000000000000001"
-            preflight.validate_environment(environment, submission_state="disabled")
 
     def test_rejects_wallet_subset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

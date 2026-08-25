@@ -8,7 +8,7 @@
 
 - `DigestSigner`：EOA、本地 signer、HSM 或 KMS 的统一签名接口；
 - `FunderAddress`：实际持有 pUSD/shares 的钱包；
-- `SignatureType`：EOA、POLY_PROXY、GNOSIS_SAFE；
+- `SignatureType`：EOA、POLY_PROXY、GNOSIS_SAFE、DEPOSIT_WALLET/POLY_1271；
 - API key、base64url secret、passphrase：用于 L2 HMAC；
 - 不存在默认钱包或 fallback，找不到账户直接拒绝。
 
@@ -21,7 +21,9 @@ order hash 和确认数作为不可变证据持久化。`/data/trades.fee_rate_b
 可由事件直接证明；非零 `BuilderCode` 如果没有独立、权威且能与链上 total fee 对账的拆分证据，
 成交会 fail closed，而不是猜测 platform/builder 分摊。
 
-当前支持 V2 signature type `0/1/2`。`POLY_1271 (3)` 使用官方 V2 特有的 Solady/EIP-1271 包装签名，当前会 fail closed；在完成 deposit-wallet 合约一致性测试以前，不能把它误当普通 EIP-712 签名。
+当前支持 V2 signature type `0/1/2/3`。`POLY_1271 (3)` 使用官方 V2 的 Deposit Wallet
+`TypedDataSign` 外层摘要和 ERC-7739 trailer；订单的 maker/signer 都是经过确定性地址校验的
+Deposit Wallet，底层 EOA 只签外层摘要，不能把它误当普通 EIP-712 签名。
 
 ## 签名和请求
 

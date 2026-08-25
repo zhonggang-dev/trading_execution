@@ -78,27 +78,12 @@ func TestCheckRejectsUnsafeOrders(t *testing.T) {
 		{name: "stale risk state", code: "RISK_STATE_STALE", mutate: func(_ *domain.OrderIntent, snapshot *domain.HardRiskSnapshot, now time.Time) {
 			snapshot.ObservedAt = now.Add(-11 * time.Second)
 		}},
-		{name: "single order limit", code: "MAX_ORDER_NOTIONAL_EXCEEDED", mutate: func(_ *domain.OrderIntent, snapshot *domain.HardRiskSnapshot, _ time.Time) {
-			snapshot.Limits.MaxOrderNotional = "4"
-		}},
-		{name: "daily limit", code: "DAILY_TRADED_NOTIONAL_EXCEEDED", mutate: func(_ *domain.OrderIntent, snapshot *domain.HardRiskSnapshot, _ time.Time) {
-			snapshot.DailyTradedNotional = "198"
-		}},
 		{name: "same direction order", code: "SAME_DIRECTION_ORDER_EXISTS", mutate: func(_ *domain.OrderIntent, snapshot *domain.HardRiskSnapshot, _ time.Time) {
 			snapshot.OpenOrders = []domain.RiskOpenOrder{openOrder(domain.SideBuy, "yes-token", "other-strategy", "market-1", "1", "0.5")}
 		}},
 		{name: "wallet balance", code: "INSUFFICIENT_WALLET_BALANCE", mutate: func(_ *domain.OrderIntent, snapshot *domain.HardRiskSnapshot, _ time.Time) {
 			snapshot.AvailableBalance = "4"
 			snapshot.ReservedBalance = "96"
-		}},
-		{name: "market exposure", code: "MAX_MARKET_EXPOSURE_EXCEEDED", mutate: func(_ *domain.OrderIntent, snapshot *domain.HardRiskSnapshot, _ time.Time) {
-			snapshot.Positions = []domain.RiskPosition{position("other-strategy", "market-1", "other-token", "1", "48")}
-		}},
-		{name: "strategy exposure", code: "MAX_STRATEGY_EXPOSURE_EXCEEDED", mutate: func(_ *domain.OrderIntent, snapshot *domain.HardRiskSnapshot, _ time.Time) {
-			snapshot.Positions = []domain.RiskPosition{position("strategy-v1", "other-market", "other-token", "1", "68")}
-		}},
-		{name: "wallet exposure", code: "MAX_WALLET_EXPOSURE_EXCEEDED", mutate: func(_ *domain.OrderIntent, snapshot *domain.HardRiskSnapshot, _ time.Time) {
-			snapshot.Positions = []domain.RiskPosition{position("other-strategy", "other-market", "other-token", "1", "98")}
 		}},
 		{name: "duplicate sell", code: "DUPLICATE_SELL_ORDER", mutate: func(intent *domain.OrderIntent, snapshot *domain.HardRiskSnapshot, _ time.Time) {
 			intent.Side = domain.SideSell
@@ -170,53 +155,24 @@ func TestCheckRejectsBrokenBalanceInvariant(t *testing.T) {
 	}
 }
 
-// TestCheckUsesWorstPriceForMarketOrderNotional 验证 Check Uses Worst Price For Market Order Notional 场景下的行为。
-func TestCheckUsesWorstPriceForMarketOrderNotional(t *testing.T) {
+// TestCheckDoesNotApplyMonetaryAllocationCaps 验证金额与曝口分配由上游策略决定。
+func TestCheckDoesNotApplyMonetaryAllocationCaps(t *testing.T) {
 	now, intent, snapshot := validRiskFixtures()
-	intent.Type = domain.OrderTypeMarket
-	intent.TimeInForce = domain.TimeInForceFOK
-	intent.Price = ""
-	intent.WorstPrice = "0.8"
-	intent.Size = "10"
-	snapshot.Limits.MaxOrderNotional = "7.99"
-	service := newRiskService(t, now, &fakeRiskSource{snapshot: snapshot})
-
-	err := service.Check(context.Background(), intent)
-	var rejection *port.Rejection
-	if !errors.As(err, &rejection) || rejection.Code != "MAX_ORDER_NOTIONAL_EXCEEDED" {
-		t.Fatalf("Check() error = %v, want MAX_ORDER_NOTIONAL_EXCEEDED", err)
-	}
-}
-
-// TestCheckUsesWorstPriceForLimitOrderNotional 验证 Check Uses Worst Price For Limit Order Notional 场景下的行为。
-func TestCheckUsesWorstPriceForLimitOrderNotional(t *testing.T) {
-	now, intent, snapshot := validRiskFixtures()
-	intent.Price = "0.5"
-	intent.WorstPrice = "0.8"
-	intent.Size = "10"
-	snapshot.Limits.MaxOrderNotional = "7.99"
-	service := newRiskService(t, now, &fakeRiskSource{snapshot: snapshot})
-
-	err := service.Check(context.Background(), intent)
-	var rejection *port.Rejection
-	if !errors.As(err, &rejection) || rejection.Code != "MAX_ORDER_NOTIONAL_EXCEEDED" {
-		t.Fatalf("Check() error = %v, want protected limit-order notional rejection", err)
-	}
-}
-
-// TestCheckCountsActiveBuyReservationsAgainstExposure 验证 Check Counts Active Buy Reservations Against Exposure 场景下的行为。
-func TestCheckCountsActiveBuyReservationsAgainstExposure(t *testing.T) {
-	now, intent, snapshot := validRiskFixtures()
+	snapshot.Limits.MaxOrderNotional = "1"
+	snapshot.Limits.MaxMarketExposure = "1"
+	snapshot.Limits.MaxStrategyExposure = "1"
 	snapshot.Limits.MaxWalletExposure = "10"
+	snapshot.Limits.MaxDailyTradedNotional = "1"
+	snapshot.DailyTradedNotional = "1000000"
+	snapshot.Positions = []domain.RiskPosition{
+		position("strategy-v1", "market-1", "other-token", "1", "1000000"),
+	}
 	snapshot.OpenOrders = []domain.RiskOpenOrder{
 		openOrder(domain.SideBuy, "other-token", "other-strategy", "other-market", "11", "0.5"),
 	}
 	service := newRiskService(t, now, &fakeRiskSource{snapshot: snapshot})
-
-	err := service.Check(context.Background(), intent)
-	var rejection *port.Rejection
-	if !errors.As(err, &rejection) || rejection.Code != "MAX_WALLET_EXPOSURE_EXCEEDED" {
-		t.Fatalf("Check() error = %v, want MAX_WALLET_EXPOSURE_EXCEEDED", err)
+	if err := service.Check(context.Background(), intent); err != nil {
+		t.Fatalf("Check() error = %v, monetary allocation caps must not be enforced", err)
 	}
 }
 

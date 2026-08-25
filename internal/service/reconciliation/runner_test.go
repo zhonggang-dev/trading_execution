@@ -227,6 +227,38 @@ func TestRunnerCheckAcceptsFreshResultsWhileLoopRuns(t *testing.T) {
 	}
 }
 
+func TestRunnerCheckAccountDoesNotLetUnrelatedWalletBlockPlacement(t *testing.T) {
+	clock := &runnerTestClock{now: time.Date(2026, time.August, 25, 3, 20, 0, 0, time.UTC)}
+	service := &fakeAccountReconciler{now: clock.Now}
+	runner, err := NewRunner(RunnerParams{
+		Service: service, Accounts: []string{"main", "wallet-7"}, Interval: time.Hour,
+		Now: clock.Now, MaxResultAge: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Sweep(context.Background(), domain.ReconciliationTriggerStartup)
+	cancel, done := startReadinessTestLoop(t, runner)
+	defer stopReadinessTestLoop(t, cancel, done)
+
+	completedAt := clock.Now()
+	runner.remember("main", Result{Run: domain.ReconciliationRun{
+		ExecutionAccountID: "main", Status: domain.ReconciliationRunAttentionRequired, CompletedAt: &completedAt,
+	}})
+	if err := runner.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "main") {
+		t.Fatalf("global Check() error = %v, want main reconciliation failure", err)
+	}
+	if err := runner.CheckAccount(context.Background(), "wallet-7"); err != nil {
+		t.Fatalf("wallet-7 CheckAccount() error = %v, want healthy account placement", err)
+	}
+	if err := runner.CheckAccount(context.Background(), "main"); err == nil || !strings.Contains(err.Error(), "ATTENTION_REQUIRED") {
+		t.Fatalf("main CheckAccount() error = %v, want account-local failure", err)
+	}
+	if err := runner.CheckAccount(context.Background(), "wallet-8"); err == nil || !strings.Contains(err.Error(), "not active") {
+		t.Fatalf("unknown CheckAccount() error = %v, want inactive account failure", err)
+	}
+}
+
 func TestRunAfterStartupReadySignalsOnlyAfterLoopIsRunning(t *testing.T) {
 	clock := &runnerTestClock{now: time.Date(2026, time.August, 19, 8, 0, 0, 0, time.UTC)}
 	runner := newReadinessTestRunner(t, clock, false)

@@ -476,12 +476,12 @@ func TestLoadRejectsSharedLiveOperationsToken(t *testing.T) {
 	}
 }
 
-func TestLoadRequiresExplicitLiveRiskLimits(t *testing.T) {
+func TestLoadDoesNotRequireExecutionMonetaryCap(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
 	t.Setenv("EXECUTION_MAX_ORDER_NOTIONAL", "")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be explicitly configured") {
-		t.Fatalf("Load() error = %v, want explicit live risk limit", err)
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() error = %v, monetary allocation belongs to the upstream strategy", err)
 	}
 }
 
@@ -516,7 +516,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"LIVE_OPERATIONS_MAX_SNAPSHOT_AGE", "LIVE_OPERATIONS_EVENT_LIMIT",
 		"DATABASE_CONNECT_TIMEOUT", "TRADING_EXECUTION_DATABASE_URL",
 		"EXECUTION_API_TOKEN", "POSITION_EXIT_JOB_TOKEN", "EXECUTION_MODE", "EXECUTION_VENUE", "EXECUTION_ALLOW_MARKET_ORDERS",
-		"EXECUTION_MAX_ORDER_SIZE", "EXECUTION_MAX_ORDER_NOTIONAL",
+		"EXECUTION_MAX_ORDER_NOTIONAL",
 		"ORDER_COORDINATOR_INTERVAL", "ORDER_COORDINATOR_BATCH_SIZE",
 		"POLYMARKET_LIVE_TRADING_ENABLED", "POLYMARKET_ACCOUNTS_FILE", "POLYMARKET_CLOB_URL",
 		"POLYMARKET_GEOBLOCK_URL", "POLYMARKET_FRONTEND_ONLY_API_COUNTRIES", "POLYMARKET_GAMMA_URL",
@@ -576,8 +576,6 @@ func setCompleteLiveEnvironment(t *testing.T) {
 	t.Setenv("TRADING_EXECUTION_DATABASE_URL", "postgres://example.invalid/trading")
 	t.Setenv("EXECUTION_MODE", "live")
 	t.Setenv("EXECUTION_VENUE", "polymarket")
-	t.Setenv("EXECUTION_MAX_ORDER_SIZE", "10")
-	t.Setenv("EXECUTION_MAX_ORDER_NOTIONAL", "10")
 	t.Setenv("POLYMARKET_LIVE_TRADING_ENABLED", "true")
 	t.Setenv("POLYMARKET_MAX_BUY_FEE_RATE_BPS", "10000")
 	t.Setenv("POLYGON_ORDER_FILLED_CONFIRMATIONS", "64")

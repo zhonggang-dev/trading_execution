@@ -66,6 +66,43 @@ func TestLoadTradingAccountsAcceptsAccountEnvelope(t *testing.T) {
 	}
 }
 
+func TestLoadTradingAccountsAcceptsDeterministicDepositWallet(t *testing.T) {
+	path := writeWalletFile(t, `{"accounts":[{
+		"execution_account_id":"wallet-6",
+		"funder_address":"0x6F908B3B67b9F9C40413775fFf48b286aeF9a081",
+		"private_key":"`+testPrivateKey+`",
+		"signature_type":3,
+		"api_key":"key",
+		"api_secret":"c2VjcmV0",
+		"api_passphrase":"passphrase"
+	}]}`)
+	accounts, err := LoadTradingAccounts(context.Background(), WalletLoadParams{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accounts[0].SignatureType != SignatureTypePolyEIP1271 ||
+		!strings.EqualFold(accounts[0].FunderAddress, "0x6F908B3B67b9F9C40413775fFf48b286aeF9a081") ||
+		!strings.EqualFold(accounts[0].Signer.Address(), testEOAAddress) {
+		t.Fatalf("deposit-wallet account = %#v", accounts[0])
+	}
+}
+
+func TestLoadTradingAccountsRejectsForeignDepositWallet(t *testing.T) {
+	path := writeWalletFile(t, `{"accounts":[{
+		"execution_account_id":"wallet-6",
+		"funder_address":"0x1111111111111111111111111111111111111111",
+		"private_key":"`+testPrivateKey+`",
+		"signature_type":3,
+		"api_key":"key",
+		"api_secret":"c2VjcmV0",
+		"api_passphrase":"passphrase"
+	}]}`)
+	_, err := LoadTradingAccounts(context.Background(), WalletLoadParams{Path: path})
+	if err == nil || !strings.Contains(err.Error(), "deterministic deposit wallet") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 // TestLoadTradingAccountsRequiresExplicitProxySignatureType 验证 Load Trading Accounts Requires Explicit Proxy Signature Type 场景下的行为。
 func TestLoadTradingAccountsRequiresExplicitProxySignatureType(t *testing.T) {
 	path := writeWalletFile(t, `{"wallet":{

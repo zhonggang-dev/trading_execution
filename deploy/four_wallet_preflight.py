@@ -39,60 +39,34 @@ EXPECTED_ROUTES = {
 EXPECTED_ACCOUNTS = frozenset(EXPECTED_ROUTES.values())
 CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS = frozenset()
 ACTIVATABLE_ACCOUNTS = frozenset({"wallet-6", "wallet-7"})
-POLICY_LIMIT_FIELDS = (
-    "max_order_notional",
-    "max_market_exposure",
-    "max_strategy_exposure",
-    "max_wallet_exposure",
-    "max_daily_traded_notional",
+POLICY_FRESHNESS_FIELDS = (
     "max_price_age_ms",
     "max_signal_age_ms",
     "max_state_age_ms",
 )
-# Current rollout evidence contract. main/wallet-1 values come from the
-# production read-only baseline; wallet-6/wallet-7 are the disabled quarantine
-# template. This constant is not approval to activate wallet-6/wallet-7: that
-# requires a new evidence pass and explicit operator approval.
+# The execution layer owns freshness and authorization safety only. Monetary
+# allocation and exposure caps belong to the upstream AI strategy and are not
+# part of the Go-side rollout contract.
 CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT = {
     "main": {
-        "max_order_notional": 1.10,
-        "max_market_exposure": 2.10,
-        "max_strategy_exposure": 2.10,
-        "max_wallet_exposure": 2.10,
-        "max_daily_traded_notional": 1.10,
         "max_price_age_ms": 90_000,
         "max_signal_age_ms": 30_000,
         "max_state_age_ms": 600_000,
         "daily_timezone": "UTC",
     },
     "wallet-1": {
-        "max_order_notional": 1.10,
-        "max_market_exposure": 2.10,
-        "max_strategy_exposure": 2.10,
-        "max_wallet_exposure": 2.10,
-        "max_daily_traded_notional": 1.10,
         "max_price_age_ms": 90_000,
         "max_signal_age_ms": 30_000,
         "max_state_age_ms": 600_000,
         "daily_timezone": "UTC",
     },
     "wallet-6": {
-        "max_order_notional": 1.10,
-        "max_market_exposure": 2.10,
-        "max_strategy_exposure": 2.10,
-        "max_wallet_exposure": 2.10,
-        "max_daily_traded_notional": 1.10,
         "max_price_age_ms": 90_000,
         "max_signal_age_ms": 30_000,
         "max_state_age_ms": 600_000,
         "daily_timezone": "UTC",
     },
     "wallet-7": {
-        "max_order_notional": 1.10,
-        "max_market_exposure": 2.10,
-        "max_strategy_exposure": 2.10,
-        "max_wallet_exposure": 2.10,
-        "max_daily_traded_notional": 1.10,
         "max_price_age_ms": 90_000,
         "max_signal_age_ms": 30_000,
         "max_state_age_ms": 600_000,
@@ -115,8 +89,6 @@ TRADING_RUNTIME_KEYS = frozenset(
         "EXECUTION_MODE",
         "EXECUTION_VENUE",
         "EXECUTION_ALLOW_MARKET_ORDERS",
-        "EXECUTION_MAX_ORDER_SIZE",
-        "EXECUTION_MAX_ORDER_NOTIONAL",
         "POLYMARKET_LIVE_TRADING_ENABLED",
         "POLYMARKET_MAX_BUY_FEE_RATE_BPS",
         "POLYGON_ORDER_FILLED_CONFIRMATIONS",
@@ -201,11 +173,6 @@ SELECT json_build_object(
       'policy_id',policy_id,
       'version',version,
       'enabled',enabled,
-      'max_order_notional',max_order_notional,
-      'max_market_exposure',max_market_exposure,
-      'max_strategy_exposure',max_strategy_exposure,
-      'max_wallet_exposure',max_wallet_exposure,
-      'max_daily_traded_notional',max_daily_traded_notional,
       'max_price_age_ms',max_price_age_ms,
       'max_signal_age_ms',max_signal_age_ms,
       'max_state_age_ms',max_state_age_ms,
@@ -739,8 +706,6 @@ def validate_environment(
     environment: dict[str, str], *, submission_state: str, entry_submission_state: str = "allowed"
 ) -> tuple[Binding, ...]:
     _required_boolean(environment, "EXECUTION_ALLOW_MARKET_ORDERS", False)
-    _required_static_decimal(environment, "EXECUTION_MAX_ORDER_SIZE")
-    _required_static_decimal(environment, "EXECUTION_MAX_ORDER_NOTIONAL")
     max_buy_fee_rate_bps = _required_static_decimal(
         environment, "POLYMARKET_MAX_BUY_FEE_RATE_BPS", allow_zero=True
     )
@@ -1120,7 +1085,7 @@ def validate_database_state(
                 f"database risk policy for {account_id!r} must have "
                 f"enabled={expected_policy_enabled}"
             )
-        for field in POLICY_LIMIT_FIELDS:
+        for field in POLICY_FRESHNESS_FIELDS:
             value = policy.get(field)
             if (
                 not isinstance(value, (int, float))
@@ -1145,7 +1110,7 @@ def validate_database_state(
         )
     for account_id in sorted(EXPECTED_ACCOUNTS):
         contract = {
-            field: policies[account_id][field] for field in POLICY_LIMIT_FIELDS
+            field: policies[account_id][field] for field in POLICY_FRESHNESS_FIELDS
         }
         contract["daily_timezone"] = policies[account_id]["daily_timezone"]
         if account_id in activated_wallets:
@@ -1159,7 +1124,7 @@ def validate_database_state(
                     "approved activation artifact"
                 )
             rollout_contract = {
-                field: approval[field] for field in POLICY_LIMIT_FIELDS
+                field: approval[field] for field in POLICY_FRESHNESS_FIELDS
             }
             rollout_contract["daily_timezone"] = approval["daily_timezone"]
         else:
@@ -2588,7 +2553,7 @@ def validate_activation_risk_approval(
         "execution_account_id",
         "policy_id",
         "version",
-        *POLICY_LIMIT_FIELDS,
+        *POLICY_FRESHNESS_FIELDS,
         "daily_timezone",
     }
     contracts: dict[str, dict[str, object]] = {}
@@ -2615,7 +2580,7 @@ def validate_activation_risk_approval(
             )
         contract = dict(row)
         contract.pop("execution_account_id")
-        for field in POLICY_LIMIT_FIELDS:
+        for field in POLICY_FRESHNESS_FIELDS:
             value = contract.get(field)
             if (
                 not isinstance(value, (int, float))

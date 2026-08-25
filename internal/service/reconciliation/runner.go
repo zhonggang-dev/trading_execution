@@ -252,24 +252,58 @@ func (runner *Runner) Check(ctx context.Context) error {
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
 	for _, accountID := range runner.accounts {
-		result, exists := runner.lastResults[accountID]
-		if !exists {
-			return fmt.Errorf("execution account %q has not completed reconciliation", accountID)
-		}
-		if result.Run.Status != domain.ReconciliationRunCompleted {
-			return fmt.Errorf("execution account %q reconciliation status is %s", accountID, result.Run.Status)
-		}
-		if result.Run.CompletedAt == nil || result.Run.CompletedAt.IsZero() {
-			return fmt.Errorf("execution account %q completed reconciliation has no completed_at", accountID)
-		}
-		completedAt := result.Run.CompletedAt.UTC()
-		if completedAt.After(now) {
-			return fmt.Errorf("execution account %q reconciliation completed_at is in the future", accountID)
-		}
-		if age := now.Sub(completedAt); age > runner.maxAge {
-			return fmt.Errorf("execution account %q reconciliation is stale (age %s, maximum %s)", accountID, age, runner.maxAge)
+		if err := runner.checkAccountResultLocked(accountID, now); err != nil {
+			return err
 		}
 	}
+	return runner.checkLoopLocked(now)
+}
+
+// CheckAccount gates a placement only on the account that will own the order.
+// A reconciliation issue in an unrelated wallet still degrades global
+// readiness through Check, but cannot suppress a healthy wallet's strategy.
+func (runner *Runner) CheckAccount(ctx context.Context, accountID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return fmt.Errorf("execution account id is required for reconciliation readiness")
+	}
+	now := runner.now().UTC()
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if _, active := runner.active[accountID]; !active {
+		return fmt.Errorf("execution account %q is not active for reconciliation", accountID)
+	}
+	if err := runner.checkAccountResultLocked(accountID, now); err != nil {
+		return err
+	}
+	return runner.checkLoopLocked(now)
+}
+
+func (runner *Runner) checkAccountResultLocked(accountID string, now time.Time) error {
+	result, exists := runner.lastResults[accountID]
+	if !exists {
+		return fmt.Errorf("execution account %q has not completed reconciliation", accountID)
+	}
+	if result.Run.Status != domain.ReconciliationRunCompleted {
+		return fmt.Errorf("execution account %q reconciliation status is %s", accountID, result.Run.Status)
+	}
+	if result.Run.CompletedAt == nil || result.Run.CompletedAt.IsZero() {
+		return fmt.Errorf("execution account %q completed reconciliation has no completed_at", accountID)
+	}
+	completedAt := result.Run.CompletedAt.UTC()
+	if completedAt.After(now) {
+		return fmt.Errorf("execution account %q reconciliation completed_at is in the future", accountID)
+	}
+	if age := now.Sub(completedAt); age > runner.maxAge {
+		return fmt.Errorf("execution account %q reconciliation is stale (age %s, maximum %s)", accountID, age, runner.maxAge)
+	}
+	return nil
+}
+
+func (runner *Runner) checkLoopLocked(now time.Time) error {
 	if !runner.loopStarted {
 		return fmt.Errorf("reconciliation background loop has not started")
 	}

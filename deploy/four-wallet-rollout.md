@@ -21,13 +21,11 @@ POSITION_EXIT_JOB_TOKEN=DEDICATED_32_BYTE_OR_LONGER_SECRET
 execution_risk_global_control.kill_switch=true
 ```
 
-The same reviewed environment must explicitly pin every process-local order
-limit and v2 history window; no Go default is accepted by this rollout:
+The same reviewed environment must explicitly pin execution-format safety and
+the v2 history window; monetary allocation belongs to the upstream AI strategy:
 
 ```text
 EXECUTION_ALLOW_MARKET_ORDERS=false
-EXECUTION_MAX_ORDER_SIZE=EXACT_REVIEWED_POSITIVE_DECIMAL
-EXECUTION_MAX_ORDER_NOTIONAL=EXACT_REVIEWED_POSITIVE_DECIMAL
 POLYMARKET_MAX_BUY_FEE_RATE_BPS=EXACT_REVIEWED_NON_NEGATIVE_DECIMAL
 POLYGON_ORDER_FILLED_CONFIRMATIONS=EXACT_REVIEWED_POSITIVE_INTEGER
 DECISION_CYCLE_MID_PRICE_LOOKBACK=EXACT_REVIEWED_DURATION
@@ -71,19 +69,17 @@ rows. Do not `UPDATE execution_account_id` on an old row, and do not delete it.
 The transaction must leave wallet-2/wallet-3 disabled and all four current
 wallet bindings enabled.
 
-Every configured account must also have one live-risk policy and one unique
-ACCOUNT control. The current-rollout policy caps are pinned per account in the
-preflight code:
-`1.10/2.10/2.10/2.10/1.10` for order/market/strategy/wallet/daily notional,
-`90000/30000/600000` milliseconds for price/signal/state age, and timezone
-`UTC` for the retained accounts; wallet-6/wallet-7 use the separately approved
-v2 limits. All four policies and bindings are enabled and all four ACCOUNT
+Every configured account must also have one enabled execution-safety policy
+and one unique ACCOUNT control. Preflight pins only
+`90000/30000/600000` milliseconds for price/signal/state age and timezone
+`UTC`; legacy monetary columns remain readable for audit but do not authorize
+or reject an order. All four policies and bindings are enabled and all four ACCOUNT
 controls are unpaused in shadow. The submission quarantine is exactly empty.
 These wallet-6/wallet-7 template values are not approval to activate either
 wallet. An active wallet-6 or wallet-7 requires a separate mode-`0600`
 `four_wallet.activation_risk_approval.v1` artifact and its externally reviewed
 SHA-256 on both preflight passes. The artifact pins the release commit, exact
-active wallet set, policy identity/version and every limit; the disabled-phase
+active wallet set, policy identity/version and freshness contract; the disabled-phase
 evidence schema cannot be reused as this approval. Activation also requires
 fresh funding/allowance/placement and strict startup reconciliation. The
 rollout must not modify the existing main/wallet-1 policies.
@@ -175,7 +171,7 @@ The preflight exits non-zero if any of these invariants is false:
   activation state;
 - the actual systemd processes do not expose the approved health identity or
   do not contain the audited non-secret environment. This includes Trading's
-  static size/notional/fee/finality limits, disabled market-order policy, PIT
+  fee/finality safety, disabled market-order policy, PIT
   and midpoint lookbacks, prediction source-mode contract, and Prediction's
   Redis address/database, so the
   preflight cannot inspect one configuration while the processes use another;
