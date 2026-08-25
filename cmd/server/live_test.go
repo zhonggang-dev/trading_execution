@@ -8,9 +8,21 @@ import (
 	"testing"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarket"
+	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 )
+
+func TestOptionalQuarantineReadinessDoesNotBoxNilPointer(t *testing.T) {
+	if checker := optionalQuarantineReadiness(nil); checker != nil {
+		t.Fatalf("optionalQuarantineReadiness(nil) = %#v, want nil interface", checker)
+	}
+
+	concrete := &postgresadapter.ExecutionAccountQuarantineChecker{}
+	if checker := optionalQuarantineReadiness(concrete); checker != concrete {
+		t.Fatalf("optionalQuarantineReadiness(non-nil) = %#v, want original checker", checker)
+	}
+}
 
 type livePreflightProbeClient struct {
 	account      polymarket.AccountProbe

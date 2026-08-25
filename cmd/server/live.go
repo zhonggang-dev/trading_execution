@@ -393,7 +393,9 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
-	placementReconciliationReadiness, err := newPlacementAccountReadiness(runner, quarantineChecker)
+	placementReconciliationReadiness, err := newPlacementAccountReadiness(
+		runner, optionalQuarantineReadiness(quarantineChecker),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -475,6 +477,18 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
 		activeAccounts: append([]string(nil), reconciliationAccountIDs...),
 	}, nil
+}
+
+// optionalQuarantineReadiness prevents a nil concrete pointer from becoming a
+// non-nil interface. With no quarantined accounts there is intentionally no
+// global quarantine placement gate.
+func optionalQuarantineReadiness(
+	checker *postgresadapter.ExecutionAccountQuarantineChecker,
+) readinessChecker {
+	if checker == nil {
+		return nil
+	}
+	return checker
 }
 
 func validateCurrentLiveWallet67Release(configured, quarantined []string) error {
