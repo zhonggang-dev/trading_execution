@@ -133,6 +133,11 @@ type TradeHistoryRepository interface {
 	DailyPnL(ctx context.Context, filter domain.DailyPnLFilter) (domain.DailyPnLReport, error)
 }
 
+// EdgeDistributionRepository 定义最新全局决策边界冻结输入的只读访问能力。
+type EdgeDistributionRepository interface {
+	ListLatestDecisionInputs(ctx context.Context, modelID string) ([]domain.StrategyDecisionRequest, error)
+}
+
 // LiveOperationsRepository 在同一个 PostgreSQL 可重复读事务中构建实盘监控所需的本地权威视图。
 type LiveOperationsRepository interface {
 	LoadLiveOperations(ctx context.Context, query domain.LiveOperationsQuery) (domain.LiveOperationsLocalState, error)

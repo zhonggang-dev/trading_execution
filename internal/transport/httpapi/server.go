@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/buildinfo"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/edgedistribution"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/positionexit"
@@ -57,6 +58,11 @@ type liveOperationsService interface {
 	Snapshot(context.Context) (domain.LiveOperationsSnapshot, error)
 }
 
+// edgeDistributionService 定义最新不可变决策快照的 Edge 分布查询能力。
+type edgeDistributionService interface {
+	Latest(context.Context, string) (domain.EdgeDistribution, error)
+}
+
 // readinessChecker 以只读方式检查安全提供请求所需的依赖。
 type readinessChecker interface {
 	Check(context.Context) error
@@ -69,6 +75,7 @@ type Params struct {
 	Reconciliation   reconciliationJob
 	TradeHistory     tradeHistoryService
 	LiveOperations   liveOperationsService
+	EdgeDistribution edgeDistributionService
 	Readiness        readinessChecker
 	ReadinessTimeout time.Duration
 	Logger           *slog.Logger
@@ -84,6 +91,7 @@ type Server struct {
 	reconciliation   reconciliationJob
 	tradeHistory     tradeHistoryService
 	liveOperations   liveOperationsService
+	edgeDistribution edgeDistributionService
 	readinessChecker readinessChecker
 	readinessTimeout time.Duration
 	logger           *slog.Logger
@@ -124,6 +132,7 @@ func New(params Params) (*Server, error) {
 		reconciliation:   params.Reconciliation,
 		tradeHistory:     params.TradeHistory,
 		liveOperations:   params.LiveOperations,
+		edgeDistribution: params.EdgeDistribution,
 		readinessChecker: params.Readiness,
 		readinessTimeout: params.ReadinessTimeout,
 		logger:           params.Logger,
@@ -146,6 +155,9 @@ func New(params Params) (*Server, error) {
 	}
 	if server.liveOperations != nil {
 		mux.Handle("GET /api/v1/live-operations", server.authenticateReadOnly(http.HandlerFunc(server.getLiveOperations)))
+	}
+	if server.edgeDistribution != nil {
+		mux.Handle("GET /api/v1/edge-distribution", server.authenticateReadOnly(http.HandlerFunc(server.getEdgeDistribution)))
 	}
 	if server.positionExitJob != nil {
 		mux.Handle("POST /internal/jobs/position-exit-evaluation/run", server.authenticateToken(server.jobToken, http.HandlerFunc(server.runPositionExitJob)))
@@ -322,6 +334,45 @@ func (server *Server) getLiveOperations(writer http.ResponseWriter, request *htt
 	}
 	server.logger.Error("live operations snapshot failed", "request_id", requestID, "error", err)
 	writeLiveOperationsError(writer, http.StatusInternalServerError, "INTERNAL_ERROR", "实盘快照读取失败", requestID)
+}
+
+// getEdgeDistribution 返回服务端统一计算和分箱的最新 Edge 分布。
+func (server *Server) getEdgeDistribution(writer http.ResponseWriter, request *http.Request) {
+	modelID, err := parseEdgeDistributionModel(request)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_EDGE_DISTRIBUTION_FILTER", err.Error())
+		return
+	}
+	distribution, err := server.edgeDistribution.Latest(request.Context(), modelID)
+	if errors.Is(err, edgedistribution.ErrNotFound) {
+		writeError(writer, http.StatusNotFound, "EDGE_DISTRIBUTION_NOT_FOUND", "no completed decision snapshot is available")
+		return
+	}
+	if err != nil {
+		server.logger.Error("edge distribution query failed", "error", err)
+		writeError(writer, http.StatusBadGateway, "EDGE_DISTRIBUTION_UNAVAILABLE", "edge distribution is temporarily unavailable")
+		return
+	}
+	writer.Header().Set("Cache-Control", "no-store")
+	writeJSON(writer, http.StatusOK, map[string]any{"data": distribution})
+}
+
+// parseEdgeDistributionModel 解析并校验 Edge 分布的模型筛选参数。
+func parseEdgeDistributionModel(request *http.Request) (string, error) {
+	query := request.URL.Query()
+	for key, values := range query {
+		if key != "model_id" {
+			return "", fmt.Errorf("unsupported query parameter %q", key)
+		}
+		if len(values) != 1 {
+			return "", fmt.Errorf("query parameter %q must be provided once", key)
+		}
+	}
+	modelID := strings.TrimSpace(query.Get("model_id"))
+	if len(modelID) > 128 || strings.ContainsAny(modelID, "\x00\r\n") {
+		return "", fmt.Errorf("model_id is invalid")
+	}
+	return modelID, nil
 }
 
 // parseTradeHistoryFilter 解析并校验交易历史 HTTP 查询参数。

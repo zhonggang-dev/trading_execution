@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/adapter/risk"
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/edgedistribution"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/ordercoordinator"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
@@ -108,13 +109,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	edgeDistributionService, err := buildEdgeDistributionService(database)
+	if err != nil {
+		return err
+	}
 	httpParams := httpapi.Params{
-		Service:       executionService,
-		TradeHistory:  tradeHistoryService,
-		Logger:        logger,
-		APIToken:      cfg.HTTP.APIToken,
-		JobToken:      cfg.HTTP.JobToken,
-		ReadOnlyToken: cfg.HTTP.ReadOnlyToken,
+		Service:          executionService,
+		TradeHistory:     tradeHistoryService,
+		EdgeDistribution: edgeDistributionService,
+		Logger:           logger,
+		APIToken:         cfg.HTTP.APIToken,
+		JobToken:         cfg.HTTP.JobToken,
+		ReadOnlyToken:    cfg.HTTP.ReadOnlyToken,
 	}
 	if readiness != nil {
 		httpParams.Readiness = readiness
@@ -270,6 +276,18 @@ func buildTradeHistoryService(database *sql.DB) (*tradehistory.Service, error) {
 		return nil, err
 	}
 	return service, nil
+}
+
+// buildEdgeDistributionService 使用执行审计的冻结策略输入构建 Edge 分布服务。
+func buildEdgeDistributionService(database *sql.DB) (*edgedistribution.Service, error) {
+	if database == nil {
+		return nil, nil
+	}
+	repository, err := postgresadapter.NewEdgeDistributionRepository(database)
+	if err != nil {
+		return nil, err
+	}
+	return edgedistribution.New(repository, nil)
 }
 
 // orderCoordinatorRunParams 收拢订单协调器后台循环参数。
