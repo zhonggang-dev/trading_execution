@@ -180,7 +180,12 @@ func (account TradingAccount) validate() error {
 		return fmt.Errorf("signature type %d is unsupported", account.SignatureType)
 	}
 	if account.SignatureType == SignatureTypePolyEIP1271 {
-		return fmt.Errorf("POLY_1271 requires the wrapped Solady signature flow and is deliberately disabled until contract-wallet conformance tests are installed")
+		if strings.EqualFold(signerAddress, account.FunderAddress) {
+			return fmt.Errorf("POLY_1271 requires a distinct deposit-wallet funder")
+		}
+		if err := validateDepositWalletAddress(signerAddress, account.FunderAddress); err != nil {
+			return err
+		}
 	}
 	if account.SignatureType == SignatureTypeEOA && !strings.EqualFold(signerAddress, account.FunderAddress) {
 		return fmt.Errorf("EOA signer and funder must be the same address")

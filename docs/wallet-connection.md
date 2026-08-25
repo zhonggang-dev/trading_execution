@@ -64,7 +64,7 @@ literal `execution_account_id`。
 - `0 EOA`：signer 和 funder 必须相同；旧实盘当前代码实际采用的默认方式。
 - `1 POLY_PROXY`：legacy proxy，signer 与 funder 可以不同。
 - `2 GNOSIS_SAFE`：legacy Safe，signer 与 funder可以不同。
-- `3 DEPOSIT_WALLET/POLY_1271`：Go adapter 当前 fail closed，尚未完成 ERC-7739/1271 的实盘一致性验收。
+- `3 DEPOSIT_WALLET/POLY_1271`：funder 必须是 signer 的确定性 UUPS 或 beacon Deposit Wallet；订单使用 ERC-7739 包装签名。
 
 不能根据地址不同自动猜 `1` 或 `2`。猜错仍可能生成结构合法但交易所拒绝的订单，因此配置缺失时
 启动直接失败。
