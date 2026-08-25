@@ -1176,6 +1176,60 @@ func TestExternalPositionBaselineRequiresExactWalletMigrationEvidence(t *testing
 	if _, err := db.Exec(`UPDATE execution_wallet_migrations SET reason='mutated' WHERE migration_id='wallet-migration-test'`); err == nil {
 		t.Fatal("append-only wallet migration UPDATE succeeded")
 	}
+	if _, err := db.Exec(`
+		INSERT INTO reconciliation_runs (
+			run_id,execution_account_id,trigger,status,summary,error,started_at,completed_at
+		) VALUES (
+			'wallet-migration-old-run',$1,'STARTUP','ATTENTION_REQUIRED','{}'::jsonb,'',$2,$3
+		)`, accountID, observedAt.Add(2*time.Minute), observedAt.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO reconciliation_issues (
+			issue_id,run_id,fingerprint,execution_account_id,issue_type,resolution,status,
+			token_id,source,details,observed_at
+		) VALUES
+			('wallet-migration-baseline-issue','wallet-migration-old-run','migration-baseline',$1,
+			 'EXTERNAL_POSITION_BASELINE_DRIFT','MANUAL_REVIEW','OPEN','wallet-migration-token',
+			 'POLYMARKET_DATA_API','old wallet baseline is absent',$2),
+			('wallet-migration-unrelated-issue','wallet-migration-old-run','migration-unrelated',$1,
+			 'EXTERNAL_TRADE','MANUAL_REVIEW','OPEN','',
+			 'POLYMARKET_DATA_API','unrelated issue must remain open',$2)`, accountID, observedAt.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	completedAt := observedAt.Add(5 * time.Minute)
+	resolveTx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveWalletMigrationIssues(context.Background(), resolveTx, domain.ReconciliationRun{
+		RunID:              "wallet-migration-clean-run",
+		ExecutionAccountID: accountID,
+		Status:             domain.ReconciliationRunCompleted,
+		StartedAt:          observedAt.Add(4 * time.Minute),
+		CompletedAt:        &completedAt,
+	})
+	if err != nil {
+		resolveTx.Rollback()
+		t.Fatal(err)
+	}
+	if resolved != 1 {
+		resolveTx.Rollback()
+		t.Fatalf("resolved wallet migration issues = %d, want 1", resolved)
+	}
+	if err := resolveTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var baselineStatus, unrelatedStatus string
+	if err := db.QueryRow(`
+		SELECT max(status) FILTER (WHERE issue_id='wallet-migration-baseline-issue'),
+		       max(status) FILTER (WHERE issue_id='wallet-migration-unrelated-issue')
+		FROM reconciliation_issues WHERE execution_account_id=$1`, accountID).Scan(&baselineStatus, &unrelatedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if baselineStatus != "RESOLVED" || unrelatedStatus != "OPEN" {
+		t.Fatalf("wallet migration issue statuses = %s/%s, want RESOLVED/OPEN", baselineStatus, unrelatedStatus)
+	}
 }
 
 // TestExternalPositionAdoptionPostgresIntegration proves that an immutable

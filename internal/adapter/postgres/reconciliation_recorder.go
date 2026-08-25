@@ -137,6 +137,23 @@ func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain
 			return resolveErr
 		}
 		if resolved > 0 {
+			if run.Summary == nil {
+				run.Summary = make(map[string]int)
+			}
+			run.Summary["issues_total"] += resolved
+			run.Summary["issues_resolved"] += resolved
+			run.Summary["issues_automatic"] += resolved
+		}
+	}
+	if run.Status == domain.ReconciliationRunCompleted {
+		resolved, resolveErr := resolveWalletMigrationIssues(ctx, tx, run)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if resolved > 0 {
+			if run.Summary == nil {
+				run.Summary = make(map[string]int)
+			}
 			run.Summary["issues_total"] += resolved
 			run.Summary["issues_resolved"] += resolved
 			run.Summary["issues_automatic"] += resolved
@@ -175,6 +192,73 @@ func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain
 		return fmt.Errorf("commit reconciliation run completion: %w", err)
 	}
 	return nil
+}
+
+// resolveWalletMigrationIssues closes only discrepancies that are made stale
+// by an exact, append-only wallet migration.  A clean later reconciliation is
+// still required, and any issue reproduced by that run remains open.
+func resolveWalletMigrationIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
+	const resolvedDetails = "; automatically resolved after an audited execution-wallet migration and a clean reconciliation of the new wallet"
+	result, err := tx.ExecContext(ctx, `
+		UPDATE reconciliation_issues issue
+		SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+		    details=issue.details || $4
+		WHERE issue.execution_account_id=$1
+		  AND issue.status='OPEN'
+		  AND issue.resolution='MANUAL_REVIEW'
+		  AND issue.run_id<>$2
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM reconciliation_issues reproduced
+		    WHERE reproduced.execution_account_id=issue.execution_account_id
+		      AND reproduced.run_id=$2
+		      AND reproduced.status='OPEN'
+		      AND reproduced.issue_type=issue.issue_type
+		      AND reproduced.token_id=issue.token_id
+		  )
+		  AND (
+		    (
+		      issue.issue_type='BALANCE_DRIFT'
+		      AND EXISTS (
+		        SELECT 1
+		        FROM execution_accounts account
+		        JOIN execution_wallet_migrations migration
+		          ON migration.execution_account_id=account.execution_account_id
+		         AND migration.new_wallet_address=lower(account.wallet_address)
+		        WHERE account.execution_account_id=issue.execution_account_id
+		          AND issue.observed_at<=migration.occurred_at
+		          AND migration.occurred_at<=$5
+		      )
+		    )
+		    OR (
+		      issue.issue_type='EXTERNAL_POSITION_BASELINE_DRIFT'
+		      AND EXISTS (
+		        SELECT 1
+		        FROM execution_external_position_baseline_items item
+		        JOIN execution_external_position_baselines baseline
+		          ON baseline.baseline_id=item.baseline_id
+		         AND baseline.execution_account_id=item.execution_account_id
+		        JOIN execution_accounts account
+		          ON account.execution_account_id=baseline.execution_account_id
+		        JOIN execution_wallet_migrations migration
+		          ON migration.execution_account_id=account.execution_account_id
+		         AND migration.old_wallet_address=lower(baseline.evidence->>'wallet_address')
+		         AND migration.new_wallet_address=lower(account.wallet_address)
+		        WHERE item.execution_account_id=issue.execution_account_id
+		          AND item.token_id=issue.token_id
+		          AND baseline.observed_at<=migration.occurred_at
+		          AND migration.occurred_at<=$5
+		      )
+		    )
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, run.StartedAt.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("resolve audited wallet-migration reconciliation issues: %w", err)
+	}
+	resolved, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count resolved wallet-migration reconciliation issues: %w", err)
+	}
+	return int(resolved), nil
 }
 
 // resolveFillLagDriftIssues closes only stale drift observations whose exact
