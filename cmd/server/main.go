@@ -69,7 +69,6 @@ func run() error {
 	}
 	guard, err := risk.NewStaticGuard(risk.StaticGuardParams{
 		AllowMarketOrders: cfg.Execution.AllowMarketOrders,
-		MaxOrderNotional:  cfg.Execution.MaxOrderNotional,
 	})
 	if err != nil {
 		return err

@@ -476,12 +476,12 @@ func TestLoadRejectsSharedLiveOperationsToken(t *testing.T) {
 	}
 }
 
-func TestLoadRequiresExplicitLiveRiskLimits(t *testing.T) {
+func TestLoadDoesNotRequireExecutionMonetaryCap(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
 	t.Setenv("EXECUTION_MAX_ORDER_NOTIONAL", "")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be explicitly configured") {
-		t.Fatalf("Load() error = %v, want explicit live risk limit", err)
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() error = %v, monetary allocation belongs to the upstream strategy", err)
 	}
 }
 
@@ -576,7 +576,6 @@ func setCompleteLiveEnvironment(t *testing.T) {
 	t.Setenv("TRADING_EXECUTION_DATABASE_URL", "postgres://example.invalid/trading")
 	t.Setenv("EXECUTION_MODE", "live")
 	t.Setenv("EXECUTION_VENUE", "polymarket")
-	t.Setenv("EXECUTION_MAX_ORDER_NOTIONAL", "10")
 	t.Setenv("POLYMARKET_LIVE_TRADING_ENABLED", "true")
 	t.Setenv("POLYMARKET_MAX_BUY_FEE_RATE_BPS", "10000")
 	t.Setenv("POLYGON_ORDER_FILLED_CONFIRMATIONS", "64")

@@ -468,9 +468,7 @@ func testServer(t *testing.T, token string) *Server {
 // baseExecutionService 构建测试使用的基础领域对象。
 func baseExecutionService(t *testing.T) *execution.Service {
 	t.Helper()
-	guard, err := risk.NewStaticGuard(risk.StaticGuardParams{
-		MaxOrderNotional: "100",
-	})
+	guard, err := risk.NewStaticGuard(risk.StaticGuardParams{})
 	if err != nil {
 		t.Fatalf("NewStaticGuard() error = %v", err)
 	}

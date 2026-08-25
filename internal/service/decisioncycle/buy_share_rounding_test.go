@@ -2,12 +2,10 @@ package decisioncycle
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
-	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
 // TestRoundBuySharesUsesHalfUpRounding 验证 BUY shares 按四舍五入变为整数。
@@ -74,15 +72,14 @@ func TestBuildEntryIntentRoundsBuySharesBeforeNotionalValidation(t *testing.T) {
 	}
 }
 
-// TestRoundedBuyUsesEffectiveSizeForHardRisk 验证硬风控、持久化和执行链路使用整数化后的 BUY shares。
-func TestRoundedBuyUsesEffectiveSizeForHardRisk(t *testing.T) {
-	fixture := newPipelineFixture(t, "9.9")
+// TestRoundedBuyUsesEffectiveSizeForExecution 验证持久化和执行链路使用整数化后的 BUY shares。
+func TestRoundedBuyUsesEffectiveSizeForExecution(t *testing.T) {
+	fixture := newPipelineFixture(t)
 	fixture.strategy.response.Evaluations[0].Order.Size = "19.50"
 
 	result, err := fixture.service.Run(context.Background(), fixture.decisionAt)
-	var rejection *port.Rejection
-	if !errors.As(err, &rejection) || rejection.Code != "ORDER_NOTIONAL_LIMIT" {
-		t.Fatalf("Run() error = %v, rejection = %#v", err, rejection)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 	if len(result.Runs) != 1 || len(result.Runs[0].Intents) != 1 {
 		t.Fatalf("pipeline result = %#v", result)
@@ -91,11 +88,11 @@ func TestRoundedBuyUsesEffectiveSizeForHardRisk(t *testing.T) {
 	if !order.Intent.Size.Equal("20") || order.Intent.Metadata["strategy_requested_size"] != "19.50" {
 		t.Fatalf("rounded order intent = %#v", order.Intent)
 	}
-	if order.Status != domain.OrderStatusRejected || order.FailureCode != "ORDER_NOTIONAL_LIMIT" {
+	if order.Status != domain.OrderStatusLive || order.FailureCode != "" {
 		t.Fatalf("rounded order = %#v", order)
 	}
-	if fixture.venue.placeCalls != 0 {
-		t.Fatalf("rounded hard-risk rejection reached venue %d times", fixture.venue.placeCalls)
+	if fixture.venue.placeCalls != 1 {
+		t.Fatalf("rounded strategy order reached venue %d times, want 1", fixture.venue.placeCalls)
 	}
 }
 

@@ -19,18 +19,13 @@ const (
 )
 
 type liveRiskPolicy struct {
-	policyID               string
-	version                int64
-	enabled                bool
-	maxOrderNotional       domain.Decimal
-	maxMarketExposure      domain.Decimal
-	maxStrategyExposure    domain.Decimal
-	maxWalletExposure      domain.Decimal
-	maxDailyTradedNotional domain.Decimal
-	maxPriceAge            time.Duration
-	maxSignalAge           time.Duration
-	maxStateAge            time.Duration
-	dailyTimezone          string
+	policyID      string
+	version       int64
+	enabled       bool
+	maxPriceAge   time.Duration
+	maxSignalAge  time.Duration
+	maxStateAge   time.Duration
+	dailyTimezone string
 }
 
 type liveRiskAuthorization struct {
@@ -93,34 +88,9 @@ func (manager *ReservationManager) authorizeLiveRisk(
 	if err != nil || grossCandidate.Sign() <= 0 {
 		return liveRiskAuthorization{}, reject("INVALID_ORDER_NOTIONAL", "worst_price multiplied by size must be positive")
 	}
-	maxOrder, _ := riskRat(policy.maxOrderNotional)
-	if grossCandidate.Cmp(maxOrder) > 0 {
-		return liveRiskAuthorization{}, reject("MAX_ORDER_NOTIONAL_EXCEEDED", "order notional exceeds the live account policy")
-	}
-
-	riskDay, dayStart, nextDayStart, err := riskDayBoundary(ctx, tx, policy.dailyTimezone, observedAt)
+	riskDay, _, _, err := riskDayBoundary(ctx, tx, policy.dailyTimezone, observedAt)
 	if err != nil {
 		return liveRiskAuthorization{}, err
-	}
-	dailyFilled, err := queryRiskRat(ctx, tx, `
-		SELECT COALESCE(SUM(gross_notional), 0)::text
-		FROM execution_fills
-		WHERE execution_account_id = $1
-		  AND status = 'CONFIRMED' AND applied_at IS NOT NULL
-		  AND matched_at >= $2 AND matched_at < $3
-		  AND matched_at <= $4`,
-		order.Intent.ExecutionAccountID, dayStart, nextDayStart, observedAt)
-	if err != nil {
-		return liveRiskAuthorization{}, fmt.Errorf("load daily confirmed notional: %w", err)
-	}
-	dailyPending, err := queryRiskRat(ctx, tx, `
-		SELECT COALESCE(SUM(GREATEST(daily_risk_notional - settled_notional, 0)), 0)::text
-		FROM asset_reservations
-		WHERE execution_account_id = $1
-		  AND status IN ('ACTIVE', 'RECONCILIATION_REQUIRED')
-		  AND order_id <> $2`, order.Intent.ExecutionAccountID, strings.TrimSpace(excludeOrderID))
-	if err != nil {
-		return liveRiskAuthorization{}, fmt.Errorf("load pending daily notional: %w", err)
 	}
 	legacyActive, err := queryRiskCount(ctx, tx, `
 		SELECT count(*)
@@ -135,19 +105,12 @@ func (manager *ReservationManager) authorizeLiveRisk(
 	if legacyActive != 0 {
 		return liveRiskAuthorization{}, reject("LEGACY_ACTIVE_RESERVATION", "an active reservation has no atomic live-risk authorization")
 	}
-	dailyTotal := new(big.Rat).Add(dailyFilled, dailyPending)
-	dailyTotal.Add(dailyTotal, grossCandidate)
-	maxDaily, _ := riskRat(policy.maxDailyTradedNotional)
-	if dailyTotal.Cmp(maxDaily) > 0 {
-		return liveRiskAuthorization{}, reject("DAILY_TRADED_NOTIONAL_EXCEEDED", "confirmed fills plus pending orders would exceed the daily live account limit")
-	}
-
 	if order.Intent.Side == domain.SideBuy {
 		protectedCandidate, productErr := riskProduct(reserveUnitPrice, order.Intent.Size)
 		if productErr != nil || protectedCandidate.Sign() <= 0 {
 			return liveRiskAuthorization{}, reject("INVALID_ORDER_NOTIONAL", "fee-protected BUY notional must be positive")
 		}
-		if err := manager.checkBuyLiveRiskExposure(ctx, tx, order, protectedCandidate, policy, excludeOrderID); err != nil {
+		if err := checkBuyAvailableBalance(ctx, tx, order.Intent.ExecutionAccountID, protectedCandidate); err != nil {
 			return liveRiskAuthorization{}, err
 		}
 	}
@@ -158,121 +121,20 @@ func (manager *ReservationManager) authorizeLiveRisk(
 	}, nil
 }
 
-func (manager *ReservationManager) checkBuyLiveRiskExposure(
+func checkBuyAvailableBalance(
 	ctx context.Context,
 	tx *sql.Tx,
-	order domain.Order,
+	executionAccountID string,
 	candidate *big.Rat,
-	policy liveRiskPolicy,
-	excludeOrderID string,
 ) error {
 	available, err := queryRiskRat(ctx, tx, `
 		SELECT available_balance::text FROM execution_accounts
-		WHERE execution_account_id = $1`, order.Intent.ExecutionAccountID)
+		WHERE execution_account_id = $1`, executionAccountID)
 	if err != nil {
 		return fmt.Errorf("load live available balance: %w", err)
 	}
 	if candidate.Cmp(available) > 0 {
 		return reject("INSUFFICIENT_WALLET_BALANCE", "available balance is below the fee-protected BUY notional")
-	}
-
-	walletExposure := new(big.Rat)
-	marketExposure := new(big.Rat)
-	strategyExposure := new(big.Rat)
-	canonicalStrategy := domain.CanonicalStrategyID(order.Intent.StrategyID)
-
-	rows, err := tx.QueryContext(ctx, `
-		SELECT market_id, strategy_id, remaining_cost::text
-		FROM position_lots
-		WHERE execution_account_id = $1
-		  AND status IN ('OPEN', 'SETTLED_PENDING_REDEEM')`, order.Intent.ExecutionAccountID)
-	if err != nil {
-		return fmt.Errorf("load live position risk: %w", err)
-	}
-	positionCost := new(big.Rat)
-	for rows.Next() {
-		var marketID, strategyID, raw string
-		if err := rows.Scan(&marketID, &strategyID, &raw); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan live position risk: %w", err)
-		}
-		value, err := riskRat(domain.Decimal(raw))
-		if err != nil || value.Sign() < 0 {
-			rows.Close()
-			return fmt.Errorf("invalid live position risk value %q", raw)
-		}
-		positionCost.Add(positionCost, value)
-		walletExposure.Add(walletExposure, value)
-		if strings.TrimSpace(marketID) == order.Intent.MarketID {
-			marketExposure.Add(marketExposure, value)
-		}
-		if domain.CanonicalStrategyID(strategyID) == canonicalStrategy {
-			strategyExposure.Add(strategyExposure, value)
-		}
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close live position risk rows: %w", err)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate live position risk: %w", err)
-	}
-	aggregateCost, err := queryRiskRat(ctx, tx, `
-		SELECT COALESCE(SUM(cost_basis), 0)::text
-		FROM execution_positions
-		WHERE execution_account_id = $1`, order.Intent.ExecutionAccountID)
-	if err != nil {
-		return fmt.Errorf("load aggregate position risk: %w", err)
-	}
-	if positionCost.Cmp(aggregateCost) != 0 {
-		return reject("RISK_POSITION_LEDGER_INCONSISTENT", "position lot cost does not equal the authoritative aggregate cost basis")
-	}
-
-	rows, err = tx.QueryContext(ctx, `
-		SELECT market_id, strategy_id, remaining_reserved_balance::text
-		FROM asset_reservations
-		WHERE execution_account_id = $1 AND side = 'BUY'
-		  AND status IN ('ACTIVE', 'RECONCILIATION_REQUIRED')
-		  AND order_id <> $2`, order.Intent.ExecutionAccountID, strings.TrimSpace(excludeOrderID))
-	if err != nil {
-		return fmt.Errorf("load open BUY risk: %w", err)
-	}
-	for rows.Next() {
-		var marketID, strategyID, raw string
-		if err := rows.Scan(&marketID, &strategyID, &raw); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan open BUY risk: %w", err)
-		}
-		value, err := riskRat(domain.Decimal(raw))
-		if err != nil || value.Sign() < 0 {
-			rows.Close()
-			return fmt.Errorf("invalid open BUY risk value %q", raw)
-		}
-		walletExposure.Add(walletExposure, value)
-		if strings.TrimSpace(marketID) == order.Intent.MarketID {
-			marketExposure.Add(marketExposure, value)
-		}
-		if domain.CanonicalStrategyID(strategyID) == canonicalStrategy {
-			strategyExposure.Add(strategyExposure, value)
-		}
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close open BUY risk rows: %w", err)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate open BUY risk: %w", err)
-	}
-
-	walletExposure.Add(walletExposure, candidate)
-	marketExposure.Add(marketExposure, candidate)
-	strategyExposure.Add(strategyExposure, candidate)
-	if exceedsRisk(marketExposure, policy.maxMarketExposure) {
-		return reject("MAX_MARKET_EXPOSURE_EXCEEDED", "BUY would exceed the market exposure limit")
-	}
-	if exceedsRisk(strategyExposure, policy.maxStrategyExposure) {
-		return reject("MAX_STRATEGY_EXPOSURE_EXCEEDED", "BUY would exceed the strategy exposure limit")
-	}
-	if exceedsRisk(walletExposure, policy.maxWalletExposure) {
-		return reject("MAX_WALLET_EXPOSURE_EXCEEDED", "BUY would exceed the wallet exposure limit")
 	}
 	return nil
 }
@@ -303,16 +165,10 @@ func loadLiveRiskPolicy(ctx context.Context, tx *sql.Tx, accountID string) (live
 	var priceAgeMS, signalAgeMS, stateAgeMS int64
 	err := tx.QueryRowContext(ctx, `
 		SELECT policy_id, version, enabled,
-		       max_order_notional::text, max_market_exposure::text,
-		       max_strategy_exposure::text, max_wallet_exposure::text,
-		       max_daily_traded_notional::text,
 		       max_price_age_ms, max_signal_age_ms, max_state_age_ms, daily_timezone
 		FROM execution_risk_policies
 		WHERE execution_account_id = $1 FOR SHARE`, accountID).Scan(
 		&policy.policyID, &policy.version, &policy.enabled,
-		&policy.maxOrderNotional, &policy.maxMarketExposure,
-		&policy.maxStrategyExposure, &policy.maxWalletExposure,
-		&policy.maxDailyTradedNotional,
 		&priceAgeMS, &signalAgeMS, &stateAgeMS, &policy.dailyTimezone,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -323,18 +179,6 @@ func loadLiveRiskPolicy(ctx context.Context, tx *sql.Tx, accountID string) (live
 	}
 	if strings.TrimSpace(policy.policyID) == "" || policy.version < 1 || strings.TrimSpace(policy.dailyTimezone) == "" {
 		return liveRiskPolicy{}, fmt.Errorf("live risk policy identity is invalid")
-	}
-	for name, value := range map[string]domain.Decimal{
-		"max_order_notional":        policy.maxOrderNotional,
-		"max_market_exposure":       policy.maxMarketExposure,
-		"max_strategy_exposure":     policy.maxStrategyExposure,
-		"max_wallet_exposure":       policy.maxWalletExposure,
-		"max_daily_traded_notional": policy.maxDailyTradedNotional,
-	} {
-		parsed, parseErr := riskRat(value)
-		if parseErr != nil || parsed.Sign() <= 0 {
-			return liveRiskPolicy{}, fmt.Errorf("live risk policy %s is invalid", name)
-		}
 	}
 	var durationErr error
 	policy.maxPriceAge, durationErr = riskDuration(priceAgeMS)
@@ -544,9 +388,4 @@ func riskRat(value domain.Decimal) (*big.Rat, error) {
 		return nil, fmt.Errorf("invalid decimal %q", value)
 	}
 	return result, nil
-}
-
-func exceedsRisk(value *big.Rat, maximum domain.Decimal) bool {
-	limit, err := riskRat(maximum)
-	return err != nil || value.Cmp(limit) > 0
 }
