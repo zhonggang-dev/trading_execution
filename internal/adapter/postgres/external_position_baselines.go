@@ -74,7 +74,18 @@ func (repository *ExternalPositionBaselineRepository) ListExternalPositionBaseli
 		JOIN effective_items item
 		  ON item.baseline_id=baseline.baseline_id
 		 AND item.execution_account_id=baseline.execution_account_id
-		WHERE baseline.execution_account_id=$1 AND item.shares>0
+		WHERE baseline.execution_account_id=$1
+		  AND item.shares>0
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM execution_accounts account
+			JOIN execution_wallet_migrations migration
+			  ON migration.execution_account_id=account.execution_account_id
+			 AND migration.new_wallet_address=lower(account.wallet_address)
+			WHERE account.execution_account_id=baseline.execution_account_id
+			  AND migration.old_wallet_address=lower(baseline.evidence->>'wallet_address')
+			  AND migration.occurred_at>=baseline.observed_at
+		  )
 		ORDER BY item.condition_id, item.outcome_index NULLS LAST, item.token_id`, executionAccountID)
 	if err != nil {
 		return nil, fmt.Errorf("query external position ownership baseline: %w", err)

@@ -1106,6 +1106,78 @@ func TestExternalPositionBaselinePostgresIntegration(t *testing.T) {
 	}
 }
 
+func TestExternalPositionBaselineRequiresExactWalletMigrationEvidence(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	const (
+		accountID  = "account-wallet-migration-baseline"
+		baselineID = "baseline-before-wallet-migration"
+		oldWallet  = "0x1111111111111111111111111111111111111111"
+		newWallet  = "0x2222222222222222222222222222222222222222"
+	)
+	insertAccount(t, db, accountID, oldWallet, "20", "20", "0")
+	observedAt := time.Now().UTC().Add(-time.Hour)
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		INSERT INTO execution_external_position_baseline_items (
+			baseline_id, execution_account_id, token_id, condition_id,
+			outcome_index, outcome_name, neg_risk, shares
+		) VALUES ($1,$2,'wallet-migration-token','wallet-migration-condition',0,'YES',FALSE,5)`, baselineID, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO execution_external_position_baselines (
+			baseline_id, execution_account_id, source, observed_at, evidence, actor, reason
+		) VALUES ($1,$2,'POLYMARKET_DATA_API',$3,jsonb_build_object('wallet_address',$4),
+		          'integration-test','pre-migration ownership')`, baselineID, accountID, observedAt, oldWallet); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	repository, err := NewExternalPositionBaselineRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselines, err := repository.ListExternalPositionBaselines(context.Background(), accountID)
+	if err != nil || len(baselines) != 1 {
+		t.Fatalf("pre-migration baselines = %#v err=%v", baselines, err)
+	}
+	if _, err := db.Exec(`UPDATE execution_accounts SET wallet_address=$2 WHERE execution_account_id=$1`, accountID, newWallet); err != nil {
+		t.Fatal(err)
+	}
+	baselines, err = repository.ListExternalPositionBaselines(context.Background(), accountID)
+	if err != nil || len(baselines) != 1 {
+		t.Fatalf("wallet mismatch without evidence did not fail closed: %#v err=%v", baselines, err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_wallet_migrations (
+			migration_id, execution_account_id, old_wallet_address, new_wallet_address,
+			chain_id, collateral_asset, collateral_balance_before, collateral_balance_after,
+			occurred_at, evidence, actor, reason
+		) VALUES (
+			'wallet-migration-test',$1,$2,$3,137,'pUSD',20,20,$4,
+			'{"transaction_hash":"0xabc"}'::jsonb,'integration-test','deposit wallet migration'
+		)`, accountID, oldWallet, newWallet, observedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	baselines, err = repository.ListExternalPositionBaselines(context.Background(), accountID)
+	if err != nil || len(baselines) != 0 {
+		t.Fatalf("exact wallet migration did not retire old baseline: %#v err=%v", baselines, err)
+	}
+	if _, err := db.Exec(`UPDATE execution_wallet_migrations SET reason='mutated' WHERE migration_id='wallet-migration-test'`); err == nil {
+		t.Fatal("append-only wallet migration UPDATE succeeded")
+	}
+}
+
 // TestExternalPositionAdoptionPostgresIntegration proves that an immutable
 // unmanaged baseline can become one managed Python-visible lot without a fake
 // execution order or fill, while its effective unmanaged remainder becomes
@@ -2235,7 +2307,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 	db := stdlib.OpenDB(*testConfig)
 	db.SetMaxOpenConns(8)
 	t.Cleanup(func() { _ = db.Close() })
-	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql", "0014_external_position_ownership_baselines.sql", "0015_position_lot_model_routes.sql", "0016_external_position_dispositions.sql", "0017_enabled_strategy_binding_uniqueness.sql"} {
+	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql", "0014_external_position_ownership_baselines.sql", "0015_position_lot_model_routes.sql", "0016_external_position_dispositions.sql", "0017_enabled_strategy_binding_uniqueness.sql", "0018_execution_wallet_migrations.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", name, err)
