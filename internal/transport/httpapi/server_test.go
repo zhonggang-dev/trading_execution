@@ -61,6 +61,11 @@ func TestLiveOperationsEndpointUsesDedicatedReadOnlyPermission(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"equity":1.25`) ||
 		!strings.Contains(response.Body.String(), `"executionAccountId":"wallet-1"`) ||
 		!strings.Contains(response.Body.String(), `"return":null`) ||
+		!strings.Contains(response.Body.String(), `"warningThreshold":8`) ||
+		!strings.Contains(response.Body.String(), `"hardLimit":10`) ||
+		!strings.Contains(response.Body.String(), `"limit":10`) ||
+		!strings.Contains(response.Body.String(), `"hardLimitEnforced":false`) ||
+		!strings.Contains(response.Body.String(), `"thresholdType":"target"`) ||
 		!strings.Contains(response.Body.String(), `"positions":[]`) {
 		t.Fatalf("response status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -101,7 +106,10 @@ func testLiveOperationsSnapshot() domain.LiveOperationsSnapshot {
 			PeakCashUsed: "0", CumulativeInvestedCost: "0",
 			RealizedPnL: "0", UnrealizedPnL: "0", TotalPnL: "0", ReturnRate: nil,
 		}},
-		Workers: []domain.LiveWorker{}, Funnel: []domain.LiveFunnelStage{}, Risks: []domain.LiveRisk{},
+		Workers: []domain.LiveWorker{}, Funnel: []domain.LiveFunnelStage{}, Risks: []domain.LiveRisk{{
+			ID: "exposure", Name: "总敞口", Current: "9", WarningThreshold: "8", HardLimit: "10", Limit: "10",
+			HardLimitEnforced: false, ThresholdType: domain.LiveRiskTarget, Unit: "$", Hint: "只读运营目标", State: domain.LiveFlowWarning,
+		}},
 		Orders: []domain.LiveOrder{}, Positions: []domain.LivePosition{}, Events: []domain.LiveEvent{},
 		DataQuality: []domain.LiveDataQuality{},
 	}
