@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/UniPat-AI/trading_execution/internal/adapter/kalshi"
+	"github.com/UniPat-AI/trading_execution/internal/adapter/marketbooks"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarket"
 	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/predictioninfra"
@@ -54,12 +56,50 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 	if err != nil {
 		return nil, fmt.Errorf("build strategy decision client: %w", err)
 	}
-	midPrices, err := polymarket.NewMidPriceHistorySource(polymarket.MidPriceHistoryParams{
+	var kalshiClient *kalshi.Client
+	var kalshiOrderBooks port.OrderBookSource
+	if params.cfg.Kalshi.MarketDataEnabled {
+		var buildErr error
+		kalshiClient, buildErr = kalshi.NewClient(kalshi.ClientParams{
+			BaseURL: params.cfg.Kalshi.APIURL, APIKeyID: params.cfg.Kalshi.APIKeyID,
+			PrivateKeyPath: params.cfg.Kalshi.PrivateKeyPath,
+			HTTPClient:     noRedirectHTTPClient(params.cfg.Kalshi.RequestTimeout),
+		})
+		if buildErr != nil {
+			return nil, fmt.Errorf("build Kalshi authenticated client: %w", buildErr)
+		}
+		kalshiOrderBooks, buildErr = kalshi.NewOrderBookSource(kalshi.OrderBookParams{Client: kalshiClient})
+		if buildErr != nil {
+			return nil, fmt.Errorf("build Kalshi orderbook source: %w", buildErr)
+		}
+	}
+	orderBooks, err := marketbooks.New(marketbooks.Params{
+		Polymarket: params.orderBooks,
+		Kalshi:     kalshiOrderBooks,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build venue orderbook router: %w", err)
+	}
+	polymarketMidPrices, err := polymarket.NewMidPriceHistorySource(polymarket.MidPriceHistoryParams{
 		BaseURL:    params.cfg.Polymarket.CLOBURL,
 		HTTPClient: noRedirectHTTPClient(cycleConfig.Timeout),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build decision mid-price source: %w", err)
+	}
+	var kalshiMidPrices port.MidPriceHistorySource
+	if kalshiClient != nil {
+		kalshiMidPrices, err = kalshi.NewMidPriceHistorySource(kalshi.MidPriceHistoryParams{Client: kalshiClient})
+		if err != nil {
+			return nil, fmt.Errorf("build Kalshi mid-price history source: %w", err)
+		}
+	}
+	midPrices, err := marketbooks.NewHistorySource(marketbooks.HistoryParams{
+		Polymarket: polymarketMidPrices,
+		Kalshi:     kalshiMidPrices,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build venue mid-price history router: %w", err)
 	}
 	recorder, err := postgresadapter.NewDecisionRecorder(params.database, nil)
 	if err != nil {
@@ -68,7 +108,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 	cycle, err := decisioncycle.New(decisioncycle.Params{
 		PredictionSource:             predictionClient,
 		PositionSource:               params.positionSource,
-		OrderBookSource:              params.orderBooks,
+		OrderBookSource:              orderBooks,
 		MidPriceSource:               midPrices,
 		Strategy:                     strategyClient,
 		Recorder:                     recorder,

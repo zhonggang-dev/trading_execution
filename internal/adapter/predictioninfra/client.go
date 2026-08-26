@@ -92,6 +92,10 @@ func (client *Client) Snapshot(ctx context.Context, decisionAt time.Time, lookba
 	if envelope.Code != "LIVE_PREDICTION_SNAPSHOT_FOUND" {
 		return domain.PredictionSnapshot{}, fmt.Errorf("unexpected prediction snapshot response code %q", envelope.Code)
 	}
+	envelope.Data, err = envelope.Data.NormalizeVenueIdentities()
+	if err != nil {
+		return domain.PredictionSnapshot{}, fmt.Errorf("normalize prediction snapshot venue identity: %w", err)
+	}
 	if err := envelope.Data.Validate(decisionAt); err != nil {
 		return domain.PredictionSnapshot{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}

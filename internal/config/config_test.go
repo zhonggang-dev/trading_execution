@@ -24,6 +24,26 @@ func TestLoadSafeDefaults(t *testing.T) {
 	if config.DecisionCycle.Enabled || config.DecisionCycle.OrderSubmissionEnabled || config.DecisionCycle.RequireCompleteModelCoverage {
 		t.Fatalf("decision cycle safe defaults = %#v", config.DecisionCycle)
 	}
+	if config.Kalshi.MarketDataEnabled {
+		t.Fatalf("Kalshi market data must be disabled without explicit credentials: %#v", config.Kalshi)
+	}
+}
+
+func TestLoadKalshiMarketDataRequiresCredentialFiles(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("KALSHI_MARKET_DATA_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH") {
+		t.Fatalf("Load() error = %v", err)
+	}
+	t.Setenv("KALSHI_API_KEY_ID", "key-id")
+	t.Setenv("KALSHI_PRIVATE_KEY_PATH", "/run/secrets/trading_execution/kalshi.pem")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !config.Kalshi.MarketDataEnabled || config.Kalshi.APIURL != "https://external-api.kalshi.com" {
+		t.Fatalf("Kalshi config = %#v", config.Kalshi)
+	}
 }
 
 func TestLoadAcceptsDecisionCycleWithSubmissionDisabled(t *testing.T) {
@@ -527,6 +547,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"RECONCILIATION_POSITION_EPSILON", "RECONCILIATION_BALANCE_EPSILON",
 		"CANCEL_FILL_FINALITY_GRACE", "MAX_ORDER_RECONCILE_ATTEMPTS",
 		"POLYMARKET_MAX_BUY_FEE_RATE_BPS", "POLYGON_ORDER_FILLED_CONFIRMATIONS",
+		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",
 		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
 		"DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",
 		"DECISION_CYCLE_PREDICTION_INFRA_URL", "DECISION_CYCLE_PREDICTION_INFRA_TOKEN",
