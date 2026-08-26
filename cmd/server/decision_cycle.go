@@ -19,13 +19,14 @@ import (
 )
 
 type buildDecisionRunnerParams struct {
-	cfg            config.Config
-	database       *sql.DB
-	positionSource port.StrategyPositionSource
-	orderBooks     port.OrderBookSource
-	executor       port.OrderExecutor
-	accountIDs     []string
-	logger         *slog.Logger
+	cfg              config.Config
+	database         *sql.DB
+	positionSource   port.StrategyPositionSource
+	orderBooks       port.OrderBookSource
+	executor         port.OrderExecutor
+	accountIDs       []string
+	logger           *slog.Logger
+	submissionPolicy decisioncycle.IntentSubmissionPolicy
 }
 
 // buildDecisionRunner composes the pull-based production workflow without
@@ -113,6 +114,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		Strategy:                     strategyClient,
 		Recorder:                     recorder,
 		Executor:                     params.executor,
+		SubmissionPolicy:             params.submissionPolicy,
 		SubmitEnabled:                cycleConfig.OrderSubmissionEnabled,
 		SubmissionDisabledAccounts:   cycleConfig.SubmissionDisabledAccounts,
 		EntrySubmissionDisabled:      cycleConfig.EntrySubmissionDisabled,

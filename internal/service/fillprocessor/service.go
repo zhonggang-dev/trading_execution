@@ -213,7 +213,7 @@ func calculateMoney(fill domain.Fill) (domain.Fill, error) {
 	if new(big.Rat).Add(platformFee, builderFee).Cmp(totalFee) != 0 {
 		return domain.Fill{}, fmt.Errorf("authoritative total_fee must equal platform_fee plus builder_fee")
 	}
-	if fill.LiquidityRole == domain.LiquidityRoleMaker {
+	if strings.EqualFold(fill.Venue, "polymarket") && fill.LiquidityRole == domain.LiquidityRoleMaker {
 		if platformFee.Sign() != 0 {
 			return domain.Fill{}, fmt.Errorf("V2 maker fill cannot contain a platform fee")
 		}

@@ -40,6 +40,7 @@ type PositionLot struct {
 	LotID              string            `json:"lot_id"`
 	ExecutionAccountID string            `json:"execution_account_id"`
 	MarketID           string            `json:"market_id"`
+	MarketSource       MarketSource      `json:"market_source,omitempty"`
 	ConditionID        string            `json:"condition_id"`
 	TokenID            string            `json:"token_id"`
 	OutcomeIndex       *int              `json:"outcome_index,omitempty"`

@@ -22,6 +22,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/clobheartbeat"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
+	"github.com/UniPat-AI/trading_execution/internal/service/executionrouter"
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/marketvalidation"
@@ -35,7 +36,7 @@ const polymarketCollateralAsset = "pUSD"
 // liveRuntime 保存已经通过预检的实盘依赖图和后台服务。
 type liveRuntime struct {
 	repository     *postgresadapter.OrderRepository
-	execution      *execution.Service
+	execution      executionrouter.Execution
 	reconciliation *reconciliation.Service
 	readiness      *readiness.All
 	heartbeat      *clobheartbeat.Service
@@ -338,6 +339,11 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	kalshiRuntime, err := composeKalshiExecution(ctx, cfg, database, repository, guard, fillLedger,
+		executionService, fillLedger, logger)
+	if err != nil {
+		return nil, fmt.Errorf("compose Kalshi live execution: %w", err)
+	}
 
 	positionSource, err := polymarketdata.NewPositionClient(polymarketdata.PositionClientParams{
 		BaseURL:    cfg.Polymarket.DataAPIURL,
@@ -434,8 +440,9 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, fmt.Errorf("build initial live operations snapshot: %w", err)
 	}
 	decisionRunner, err := buildDecisionRunner(buildDecisionRunnerParams{
-		cfg: cfg, database: database, positionSource: fillLedger, orderBooks: orderBooks,
-		executor: executionService, accountIDs: accountIDs, logger: logger,
+		cfg: cfg, database: database, positionSource: kalshiRuntime.positionSource, orderBooks: orderBooks,
+		executor: kalshiRuntime.execution, accountIDs: accountIDs, logger: logger,
+		submissionPolicy: kalshiRuntime.execution,
 	})
 	if err != nil {
 		return nil, err
@@ -472,10 +479,10 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		"quarantined_accounts", len(quarantinedAccountIDs),
 	)
 	return &liveRuntime{
-		repository: repository, execution: executionService,
+		repository: repository, execution: kalshiRuntime.execution,
 		reconciliation: reconciliationService, readiness: combinedReadiness,
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
-		activeAccounts: append([]string(nil), reconciliationAccountIDs...),
+		activeAccounts: append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
 	}, nil
 }
 

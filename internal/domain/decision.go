@@ -633,20 +633,24 @@ func CanonicalStrategyID(value string) string {
 
 // StrategyPositionLot 表示发送给 Python 的逐成交仓位批次，Shares 是该批次的精确剩余数量而不是 Token 净仓位。
 type StrategyPositionLot struct {
-	LotID        string    `json:"lot_id"`
-	MarketID     string    `json:"market_id"`
-	ConditionID  string    `json:"condition_id"`
-	OutcomeIndex int       `json:"outcome_index"`
-	OutcomeName  string    `json:"outcome_name"`
-	TokenID      string    `json:"token_id"`
-	NegRisk      bool      `json:"neg_risk"`
-	EnteredAt    time.Time `json:"entered_at"`
-	Shares       Decimal   `json:"shares"`
-	EntryPrice   Decimal   `json:"entry_price"`
+	LotID        string       `json:"lot_id"`
+	MarketSource MarketSource `json:"market_source,omitempty"`
+	MarketID     string       `json:"market_id"`
+	ConditionID  string       `json:"condition_id"`
+	OutcomeIndex int          `json:"outcome_index"`
+	OutcomeName  string       `json:"outcome_name"`
+	TokenID      string       `json:"token_id"`
+	NegRisk      bool         `json:"neg_risk"`
+	EnteredAt    time.Time    `json:"entered_at"`
+	Shares       Decimal      `json:"shares"`
+	EntryPrice   Decimal      `json:"entry_price"`
 }
 
 // Validate 校验当前模型的字段完整性和业务约束。
 func (lot StrategyPositionLot) Validate(decisionAt time.Time) error {
+	if source := lot.MarketSource.Normalize(); source != MarketSourcePolymarket && source != MarketSourceKalshi {
+		return fmt.Errorf("position lot market_source is invalid")
+	}
 	if strings.TrimSpace(lot.LotID) == "" || strings.TrimSpace(lot.MarketID) == "" ||
 		strings.TrimSpace(lot.ConditionID) == "" || strings.TrimSpace(lot.OutcomeName) == "" || strings.TrimSpace(lot.TokenID) == "" {
 		return fmt.Errorf("position lot identity is required")

@@ -49,7 +49,8 @@ type Client struct {
 }
 
 type Balance struct {
-	BalanceDollars domain.Decimal `json:"balance_dollars"`
+	Balance        int64          `json:"balance"`
+	BalanceDollars domain.Decimal `json:"balance_dollars,omitempty"`
 	PortfolioValue int64          `json:"portfolio_value"`
 }
 
@@ -98,6 +99,36 @@ type SubmittedOrder struct {
 	AverageFeePaid   domain.Decimal `json:"average_fee_paid,omitempty"`
 }
 
+type Order struct {
+	OrderID        string         `json:"order_id"`
+	ClientOrderID  string         `json:"client_order_id"`
+	Ticker         string         `json:"ticker"`
+	Status         string         `json:"status"`
+	FillCount      domain.Decimal `json:"fill_count_fp"`
+	RemainingCount domain.Decimal `json:"remaining_count_fp"`
+	InitialCount   domain.Decimal `json:"initial_count_fp"`
+	TakerFillCost  domain.Decimal `json:"taker_fill_cost_dollars"`
+	MakerFillCost  domain.Decimal `json:"maker_fill_cost_dollars"`
+	TakerFees      domain.Decimal `json:"taker_fees_dollars"`
+	MakerFees      domain.Decimal `json:"maker_fees_dollars"`
+	LastUpdateTime time.Time      `json:"last_update_time"`
+}
+
+type Fill struct {
+	FillID       string         `json:"fill_id"`
+	OrderID      string         `json:"order_id"`
+	Ticker       string         `json:"ticker"`
+	MarketTicker string         `json:"market_ticker"`
+	OutcomeSide  string         `json:"outcome_side"`
+	Count        domain.Decimal `json:"count_fp"`
+	YesPrice     domain.Decimal `json:"yes_price_dollars"`
+	NoPrice      domain.Decimal `json:"no_price_dollars"`
+	IsTaker      bool           `json:"is_taker"`
+	FeeCost      domain.Decimal `json:"fee_cost"`
+	Action       string         `json:"action"`
+	CreatedTime  time.Time      `json:"created_time"`
+}
+
 func NewClient(params ClientParams) (*Client, error) {
 	baseURL, err := url.Parse(strings.TrimSpace(params.BaseURL))
 	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
@@ -135,6 +166,152 @@ func (client *Client) GetBalance(ctx context.Context) (Balance, error) {
 		return Balance{}, err
 	}
 	return balance, nil
+}
+
+func (balance Balance) AvailableDollars() domain.Decimal {
+	if !balance.BalanceDollars.IsEmpty() {
+		return balance.BalanceDollars
+	}
+	return domain.Decimal(new(big.Rat).Quo(big.NewRat(balance.Balance, 1), big.NewRat(100, 1)).FloatString(2))
+}
+
+func (client *Client) GetOrder(ctx context.Context, orderID string) (Order, error) {
+	var envelope struct {
+		Order Order `json:"order"`
+	}
+	requestPath := "/trade-api/v2/portfolio/orders/" + url.PathEscape(strings.TrimSpace(orderID))
+	if err := client.doAuthenticated(ctx, http.MethodGet, requestPath, nil, &envelope); err != nil {
+		return Order{}, err
+	}
+	return envelope.Order, nil
+}
+
+func (client *Client) FindOrderByClientOrderID(ctx context.Context, clientOrderID string) (Order, error) {
+	wanted, cursor := strings.TrimSpace(clientOrderID), ""
+	for page := 0; page < 100; page++ {
+		var envelope struct {
+			Orders []Order `json:"orders"`
+			Cursor string  `json:"cursor"`
+		}
+		query := url.Values{"limit": []string{"1000"}}
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
+		if err := client.doAuthenticated(ctx, http.MethodGet, "/trade-api/v2/portfolio/orders?"+query.Encode(), nil, &envelope); err != nil {
+			return Order{}, err
+		}
+		for _, order := range envelope.Orders {
+			if order.ClientOrderID == wanted {
+				return order, nil
+			}
+		}
+		next := strings.TrimSpace(envelope.Cursor)
+		if next == "" {
+			return Order{}, fmt.Errorf("Kalshi order for client_order_id was not found")
+		}
+		if next == cursor {
+			return Order{}, fmt.Errorf("Kalshi orders cursor did not advance")
+		}
+		cursor = next
+	}
+	return Order{}, fmt.Errorf("Kalshi order lookup exceeded pagination limit")
+}
+
+func (client *Client) CancelOrder(ctx context.Context, orderID string) (Order, error) {
+	if !client.liveTradingEnabled {
+		return Order{}, fmt.Errorf("Kalshi live trading is disabled")
+	}
+	var envelope struct {
+		Order Order `json:"order"`
+	}
+	requestPath := "/trade-api/v2/portfolio/events/orders/" + url.PathEscape(strings.TrimSpace(orderID))
+	if err := client.doAuthenticated(ctx, http.MethodDelete, requestPath, nil, &envelope); err != nil {
+		return Order{}, err
+	}
+	return envelope.Order, nil
+}
+
+func (client *Client) ListFills(ctx context.Context, orderID string) ([]Fill, error) {
+	orderID, cursor := strings.TrimSpace(orderID), ""
+	result := make([]Fill, 0)
+	for page := 0; page < 100; page++ {
+		var envelope struct {
+			Fills  []Fill `json:"fills"`
+			Cursor string `json:"cursor"`
+		}
+		query := url.Values{"order_id": []string{orderID}, "limit": []string{"1000"}}
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
+		if err := client.doAuthenticated(ctx, http.MethodGet, "/trade-api/v2/portfolio/fills?"+query.Encode(), nil, &envelope); err != nil {
+			return nil, err
+		}
+		result = append(result, envelope.Fills...)
+		next := strings.TrimSpace(envelope.Cursor)
+		if next == "" {
+			return result, nil
+		}
+		if next == cursor {
+			return nil, fmt.Errorf("Kalshi fills cursor did not advance")
+		}
+		cursor = next
+	}
+	return nil, fmt.Errorf("Kalshi fill lookup exceeded pagination limit")
+}
+
+// ListOrderFills returns Kalshi's authoritative account fills for the exact
+// venue order. The API reports final fee_cost per fill, so no fee is inferred.
+func (client *Client) ListOrderFills(ctx context.Context, order domain.Order) ([]domain.Fill, error) {
+	fills, err := client.ListFills(ctx, order.VenueOrderID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]domain.Fill, 0, len(fills))
+	for _, raw := range fills {
+		remoteTicker := strings.TrimSpace(raw.Ticker)
+		if remoteTicker == "" {
+			remoteTicker = strings.TrimSpace(raw.MarketTicker)
+		}
+		if raw.OrderID != order.VenueOrderID || remoteTicker != order.Intent.MarketID {
+			return nil, fmt.Errorf("Kalshi fill identity does not match order")
+		}
+		if !strings.EqualFold(raw.OutcomeSide, order.Intent.OutcomeID) ||
+			!strings.EqualFold(raw.Action, string(order.Intent.Side)) {
+			return nil, fmt.Errorf("Kalshi fill outcome/action does not match order intent")
+		}
+		price := raw.YesPrice
+		if strings.EqualFold(order.Intent.OutcomeID, "NO") {
+			price = raw.NoPrice
+		}
+		shares, priceRat, fee, ok := new(big.Rat), new(big.Rat), new(big.Rat), false
+		if shares, ok = shares.SetString(raw.Count.String()); !ok {
+			return nil, fmt.Errorf("invalid Kalshi fill count")
+		}
+		if priceRat, ok = priceRat.SetString(price.String()); !ok {
+			return nil, fmt.Errorf("invalid Kalshi fill price")
+		}
+		if fee, ok = fee.SetString(raw.FeeCost.String()); !ok {
+			return nil, fmt.Errorf("invalid Kalshi fill fee")
+		}
+		gross := new(big.Rat).Mul(shares, priceRat)
+		role := domain.LiquidityRoleMaker
+		if raw.IsTaker {
+			role = domain.LiquidityRoleTaker
+		}
+		payload, _ := json.Marshal(raw)
+		digest := sha256.Sum256(payload)
+		confirmedAt := raw.CreatedTime.UTC()
+		result = append(result, domain.Fill{
+			VenueFillID: raw.FillID, Venue: "kalshi", VenueOrderID: raw.OrderID,
+			LiquidityRole: role, Status: domain.FillStatusConfirmed, Shares: raw.Count, Price: price,
+			GrossNotional: domain.Decimal(gross.FloatString(8)), FeeRateBPS: "0", PlatformFeeRate: "0",
+			FeeExponent: "0", PlatformFee: domain.Decimal(fee.FloatString(8)), BuilderFeeRateBPS: "0",
+			BuilderFee: "0", TotalFee: domain.Decimal(fee.FloatString(8)), FeeSource: "KALSHI_API",
+			MatchedAt: raw.CreatedTime.UTC(), VenueUpdatedAt: raw.CreatedTime.UTC(), ObservedAt: client.now().UTC(),
+			ConfirmedAt: &confirmedAt, RawPayloadSHA256: hex.EncodeToString(digest[:]),
+		})
+	}
+	return result, nil
 }
 
 func (client *Client) GetAPIKeys(ctx context.Context) ([]APIKey, error) {

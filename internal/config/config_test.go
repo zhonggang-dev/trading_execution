@@ -298,6 +298,27 @@ func TestLoadRejectsInvalidEntryDisabledAccounts(t *testing.T) {
 	}
 }
 
+func TestDecodeKalshiLiveBindingsRequiresExactIsolatedRoutes(t *testing.T) {
+	bindings, err := decodeKalshiLiveBindings(`[
+		{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"echo-key","private_key_path":"/run/secrets/kalshi-echo.pem"},
+		{"model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7","api_key_id":"gemini-key","private_key_path":"/run/secrets/kalshi-gemini.pem"}
+	]`)
+	if err != nil || len(bindings) != 2 {
+		t.Fatalf("bindings=%#v err=%v", bindings, err)
+	}
+	if bindings[0].StrategyID != domain.StrategyIDMultfactorV2 || bindings[1].ExecutionAccountID != "wallet-7" {
+		t.Fatalf("bindings=%#v", bindings)
+	}
+	for _, invalid := range []string{
+		`[{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"same","private_key_path":"relative.pem"}]`,
+		`[{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"same","private_key_path":"/a.pem"},{"model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7","api_key_id":"same","private_key_path":"/b.pem"}]`,
+	} {
+		if _, err := decodeKalshiLiveBindings(invalid); err == nil {
+			t.Fatalf("invalid bindings accepted: %s", invalid)
+		}
+	}
+}
+
 func TestLoadKeepsCurrentLiveAccountEntryGateWhenSchedulerDisabled(t *testing.T) {
 	for _, test := range []struct {
 		name  string

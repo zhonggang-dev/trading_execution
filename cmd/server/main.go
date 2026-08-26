@@ -20,6 +20,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/edgedistribution"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
+	"github.com/UniPat-AI/trading_execution/internal/service/executionrouter"
 	"github.com/UniPat-AI/trading_execution/internal/service/ordercoordinator"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 	"github.com/UniPat-AI/trading_execution/internal/service/tradehistory"
@@ -77,7 +78,7 @@ func run() error {
 
 	var (
 		repository            port.OrderRepository
-		executionService      *execution.Service
+		executionService      executionrouter.Execution
 		readiness             readinessChecker
 		reconciliationService *reconciliation.Service
 		live                  *liveRuntime
