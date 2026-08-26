@@ -29,6 +29,12 @@ var (
 	ErrInvalidStrategy = errors.New("strategy response is invalid")
 )
 
+// IntentSubmissionPolicy is a fail-closed venue/binding allowlist. It can
+// narrow durable delivery, but it does not override account entry gates.
+type IntentSubmissionPolicy interface {
+	Enabled(domain.OrderIntent) bool
+}
+
 // Params 表示后端使用的 Params 类型。
 type Params struct {
 	PredictionSource port.PredictionSource
@@ -38,6 +44,7 @@ type Params struct {
 	Strategy         port.StrategyClient
 	Recorder         port.DecisionRecorder
 	Executor         port.OrderExecutor
+	SubmissionPolicy IntentSubmissionPolicy
 	// SubmitEnabled is an independent, fail-closed gate. A disabled cycle still
 	// records the validated strategy output but never invokes execution.Submit.
 	SubmitEnabled bool
@@ -74,6 +81,7 @@ type Service struct {
 	strategy                         port.StrategyClient
 	recorder                         port.DecisionRecorder
 	executor                         port.OrderExecutor
+	submissionPolicy                 IntentSubmissionPolicy
 	submitEnabled                    bool
 	submissionDisabledAccounts       []string
 	submissionDisabledAccountSet     map[string]struct{}
@@ -204,6 +212,7 @@ func New(params Params) (*Service, error) {
 		strategy:                         params.Strategy,
 		recorder:                         params.Recorder,
 		executor:                         params.Executor,
+		submissionPolicy:                 params.SubmissionPolicy,
 		submitEnabled:                    params.SubmitEnabled,
 		submissionDisabledAccounts:       disabledAccounts,
 		submissionDisabledAccountSet:     disabledAccountSet,
@@ -401,7 +410,7 @@ func (service *Service) loadPositionLots(ctx context.Context, decisionAt time.Ti
 			}
 			seen[lot.LotID] = struct{}{}
 			strategyLot, err := (domain.StrategyPositionLotParams{
-				LotID: lot.LotID, MarketID: lot.MarketID, ConditionID: lot.ConditionID,
+				LotID: lot.LotID, MarketSource: lot.MarketSource, MarketID: lot.MarketID, ConditionID: lot.ConditionID,
 				OutcomeIndex: *lot.OutcomeIndex, OutcomeName: lot.OutcomeName, TokenID: lot.TokenID,
 				NegRisk:   *lot.NegRisk,
 				EnteredAt: lot.OpenedAt.UTC(), Shares: lot.RemainingShares, EntryPrice: lot.AverageEntryPrice,
@@ -585,7 +594,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, err
 	}
-	deliverableIntents, venueDryRunIntents := submissionIntents(intents)
+	deliverableIntents, venueDryRunIntents := service.submissionIntents(intents)
 	response, _, err = service.recorder.ClaimOutput(ctx, response, deliverableIntents, params.submitEnabled)
 	run.Response = response
 	if err != nil {
@@ -595,7 +604,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, fmt.Errorf("validate recorded strategy output: %w", err)
 	}
-	_, venueDryRunIntents = submissionIntents(intents)
+	_, venueDryRunIntents = service.submissionIntents(intents)
 	if !params.submitEnabled {
 		run.Intents = make([]IntentResult, 0, len(intents))
 		for _, intent := range intents {
@@ -634,9 +643,13 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 // exposed as dry-run results, but are not inserted into the durable delivery
 // queue until a venue-specific executor, fills, positions, and reconciliation
 // path are composed.
-func submissionIntents(intents []domain.OrderIntent) (deliverable, venueDryRun []domain.OrderIntent) {
+func (service *Service) submissionIntents(intents []domain.OrderIntent) (deliverable, venueDryRun []domain.OrderIntent) {
 	for _, intent := range intents {
-		if intent.MarketSource.Normalize() == domain.MarketSourcePolymarket {
+		enabled := intent.MarketSource.Normalize() == domain.MarketSourcePolymarket
+		if service.submissionPolicy != nil {
+			enabled = service.submissionPolicy.Enabled(intent)
+		}
+		if enabled {
 			deliverable = append(deliverable, intent)
 			continue
 		}
@@ -1104,7 +1117,7 @@ func buildInputTargets(predictions []domain.Prediction, positions []domain.Strat
 	}
 	for _, lot := range positions {
 		target, err := (domain.BookTargetParams{
-			MarketID: lot.MarketID, ConditionID: lot.ConditionID,
+			MarketSource: lot.MarketSource, MarketID: lot.MarketID, ConditionID: lot.ConditionID,
 			OutcomeIndex: lot.OutcomeIndex, TokenID: lot.TokenID,
 		}).Build()
 		if err != nil {
@@ -1648,11 +1661,15 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 		"model_id":                 request.Context.ModelID,
 		"execution_account_id":     request.Context.ExecutionAccountID,
 	}
+	intentVenue, err := lot.MarketSource.Venue(venue)
+	if err != nil {
+		return domain.OrderIntent{}, err
+	}
 	intent, err := (domain.OrderIntentParams{
 		ModelID: request.Context.ModelID, StrategyID: request.Context.StrategyID,
 		ExecutionAccountID: request.Context.ExecutionAccountID,
 		SignalID:           exit.DecisionID, ClientOrderID: clientOrderID(request.CycleID, exit.DecisionID),
-		Venue: venue, MarketID: lot.MarketID, ConditionID: lot.ConditionID,
+		Venue: intentVenue, MarketSource: lot.MarketSource, MarketID: lot.MarketID, ConditionID: lot.ConditionID,
 		OutcomeIndex: &outcomeIndex, OutcomeName: lot.OutcomeName, TokenID: lot.TokenID,
 		TargetLotID: lot.LotID, ExpectedNegRisk: &expectedNegRisk,
 		MarketSnapshotAt: &marketSnapshotAt, SignalAt: &signalAt,

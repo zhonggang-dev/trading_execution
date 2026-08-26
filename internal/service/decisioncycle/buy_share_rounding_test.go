@@ -114,7 +114,7 @@ func TestKalshiPredictionBuildsVenueIntentButStaysOutOfPolymarketDelivery(t *tes
 	if intent.Venue != "kalshi" || intent.MarketSource != domain.MarketSourceKalshi || intent.OutcomeID != "YES" {
 		t.Fatalf("intent = %#v", intent)
 	}
-	deliverable, dryRun := submissionIntents([]domain.OrderIntent{intent})
+	deliverable, dryRun := (&Service{}).submissionIntents([]domain.OrderIntent{intent})
 	if len(deliverable) != 0 || len(dryRun) != 1 || dryRun[0].ClientOrderID != intent.ClientOrderID {
 		t.Fatalf("submission partition: deliverable=%#v dry-run=%#v", deliverable, dryRun)
 	}

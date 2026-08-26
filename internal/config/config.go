@@ -137,6 +137,18 @@ type Kalshi struct {
 	APIKeyID          string
 	PrivateKeyPath    string
 	RequestTimeout    time.Duration
+	LiveBindings      []KalshiLiveBinding
+}
+
+// KalshiLiveBinding binds one exact strategy route to one isolated Kalshi
+// credential. PrivateKeyPath points at a root-provisioned 0600 secret file;
+// private key material is never accepted inline.
+type KalshiLiveBinding struct {
+	ModelID            string `json:"model_id"`
+	StrategyID         string `json:"strategy_id"`
+	ExecutionAccountID string `json:"execution_account_id"`
+	APIKeyID           string `json:"api_key_id"`
+	PrivateKeyPath     string `json:"private_key_path"`
 }
 
 // Load 从环境变量加载并校验服务配置。
@@ -208,6 +220,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	kalshiRequestTimeout, err := duration("KALSHI_REQUEST_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiLiveBindings, err := decodeKalshiLiveBindings(os.Getenv("KALSHI_LIVE_BINDINGS_JSON"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -344,6 +360,7 @@ func Load() (Config, error) {
 			APIKeyID:          strings.TrimSpace(os.Getenv("KALSHI_API_KEY_ID")),
 			PrivateKeyPath:    strings.TrimSpace(os.Getenv("KALSHI_PRIVATE_KEY_PATH")),
 			RequestTimeout:    kalshiRequestTimeout,
+			LiveBindings:      kalshiLiveBindings,
 		},
 		LiveOperations: LiveOperations{
 			Interval: liveOperationsInterval, RefreshTimeout: liveOperationsRefreshTimeout,
@@ -643,6 +660,44 @@ func decodeDecisionEntryDisabledAccounts(value string) ([]string, error) {
 		accounts[index] = strings.TrimSpace(accounts[index])
 	}
 	return accounts, nil
+}
+
+func decodeKalshiLiveBindings(value string) ([]KalshiLiveBinding, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	var bindings []KalshiLiveBinding
+	if err := json.Unmarshal([]byte(value), &bindings); err != nil {
+		return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON must be a JSON array: %w", err)
+	}
+	seenRoutes := make(map[string]struct{}, len(bindings))
+	seenKeys := make(map[string]struct{}, len(bindings))
+	for index := range bindings {
+		binding := &bindings[index]
+		binding.ModelID = strings.TrimSpace(binding.ModelID)
+		binding.StrategyID = domain.CanonicalStrategyID(binding.StrategyID)
+		binding.ExecutionAccountID = strings.TrimSpace(binding.ExecutionAccountID)
+		binding.APIKeyID = strings.TrimSpace(binding.APIKeyID)
+		binding.PrivateKeyPath = strings.TrimSpace(binding.PrivateKeyPath)
+		if binding.ModelID == "" || binding.StrategyID == "" || binding.ExecutionAccountID == "" ||
+			binding.APIKeyID == "" || binding.PrivateKeyPath == "" {
+			return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON binding %d is incomplete", index)
+		}
+		if !filepath.IsAbs(binding.PrivateKeyPath) {
+			return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON binding %d private_key_path must be absolute", index)
+		}
+		route := binding.ModelID + "\x00" + binding.StrategyID + "\x00" + binding.ExecutionAccountID
+		if _, duplicate := seenRoutes[route]; duplicate {
+			return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON repeats a strategy route")
+		}
+		seenRoutes[route] = struct{}{}
+		if _, duplicate := seenKeys[binding.APIKeyID]; duplicate {
+			return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON reuses one API key across bindings")
+		}
+		seenKeys[binding.APIKeyID] = struct{}{}
+	}
+	return bindings, nil
 }
 
 func decodeDecisionPredictionSourceModes(value string) (map[string]domain.PredictionSourceMode, error) {
