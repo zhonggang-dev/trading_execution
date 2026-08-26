@@ -8,6 +8,12 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 )
 
+type testIntentSubmissionPolicy func(domain.OrderIntent) bool
+
+func (policy testIntentSubmissionPolicy) Enabled(intent domain.OrderIntent) bool {
+	return policy(intent)
+}
+
 // TestRoundBuySharesUsesHalfUpRounding 验证 BUY shares 按四舍五入变为整数。
 func TestRoundBuySharesUsesHalfUpRounding(t *testing.T) {
 	tests := []struct {
@@ -117,6 +123,13 @@ func TestKalshiPredictionBuildsVenueIntentButStaysOutOfPolymarketDelivery(t *tes
 	deliverable, dryRun := (&Service{}).submissionIntents([]domain.OrderIntent{intent})
 	if len(deliverable) != 0 || len(dryRun) != 1 || dryRun[0].ClientOrderID != intent.ClientOrderID {
 		t.Fatalf("submission partition: deliverable=%#v dry-run=%#v", deliverable, dryRun)
+	}
+	liveService := &Service{submissionPolicy: testIntentSubmissionPolicy(func(candidate domain.OrderIntent) bool {
+		return candidate.MarketSource.Normalize() == domain.MarketSourceKalshi && candidate.ModelID == "model-1" && candidate.StrategyID == domain.StrategyIDMultfactorV1 && candidate.ExecutionAccountID == "account-1"
+	})}
+	deliverable, dryRun = liveService.submissionIntents([]domain.OrderIntent{intent})
+	if len(deliverable) != 1 || len(dryRun) != 0 {
+		t.Fatalf("enabled Kalshi partition: deliverable=%#v dry-run=%#v", deliverable, dryRun)
 	}
 }
 

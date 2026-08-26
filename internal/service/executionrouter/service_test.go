@@ -2,6 +2,7 @@ package executionrouter
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
@@ -14,6 +15,32 @@ type fakeExecution struct{ submitted []domain.OrderIntent }
 func (fake *fakeExecution) Submit(_ context.Context, intent domain.OrderIntent) (port.OrderSubmitResult, error) {
 	fake.submitted = append(fake.submitted, intent)
 	return port.OrderSubmitResult{}, nil
+}
+
+func TestPolymarketSubmissionRemainsOnPrimaryWithoutMutation(t *testing.T) {
+	primary, kalshiExecution := &fakeExecution{}, &fakeExecution{}
+	router, err := New(memory.NewOrderRepository(), primary, []Route{{ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2,
+		LogicalAccountID: "main", InternalAccountID: "kalshi:main", Execution: kalshiExecution}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := domain.OrderIntent{ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main",
+		MarketSource: domain.MarketSourcePolymarket, Venue: "polymarket", MarketID: "pm-market", TokenID: "pm-token",
+		ClientOrderID: "pm-order", Metadata: map[string]string{"sentinel": "unchanged"}}
+	want := intent
+	want.Metadata = map[string]string{"sentinel": "unchanged"}
+	if !router.Enabled(intent) {
+		t.Fatal("Polymarket must remain enabled")
+	}
+	if _, err := router.Submit(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(primary.submitted) != 1 || len(kalshiExecution.submitted) != 0 {
+		t.Fatalf("wrong venue route: primary=%d kalshi=%d", len(primary.submitted), len(kalshiExecution.submitted))
+	}
+	if !reflect.DeepEqual(primary.submitted[0], want) {
+		t.Fatalf("Polymarket intent mutated\n got: %#v\nwant: %#v", primary.submitted[0], want)
+	}
 }
 func (*fakeExecution) Resume(context.Context, string) (domain.Order, error) {
 	return domain.Order{}, nil

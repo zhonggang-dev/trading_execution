@@ -42,57 +42,20 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 		if !configuredBinding(cfg.DecisionCycle.Bindings, binding) {
 			return kalshiComposition{}, fmt.Errorf("Kalshi live route is not an exact decision binding")
 		}
-		client, err := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, APIKeyID: binding.APIKeyID,
-			PrivateKeyPath: binding.PrivateKeyPath, HTTPClient: noRedirectHTTPClient(cfg.Kalshi.RequestTimeout), LiveTradingEnabled: true})
+		built, err := buildKalshiLiveRoute(ctx, cfg, binding, database, repository, guard, ledger)
 		if err != nil {
-			return kalshiComposition{}, err
+			// Kalshi is an additive venue. A credential/API failure downgrades only
+			// this exact route to dry-run; it must never take Polymarket offline.
+			logger.Error("Kalshi live binding disabled after preflight", "model_id", binding.ModelID,
+				"strategy_id", binding.StrategyID, "execution_account_id", binding.ExecutionAccountID, "error", err)
+			continue
 		}
-		capabilities, err := client.ProbeCapabilities(ctx)
-		if err != nil || !capabilities.Write {
-			return kalshiComposition{}, fmt.Errorf("Kalshi route %s/%s preflight lacks write scope: %w", binding.ModelID, binding.StrategyID, err)
-		}
-		balance, err := client.GetBalance(ctx)
-		if err != nil {
-			return kalshiComposition{}, err
-		}
-		internalID := "kalshi:" + binding.ExecutionAccountID
-		if err := syncKalshiExecutionAccount(ctx, database, internalID, binding.APIKeyID, balance.AvailableDollars()); err != nil {
-			return kalshiComposition{}, err
-		}
-		venue, _ := kalshi.NewVenue(client)
-		books, err := kalshi.NewOrderBookSource(kalshi.OrderBookParams{Client: client})
-		if err != nil {
-			return kalshiComposition{}, err
-		}
-		validator, err := kalshi.NewMarketValidator(books)
-		if err != nil {
-			return kalshiComposition{}, err
-		}
-		processor, err := fillprocessor.New(fillprocessor.Params{Orders: repository, Source: client, Ledger: ledger})
-		if err != nil {
-			return kalshiComposition{}, err
-		}
-		reservations, err := postgresadapter.NewReservationManager(postgresadapter.ReservationManagerParams{DB: database, MaxBuyFeeRateBPS: cfg.Polymarket.MaxBuyFeeRateBPS})
-		if err != nil {
-			return kalshiComposition{}, err
-		}
-		scope, err := accountscope.New([]string{internalID}, []string{internalID})
-		if err != nil {
-			return kalshiComposition{}, err
-		}
-		service, err := execution.New(execution.Params{Repository: repository, Venue: venue, Guard: guard, MarketValidator: validator,
-			Reservations: reservations, FillSynchronizer: processor, AuthoritativeFills: true, AccountScope: scope,
-			RequirePreparedPlacement: true, MaxReconcileAttempts: cfg.Polymarket.MaxReconcileAttempts,
-			CancelFillFinalityGrace: cfg.Polymarket.CancelFillFinalityGrace, EntrySubmissionDisabled: cfg.DecisionCycle.EntrySubmissionDisabled})
-		if err != nil {
-			return kalshiComposition{}, err
-		}
-		routes = append(routes, executionrouter.Route{ModelID: binding.ModelID, StrategyID: binding.StrategyID,
-			LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID, Execution: service})
-		positionRoutes = append(positionRoutes, positionsource.Route{LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID})
-		active = append(active, internalID)
+		routes = append(routes, built.route)
+		positionRoutes = append(positionRoutes, built.positionRoute)
+		active = append(active, built.internalAccountID)
 		logger.Info("Kalshi live binding preflight passed", "model_id", binding.ModelID, "strategy_id", binding.StrategyID,
-			"execution_account_id", binding.ExecutionAccountID, "internal_account_id", internalID)
+			"execution_account_id", binding.ExecutionAccountID, "internal_account_id", built.internalAccountID,
+			"buy_funded", built.buyFunded)
 	}
 	router, err := executionrouter.New(repository, primary, routes)
 	if err != nil {
@@ -103,6 +66,88 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 		return kalshiComposition{}, err
 	}
 	return kalshiComposition{execution: router, positionSource: positionRouter, activeAccounts: active}, nil
+}
+
+type builtKalshiLiveRoute struct {
+	route             executionrouter.Route
+	positionRoute     positionsource.Route
+	internalAccountID string
+	buyFunded         bool
+}
+
+func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config.KalshiLiveBinding, database *sql.DB,
+	repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger) (builtKalshiLiveRoute, error) {
+	client, err := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, APIKeyID: binding.APIKeyID,
+		PrivateKeyPath: binding.PrivateKeyPath, HTTPClient: noRedirectHTTPClient(cfg.Kalshi.RequestTimeout), LiveTradingEnabled: true})
+	if err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	capabilities, err := client.ProbeCapabilities(ctx)
+	if err != nil {
+		return builtKalshiLiveRoute{}, fmt.Errorf("probe Kalshi capabilities: %w", err)
+	}
+	if !capabilities.Write {
+		return builtKalshiLiveRoute{}, fmt.Errorf("Kalshi API key lacks write scope")
+	}
+	balance, err := client.GetBalance(ctx)
+	if err != nil {
+		return builtKalshiLiveRoute{}, fmt.Errorf("read Kalshi balance: %w", err)
+	}
+	availableBalance := balance.AvailableDollars()
+	availableSign, signErr := availableBalance.Sign()
+	if signErr != nil {
+		return builtKalshiLiveRoute{}, fmt.Errorf("Kalshi available balance is invalid")
+	}
+	internalID := "kalshi:" + binding.ExecutionAccountID
+	if err := syncKalshiExecutionAccount(ctx, database, internalID, binding.APIKeyID, availableBalance); err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	venue, err := kalshi.NewVenue(client)
+	if err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	books, err := kalshi.NewOrderBookSource(kalshi.OrderBookParams{Client: client})
+	if err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	validator, err := kalshi.NewMarketValidator(books)
+	if err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	processor, err := fillprocessor.New(fillprocessor.Params{Orders: repository, Source: client, Ledger: ledger})
+	if err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	reservations, err := postgresadapter.NewReservationManager(postgresadapter.ReservationManagerParams{DB: database, MaxBuyFeeRateBPS: cfg.Polymarket.MaxBuyFeeRateBPS})
+	if err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	scope, err := accountscope.New([]string{internalID}, []string{internalID})
+	if err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	service, err := execution.New(execution.Params{Repository: repository, Venue: venue, Guard: guard, MarketValidator: validator,
+		Reservations: reservations, FillSynchronizer: processor, AuthoritativeFills: true, AccountScope: scope,
+		RequirePreparedPlacement: true, MaxReconcileAttempts: cfg.Polymarket.MaxReconcileAttempts,
+		CancelFillFinalityGrace: cfg.Polymarket.CancelFillFinalityGrace, EntrySubmissionDisabled: cfg.DecisionCycle.EntrySubmissionDisabled,
+		EntryDisabledAccounts: internalEntryDisabledAccounts(binding.ExecutionAccountID, internalID, cfg.DecisionCycle.EntryDisabledAccounts)})
+	if err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	return builtKalshiLiveRoute{
+		route:             executionrouter.Route{ModelID: binding.ModelID, StrategyID: binding.StrategyID, LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID, Execution: service},
+		positionRoute:     positionsource.Route{LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID},
+		internalAccountID: internalID, buyFunded: availableSign > 0,
+	}, nil
+}
+
+func internalEntryDisabledAccounts(logicalAccountID, internalAccountID string, disabled []string) []string {
+	for _, accountID := range disabled {
+		if strings.TrimSpace(accountID) == logicalAccountID {
+			return []string{internalAccountID}
+		}
+	}
+	return nil
 }
 
 func configuredBinding(bindings []domain.StrategyExecutionBinding, candidate config.KalshiLiveBinding) bool {

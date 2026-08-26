@@ -105,6 +105,65 @@ func TestSubmitPreparedIsIndependentAndFailClosed(t *testing.T) {
 	}
 }
 
+func TestBalanceSupportsCurrentCentResponse(t *testing.T) {
+	if got := (Balance{Balance: 12345}).AvailableDollars(); got != "123.45" {
+		t.Fatalf("AvailableDollars()=%s", got)
+	}
+}
+
+func TestOrderLifecycleAndFillEvidenceUseExactVenueIdentity(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		verifySignature(t, request, "key", &privateKey.PublicKey)
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/orders/venue-order":
+			_, _ = writer.Write([]byte(`{"order":{"order_id":"venue-order","client_order_id":"client-order","ticker":"TEST-MARKET","status":"executed","fill_count_fp":"2.00","remaining_count_fp":"0.00","initial_count_fp":"2.00","taker_fill_cost_dollars":"1.20","maker_fill_cost_dollars":"0","last_update_time":"2026-08-26T00:00:01Z"}}`))
+		case request.Method == http.MethodDelete && request.URL.Path == "/trade-api/v2/portfolio/events/orders/venue-order":
+			_, _ = writer.Write([]byte(`{"order":{"order_id":"venue-order","client_order_id":"client-order","ticker":"TEST-MARKET","status":"canceled","fill_count_fp":"0","remaining_count_fp":"0","initial_count_fp":"2.00","last_update_time":"2026-08-26T00:00:02Z"}}`))
+		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/fills":
+			if request.URL.Query().Get("order_id") != "venue-order" {
+				t.Errorf("order_id query=%q", request.URL.Query().Get("order_id"))
+			}
+			_, _ = writer.Write([]byte(`{"fills":[{"fill_id":"fill-1","order_id":"venue-order","market_ticker":"TEST-MARKET","outcome_side":"yes","count_fp":"2.00","yes_price_dollars":"0.6000","no_price_dollars":"0.4000","is_taker":true,"fee_cost":"0.03","action":"buy","created_time":"2026-08-26T00:00:01Z"}],"cursor":""}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, true)
+	remote, err := client.GetOrder(context.Background(), "venue-order")
+	if err != nil || remote.Status != "executed" {
+		t.Fatalf("GetOrder=%#v err=%v", remote, err)
+	}
+	order := domain.Order{VenueOrderID: "venue-order", Intent: validKalshiIntent(domain.SideBuy, "YES")}
+	fills, err := client.ListOrderFills(context.Background(), order)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fills) != 1 || fills[0].VenueFillID != "fill-1" || fills[0].Price != "0.6000" || fills[0].TotalFee != "0.03000000" || fills[0].FeeSource != "KALSHI_API" {
+		t.Fatalf("fills=%#v", fills)
+	}
+	cancelled, err := client.CancelOrder(context.Background(), "venue-order")
+	if err != nil || cancelled.Status != "canceled" {
+		t.Fatalf("CancelOrder=%#v err=%v", cancelled, err)
+	}
+}
+
+func TestFillEvidenceRejectsWrongOutcomeOrAction(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"fills":[{"fill_id":"fill-1","order_id":"venue-order","ticker":"TEST-MARKET","outcome_side":"no","count_fp":"1","yes_price_dollars":"0.6","no_price_dollars":"0.4","is_taker":true,"fee_cost":"0","action":"sell","created_time":"2026-08-26T00:00:01Z"}]}`))
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, false)
+	order := domain.Order{VenueOrderID: "venue-order", Intent: validKalshiIntent(domain.SideBuy, "YES")}
+	if _, err := client.ListOrderFills(context.Background(), order); err == nil {
+		t.Fatal("mismatched fill identity must fail closed")
+	}
+}
+
 func validKalshiIntent(side domain.Side, outcomeID string) domain.OrderIntent {
 	intent := domain.OrderIntent{
 		ModelID: "model", StrategyID: "multfactor_v1", ExecutionAccountID: "account",

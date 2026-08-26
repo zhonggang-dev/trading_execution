@@ -187,18 +187,34 @@ func (client *Client) GetOrder(ctx context.Context, orderID string) (Order, erro
 }
 
 func (client *Client) FindOrderByClientOrderID(ctx context.Context, clientOrderID string) (Order, error) {
-	var envelope struct {
-		Orders []Order `json:"orders"`
-	}
-	if err := client.doAuthenticated(ctx, http.MethodGet, "/trade-api/v2/portfolio/orders?limit=1000", nil, &envelope); err != nil {
-		return Order{}, err
-	}
-	for _, order := range envelope.Orders {
-		if order.ClientOrderID == strings.TrimSpace(clientOrderID) {
-			return order, nil
+	wanted, cursor := strings.TrimSpace(clientOrderID), ""
+	for page := 0; page < 100; page++ {
+		var envelope struct {
+			Orders []Order `json:"orders"`
+			Cursor string  `json:"cursor"`
 		}
+		query := url.Values{"limit": []string{"1000"}}
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
+		if err := client.doAuthenticated(ctx, http.MethodGet, "/trade-api/v2/portfolio/orders?"+query.Encode(), nil, &envelope); err != nil {
+			return Order{}, err
+		}
+		for _, order := range envelope.Orders {
+			if order.ClientOrderID == wanted {
+				return order, nil
+			}
+		}
+		next := strings.TrimSpace(envelope.Cursor)
+		if next == "" {
+			return Order{}, fmt.Errorf("Kalshi order for client_order_id was not found")
+		}
+		if next == cursor {
+			return Order{}, fmt.Errorf("Kalshi orders cursor did not advance")
+		}
+		cursor = next
 	}
-	return Order{}, fmt.Errorf("Kalshi order for client_order_id was not found")
+	return Order{}, fmt.Errorf("Kalshi order lookup exceeded pagination limit")
 }
 
 func (client *Client) CancelOrder(ctx context.Context, orderID string) (Order, error) {
@@ -216,14 +232,31 @@ func (client *Client) CancelOrder(ctx context.Context, orderID string) (Order, e
 }
 
 func (client *Client) ListFills(ctx context.Context, orderID string) ([]Fill, error) {
-	var envelope struct {
-		Fills []Fill `json:"fills"`
+	orderID, cursor := strings.TrimSpace(orderID), ""
+	result := make([]Fill, 0)
+	for page := 0; page < 100; page++ {
+		var envelope struct {
+			Fills  []Fill `json:"fills"`
+			Cursor string `json:"cursor"`
+		}
+		query := url.Values{"order_id": []string{orderID}, "limit": []string{"1000"}}
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
+		if err := client.doAuthenticated(ctx, http.MethodGet, "/trade-api/v2/portfolio/fills?"+query.Encode(), nil, &envelope); err != nil {
+			return nil, err
+		}
+		result = append(result, envelope.Fills...)
+		next := strings.TrimSpace(envelope.Cursor)
+		if next == "" {
+			return result, nil
+		}
+		if next == cursor {
+			return nil, fmt.Errorf("Kalshi fills cursor did not advance")
+		}
+		cursor = next
 	}
-	requestPath := "/trade-api/v2/portfolio/fills?order_id=" + url.QueryEscape(strings.TrimSpace(orderID)) + "&limit=1000"
-	if err := client.doAuthenticated(ctx, http.MethodGet, requestPath, nil, &envelope); err != nil {
-		return nil, err
-	}
-	return envelope.Fills, nil
+	return nil, fmt.Errorf("Kalshi fill lookup exceeded pagination limit")
 }
 
 // ListOrderFills returns Kalshi's authoritative account fills for the exact
@@ -241,6 +274,10 @@ func (client *Client) ListOrderFills(ctx context.Context, order domain.Order) ([
 		}
 		if raw.OrderID != order.VenueOrderID || remoteTicker != order.Intent.MarketID {
 			return nil, fmt.Errorf("Kalshi fill identity does not match order")
+		}
+		if !strings.EqualFold(raw.OutcomeSide, order.Intent.OutcomeID) ||
+			!strings.EqualFold(raw.Action, string(order.Intent.Side)) {
+			return nil, fmt.Errorf("Kalshi fill outcome/action does not match order intent")
 		}
 		price := raw.YesPrice
 		if strings.EqualFold(order.Intent.OutcomeID, "NO") {
