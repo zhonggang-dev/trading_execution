@@ -73,7 +73,6 @@ const (
 	LiveFlowDone    LiveFlowState = "done"
 	LiveFlowActive  LiveFlowState = "active"
 	LiveFlowWarning LiveFlowState = "warning"
-	LiveFlowDanger  LiveFlowState = "danger"
 	LiveFlowIdle    LiveFlowState = "idle"
 	LiveFlowSafe    LiveFlowState = "safe"
 )
@@ -157,28 +156,15 @@ type LiveFunnelStage struct {
 	State           LiveFlowState `json:"state"`
 }
 
-// LiveRiskThresholdType 区分服务端强制硬上限与只读运营目标。
-type LiveRiskThresholdType string
-
-const (
-	LiveRiskHardLimit LiveRiskThresholdType = "hard_limit"
-	LiveRiskTarget    LiveRiskThresholdType = "target"
-)
-
-// LiveRisk 表示一个由服务端计算并标明执行语义的风险指标。
+// LiveRisk 表示一个当前生效的硬风控指标及其限额。
 type LiveRisk struct {
-	ID                string                `json:"id"`
-	Name              string                `json:"name"`
-	Current           LiveNumber            `json:"current"`
-	WarningThreshold  LiveNumber            `json:"warningThreshold"`
-	HardLimit         LiveNumber            `json:"hardLimit"`
-	Limit             LiveNumber            `json:"limit"`
-	UsagePercentage   *LiveNumber           `json:"usagePercentage,omitempty"`
-	HardLimitEnforced bool                  `json:"hardLimitEnforced"`
-	ThresholdType     LiveRiskThresholdType `json:"thresholdType"`
-	Unit              string                `json:"unit"`
-	Hint              string                `json:"hint"`
-	State             LiveFlowState         `json:"state"`
+	ID      string        `json:"id"`
+	Name    string        `json:"name"`
+	Current LiveNumber    `json:"current"`
+	Limit   LiveNumber    `json:"limit"`
+	Unit    string        `json:"unit"`
+	Hint    string        `json:"hint"`
+	State   LiveFlowState `json:"state"`
 }
 
 // LiveLifecycleStep 表示订单不可变事件映射出的一个生命周期节点。

@@ -651,7 +651,7 @@ func TestAtomicLiveRiskPostgresIntegration(t *testing.T) {
 		assertAccount(t, db, accountID, "100", "100", "0")
 	})
 
-	t.Run("daily hard limit serializes concurrent strategy orders", func(t *testing.T) {
+	t.Run("legacy daily cap does not block concurrent strategy orders", func(t *testing.T) {
 		accountID := "account-live-daily"
 		insertAccount(t, db, accountID, "0xlivedaily", "1000", "1000", "0")
 		provisionLiveRisk(t, db, liveRiskFixture{
@@ -663,18 +663,18 @@ func TestAtomicLiveRiskPostgresIntegration(t *testing.T) {
 			liveIntegrationOrder("daily-a", accountID, "token-daily-a", "100", "0.5", now),
 			liveIntegrationOrder("daily-b", accountID, "token-daily-b", "100", "0.5", now),
 		}
-		assertConcurrentReservationsLimited(t, manager, orders, "DAILY_TRADED_NOTIONAL_EXCEEDED")
-		assertAccount(t, db, accountID, "1000", "950", "50")
+		assertConcurrentReservationsSucceed(t, manager, orders)
+		assertAccount(t, db, accountID, "1000", "900", "100")
 		var authorized int
 		if err := db.QueryRow(`
 			SELECT count(*) FROM asset_reservations
 			WHERE execution_account_id=$1 AND risk_policy_id <> ''
-			  AND daily_risk_notional=50`, accountID).Scan(&authorized); err != nil || authorized != 1 {
-			t.Fatalf("authorized daily reservations=%d err=%v, want 1", authorized, err)
+			  AND daily_risk_notional=50`, accountID).Scan(&authorized); err != nil || authorized != 2 {
+			t.Fatalf("authorized daily reservations=%d err=%v, want 2", authorized, err)
 		}
 	})
 
-	t.Run("market hard limit serializes concurrent strategy orders", func(t *testing.T) {
+	t.Run("legacy market cap does not block concurrent strategy orders", func(t *testing.T) {
 		accountID := "account-live-market"
 		insertAccount(t, db, accountID, "0xlivemarket", "1000", "1000", "0")
 		provisionLiveRisk(t, db, liveRiskFixture{
@@ -686,8 +686,8 @@ func TestAtomicLiveRiskPostgresIntegration(t *testing.T) {
 			liveIntegrationOrder("market-a", accountID, "token-market-a", "100", "0.5", now),
 			liveIntegrationOrder("market-b", accountID, "token-market-b", "100", "0.5", now),
 		}
-		assertConcurrentReservationsLimited(t, manager, orders, "MAX_MARKET_EXPOSURE_EXCEEDED")
-		assertAccount(t, db, accountID, "1000", "950", "50")
+		assertConcurrentReservationsSucceed(t, manager, orders)
+		assertAccount(t, db, accountID, "1000", "900", "100")
 	})
 
 	t.Run("submit trigger rechecks kill switch after reservation", func(t *testing.T) {
@@ -808,8 +808,7 @@ func liveIntegrationOrder(orderID, accountID, tokenID, size, worstPrice string, 
 	return order
 }
 
-// assertConcurrentReservationsLimited 验证并发新增风险只允许一个订单越过串行检查点。
-func assertConcurrentReservationsLimited(t *testing.T, manager *ReservationManager, orders []domain.Order, rejectionCode string) {
+func assertConcurrentReservationsSucceed(t *testing.T, manager *ReservationManager, orders []domain.Order) {
 	t.Helper()
 	errorsChannel := make(chan error, len(orders))
 	var waitGroup sync.WaitGroup
@@ -824,24 +823,18 @@ func assertConcurrentReservationsLimited(t *testing.T, manager *ReservationManag
 	waitGroup.Wait()
 	close(errorsChannel)
 	successes := 0
-	rejections := 0
 	for err := range errorsChannel {
 		if err == nil {
 			successes++
 			continue
 		}
-		var rejection *port.Rejection
-		if !errors.As(err, &rejection) || rejection.Code != rejectionCode {
-			t.Fatalf("concurrent strategy reservation error=%v, want %s", err, rejectionCode)
-		}
-		rejections++
+		t.Fatalf("concurrent strategy reservation error: %v", err)
 	}
-	if successes != 1 || rejections != len(orders)-1 {
-		t.Fatalf("successes=%d rejections=%d, want 1/%d", successes, rejections, len(orders)-1)
+	if successes != len(orders) {
+		t.Fatalf("successes=%d, want %d", successes, len(orders))
 	}
 }
 
-// assertRejectionCode 校验错误是指定的领域拒绝码。
 func assertRejectionCode(t *testing.T, err error, code string) {
 	t.Helper()
 	var rejection *port.Rejection
