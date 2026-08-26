@@ -96,11 +96,16 @@ type BookTargetParams BookTarget
 // Build 规范化并校验市场、条件、结果和 token 的联合身份。
 func (params BookTargetParams) Build() (BookTarget, error) {
 	target := BookTarget(params)
+	target.MarketSource = inferredMarketSource(target.MarketSource, target.ConditionID)
 	target.MarketID = strings.TrimSpace(target.MarketID)
 	target.ConditionID = strings.TrimSpace(target.ConditionID)
+	target.OutcomeID = strings.ToUpper(strings.TrimSpace(target.OutcomeID))
 	target.TokenID = strings.TrimSpace(target.TokenID)
-	if target.MarketID == "" || target.ConditionID == "" || target.TokenID == "" {
-		return BookTarget{}, fmt.Errorf("book target market, condition, and token identifiers are required")
+	instrumentID, err := CanonicalInstrumentID(
+		target.MarketSource, target.MarketID, target.ConditionID, target.OutcomeID, target.TokenID,
+	)
+	if err != nil || instrumentID != target.TokenID {
+		return BookTarget{}, fmt.Errorf("book target venue identity is invalid")
 	}
 	if target.OutcomeIndex != 0 && target.OutcomeIndex != 1 {
 		return BookTarget{}, fmt.Errorf("book target outcome index must be 0 or 1")

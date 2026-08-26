@@ -28,6 +28,7 @@ type PredictionOutcome struct {
 	Index       int     `json:"index"`
 	Name        string  `json:"name"`
 	TokenID     string  `json:"token_id"`
+	OutcomeID   string  `json:"outcome_id,omitempty"`
 	Probability float64 `json:"probability"`
 }
 
@@ -43,6 +44,7 @@ type Prediction struct {
 	PredictionID   string              `json:"prediction_id"`
 	SourceJobID    string              `json:"source_job_id"`
 	SandboxID      string              `json:"sandbox_id"`
+	MarketSource   MarketSource        `json:"market_source,omitempty"`
 	MarketID       string              `json:"market_id"`
 	ConditionID    string              `json:"condition_id"`
 	EventID        string              `json:"event_id,omitempty"`
@@ -89,6 +91,7 @@ type PredictionExpectation struct {
 	PredictionModelID string                      `json:"prediction_model_id"`
 	SelectionID       int64                       `json:"selection_id"`
 	SelectionRunID    int64                       `json:"selection_run_id"`
+	MarketSource      MarketSource                `json:"market_source,omitempty"`
 	MarketID          string                      `json:"market_id"`
 	ConditionID       string                      `json:"condition_id"`
 	Outcomes          []PredictionOutcome         `json:"outcomes"`
@@ -107,6 +110,63 @@ type PredictionSnapshot struct {
 	GeneratedAt         time.Time               `json:"generated_at"`
 	Predictions         []Prediction            `json:"predictions"`
 	ExpectedPredictions []PredictionExpectation `json:"expected_predictions"`
+}
+
+// NormalizeVenueIdentities converts venue-native outcome identity into the
+// opaque token_id currently used by the strategy protocol. Polymarket values
+// remain unchanged; Kalshi receives deterministic Trading-owned instrument ids.
+func (snapshot PredictionSnapshot) NormalizeVenueIdentities() (PredictionSnapshot, error) {
+	snapshot.Predictions = append([]Prediction(nil), snapshot.Predictions...)
+	for predictionIndex := range snapshot.Predictions {
+		prediction := &snapshot.Predictions[predictionIndex]
+		prediction.Outcomes = append([]PredictionOutcome(nil), prediction.Outcomes...)
+		prediction.MarketSource = inferredMarketSource(prediction.MarketSource, prediction.ConditionID)
+		for outcomeIndex := range prediction.Outcomes {
+			outcome := &prediction.Outcomes[outcomeIndex]
+			if prediction.MarketSource.Normalize() == MarketSourceKalshi && strings.TrimSpace(outcome.OutcomeID) == "" {
+				outcome.OutcomeID = strings.ToUpper(strings.TrimSpace(outcome.Name))
+			}
+			instrumentID, err := CanonicalInstrumentID(
+				prediction.MarketSource, prediction.MarketID, prediction.ConditionID, outcome.OutcomeID, outcome.TokenID,
+			)
+			if err != nil {
+				return PredictionSnapshot{}, fmt.Errorf("prediction %d outcome %d: %w", predictionIndex, outcomeIndex, err)
+			}
+			outcome.OutcomeID = strings.ToUpper(strings.TrimSpace(outcome.OutcomeID))
+			outcome.TokenID = instrumentID
+		}
+	}
+	snapshot.ExpectedPredictions = append([]PredictionExpectation(nil), snapshot.ExpectedPredictions...)
+	for expectationIndex := range snapshot.ExpectedPredictions {
+		expectation := &snapshot.ExpectedPredictions[expectationIndex]
+		expectation.Outcomes = append([]PredictionOutcome(nil), expectation.Outcomes...)
+		expectation.MarketSource = inferredMarketSource(expectation.MarketSource, expectation.ConditionID)
+		for outcomeIndex := range expectation.Outcomes {
+			outcome := &expectation.Outcomes[outcomeIndex]
+			if expectation.MarketSource.Normalize() == MarketSourceKalshi && strings.TrimSpace(outcome.OutcomeID) == "" {
+				outcome.OutcomeID = strings.ToUpper(strings.TrimSpace(outcome.Name))
+			}
+			instrumentID, err := CanonicalInstrumentID(
+				expectation.MarketSource, expectation.MarketID, expectation.ConditionID, outcome.OutcomeID, outcome.TokenID,
+			)
+			if err != nil {
+				return PredictionSnapshot{}, fmt.Errorf("expected prediction %d outcome %d: %w", expectationIndex, outcomeIndex, err)
+			}
+			outcome.OutcomeID = strings.ToUpper(strings.TrimSpace(outcome.OutcomeID))
+			outcome.TokenID = instrumentID
+		}
+	}
+	return snapshot, nil
+}
+
+func inferredMarketSource(source MarketSource, conditionID string) MarketSource {
+	if strings.TrimSpace(string(source)) == "" && strings.HasPrefix(strings.TrimSpace(conditionID), "kalshi:") {
+		return MarketSourceKalshi
+	}
+	if source.Normalize() == MarketSourcePolymarket {
+		return ""
+	}
+	return source.Normalize()
 }
 
 // Validate 校验当前模型的字段完整性和业务约束。
@@ -184,6 +244,12 @@ func (expectation PredictionExpectation) Validate(decisionAt time.Time) error {
 		if outcome.Index != index || strings.TrimSpace(outcome.Name) == "" || strings.TrimSpace(outcome.TokenID) == "" {
 			return fmt.Errorf("expected outcome %d identity is invalid", index)
 		}
+		instrumentID, err := CanonicalInstrumentID(
+			expectation.MarketSource, expectation.MarketID, expectation.ConditionID, outcome.OutcomeID, outcome.TokenID,
+		)
+		if err != nil || instrumentID != strings.TrimSpace(outcome.TokenID) {
+			return fmt.Errorf("expected outcome %d venue identity is invalid", index)
+		}
 		if _, exists := seenTokens[outcome.TokenID]; exists {
 			return fmt.Errorf("expected prediction task contains duplicate token ids")
 		}
@@ -223,6 +289,12 @@ func (prediction Prediction) Validate(decisionAt time.Time) error {
 	for index, outcome := range prediction.Outcomes {
 		if outcome.Index != index || strings.TrimSpace(outcome.Name) == "" || strings.TrimSpace(outcome.TokenID) == "" {
 			return fmt.Errorf("outcome %d identity is invalid", index)
+		}
+		instrumentID, err := CanonicalInstrumentID(
+			prediction.MarketSource, prediction.MarketID, prediction.ConditionID, outcome.OutcomeID, outcome.TokenID,
+		)
+		if err != nil || instrumentID != strings.TrimSpace(outcome.TokenID) {
+			return fmt.Errorf("outcome %d venue identity is invalid", index)
 		}
 		if math.IsNaN(outcome.Probability) || math.IsInf(outcome.Probability, 0) || outcome.Probability < 0 || outcome.Probability > 1 {
 			return fmt.Errorf("outcome %d probability is outside [0,1]", index)
@@ -265,10 +337,12 @@ const (
 
 // OrderBookSnapshot 表示标准化的前 N 档市场数据观察结果，供策略使用而不是执行风控读取的最新报价。
 type OrderBookSnapshot struct {
+	MarketSource MarketSource    `json:"market_source,omitempty"`
 	MarketID     string          `json:"market_id"`
 	ConditionID  string          `json:"condition_id"`
 	OutcomeIndex int             `json:"outcome_index"`
 	TokenID      string          `json:"token_id"`
+	OutcomeID    string          `json:"outcome_id,omitempty"`
 	Status       OrderBookStatus `json:"status"`
 	SourceAt     time.Time       `json:"source_at,omitempty"`
 	ObservedAt   time.Time       `json:"observed_at"`
@@ -286,6 +360,12 @@ type OrderBookSnapshot struct {
 func (book OrderBookSnapshot) Validate() error {
 	if strings.TrimSpace(book.MarketID) == "" || strings.TrimSpace(book.ConditionID) == "" || strings.TrimSpace(book.TokenID) == "" {
 		return fmt.Errorf("orderbook market, condition, and token identifiers are required")
+	}
+	instrumentID, err := CanonicalInstrumentID(
+		book.MarketSource, book.MarketID, book.ConditionID, book.OutcomeID, book.TokenID,
+	)
+	if err != nil || instrumentID != strings.TrimSpace(book.TokenID) {
+		return fmt.Errorf("orderbook venue identity is invalid")
 	}
 	if book.OutcomeIndex != 0 && book.OutcomeIndex != 1 {
 		return fmt.Errorf("orderbook outcome index must be 0 or 1")
@@ -358,10 +438,12 @@ func validateLevels(levels []PriceLevel, descending bool) error {
 
 // BookTarget 表示后端使用的 BookTarget 类型。
 type BookTarget struct {
+	MarketSource MarketSource
 	MarketID     string
 	ConditionID  string
 	OutcomeIndex int
 	TokenID      string
+	OutcomeID    string
 }
 
 // MidPriceHistoryStatus 表示后端使用的 MidPriceHistoryStatus 类型。

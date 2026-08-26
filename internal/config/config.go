@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ type Config struct {
 	Database       Database
 	Execution      Execution
 	Polymarket     Polymarket
+	Kalshi         Kalshi
 	LiveOperations LiveOperations
 	DecisionCycle  DecisionCycle
 }
@@ -127,6 +129,16 @@ type Polymarket struct {
 	OrderFilledConfirmations int
 }
 
+// Kalshi keeps authenticated market-data credentials outside the repository.
+// Order submission is intentionally not controlled by these read-path fields.
+type Kalshi struct {
+	MarketDataEnabled bool
+	APIURL            string
+	APIKeyID          string
+	PrivateKeyPath    string
+	RequestTimeout    time.Duration
+}
+
 // Load 从环境变量加载并校验服务配置。
 func Load() (Config, error) {
 	executionMode := strings.ToLower(env("EXECUTION_MODE", "paper"))
@@ -188,6 +200,14 @@ func Load() (Config, error) {
 		}
 	}
 	polymarketRequestTimeout, err := duration("POLYMARKET_REQUEST_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiMarketDataEnabled, err := boolean("KALSHI_MARKET_DATA_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiRequestTimeout, err := duration("KALSHI_REQUEST_TIMEOUT", 5*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
@@ -318,6 +338,13 @@ func Load() (Config, error) {
 			MaxBuyFeeRateBPS:         maxBuyFeeRateBPS,
 			OrderFilledConfirmations: orderFilledConfirmations,
 		},
+		Kalshi: Kalshi{
+			MarketDataEnabled: kalshiMarketDataEnabled,
+			APIURL:            env("KALSHI_API_URL", "https://external-api.kalshi.com"),
+			APIKeyID:          strings.TrimSpace(os.Getenv("KALSHI_API_KEY_ID")),
+			PrivateKeyPath:    strings.TrimSpace(os.Getenv("KALSHI_PRIVATE_KEY_PATH")),
+			RequestTimeout:    kalshiRequestTimeout,
+		},
 		LiveOperations: LiveOperations{
 			Interval: liveOperationsInterval, RefreshTimeout: liveOperationsRefreshTimeout,
 			MaxSnapshotAge: liveOperationsMaxAge, EventLimit: liveOperationsEventLimit,
@@ -416,6 +443,20 @@ func (config Config) Validate() error {
 	}
 	if config.DecisionCycle.OrderSubmissionEnabled && !config.DecisionCycle.Enabled {
 		return fmt.Errorf("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED requires DECISION_CYCLE_ENABLED=true")
+	}
+	if config.Kalshi.MarketDataEnabled {
+		if !secureExternalURL(config.Kalshi.APIURL) {
+			return fmt.Errorf("KALSHI_API_URL must be an absolute HTTPS URL")
+		}
+		if strings.TrimSpace(config.Kalshi.APIKeyID) == "" || strings.TrimSpace(config.Kalshi.PrivateKeyPath) == "" {
+			return fmt.Errorf("KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH are required when Kalshi market data is enabled")
+		}
+		if !filepath.IsAbs(config.Kalshi.PrivateKeyPath) {
+			return fmt.Errorf("KALSHI_PRIVATE_KEY_PATH must be absolute")
+		}
+		if config.Kalshi.RequestTimeout <= 0 || config.Kalshi.RequestTimeout > time.Minute {
+			return fmt.Errorf("KALSHI_REQUEST_TIMEOUT must be positive and at most 1m")
+		}
 	}
 	if config.DecisionCycle.OrderSubmissionEnabled && !config.DecisionCycle.RequireCompleteModelCoverage {
 		return fmt.Errorf("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED requires DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true")

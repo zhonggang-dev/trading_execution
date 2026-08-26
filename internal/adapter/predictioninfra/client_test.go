@@ -106,3 +106,45 @@ func TestSnapshotRejectsMismatchedDecisionBoundary(t *testing.T) {
 		t.Fatal("Snapshot() error = nil, want mismatched decision boundary error")
 	}
 }
+
+func TestSnapshotNormalizesKalshiOutcomeIdentity(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{
+			"code":"LIVE_PREDICTION_SNAPSHOT_FOUND",
+			"data":{
+				"schema_version":"prediction.live_snapshot.v1",
+				"snapshot_id":"predsnap-kalshi",
+				"decision_at":"2026-08-18T04:20:00Z",
+				"completed_after":"2026-08-18T01:20:00Z",
+				"generated_at":"2026-08-18T04:20:15Z",
+				"predictions":[{
+					"prediction_id":"pred-kalshi","source_job_id":"job-kalshi","sandbox_id":"sandbox-kalshi",
+					"market_source":"KALSHI","market_id":"TEST-MARKET","condition_id":"kalshi:TEST-MARKET",
+					"question":"Will it happen?","domains":["Finance"],"neg_risk":false,
+					"outcomes":[
+						{"index":0,"name":"Yes","token_id":"","outcome_id":"YES","probability":0.7},
+						{"index":1,"name":"No","token_id":"","outcome_id":"NO","probability":0.3}
+					],
+					"prediction_as_of":"2026-08-18T04:00:00Z","completed_at":"2026-08-18T04:10:00Z",
+					"available_at":"2026-08-18T04:10:01Z","model":{"name":"test"}
+				}],
+				"expected_predictions":[]
+			}
+		}`))
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(Params{BaseURL: server.URL, BearerToken: "test-token", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	snapshot, err := client.Snapshot(t.Context(), decisionAt, 3*time.Hour)
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	prediction := snapshot.Predictions[0]
+	if prediction.MarketSource != "KALSHI" || prediction.Outcomes[0].TokenID != "kalshi:TEST-MARKET:YES" || prediction.Outcomes[1].TokenID != "kalshi:TEST-MARKET:NO" {
+		t.Fatalf("prediction = %#v", prediction)
+	}
+}

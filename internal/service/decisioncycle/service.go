@@ -585,7 +585,8 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, err
 	}
-	response, _, err = service.recorder.ClaimOutput(ctx, response, intents, params.submitEnabled)
+	deliverableIntents, venueDryRunIntents := submissionIntents(intents)
+	response, _, err = service.recorder.ClaimOutput(ctx, response, deliverableIntents, params.submitEnabled)
 	run.Response = response
 	if err != nil {
 		return run, fmt.Errorf("record strategy output: %w", err)
@@ -594,6 +595,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, fmt.Errorf("validate recorded strategy output: %w", err)
 	}
+	_, venueDryRunIntents = submissionIntents(intents)
 	if !params.submitEnabled {
 		run.Intents = make([]IntentResult, 0, len(intents))
 		for _, intent := range intents {
@@ -610,7 +612,10 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if listErr != nil {
 		return run, errors.Join(deliveryErr, fmt.Errorf("list strategy intent deliveries: %w", listErr))
 	}
-	run.Intents = make([]IntentResult, 0, len(storedDeliveries))
+	run.Intents = make([]IntentResult, 0, len(storedDeliveries)+len(venueDryRunIntents))
+	for _, intent := range venueDryRunIntents {
+		run.Intents = append(run.Intents, IntentResult{Intent: intent, SubmissionDisabled: true})
+	}
 	for _, delivery := range storedDeliveries {
 		if result, exists := deliveryByID[delivery.ClientOrderID]; exists {
 			run.Intents = append(run.Intents, result)
@@ -622,6 +627,22 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 		})
 	}
 	return run, deliveryErr
+}
+
+// submissionIntents keeps the current Polymarket execution/reconciliation
+// pipeline isolated from Kalshi. Kalshi intents are fully validated and
+// exposed as dry-run results, but are not inserted into the durable delivery
+// queue until a venue-specific executor, fills, positions, and reconciliation
+// path are composed.
+func submissionIntents(intents []domain.OrderIntent) (deliverable, venueDryRun []domain.OrderIntent) {
+	for _, intent := range intents {
+		if intent.MarketSource.Normalize() == domain.MarketSourcePolymarket {
+			deliverable = append(deliverable, intent)
+			continue
+		}
+		venueDryRun = append(venueDryRun, intent)
+	}
+	return deliverable, venueDryRun
 }
 
 // RecoverPending safely resumes durable strategy intents from an earlier
@@ -1065,10 +1086,12 @@ func buildInputTargets(predictions []domain.Prediction, positions []domain.Strat
 	for _, prediction := range predictions {
 		for _, outcome := range prediction.Outcomes {
 			target, err := (domain.BookTargetParams{
+				MarketSource: prediction.MarketSource,
 				MarketID:     prediction.MarketID,
 				ConditionID:  prediction.ConditionID,
 				OutcomeIndex: outcome.Index,
 				TokenID:      outcome.TokenID,
+				OutcomeID:    outcome.OutcomeID,
 			}).Build()
 			if err != nil {
 				return nil, err
@@ -1119,10 +1142,12 @@ func alignBooks(targets []domain.BookTarget, books []domain.OrderBookSnapshot, o
 		book, found := byToken[target.TokenID]
 		if !found {
 			book = domain.OrderBookSnapshot{
+				MarketSource: target.MarketSource,
 				MarketID:     target.MarketID,
 				ConditionID:  target.ConditionID,
 				OutcomeIndex: target.OutcomeIndex,
 				TokenID:      target.TokenID,
+				OutcomeID:    target.OutcomeID,
 				Status:       domain.OrderBookStatusMissing,
 				DepthLimit:   domain.StrategyOrderBookDepth,
 				ObservedAt:   observedAt,
@@ -1130,7 +1155,9 @@ func alignBooks(targets []domain.BookTarget, books []domain.OrderBookSnapshot, o
 				Asks:         []domain.PriceLevel{},
 				ErrorCode:    "SOURCE_DID_NOT_RETURN_TOKEN",
 			}
-		} else if book.MarketID != target.MarketID || book.ConditionID != target.ConditionID || book.OutcomeIndex != target.OutcomeIndex {
+		} else if book.MarketSource.Normalize() != target.MarketSource.Normalize() || book.MarketID != target.MarketID ||
+			book.ConditionID != target.ConditionID || book.OutcomeIndex != target.OutcomeIndex ||
+			strings.ToUpper(strings.TrimSpace(book.OutcomeID)) != strings.ToUpper(strings.TrimSpace(target.OutcomeID)) {
 			return nil, fmt.Errorf("orderbook token %q has mismatched market identity", target.TokenID)
 		}
 		book = failClosedInvalidMinimumOrderSize(book)
@@ -1252,7 +1279,10 @@ func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleI
 			return fmt.Errorf("claimed strategy prediction %q: %w", prediction.PredictionID, err)
 		}
 		for _, outcome := range prediction.Outcomes {
-			target := domain.BookTarget{MarketID: prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: outcome.Index, TokenID: outcome.TokenID}
+			target := domain.BookTarget{
+				MarketSource: prediction.MarketSource, MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+				OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, OutcomeID: outcome.OutcomeID,
+			}
 			if existing, exists := tokens[outcome.TokenID]; exists && existing != target {
 				return fmt.Errorf("claimed strategy prediction token %q has conflicting market identity", outcome.TokenID)
 			}
@@ -1289,7 +1319,9 @@ func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleI
 			return fmt.Errorf("claimed strategy orderbook %q must have depth_limit=%d", book.TokenID, domain.StrategyOrderBookDepth)
 		}
 		target, exists := tokens[book.TokenID]
-		if !exists || target.MarketID != book.MarketID || target.ConditionID != book.ConditionID || target.OutcomeIndex != book.OutcomeIndex {
+		if !exists || target.MarketSource.Normalize() != book.MarketSource.Normalize() || target.MarketID != book.MarketID ||
+			target.ConditionID != book.ConditionID || target.OutcomeIndex != book.OutcomeIndex ||
+			strings.ToUpper(strings.TrimSpace(target.OutcomeID)) != strings.ToUpper(strings.TrimSpace(book.OutcomeID)) {
 			return fmt.Errorf("claimed strategy orderbook %q has unexpected identity", book.TokenID)
 		}
 		delete(tokens, book.TokenID)
@@ -1515,6 +1547,10 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		return domain.OrderIntent{}, fmt.Errorf("strategy prediction/outcome identity is missing")
 	}
 	outcomeIndex := evaluation.OutcomeIndex
+	intentVenue, err := prediction.MarketSource.Venue(venue)
+	if err != nil {
+		return domain.OrderIntent{}, err
+	}
 	expectedNegRisk := prediction.NegRisk
 	marketSnapshotAt := book.SourceAt
 	signalAt = signalAt.UTC()
@@ -1534,6 +1570,8 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		"market_question":          prediction.Question,
 		"model_id":                 request.Context.ModelID,
 		"execution_account_id":     request.Context.ExecutionAccountID,
+		"market_source":            string(prediction.MarketSource.Normalize()),
+		"outcome_id":               prediction.Outcomes[outcomeIndex].OutcomeID,
 	}
 	if !evaluation.Evidence.Edge.IsEmpty() {
 		metadata["strategy_edge"] = evaluation.Evidence.Edge.String()
@@ -1547,11 +1585,13 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		ExecutionAccountID: request.Context.ExecutionAccountID,
 		SignalID:           evaluation.DecisionID,
 		ClientOrderID:      clientOrderID(request.CycleID, evaluation.DecisionID),
-		Venue:              venue,
+		Venue:              intentVenue,
+		MarketSource:       prediction.MarketSource,
 		MarketID:           evaluation.MarketID,
 		ConditionID:        evaluation.ConditionID,
 		OutcomeIndex:       &outcomeIndex,
 		OutcomeName:        prediction.Outcomes[outcomeIndex].Name,
+		OutcomeID:          prediction.Outcomes[outcomeIndex].OutcomeID,
 		TokenID:            evaluation.TokenID,
 		ExpectedNegRisk:    &expectedNegRisk,
 		MarketSnapshotAt:   &marketSnapshotAt,

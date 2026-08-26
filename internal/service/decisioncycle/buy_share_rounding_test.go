@@ -72,6 +72,54 @@ func TestBuildEntryIntentRoundsBuySharesBeforeNotionalValidation(t *testing.T) {
 	}
 }
 
+func TestKalshiPredictionBuildsVenueIntentButStaysOutOfPolymarketDelivery(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	prediction.MarketSource = domain.MarketSourceKalshi
+	prediction.MarketID = "TEST-MARKET"
+	prediction.ConditionID = "kalshi:TEST-MARKET"
+	prediction.Outcomes[0].OutcomeID = "YES"
+	prediction.Outcomes[0].TokenID = "kalshi:TEST-MARKET:YES"
+	prediction.Outcomes[1].OutcomeID = "NO"
+	prediction.Outcomes[1].TokenID = "kalshi:TEST-MARKET:NO"
+	request := domain.StrategyDecisionRequest{
+		CycleID: "cycle-kalshi", InputID: "input-kalshi",
+		Context: domain.StrategyExecutionContext{
+			ModelID: "model-1", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-1",
+		},
+		DecisionAt: decisionAt, Predictions: []domain.Prediction{prediction},
+		OrderBooks: []domain.OrderBookSnapshot{{
+			MarketSource: domain.MarketSourceKalshi,
+			MarketID:     prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: 0,
+			OutcomeID: "YES", TokenID: prediction.Outcomes[0].TokenID, Status: domain.OrderBookStatusOK,
+			SourceAt: decisionAt, MinOrderSize: "1", TickSize: "0.01",
+			Bids: []domain.PriceLevel{{Price: "0.59", Size: "100"}},
+			Asks: []domain.PriceLevel{{Price: "0.60", Size: "100"}},
+		}},
+		ExecutionConstraints: domain.DefaultStrategyExecutionConstraints(),
+	}
+	evaluation := domain.StrategyEvaluation{
+		DecisionID: "decision-kalshi", PredictionID: prediction.PredictionID,
+		MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+		OutcomeIndex: 0, TokenID: prediction.Outcomes[0].TokenID,
+		Evidence: domain.StrategyEvidence{Probability: 0.7},
+		Order: &domain.StrategyOrderParams{
+			Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.60", Size: "2", TimeInForce: domain.TimeInForceFOK,
+		},
+	}
+	intent, err := buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket")
+	if err != nil {
+		t.Fatalf("buildEntryIntent() error = %v", err)
+	}
+	if intent.Venue != "kalshi" || intent.MarketSource != domain.MarketSourceKalshi || intent.OutcomeID != "YES" {
+		t.Fatalf("intent = %#v", intent)
+	}
+	deliverable, dryRun := submissionIntents([]domain.OrderIntent{intent})
+	if len(deliverable) != 0 || len(dryRun) != 1 || dryRun[0].ClientOrderID != intent.ClientOrderID {
+		t.Fatalf("submission partition: deliverable=%#v dry-run=%#v", deliverable, dryRun)
+	}
+}
+
 // TestRoundedBuyUsesEffectiveSizeForExecution 验证持久化和执行链路使用整数化后的 BUY shares。
 func TestRoundedBuyUsesEffectiveSizeForExecution(t *testing.T) {
 	fixture := newPipelineFixture(t)

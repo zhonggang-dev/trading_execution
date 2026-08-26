@@ -70,10 +70,12 @@ type OrderIntent struct {
 	SignalID           string            `json:"signal_id"`
 	ClientOrderID      string            `json:"client_order_id"`
 	Venue              string            `json:"venue"`
+	MarketSource       MarketSource      `json:"market_source,omitempty"`
 	MarketID           string            `json:"market_id"`
 	ConditionID        string            `json:"condition_id,omitempty"`
 	OutcomeIndex       *int              `json:"outcome_index,omitempty"`
 	OutcomeName        string            `json:"outcome_name,omitempty"`
+	OutcomeID          string            `json:"outcome_id,omitempty"`
 	TokenID            string            `json:"token_id"`
 	TargetLotID        string            `json:"target_lot_id,omitempty"`
 	ExpectedNegRisk    *bool             `json:"expected_neg_risk,omitempty"`
@@ -97,9 +99,11 @@ func (intent OrderIntent) Normalize() OrderIntent {
 	intent.SignalID = strings.TrimSpace(intent.SignalID)
 	intent.ClientOrderID = strings.TrimSpace(intent.ClientOrderID)
 	intent.Venue = strings.ToLower(strings.TrimSpace(intent.Venue))
+	intent.MarketSource = inferredMarketSource(intent.MarketSource, intent.ConditionID)
 	intent.MarketID = strings.TrimSpace(intent.MarketID)
 	intent.ConditionID = strings.TrimSpace(intent.ConditionID)
 	intent.OutcomeName = strings.TrimSpace(intent.OutcomeName)
+	intent.OutcomeID = strings.ToUpper(strings.TrimSpace(intent.OutcomeID))
 	intent.TokenID = strings.TrimSpace(intent.TokenID)
 	intent.TargetLotID = strings.TrimSpace(intent.TargetLotID)
 	intent.Side = Side(strings.ToUpper(strings.TrimSpace(string(intent.Side))))
@@ -140,6 +144,16 @@ func (intent OrderIntent) Validate() error {
 	}
 	if intent.Venue == "" || intent.MarketID == "" || intent.TokenID == "" {
 		return fmt.Errorf("venue, market_id, and token_id are required")
+	}
+	expectedVenue, err := intent.MarketSource.Venue(intent.Venue)
+	if err != nil || expectedVenue != intent.Venue {
+		return fmt.Errorf("venue does not match market_source")
+	}
+	instrumentID, err := CanonicalInstrumentID(
+		intent.MarketSource, intent.MarketID, intent.ConditionID, intent.OutcomeID, intent.TokenID,
+	)
+	if err != nil || instrumentID != intent.TokenID {
+		return fmt.Errorf("order instrument identity is invalid")
 	}
 	if intent.OutcomeIndex != nil && *intent.OutcomeIndex != 0 && *intent.OutcomeIndex != 1 {
 		return fmt.Errorf("outcome_index must be 0 or 1")
@@ -202,9 +216,9 @@ func (intent OrderIntent) Equivalent(other OrderIntent) bool {
 	right := other.Normalize()
 	if left.ModelID != right.ModelID || left.StrategyID != right.StrategyID || left.ExecutionAccountID != right.ExecutionAccountID || left.SignalID != right.SignalID ||
 		left.ClientOrderID != right.ClientOrderID || left.Venue != right.Venue ||
-		left.MarketID != right.MarketID || left.ConditionID != right.ConditionID ||
+		left.MarketSource.Normalize() != right.MarketSource.Normalize() || left.MarketID != right.MarketID || left.ConditionID != right.ConditionID ||
 		!sameInt(left.OutcomeIndex, right.OutcomeIndex) || left.OutcomeName != right.OutcomeName ||
-		left.TokenID != right.TokenID || left.TargetLotID != right.TargetLotID || !sameBool(left.ExpectedNegRisk, right.ExpectedNegRisk) ||
+		left.OutcomeID != right.OutcomeID || left.TokenID != right.TokenID || left.TargetLotID != right.TargetLotID || !sameBool(left.ExpectedNegRisk, right.ExpectedNegRisk) ||
 		!sameTime(left.MarketSnapshotAt, right.MarketSnapshotAt) || !sameTime(left.SignalAt, right.SignalAt) || left.Side != right.Side || left.Type != right.Type ||
 		!left.Price.Equal(right.Price) || !left.WorstPrice.Equal(right.WorstPrice) || !left.Size.Equal(right.Size) ||
 		left.TimeInForce != right.TimeInForce || !sameTime(left.ExpiresAt, right.ExpiresAt) {
