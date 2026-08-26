@@ -86,16 +86,22 @@ func (service *Service) Check(ctx context.Context, intent domain.OrderIntent) er
 	}
 
 	if intent.Side == domain.SideSell {
-		return checkSellRisk(intent, state)
+		candidateSize, _ := decimalRat(intent.Size)
+		if candidateSize.Cmp(state.availablePositionSize) > 0 {
+			return reject("INSUFFICIENT_SELL_POSITION", "sell size exceeds wallet position after active sell reservations")
+		}
+		return nil
 	}
-	return checkBuyRisk(snapshot, intent, candidateNotional, state)
+
+	availableBalance, _ := decimalRat(snapshot.AvailableBalance)
+	if candidateNotional.Cmp(availableBalance) > 0 {
+		return reject("INSUFFICIENT_WALLET_BALANCE", "available wallet balance is below protected order notional")
+	}
+	return nil
 }
 
 // calculatedState 表示后端使用的 calculatedState 类型。
 type calculatedState struct {
-	marketExposure        *big.Rat
-	strategyExposure      *big.Rat
-	walletExposure        *big.Rat
 	availablePositionSize *big.Rat
 	sameDirectionOrder    bool
 }
@@ -103,107 +109,23 @@ type calculatedState struct {
 // calculateState 精确计算 State。
 func calculateState(snapshot domain.HardRiskSnapshot, intent domain.OrderIntent) (calculatedState, error) {
 	state := calculatedState{
-		marketExposure:        new(big.Rat),
-		strategyExposure:      new(big.Rat),
-		walletExposure:        new(big.Rat),
 		availablePositionSize: new(big.Rat),
 	}
 	for index, position := range snapshot.Positions {
-		if err := addPositionRisk(&state, position, intent, index); err != nil {
-			return calculatedState{}, err
+		if strings.TrimSpace(position.TokenID) == intent.TokenID {
+			size, err := decimalRat(position.AvailableShares)
+			if err != nil {
+				return calculatedState{}, fmt.Errorf("position %d available shares: %w", index, err)
+			}
+			state.availablePositionSize.Add(state.availablePositionSize, size)
 		}
 	}
-	for index, order := range snapshot.OpenOrders {
-		if err := addOpenOrderRisk(&state, order, intent, index); err != nil {
-			return calculatedState{}, err
+	for _, order := range snapshot.OpenOrders {
+		if strings.TrimSpace(order.TokenID) == intent.TokenID && order.Side == intent.Side {
+			state.sameDirectionOrder = true
 		}
 	}
 	return state, nil
-}
-
-// addPositionRisk 把一个持仓的金额和可卖数量加入一致性快照。
-func addPositionRisk(state *calculatedState, position domain.RiskPosition, intent domain.OrderIntent, index int) error {
-	riskValue, err := decimalRat(position.RiskValue)
-	if err != nil {
-		return fmt.Errorf("position %d risk value: %w", index, err)
-	}
-	state.walletExposure.Add(state.walletExposure, riskValue)
-	if strings.TrimSpace(position.MarketID) == intent.MarketID {
-		state.marketExposure.Add(state.marketExposure, riskValue)
-	}
-	if domain.CanonicalStrategyID(position.StrategyID) == domain.CanonicalStrategyID(intent.StrategyID) {
-		state.strategyExposure.Add(state.strategyExposure, riskValue)
-	}
-	if strings.TrimSpace(position.TokenID) != intent.TokenID {
-		return nil
-	}
-	available, err := decimalRat(position.AvailableShares)
-	if err != nil {
-		return fmt.Errorf("position %d available shares: %w", index, err)
-	}
-	state.availablePositionSize.Add(state.availablePositionSize, available)
-	return nil
-}
-
-// addOpenOrderRisk 把活动买单预占加入敞口，并记录同向订单冲突。
-func addOpenOrderRisk(state *calculatedState, order domain.RiskOpenOrder, intent domain.OrderIntent, index int) error {
-	if strings.TrimSpace(order.TokenID) == intent.TokenID && order.Side == intent.Side {
-		state.sameDirectionOrder = true
-	}
-	if order.Side != domain.SideBuy {
-		return nil
-	}
-	remainingSize, err := decimalRat(order.RemainingSize)
-	if err != nil {
-		return fmt.Errorf("open order %d remaining size: %w", index, err)
-	}
-	worstPrice, err := decimalRat(order.WorstPrice)
-	if err != nil {
-		return fmt.Errorf("open order %d worst price: %w", index, err)
-	}
-	exposure := new(big.Rat).Mul(worstPrice, remainingSize)
-	state.walletExposure.Add(state.walletExposure, exposure)
-	if strings.TrimSpace(order.MarketID) == intent.MarketID {
-		state.marketExposure.Add(state.marketExposure, exposure)
-	}
-	if domain.CanonicalStrategyID(order.StrategyID) == domain.CanonicalStrategyID(intent.StrategyID) {
-		state.strategyExposure.Add(state.strategyExposure, exposure)
-	}
-	return nil
-}
-
-// checkSellRisk 只校验卖出数量，确保超限账户仍可减仓。
-func checkSellRisk(intent domain.OrderIntent, state calculatedState) error {
-	candidateSize, _ := decimalRat(intent.Size)
-	if candidateSize.Cmp(state.availablePositionSize) > 0 {
-		return reject("INSUFFICIENT_SELL_POSITION", "sell size exceeds wallet position after active sell reservations")
-	}
-	return nil
-}
-
-// checkBuyRisk 校验买单余额和所有服务端强制金额上限。
-func checkBuyRisk(snapshot domain.HardRiskSnapshot, intent domain.OrderIntent, candidate *big.Rat, state calculatedState) error {
-	availableBalance, _ := decimalRat(snapshot.AvailableBalance)
-	if candidate.Cmp(availableBalance) > 0 {
-		return reject("INSUFFICIENT_WALLET_BALANCE", "available wallet balance is below protected order notional")
-	}
-	if exceeds(candidate, snapshot.Limits.MaxOrderNotional) {
-		return reject("MAX_ORDER_NOTIONAL_EXCEEDED", "order notional exceeds the single-order hard limit")
-	}
-	dailyTraded, _ := decimalRat(snapshot.DailyTradedNotional)
-	if exceeds(new(big.Rat).Add(dailyTraded, candidate), snapshot.Limits.MaxDailyTradedNotional) {
-		return reject("DAILY_TRADED_NOTIONAL_EXCEEDED", "order would exceed the wallet daily traded-notional hard limit")
-	}
-	if exceeds(new(big.Rat).Add(state.marketExposure, candidate), snapshot.Limits.MaxMarketExposure) {
-		return reject("MAX_MARKET_EXPOSURE_EXCEEDED", "order would exceed the wallet market hard limit")
-	}
-	if exceeds(new(big.Rat).Add(state.strategyExposure, candidate), snapshot.Limits.MaxStrategyExposure) {
-		return reject("MAX_STRATEGY_EXPOSURE_EXCEEDED", "order would exceed the strategy hard limit")
-	}
-	if exceeds(new(big.Rat).Add(state.walletExposure, candidate), snapshot.Limits.MaxWalletExposure) {
-		return reject("MAX_WALLET_EXPOSURE_EXCEEDED", "order would exceed the wallet hard limit")
-	}
-	return nil
 }
 
 // validateSnapshot 校验 Snapshot 的字段和业务约束。
@@ -213,17 +135,6 @@ func validateSnapshot(snapshot domain.HardRiskSnapshot, intent domain.OrderInten
 	}
 	if strings.TrimSpace(snapshot.Limits.PolicyID) == "" {
 		return fmt.Errorf("risk policy id is required")
-	}
-	for name, value := range map[string]domain.Decimal{
-		"max_order_notional":        snapshot.Limits.MaxOrderNotional,
-		"max_market_exposure":       snapshot.Limits.MaxMarketExposure,
-		"max_strategy_exposure":     snapshot.Limits.MaxStrategyExposure,
-		"max_wallet_exposure":       snapshot.Limits.MaxWalletExposure,
-		"max_daily_traded_notional": snapshot.Limits.MaxDailyTradedNotional,
-	} {
-		if sign, err := value.Sign(); err != nil || sign <= 0 {
-			return fmt.Errorf("%s must be a positive decimal", name)
-		}
 	}
 	if snapshot.Limits.MaxPriceAge <= 0 || snapshot.Limits.MaxSignalAge <= 0 || snapshot.Limits.MaxStateAge <= 0 {
 		return fmt.Errorf("risk freshness limits must be positive")
@@ -243,9 +154,6 @@ func validateSnapshot(snapshot domain.HardRiskSnapshot, intent domain.OrderInten
 	if totalBalance.Cmp(new(big.Rat).Add(availableBalance, reservedBalance)) != 0 {
 		return fmt.Errorf("total_balance must equal available_balance + reserved_balance")
 	}
-	if sign, err := snapshot.DailyTradedNotional.Sign(); err != nil || sign < 0 {
-		return fmt.Errorf("daily_traded_notional must be a non-negative decimal")
-	}
 	for index, position := range snapshot.Positions {
 		if strings.TrimSpace(position.StrategyID) == "" || strings.TrimSpace(position.MarketID) == "" || strings.TrimSpace(position.TokenID) == "" {
 			return fmt.Errorf("position %d identity is incomplete", index)
@@ -264,9 +172,6 @@ func validateSnapshot(snapshot domain.HardRiskSnapshot, intent domain.OrderInten
 		reservedShares, _ := decimalRat(position.ReservedShares)
 		if totalShares.Cmp(new(big.Rat).Add(availableShares, reservedShares)) != 0 {
 			return fmt.Errorf("position %d total_shares must equal available_shares + reserved_shares", index)
-		}
-		if sign, err := position.RiskValue.Sign(); err != nil || sign < 0 {
-			return fmt.Errorf("position %d risk_value must be non-negative", index)
 		}
 	}
 	for index, order := range snapshot.OpenOrders {
@@ -341,12 +246,6 @@ func decimalRat(value domain.Decimal) (*big.Rat, error) {
 		return nil, fmt.Errorf("invalid decimal %q", value)
 	}
 	return parsed, nil
-}
-
-// exceeds 判断精确金额是否超过配置的正数硬上限。
-func exceeds(value *big.Rat, limit domain.Decimal) bool {
-	maximum, err := decimalRat(limit)
-	return err != nil || value.Cmp(maximum) > 0
 }
 
 // reject 构建并返回 对应数据 的拒绝结果。

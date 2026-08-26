@@ -98,21 +98,7 @@ Accept: application/json
 
 ## 风险字段说明
 
-接口只展示当前 Go 风控实际计算的口径：总敞口、单市场敞口、按各账户 `daily_timezone` 统计的当日已验真交易金额加活动订单预占，以及按 `max_signal_age` 统计的过期预测数。已实现盈亏和手续费仍固定按 UTC 自然日展示。
-
-每个 `risks[]` 条目显式返回：
-
-- `current`：当前真实值；
-- `warningThreshold`：服务端统一计算的 80% 预警线；
-- `hardLimit`：账户策略中的执行硬上限，目标型指标可为 0；
-- `usagePercentage`：相对硬上限的真实占用率，允许大于 100；目标为 0 时省略；
-- `hardLimitEnforced`：Trading 是否在新增 BUY 的原子预占事务中强制执行；
-- `thresholdType`：`hard_limit` 或 `target`；
-- `state`：`safe`、`warning` 或 `danger`。
-
-为保证 Trading 先发布、Console 后发布时旧页面仍可读取，V1 暂时保留 `limit` 作为 `hardLimit` 的兼容别名；新代码不得再根据 `limit` 猜测执行语义。
-
-金额硬上限达到后只阻止继续增加 BUY 风险，不阻止 SELL 减仓、撤单和对账。过期预测数量属于目标型只读指标，不会伪装成可除的百分比。
+接口只展示当前 Go 硬风控实际执行的限额：总敞口、单市场敞口、按各账户 `daily_timezone` 统计的当日已验真交易金额加活动订单预占，以及按 `max_signal_age` 统计的过期预测数。已实现盈亏和手续费仍固定按 UTC 自然日展示。
 
 当前硬风控表没有“当日亏损熔断金额”字段，因此 V1 不伪造 `loss` 限额。后续如果风控事务真正增加并执行该配置，再把同一口径加入响应；不能只为前端展示添加一个不参与交易拒绝逻辑的数字。
 

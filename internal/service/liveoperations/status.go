@@ -104,7 +104,7 @@ func reconciliationStatus(observedAt time.Time, states []domain.LiveReconciliati
 // liveRiskHealth 将任一风险告警提升为引擎降级状态。
 func liveRiskHealth(risks []domain.LiveRisk) domain.LiveHealth {
 	for _, risk := range risks {
-		if risk.State == domain.LiveFlowWarning || risk.State == domain.LiveFlowDanger {
+		if risk.State == domain.LiveFlowWarning {
 			return domain.LiveHealthDegraded
 		}
 	}
@@ -263,7 +263,7 @@ type buildRisksParams struct {
 	observedAt     time.Time
 }
 
-// buildRisks 返回由 Go 服务端计算的预警线、硬上限和执行状态。
+// buildRisks 只展示 Go 硬风控真实存在的口径，不虚构尚未执行的当日亏损限额。
 func buildRisks(params buildRisksParams) ([]domain.LiveRisk, error) {
 	maxMarketLimit := marketLimitForAccount(params.policies, params.positionTotals.maxMarketAccountID)
 	dailyLimit := sumPolicyDecimal(params.policies, func(policy domain.LiveRiskPolicyState) domain.Decimal { return policy.MaxDailyTradedNotional })
@@ -273,10 +273,10 @@ func buildRisks(params buildRisksParams) ([]domain.LiveRisk, error) {
 	}
 	staleCount := countStalePositions(params.positions, params.policies, params.observedAt)
 	definitions := []riskDefinition{
-		{id: "exposure", name: "总敞口", current: params.positionTotals.cost, hardLimit: params.exposureLimit, hardLimitEnforced: true, thresholdType: domain.LiveRiskHardLimit, unit: "$", hint: "全局所有钱包真实持仓成本，包含外部未纳管仓位"},
-		{id: "market", name: "单市场最大敞口", current: params.positionTotals.maxMarketCost, hardLimit: maxMarketLimit, hardLimitEnforced: true, thresholdType: domain.LiveRiskHardLimit, unit: "$", hint: "当前敞口最大的账户内市场"},
-		{id: "daily_volume", name: "当日交易金额", current: dailyCurrent, hardLimit: dailyLimit, hardLimitEnforced: true, thresholdType: domain.LiveRiskHardLimit, unit: "$", hint: "按各账户 daily_timezone 统计已验真成交加活动预占"},
-		{id: "stale", name: "预测过期", current: big.NewRat(staleCount, 1), hardLimit: new(big.Rat), hardLimitEnforced: false, thresholdType: domain.LiveRiskTarget, unit: "count", hint: "超过各账户 signal_age 的持仓数量，运营目标为 0"},
+		{id: "exposure", name: "总敞口", current: params.positionTotals.cost, limit: params.exposureLimit, unit: "$", hint: "所有未结算持仓的成本口径"},
+		{id: "market", name: "单市场最大敞口", current: params.positionTotals.maxMarketCost, limit: maxMarketLimit, unit: "$", hint: "当前敞口最大的账户内市场"},
+		{id: "daily_volume", name: "当日交易金额", current: dailyCurrent, limit: dailyLimit, unit: "$", hint: "按各账户 daily_timezone 统计已验真成交加活动预占，与 Go 硬风控一致"},
+		{id: "stale", name: "预测过期", current: big.NewRat(staleCount, 1), limit: new(big.Rat), unit: "count", hint: "超过各账户硬风控 signal_age 的持仓数量，目标为 0"},
 	}
 	result := make([]domain.LiveRisk, 0, len(definitions))
 	for _, definition := range definitions {
@@ -309,14 +309,12 @@ func marketLimitForAccount(policies []domain.LiveRiskPolicyState, accountID stri
 
 // riskDefinition 保存单个风险指标的内部精确值。
 type riskDefinition struct {
-	id                string
-	name              string
-	current           *big.Rat
-	hardLimit         *big.Rat
-	hardLimitEnforced bool
-	thresholdType     domain.LiveRiskThresholdType
-	unit              string
-	hint              string
+	id      string
+	name    string
+	current *big.Rat
+	limit   *big.Rat
+	unit    string
+	hint    string
 }
 
 // makeRisk 把风险精确值转换成接口模型并计算安全等级。
@@ -325,61 +323,19 @@ func makeRisk(definition riskDefinition) (domain.LiveRisk, error) {
 	if err != nil {
 		return domain.LiveRisk{}, err
 	}
-	hardLimit, err := numberFromRat(definition.hardLimit)
+	limit, err := numberFromRat(definition.limit)
 	if err != nil {
 		return domain.LiveRisk{}, err
 	}
-	warningRat := riskWarningThreshold(definition.hardLimit)
-	warning, err := numberFromRat(warningRat)
-	if err != nil {
-		return domain.LiveRisk{}, err
-	}
-	usage, err := riskUsagePercentage(definition.current, definition.hardLimit)
-	if err != nil {
-		return domain.LiveRisk{}, err
-	}
-	return domain.LiveRisk{
-		ID: definition.id, Name: definition.name, Current: current,
-		WarningThreshold: warning, HardLimit: hardLimit, Limit: hardLimit, UsagePercentage: usage,
-		HardLimitEnforced: definition.hardLimitEnforced, ThresholdType: definition.thresholdType,
-		Unit: definition.unit, Hint: definition.hint,
-		State: riskState(definition.current, warningRat, definition.hardLimit),
-	}, nil
-}
-
-// riskWarningThreshold 使用硬上限的 80% 作为统一服务端预警线。
-func riskWarningThreshold(hardLimit *big.Rat) *big.Rat {
-	return new(big.Rat).Mul(hardLimit, big.NewRat(4, 5))
-}
-
-// riskUsagePercentage 计算相对硬上限的真实百分比，目标为零时不返回无意义比例。
-func riskUsagePercentage(current *big.Rat, hardLimit *big.Rat) (*domain.LiveNumber, error) {
-	if hardLimit.Sign() == 0 {
-		return nil, nil
-	}
-	percentage := new(big.Rat).Mul(new(big.Rat).Quo(current, hardLimit), big.NewRat(100, 1))
-	number, err := numberFromRat(percentage)
-	if err != nil {
-		return nil, err
-	}
-	return &number, nil
-}
-
-// riskState 区分安全、达到预警线和达到或超过硬上限三种状态。
-func riskState(current *big.Rat, warning *big.Rat, hardLimit *big.Rat) domain.LiveFlowState {
-	if hardLimit.Sign() == 0 {
-		if current.Sign() > 0 {
-			return domain.LiveFlowDanger
+	state := domain.LiveFlowSafe
+	if definition.limit.Sign() == 0 {
+		if definition.current.Sign() > 0 {
+			state = domain.LiveFlowWarning
 		}
-		return domain.LiveFlowSafe
+	} else if new(big.Rat).Mul(definition.current, big.NewRat(5, 4)).Cmp(definition.limit) >= 0 {
+		state = domain.LiveFlowWarning
 	}
-	if current.Cmp(hardLimit) >= 0 {
-		return domain.LiveFlowDanger
-	}
-	if current.Cmp(warning) >= 0 {
-		return domain.LiveFlowWarning
-	}
-	return domain.LiveFlowSafe
+	return domain.LiveRisk{ID: definition.id, Name: definition.name, Current: current, Limit: limit, Unit: definition.unit, Hint: definition.hint, State: state}, nil
 }
 
 // sumPolicyDecimal 返回所有账户可独立使用限额的合计值。

@@ -61,11 +61,6 @@ func TestLiveOperationsEndpointUsesDedicatedReadOnlyPermission(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"equity":1.25`) ||
 		!strings.Contains(response.Body.String(), `"executionAccountId":"wallet-1"`) ||
 		!strings.Contains(response.Body.String(), `"return":null`) ||
-		!strings.Contains(response.Body.String(), `"warningThreshold":8`) ||
-		!strings.Contains(response.Body.String(), `"hardLimit":10`) ||
-		!strings.Contains(response.Body.String(), `"usagePercentage":42.5`) ||
-		!strings.Contains(response.Body.String(), `"hardLimitEnforced":true`) ||
-		!strings.Contains(response.Body.String(), `"thresholdType":"hard_limit"`) ||
 		!strings.Contains(response.Body.String(), `"positions":[]`) {
 		t.Fatalf("response status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -95,7 +90,6 @@ func TestLiveOperationsEndpointReturnsTopLevelUnavailableError(t *testing.T) {
 // testLiveOperationsSnapshot 创建字段可完整 JSON 编码的最小只读快照。
 func testLiveOperationsSnapshot() domain.LiveOperationsSnapshot {
 	now := time.Date(2026, 8, 19, 8, 0, 0, 0, time.UTC)
-	usage := domain.LiveNumber("42.5")
 	return domain.LiveOperationsSnapshot{
 		ObservedAt: now, Engine: domain.LiveEngine{Health: domain.LiveHealthHealthy},
 		Capital: domain.LiveCapital{
@@ -107,11 +101,7 @@ func testLiveOperationsSnapshot() domain.LiveOperationsSnapshot {
 			PeakCashUsed: "0", CumulativeInvestedCost: "0",
 			RealizedPnL: "0", UnrealizedPnL: "0", TotalPnL: "0", ReturnRate: nil,
 		}},
-		Workers: []domain.LiveWorker{}, Funnel: []domain.LiveFunnelStage{}, Risks: []domain.LiveRisk{{
-			ID: "exposure", Name: "总敞口", Current: "4.25", WarningThreshold: "8", HardLimit: "10", Limit: "10",
-			UsagePercentage: &usage, HardLimitEnforced: true, ThresholdType: domain.LiveRiskHardLimit,
-			Unit: "$", Hint: "测试风险", State: domain.LiveFlowSafe,
-		}},
+		Workers: []domain.LiveWorker{}, Funnel: []domain.LiveFunnelStage{}, Risks: []domain.LiveRisk{},
 		Orders: []domain.LiveOrder{}, Positions: []domain.LivePosition{}, Events: []domain.LiveEvent{},
 		DataQuality: []domain.LiveDataQuality{},
 	}
