@@ -19,7 +19,6 @@ import (
 
 const (
 	decisionInterval        = 10 * time.Minute
-	defaultMidPriceLookback = 48 * time.Hour
 	defaultDeliveryBatch    = 100
 	defaultDeliveryStaleAge = 9 * time.Minute
 )
@@ -40,7 +39,6 @@ type Params struct {
 	PredictionSource port.PredictionSource
 	PositionSource   port.StrategyPositionSource
 	OrderBookSource  port.OrderBookSource
-	MidPriceSource   port.MidPriceHistorySource
 	Strategy         port.StrategyClient
 	Recorder         port.DecisionRecorder
 	Executor         port.OrderExecutor
@@ -67,7 +65,6 @@ type Params struct {
 	PredictionSourceModes        map[string]domain.PredictionSourceMode
 	Venue                        string
 	PredictionLookback           time.Duration
-	MidPriceLookback             time.Duration
 	DeliveryStaleAge             time.Duration
 	Now                          func() time.Time
 }
@@ -77,7 +74,6 @@ type Service struct {
 	predictionSource                 port.PredictionSource
 	positionSource                   port.StrategyPositionSource
 	orderBookSource                  port.OrderBookSource
-	midPriceSource                   port.MidPriceHistorySource
 	strategy                         port.StrategyClient
 	recorder                         port.DecisionRecorder
 	executor                         port.OrderExecutor
@@ -98,7 +94,6 @@ type Service struct {
 	entryDisabledExecutionAccountIDs []string
 	venue                            string
 	predictionLookback               time.Duration
-	midPriceLookback                 time.Duration
 	deliveryStaleAge                 time.Duration
 	now                              func() time.Time
 }
@@ -138,9 +133,9 @@ type RunResult struct {
 
 // New 校验依赖和配置后创建当前服务实例。
 func New(params Params) (*Service, error) {
-	if params.PredictionSource == nil || params.PositionSource == nil || params.OrderBookSource == nil || params.MidPriceSource == nil || params.Strategy == nil ||
+	if params.PredictionSource == nil || params.PositionSource == nil || params.OrderBookSource == nil || params.Strategy == nil ||
 		params.Recorder == nil {
-		return nil, fmt.Errorf("prediction, position, orderbook, mid-price history, strategy, and recorder dependencies are required")
+		return nil, fmt.Errorf("prediction, position, orderbook, strategy, and recorder dependencies are required")
 	}
 	if params.SubmitEnabled && params.Executor == nil {
 		return nil, fmt.Errorf("order executor is required when decision-cycle submission is enabled")
@@ -189,12 +184,6 @@ func New(params Params) (*Service, error) {
 	if params.PredictionLookback < decisionInterval {
 		return nil, fmt.Errorf("prediction lookback must be at least %s", decisionInterval)
 	}
-	if params.MidPriceLookback == 0 {
-		params.MidPriceLookback = defaultMidPriceLookback
-	}
-	if params.MidPriceLookback < decisionInterval {
-		return nil, fmt.Errorf("mid-price lookback must be at least %s", decisionInterval)
-	}
 	if params.DeliveryStaleAge == 0 {
 		params.DeliveryStaleAge = defaultDeliveryStaleAge
 	}
@@ -208,7 +197,6 @@ func New(params Params) (*Service, error) {
 		predictionSource:                 params.PredictionSource,
 		positionSource:                   params.PositionSource,
 		orderBookSource:                  params.OrderBookSource,
-		midPriceSource:                   params.MidPriceSource,
 		strategy:                         params.Strategy,
 		recorder:                         params.Recorder,
 		executor:                         params.Executor,
@@ -229,7 +217,6 @@ func New(params Params) (*Service, error) {
 		entryDisabledExecutionAccountIDs: executionAccountIDs(entryDisabledBindings),
 		venue:                            params.Venue,
 		predictionLookback:               params.PredictionLookback,
-		midPriceLookback:                 params.MidPriceLookback,
 		deliveryStaleAge:                 params.DeliveryStaleAge,
 		now:                              params.Now,
 	}, nil
@@ -267,26 +254,13 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err != nil {
 		return RunResult{}, err
 	}
-	historyTargets, err := buildHistoryTargets(selectedPredictions, positionLots, service.activeBindings)
+	books, err := service.orderBookSource.Capture(ctx, decisionAt, targets)
 	if err != nil {
-		return RunResult{}, err
-	}
-	books, histories, historyCaptureErr, err := service.captureMarketData(ctx, decisionAt, targets, historyTargets)
-	if err != nil {
-		return RunResult{}, err
+		return RunResult{}, wrapError("capture orderbooks", err)
 	}
 	books, err = alignBooks(targets, books, service.now().UTC())
 	if err != nil {
 		return RunResult{}, err
-	}
-	if historyCaptureErr == nil {
-		histories, err = alignMidPriceHistories(alignMidPriceHistoriesParams{
-			targets: historyTargets, histories: histories, decisionAt: decisionAt,
-			lookback: service.midPriceLookback, fetchedAt: service.now().UTC(),
-		})
-		if err != nil {
-			historyCaptureErr = err
-		}
 	}
 	result := RunResult{
 		DecisionAt:           decisionAt,
@@ -341,41 +315,9 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
 			continue
 		}
-		var bindingHistories []domain.MidPriceHistory
-		if binding.StrategyID == domain.StrategyIDMultfactorV2 {
-			if historyCaptureErr != nil {
-				selectErr = fmt.Errorf("capture mid-price histories: %w", historyCaptureErr)
-				run := BindingRunResult{
-					Context: executionContext, PredictionModelID: binding.PredictionModelID,
-					PredictionCount: len(predictions), PositionCount: len(positions),
-					OrderSubmissionEnabled: bindingSubmissionEnabled, Error: selectErr,
-				}
-				result.Runs = append(result.Runs, run)
-				runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
-				continue
-			}
-			bindingHistories, selectErr = midPriceHistoriesForTargets(bindingTargets, histories)
-			if selectErr != nil {
-				run := BindingRunResult{
-					Context: executionContext, PredictionModelID: binding.PredictionModelID,
-					PredictionCount: len(predictions), PositionCount: len(positions),
-					OrderSubmissionEnabled: bindingSubmissionEnabled, Error: selectErr,
-				}
-				result.Runs = append(result.Runs, run)
-				runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, selectErr))
-				continue
-			}
-		} else {
-			bindingHistories, selectErr = v1MidPricePlaceholders(
-				bindingTargets, decisionAt, service.midPriceLookback, service.now().UTC(),
-			)
-			if selectErr != nil {
-				return result, selectErr
-			}
-		}
 		run, runErr := service.runBinding(ctx, runBindingParams{
 			decisionAt: decisionAt, predictionSnapshotID: snapshot.SnapshotID, binding: executionContext,
-			predictions: predictions, positions: positions, books: bindingBooks, histories: bindingHistories,
+			predictions: predictions, positions: positions, books: bindingBooks,
 			allowEntries:     bindingCoverageErr == nil && !accountEntryDisabled,
 			entryBlockReason: entryBlockReason(bindingCoverageErr, accountEntryDisabled),
 			submitEnabled:    bindingSubmissionEnabled,
@@ -434,82 +376,6 @@ func flattenPositionLots(byAccount map[string][]domain.StrategyPositionLot) []do
 	return result
 }
 
-// captureMarketData 采集 Market Data。
-func (service *Service) captureMarketData(
-	ctx context.Context,
-	decisionAt time.Time,
-	bookTargets []domain.BookTarget,
-	historyTargets []domain.BookTarget,
-) ([]domain.OrderBookSnapshot, []domain.MidPriceHistory, error, error) {
-	type bookResult struct {
-		books []domain.OrderBookSnapshot
-		err   error
-	}
-	type historyResult struct {
-		histories []domain.MidPriceHistory
-		err       error
-	}
-	booksChannel := make(chan bookResult, 1)
-	historiesChannel := make(chan historyResult, 1)
-	go func() {
-		books, err := service.orderBookSource.Capture(ctx, decisionAt, bookTargets)
-		booksChannel <- bookResult{books: books, err: err}
-	}()
-	if len(historyTargets) == 0 {
-		historiesChannel <- historyResult{histories: []domain.MidPriceHistory{}}
-	} else {
-		go func() {
-			histories, err := service.midPriceSource.Capture(ctx, decisionAt, service.midPriceLookback, historyTargets)
-			historiesChannel <- historyResult{histories: histories, err: err}
-		}()
-	}
-	books := <-booksChannel
-	histories := <-historiesChannel
-	if books.err != nil {
-		return nil, nil, histories.err, wrapError("capture orderbooks", books.err)
-	}
-	return books.books, histories.histories, histories.err, nil
-}
-
-// buildHistoryTargets limits expensive 48-hour CLOB history reads to v2
-// bindings. V1 receives explicit NOT_REQUIRED placeholders in its frozen input
-// so the wire contract remains complete without making v1 availability depend
-// on an unrelated hourly-data source.
-func buildHistoryTargets(
-	predictions []domain.Prediction,
-	positions map[string][]domain.StrategyPositionLot,
-	bindings []domain.StrategyExecutionBinding,
-) ([]domain.BookTarget, error) {
-	var selectedPredictions []domain.Prediction
-	var selectedPositions []domain.StrategyPositionLot
-	for _, binding := range bindings {
-		if binding.StrategyID != domain.StrategyIDMultfactorV2 {
-			continue
-		}
-		selectedPredictions = append(selectedPredictions, predictionsForModel(predictions, binding.PredictionModelID)...)
-		selectedPositions = append(selectedPositions, positions[binding.ExecutionAccountID]...)
-	}
-	return buildInputTargets(selectedPredictions, selectedPositions)
-}
-
-func v1MidPricePlaceholders(
-	targets []domain.BookTarget,
-	decisionAt time.Time,
-	lookback time.Duration,
-	fetchedAt time.Time,
-) ([]domain.MidPriceHistory, error) {
-	histories, err := alignMidPriceHistories(alignMidPriceHistoriesParams{
-		targets: targets, decisionAt: decisionAt, lookback: lookback, fetchedAt: fetchedAt,
-	})
-	if err != nil {
-		return nil, err
-	}
-	for index := range histories {
-		histories[index].ErrorCode = "NOT_REQUIRED_FOR_MULTFACTOR_V1"
-	}
-	return histories, nil
-}
-
 // wrapError 为 Error 包装操作上下文。
 func wrapError(operation string, err error) error {
 	if err == nil {
@@ -536,7 +402,6 @@ type runBindingParams struct {
 	predictions          []domain.Prediction
 	positions            []domain.StrategyPositionLot
 	books                []domain.OrderBookSnapshot
-	histories            []domain.MidPriceHistory
 	allowEntries         bool
 	entryBlockReason     string
 	submitEnabled        bool
@@ -553,7 +418,6 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 		Predictions:          params.predictions,
 		Positions:            params.positions,
 		OrderBooks:           params.books,
-		MidPriceHistories:    params.histories,
 	}).Build()
 	run := BindingRunResult{
 		Context: params.binding, PredictionCount: len(params.predictions), PositionCount: len(params.positions),
@@ -1071,23 +935,6 @@ func booksForTargets(targets []domain.BookTarget, books []domain.OrderBookSnapsh
 	return result, nil
 }
 
-// midPriceHistoriesForTargets 按目标顺序选取共享中间价历史快照。
-func midPriceHistoriesForTargets(targets []domain.BookTarget, histories []domain.MidPriceHistory) ([]domain.MidPriceHistory, error) {
-	byToken := make(map[string]domain.MidPriceHistory, len(histories))
-	for _, history := range histories {
-		byToken[history.TokenID] = history
-	}
-	result := make([]domain.MidPriceHistory, 0, len(targets))
-	for _, target := range targets {
-		history, found := byToken[target.TokenID]
-		if !found {
-			return nil, fmt.Errorf("shared mid-price history snapshot is missing token %q", target.TokenID)
-		}
-		result = append(result, history)
-	}
-	return result, nil
-}
-
 // buildBookTargets 根据预测结果构建去重的行情采集目标。
 func buildBookTargets(predictions []domain.Prediction) ([]domain.BookTarget, error) {
 	return buildInputTargets(predictions, nil)
@@ -1214,63 +1061,6 @@ func failClosedInvalidMinimumOrderSize(book domain.OrderBookSnapshot) domain.Ord
 	return book
 }
 
-// alignMidPriceHistoriesParams 收拢中间价历史对齐所需的目标和时间窗口。
-type alignMidPriceHistoriesParams struct {
-	targets    []domain.BookTarget
-	histories  []domain.MidPriceHistory
-	decisionAt time.Time
-	lookback   time.Duration
-	fetchedAt  time.Time
-}
-
-// alignMidPriceHistories 按目标身份对齐 Mid Price Histories。
-func alignMidPriceHistories(params alignMidPriceHistoriesParams) ([]domain.MidPriceHistory, error) {
-	byToken := make(map[string]domain.MidPriceHistory, len(params.histories))
-	for _, history := range params.histories {
-		if _, exists := byToken[history.TokenID]; exists {
-			return nil, fmt.Errorf("mid-price source returned duplicate token %q", history.TokenID)
-		}
-		byToken[history.TokenID] = history
-	}
-	windowStart := params.decisionAt.Add(-params.lookback)
-	result := make([]domain.MidPriceHistory, 0, len(params.targets))
-	for _, target := range params.targets {
-		history, found := byToken[target.TokenID]
-		if !found {
-			history = domain.MidPriceHistory{
-				MarketID:           target.MarketID,
-				ConditionID:        target.ConditionID,
-				OutcomeIndex:       target.OutcomeIndex,
-				TokenID:            target.TokenID,
-				Status:             domain.MidPriceHistoryStatusMissing,
-				WindowStart:        windowStart,
-				WindowEnd:          params.decisionAt,
-				FidelitySeconds:    60,
-				Sampling:           domain.MidPriceSamplingUpstreamRaw,
-				MissingValues:      domain.MidPriceMissingValuePolicyNoFill,
-				TimestampSemantics: domain.MidPriceTimestampSemanticsIntervalEndUTC,
-				FetchedAt:          params.fetchedAt,
-				MidPrices:          []domain.MidPricePoint{},
-				ErrorCode:          "SOURCE_DID_NOT_RETURN_TOKEN",
-			}
-		} else if history.MarketID != target.MarketID || history.ConditionID != target.ConditionID || history.OutcomeIndex != target.OutcomeIndex {
-			return nil, fmt.Errorf("mid-price token %q has mismatched market identity", target.TokenID)
-		}
-		if !history.WindowStart.Equal(windowStart) || !history.WindowEnd.Equal(params.decisionAt) {
-			return nil, fmt.Errorf("mid-price token %q has mismatched requested window", target.TokenID)
-		}
-		if err := history.Validate(); err != nil {
-			return nil, fmt.Errorf("invalid mid-price history for token %q: %w", history.TokenID, err)
-		}
-		result = append(result, history)
-		delete(byToken, target.TokenID)
-	}
-	if len(byToken) != 0 {
-		return nil, fmt.Errorf("mid-price source returned an unexpected token")
-	}
-	return result, nil
-}
-
 // validateClaimedInput 校验 Claimed Input 的字段和业务约束。
 func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleID string, expectedContext domain.StrategyExecutionContext, expectedDecisionAt time.Time) error {
 	if request.SchemaVersion != domain.StrategyInputSchemaVersion || request.CycleID != expectedCycleID || request.InputID == "" ||
@@ -1317,12 +1107,8 @@ func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleI
 		}
 		tokens[lot.TokenID] = target
 	}
-	if len(request.OrderBooks) != len(tokens) || len(request.MidPriceHistories) != len(tokens) {
-		return fmt.Errorf("claimed strategy input must contain one orderbook and history for every prediction or position token")
-	}
-	historyTokens := make(map[string]domain.BookTarget, len(tokens))
-	for tokenID, target := range tokens {
-		historyTokens[tokenID] = target
+	if len(request.OrderBooks) != len(tokens) {
+		return fmt.Errorf("claimed strategy input must contain one orderbook for every prediction or position token")
 	}
 	for _, book := range request.OrderBooks {
 		if err := book.Validate(); err != nil {
@@ -1341,19 +1127,6 @@ func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleI
 	}
 	if len(tokens) != 0 {
 		return fmt.Errorf("claimed strategy input is missing an orderbook")
-	}
-	for _, history := range request.MidPriceHistories {
-		if err := history.Validate(); err != nil {
-			return fmt.Errorf("claimed strategy mid-price history %q: %w", history.TokenID, err)
-		}
-		target, exists := historyTokens[history.TokenID]
-		if !exists || target.MarketID != history.MarketID || target.ConditionID != history.ConditionID || target.OutcomeIndex != history.OutcomeIndex {
-			return fmt.Errorf("claimed strategy mid-price history %q has unexpected identity", history.TokenID)
-		}
-		delete(historyTokens, history.TokenID)
-	}
-	if len(historyTokens) != 0 {
-		return fmt.Errorf("claimed strategy input is missing a mid-price history")
 	}
 	inputID, err := domain.ComputeStrategyInputID(request)
 	if err != nil {
@@ -1540,12 +1313,6 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 	book, found := strategyBook(request.OrderBooks, evaluation.TokenID)
 	if !found || book.Status != domain.OrderBookStatusOK {
 		return domain.OrderIntent{}, fmt.Errorf("SUBMIT requires an OK orderbook")
-	}
-	if strategyID == domain.StrategyIDMultfactorV2 {
-		history, found := strategyMidPriceHistory(request.MidPriceHistories, evaluation.TokenID)
-		if !found || history.Status != domain.MidPriceHistoryStatusOK {
-			return domain.OrderIntent{}, fmt.Errorf("multfactor_v2 SUBMIT requires usable raw mid-price history")
-		}
 	}
 	if err := validateStrategyOrder(order, domain.SideBuy, book.Asks[0].Price, book, request.ExecutionConstraints); err != nil {
 		return domain.OrderIntent{}, err
@@ -1837,17 +1604,11 @@ func validateEvidenceMetrics(evidence domain.StrategyEvidence, request domain.St
 	return nil
 }
 
-// inputFailureReason 根据订单簿和历史价格状态返回强制跳过原因。
+// inputFailureReason 根据订单簿状态返回强制跳过原因。MOM/MACD 所需历史由策略服务自行读取。
 func inputFailureReason(request domain.StrategyDecisionRequest, tokenID string) domain.StrategyReasonCode {
 	book, found := strategyBook(request.OrderBooks, tokenID)
 	if !found || book.Status != domain.OrderBookStatusOK {
 		return domain.StrategyReasonInvalidBook
-	}
-	if request.Context.Normalize().StrategyID == domain.StrategyIDMultfactorV2 {
-		history, found := strategyMidPriceHistory(request.MidPriceHistories, tokenID)
-		if !found || history.Status != domain.MidPriceHistoryStatusOK {
-			return domain.StrategyReasonStaleData
-		}
 	}
 	return ""
 }
@@ -1894,16 +1655,6 @@ func strategyBook(books []domain.OrderBookSnapshot, tokenID string) (domain.Orde
 		}
 	}
 	return domain.OrderBookSnapshot{}, false
-}
-
-// strategyMidPriceHistory 按 token 查找冻结输入中的中间价历史。
-func strategyMidPriceHistory(histories []domain.MidPriceHistory, tokenID string) (domain.MidPriceHistory, bool) {
-	for _, history := range histories {
-		if history.TokenID == tokenID {
-			return history, true
-		}
-	}
-	return domain.MidPriceHistory{}, false
 }
 
 // evaluationKey 根据稳定业务身份生成幂等标识。

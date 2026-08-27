@@ -143,7 +143,6 @@ type StrategyDecisionRequestParams struct {
 	Predictions          []Prediction
 	Positions            []StrategyPositionLot
 	OrderBooks           []OrderBookSnapshot
-	MidPriceHistories    []MidPriceHistory
 }
 
 // Build 填充固定协议字段并计算内容寻址的策略输入 ID。
@@ -159,7 +158,6 @@ func (params StrategyDecisionRequestParams) Build() (StrategyDecisionRequest, er
 		Predictions:          slices.Clone(params.Predictions),
 		Positions:            slices.Clone(params.Positions),
 		OrderBooks:           slices.Clone(params.OrderBooks),
-		MidPriceHistories:    slices.Clone(params.MidPriceHistories),
 		ExecutionConstraints: DefaultStrategyExecutionConstraints(),
 	}
 	if request.CycleID == "" || request.PredictionSnapshotID == "" || request.DecisionAt.IsZero() || request.GeneratedAt.IsZero() {

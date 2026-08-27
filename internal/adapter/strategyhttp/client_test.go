@@ -1,6 +1,7 @@
 package strategyhttp
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -25,13 +26,25 @@ func TestDecideSendsCycleAsIdempotencyKey(t *testing.T) {
 			request.Header.Get("X-Execution-Account-ID") != "account-1" {
 			t.Fatalf("execution context headers are invalid")
 		}
-		var input domain.StrategyDecisionRequest
-		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+		var body bytes.Buffer
+		if _, err := body.ReadFrom(request.Body); err != nil {
+			t.Fatalf("read request: %v", err)
+		}
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(body.Bytes(), &payload); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if len(input.MidPriceHistories) != 1 || len(input.MidPriceHistories[0].MidPrices) != 1 ||
-			input.MidPriceHistories[0].MidPrices[0].P != "0.135" {
-			t.Fatalf("mid-price histories = %#v", input.MidPriceHistories)
+		if _, exists := payload["mid_price_histories"]; exists {
+			t.Fatalf("request unexpectedly contains mid_price_histories: %s", body.String())
+		}
+		for _, key := range []string{"predictions", "positions", "orderbooks"} {
+			if _, exists := payload[key]; !exists {
+				t.Fatalf("request is missing %s: %s", key, body.String())
+			}
+		}
+		var schemaVersion string
+		if err := json.Unmarshal(payload["schema_version"], &schemaVersion); err != nil || schemaVersion != domain.StrategyInputSchemaVersion {
+			t.Fatalf("schema_version = %q, error = %v", schemaVersion, err)
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write([]byte(`{"data":{"schema_version":"trading.strategy_output.v4","cycle_id":"account-1:20260818T042000Z","input_id":"strategy-input-test","context":{"model_id":"model-a","strategy_id":"strategy-v1","execution_account_id":"account-1"},"decided_at":"2026-08-18T04:20:04Z","evaluations":[],"exits":[]}}`))
@@ -43,10 +56,9 @@ func TestDecideSendsCycleAsIdempotencyKey(t *testing.T) {
 	}
 	executionContext := domain.StrategyExecutionContext{ModelID: "model-a", StrategyID: "strategy-v1", ExecutionAccountID: "account-1"}
 	response, err := client.Decide(t.Context(), domain.StrategyDecisionRequest{
-		CycleID: "account-1:20260818T042000Z", InputID: "strategy-input-test", Context: executionContext,
-		MidPriceHistories: []domain.MidPriceHistory{{
-			TokenID: "token-1", MidPrices: []domain.MidPricePoint{{P: "0.135"}},
-		}},
+		SchemaVersion: domain.StrategyInputSchemaVersion,
+		CycleID:       "account-1:20260818T042000Z", InputID: "strategy-input-test", Context: executionContext,
+		Predictions: []domain.Prediction{}, Positions: []domain.StrategyPositionLot{}, OrderBooks: []domain.OrderBookSnapshot{},
 	})
 	if err != nil {
 		t.Fatalf("Decide() error = %v", err)

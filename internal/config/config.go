@@ -83,7 +83,6 @@ type DecisionCycle struct {
 	MaxStartLateness             time.Duration
 	Timeout                      time.Duration
 	PredictionLookback           time.Duration
-	MidPriceLookback             time.Duration
 	Bindings                     []domain.StrategyExecutionBinding
 	PredictionSourceModes        map[string]domain.PredictionSourceMode
 }
@@ -497,9 +496,6 @@ func (config Config) Validate() error {
 		if config.DecisionCycle.PredictionLookback < 10*time.Minute || config.DecisionCycle.PredictionLookback > 24*time.Hour {
 			return fmt.Errorf("DECISION_CYCLE_PREDICTION_LOOKBACK must be between 10m and 24h")
 		}
-		if config.DecisionCycle.MidPriceLookback < 2*time.Hour || config.DecisionCycle.MidPriceLookback > 7*24*time.Hour {
-			return fmt.Errorf("DECISION_CYCLE_MID_PRICE_LOOKBACK must be between 2h and 168h")
-		}
 		for name, value := range map[string]string{
 			"DECISION_CYCLE_PREDICTION_INFRA_URL": config.DecisionCycle.PredictionInfraBaseURL,
 			"DECISION_CYCLE_STRATEGY_URL":         config.DecisionCycle.StrategyBaseURL,
@@ -599,10 +595,6 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
-	midPriceLookback, err := duration("DECISION_CYCLE_MID_PRICE_LOOKBACK", 48*time.Hour)
-	if err != nil {
-		return DecisionCycle{}, err
-	}
 	bindings, err := decodeDecisionBindings(os.Getenv("DECISION_CYCLE_BINDINGS_JSON"))
 	if err != nil {
 		return DecisionCycle{}, err
@@ -637,8 +629,8 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		StrategyToken:                strings.TrimSpace(os.Getenv("DECISION_CYCLE_STRATEGY_TOKEN")),
 		Interval:                     interval, StartupDelay: startupDelay,
 		MaxStartLateness: maxStartLateness, Timeout: timeout,
-		PredictionLookback: predictionLookback, MidPriceLookback: midPriceLookback,
-		Bindings: bindings, PredictionSourceModes: predictionSourceModes,
+		PredictionLookback: predictionLookback,
+		Bindings:           bindings, PredictionSourceModes: predictionSourceModes,
 	}, nil
 }
 

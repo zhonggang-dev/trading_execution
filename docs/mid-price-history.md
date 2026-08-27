@@ -1,5 +1,8 @@
 # Polymarket 48 小时 Mid Price History
 
+> 此适配器只保留给尚未在 `cmd/server` 装配的独立 position-exit 协议。入场 decision cycle
+> 不再抓取或发送历史价格；multfactor_v2 由策略服务直取官方 prices-history。
+
 Trading Execution 通过 Polymarket CLOB `POST /batch-prices-history` 获取每个 outcome token 在
 `[decision_at-48h, decision_at]` 内的历史 midpoint。
 

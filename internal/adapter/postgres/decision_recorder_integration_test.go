@@ -332,7 +332,6 @@ func integrationDecisionRequestForAccount(
 		Predictions:          []domain.Prediction{},
 		Positions:            []domain.StrategyPositionLot{},
 		OrderBooks:           []domain.OrderBookSnapshot{},
-		MidPriceHistories:    []domain.MidPriceHistory{},
 	}).Build()
 	if err != nil {
 		t.Fatal(err)
