@@ -174,6 +174,16 @@ func TestLoadAcceptsExplicitShadowDecisionCycle(t *testing.T) {
 	}
 }
 
+func TestLoadIgnoresRetiredDecisionCycleMidPriceLookback(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_MID_PRICE_LOOKBACK", "not-a-duration")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() error = %v, want retired mid-price lookback to be ignored", err)
+	}
+}
+
 func TestLoadRejectsRemappedFourWalletRoutes(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -596,7 +606,6 @@ func setCompleteDecisionCycleEnvironment(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_MAX_START_LATENESS", "30s")
 	t.Setenv("DECISION_CYCLE_TIMEOUT", "8m")
 	t.Setenv("DECISION_CYCLE_PREDICTION_LOOKBACK", "3h")
-	t.Setenv("DECISION_CYCLE_MID_PRICE_LOOKBACK", "48h")
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"echo-source","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
 		{"prediction_model_id":"echo-source","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},

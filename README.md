@@ -23,7 +23,7 @@
 新框架通过独立的 `decisioncycle` 应用服务编排 10 分钟周期，但不包含策略规则：
 
 ```text
-prediction_infra PIT 概率快照 + PostgreSQL OPEN lots + Polymarket top-15 订单簿 + v2 所需的 48 小时 mid price history
+prediction_infra PIT 概率快照 + PostgreSQL OPEN lots + venue top-15 订单簿；multfactor_v2 的 MOM/MACD 历史由策略服务直接读取官方 prices-history
   -> 按 (model_id, strategy_id, execution_account_id) 展开
   -> trading.strategy_input.v4
   -> 外部策略服务
@@ -32,7 +32,7 @@ prediction_infra PIT 概率快照 + PostgreSQL OPEN lots + Polymarket top-15 订
 ```
 
 它不使用旧的 Redis live consumer。概率通过 `prediction_infra` 的只读 HTTP API 拉取，
-盘口和历史 midpoint 由 Trading Execution 自己采集；每个执行上下文的冻结输入必须在调用策略前持久化，策略输出
+盘口由 Trading Execution 采集，MOM/MACD 历史由策略服务直取官方 prices-history；每个执行上下文的冻结输入必须在调用策略前持久化，策略输出
 也必须在下单前持久化。完整协议见
 [`docs/decision-cycle.md`](docs/decision-cycle.md)。
 外部策略团队需要实现的入场与逐笔持仓退出 HTTP 接口、完整请求/响应类型和业务校验见

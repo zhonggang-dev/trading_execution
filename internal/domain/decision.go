@@ -724,7 +724,6 @@ type StrategyDecisionRequest struct {
 	Predictions          []Prediction                 `json:"predictions"`
 	Positions            []StrategyPositionLot        `json:"positions"`
 	OrderBooks           []OrderBookSnapshot          `json:"orderbooks"`
-	MidPriceHistories    []MidPriceHistory            `json:"mid_price_histories"`
 	ExecutionConstraints StrategyExecutionConstraints `json:"execution_constraints"`
 }
 
@@ -740,7 +739,6 @@ func ComputeStrategyInputID(request StrategyDecisionRequest) (string, error) {
 		Predictions          []Prediction                 `json:"predictions"`
 		Positions            []StrategyPositionLot        `json:"positions"`
 		OrderBooks           []OrderBookSnapshot          `json:"orderbooks"`
-		MidPriceHistories    []MidPriceHistory            `json:"mid_price_histories"`
 		ExecutionConstraints StrategyExecutionConstraints `json:"execution_constraints"`
 	}{
 		SchemaVersion:        request.SchemaVersion,
@@ -752,7 +750,6 @@ func ComputeStrategyInputID(request StrategyDecisionRequest) (string, error) {
 		Predictions:          request.Predictions,
 		Positions:            request.Positions,
 		OrderBooks:           request.OrderBooks,
-		MidPriceHistories:    request.MidPriceHistories,
 		ExecutionConstraints: request.ExecutionConstraints,
 	}
 	payload, err := json.Marshal(identity)

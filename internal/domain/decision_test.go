@@ -150,7 +150,6 @@ func TestComputeStrategyInputIDIgnoresTransportGenerationTime(t *testing.T) {
 		PredictionSnapshotID: "predsnap-1",
 		Predictions:          []Prediction{},
 		OrderBooks:           []OrderBookSnapshot{},
-		MidPriceHistories:    []MidPriceHistory{},
 	}
 	first, err := ComputeStrategyInputID(request)
 	if err != nil {
@@ -171,15 +170,6 @@ func TestComputeStrategyInputIDIgnoresTransportGenerationTime(t *testing.T) {
 	}
 	if third == first {
 		t.Fatal("different execution accounts produced the same input id")
-	}
-	request.Context.ExecutionAccountID = "account-1"
-	request.MidPriceHistories = []MidPriceHistory{{TokenID: "token-1"}}
-	fourth, err := ComputeStrategyInputID(request)
-	if err != nil {
-		t.Fatalf("ComputeStrategyInputID() mid-price history error = %v", err)
-	}
-	if fourth == first {
-		t.Fatal("different mid-price histories produced the same input id")
 	}
 }
 

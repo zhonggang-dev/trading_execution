@@ -72,7 +72,6 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
   "predictions": [],
   "positions": [],
   "orderbooks": [],
-  "mid_price_histories": [],
   "execution_constraints": {
     "size_unit": "SHARES",
     "size_decimal_places": 2,
@@ -114,13 +113,10 @@ prob 和盘口，但使用不同 `strategy_id`、`execution_account_id`、`cycle
 运行日志会逐 binding 记录上游模型和 prediction count，空预测不再与“未调用”混淆。
 `positions` 按开仓批次发送当前 binding 的全部 OPEN lot，不按 token 聚合。`orderbooks` 覆盖
 prediction 和 position 的 token 并固定请求 top 15，每侧返回实际存在的最多 15 档；价格和数量必须使用 JSON string decimal。
-`mid_price_histories` 也按 token 一一对应，`mid_prices[].p` 直接来自 Polymarket
-`/prices-history` 的 `p`，不进行二次平均；默认窗口为 48 小时、源粒度为一分钟、原始点不重采样不补值。
-时间戳使用唯一字段 `interval_end_at`，由上游 `t` 按 UTC `ceil('min')` 归一化。
+Trading 不再抓取或发送 `mid_price_histories`。`multfactor_v2` 计算 MOM/MACD 所需的历史由策略服务
+直接读取对应 venue 的官方 prices-history。
 
 单个盘口失败不会伪装成空数据：`status` 使用 `OK`、`EMPTY`、`MISSING` 或 `ERROR`；
-历史价格额外支持 `PARTIAL`，
-策略必须 fail closed 或记录拒绝原因。
 
 ## 策略输出
 
@@ -194,7 +190,6 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
 [`market-validation.md`](market-validation.md)；余额、仓位、敞口与暂停检查由 Go Hard Risk
 负责，详见 [`risk-control.md`](risk-control.md)。
 
-`multfactor_v1` 不依赖小时因子，因此调度器不会为仅由 v1 使用的 Token 请求
-48 小时历史数据；冻结输入仍保留一条 `MISSING` 占位记录，并使用
-`error_code=NOT_REQUIRED_FOR_MULTFACTOR_V1` 明确表示“未请求”而不是上游故障。
-混合 v1/v2 周期中，历史源故障只会让 v2 绑定失败关闭，v1 仍可基于同一冻结盘口完成审计决策。
+调度器不会为任何入场决策 Token 请求历史价格，也不会在 v1/v2 冻结输入中保留历史占位记录。
+混合 v1/v2 周期只共享冻结盘口；v2 的历史数据可用性由策略服务自己的官方 prices-history 读取负责，
+不会再触发 Trading 侧 `STALE_DATA` 映射要求。

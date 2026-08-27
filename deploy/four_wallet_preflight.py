@@ -103,7 +103,6 @@ TRADING_RUNTIME_KEYS = frozenset(
         "POLYMARKET_ACCOUNTS_FILE",
         "DECISION_CYCLE_PREDICTION_INFRA_URL",
         "DECISION_CYCLE_PREDICTION_LOOKBACK",
-        "DECISION_CYCLE_MID_PRICE_LOOKBACK",
         "DECISION_CYCLE_STRATEGY_URL",
         "DECISION_CYCLE_INTERVAL",
         "DECISION_CYCLE_STARTUP_DELAY",
@@ -725,18 +724,6 @@ def validate_environment(
     if confirmation_count < 1 or confirmation_count > 10_000:
         raise PreflightError(
             "POLYGON_ORDER_FILLED_CONFIRMATIONS must be between 1 and 10000"
-        )
-    mid_price_lookback = environment.get(
-        "DECISION_CYCLE_MID_PRICE_LOOKBACK", ""
-    ).strip()
-    mid_price_lookback_seconds = _duration_seconds(
-        mid_price_lookback,
-        "DECISION_CYCLE_MID_PRICE_LOOKBACK",
-        max_seconds=7 * 24 * 60 * 60,
-    )
-    if not 2 * 60 * 60 <= mid_price_lookback_seconds <= 7 * 24 * 60 * 60:
-        raise PreflightError(
-            "DECISION_CYCLE_MID_PRICE_LOOKBACK must be between 2h and 168h"
         )
     _required_boolean(environment, "DECISION_CYCLE_ENABLED", True)
     _required_boolean(environment, "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", True)

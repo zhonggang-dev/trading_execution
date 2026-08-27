@@ -8,7 +8,6 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/kalshi"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/marketbooks"
-	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarket"
 	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/predictioninfra"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/strategyhttp"
@@ -81,27 +80,6 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 	if err != nil {
 		return nil, fmt.Errorf("build venue orderbook router: %w", err)
 	}
-	polymarketMidPrices, err := polymarket.NewMidPriceHistorySource(polymarket.MidPriceHistoryParams{
-		BaseURL:    params.cfg.Polymarket.CLOBURL,
-		HTTPClient: noRedirectHTTPClient(cycleConfig.Timeout),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("build decision mid-price source: %w", err)
-	}
-	var kalshiMidPrices port.MidPriceHistorySource
-	if kalshiClient != nil {
-		kalshiMidPrices, err = kalshi.NewMidPriceHistorySource(kalshi.MidPriceHistoryParams{Client: kalshiClient})
-		if err != nil {
-			return nil, fmt.Errorf("build Kalshi mid-price history source: %w", err)
-		}
-	}
-	midPrices, err := marketbooks.NewHistorySource(marketbooks.HistoryParams{
-		Polymarket: polymarketMidPrices,
-		Kalshi:     kalshiMidPrices,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("build venue mid-price history router: %w", err)
-	}
 	recorder, err := postgresadapter.NewDecisionRecorder(params.database, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build strategy decision recorder: %w", err)
@@ -110,7 +88,6 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		PredictionSource:             predictionClient,
 		PositionSource:               params.positionSource,
 		OrderBookSource:              orderBooks,
-		MidPriceSource:               midPrices,
 		Strategy:                     strategyClient,
 		Recorder:                     recorder,
 		Executor:                     params.executor,
@@ -124,7 +101,6 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		PredictionSourceModes:        cycleConfig.PredictionSourceModes,
 		Venue:                        params.cfg.Execution.Venue,
 		PredictionLookback:           cycleConfig.PredictionLookback,
-		MidPriceLookback:             cycleConfig.MidPriceLookback,
 		DeliveryStaleAge:             cycleConfig.Timeout,
 	})
 	if err != nil {

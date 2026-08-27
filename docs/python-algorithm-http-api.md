@@ -247,13 +247,13 @@ type StrategyDecisionRequest = {
   predictions: Prediction[];
   positions: StrategyPositionLot[];
   orderbooks: OrderBookSnapshot[];
-  mid_price_histories: MidPriceHistory[];
   execution_constraints: StrategyExecutionConstraints;
 };
 ```
 
 `positions` 是当前绑定下的全部开放持仓批次，一手一行，不按token合并。`shares` 是该手当前真实
-剩余shares。`orderbooks` 和 `mid_price_histories` 覆盖预测与持仓token的并集。
+剩余shares。`orderbooks` 覆盖预测与持仓token的并集。Trading 不发送 `mid_price_histories`；
+`multfactor_v2` 的 MOM/MACD 历史由策略服务直接读取对应 venue 的官方 prices-history。
 
 ### 3.3 Response 类型
 
@@ -332,8 +332,7 @@ type StrategyDecisionSuccess = {
 - `multfactor_v1` SUBMIT 的 `evidence.metrics` 必须包含
   `best_ask/near_logdiff_usd/rel_spread`，MOM/MACD 可选；`multfactor_v2` 必须完整包含五项；
 - `metrics.best_ask` 必须等于输入 `best_ask`，metrics value 全部为十进制字符串；
-- 订单簿不可用必须 `SKIP + INVALID_BOOK`；只有 `multfactor_v2` 在 mid price 不可用时必须
-  `SKIP + STALE_DATA`；策略范围外预测使用 `SKIP + OUTSIDE_STRATEGY_UNIVERSE`；
+- 订单簿不可用必须 `SKIP + INVALID_BOOK`；策略范围外预测使用 `SKIP + OUTSIDE_STRATEGY_UNIVERSE`；
 - 任何漏评、重复评价、非法字段都会导致整个响应被拒绝，不会部分执行。
 
 `entry_policy` 不是 Python 响应契约的一部分。Trading 在 model task manifest 不完整时，会在 HTTP
@@ -364,7 +363,6 @@ type StrategyDecisionSuccess = {
   "predictions": [],
   "positions": [],
   "orderbooks": [],
-  "mid_price_histories": [],
   "execution_constraints": {
     "size_unit": "SHARES",
     "size_decimal_places": 2,

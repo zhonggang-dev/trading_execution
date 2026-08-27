@@ -59,23 +59,6 @@ type fakeOrderBookSource struct {
 	books   []domain.OrderBookSnapshot
 }
 
-// fakeMidPriceHistorySource 表示后端使用的 fakeMidPriceHistorySource 类型。
-type fakeMidPriceHistorySource struct {
-	targets   []domain.BookTarget
-	lookback  time.Duration
-	histories []domain.MidPriceHistory
-	err       error
-	calls     int
-}
-
-// Capture 返回模拟行情快照。
-func (source *fakeMidPriceHistorySource) Capture(_ context.Context, _ time.Time, lookback time.Duration, targets []domain.BookTarget) ([]domain.MidPriceHistory, error) {
-	source.calls++
-	source.targets = targets
-	source.lookback = lookback
-	return source.histories, source.err
-}
-
 // Capture 返回模拟行情快照。
 func (source *fakeOrderBookSource) Capture(_ context.Context, _ time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, error) {
 	source.targets = targets
@@ -421,9 +404,6 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		Bids:         []domain.PriceLevel{{Price: "0.48", Size: "10"}},
 		Asks:         []domain.PriceLevel{{Price: "0.50", Size: "20"}},
 	}}}
-	midPriceSource := &fakeMidPriceHistorySource{histories: []domain.MidPriceHistory{
-		validMidPriceHistory(prediction, 0, decisionAt),
-	}}
 	strategy := &fakeStrategy{response: domain.StrategyDecisionResponse{
 		SchemaVersion: domain.StrategyOutputSchemaVersion,
 		DecidedAt:     decisionAt.Add(4 * time.Second),
@@ -478,7 +458,6 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              bookSource,
-		MidPriceSource:               midPriceSource,
 		Strategy:                     strategy,
 		Recorder:                     recorder,
 		Executor:                     executor,
@@ -502,16 +481,11 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 	if run.Response.EntryPolicy != nil || !run.EntrySubmissionEnabled || run.EntryBlockReason != "" {
 		t.Fatalf("healthy entry policy = %#v/%v/%q, want backward-compatible enabled state", run.Response.EntryPolicy, run.EntrySubmissionEnabled, run.EntryBlockReason)
 	}
-	if len(bookSource.targets) != 2 || len(midPriceSource.targets) != 2 || midPriceSource.lookback != 48*time.Hour ||
-		len(run.Request.OrderBooks) != 2 || len(run.Request.MidPriceHistories) != 2 {
+	if len(bookSource.targets) != 2 || len(run.Request.OrderBooks) != 2 {
 		t.Fatalf("targets = %#v, books = %#v, want both outcome tokens", bookSource.targets, run.Request.OrderBooks)
 	}
 	if run.Request.OrderBooks[1].Status != domain.OrderBookStatusMissing {
 		t.Fatalf("missing book = %#v, want explicit MISSING status", run.Request.OrderBooks[1])
-	}
-	if run.Request.MidPriceHistories[0].MidPrices[0].P != "0.49" ||
-		run.Request.MidPriceHistories[1].Status != domain.MidPriceHistoryStatusMissing {
-		t.Fatalf("mid-price histories = %#v", run.Request.MidPriceHistories)
 	}
 	if !recorder.inputRecorded || !recorder.outputRecorded || len(executor.intents) != 1 {
 		t.Fatalf("recorded input/output = %v/%v, executed = %d", recorder.inputRecorded, recorder.outputRecorded, len(executor.intents))
@@ -533,7 +507,6 @@ func TestRunSkipsQuarantinedBindingWhileOtherBindingSubmits(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
 	books := make([]domain.OrderBookSnapshot, 0, len(prediction.Outcomes))
-	histories := make([]domain.MidPriceHistory, 0, len(prediction.Outcomes))
 	for _, outcome := range prediction.Outcomes {
 		books = append(books, domain.OrderBookSnapshot{
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
@@ -543,7 +516,6 @@ func TestRunSkipsQuarantinedBindingWhileOtherBindingSubmits(t *testing.T) {
 			Bids: []domain.PriceLevel{{Price: "0.48", Size: "20"}},
 			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
 		})
-		histories = append(histories, validMidPriceHistory(prediction, outcome.Index, decisionAt))
 	}
 	strategy := &fakeStrategy{response: domain.StrategyDecisionResponse{
 		SchemaVersion: domain.StrategyOutputSchemaVersion,
@@ -575,7 +547,6 @@ func TestRunSkipsQuarantinedBindingWhileOtherBindingSubmits(t *testing.T) {
 	recorder := &fakeRecorder{}
 	executor := &fakeExecutor{}
 	positionSource := &quarantinePositionSource{rejectedAccount: "account-quarantined"}
-	midPriceSource := &fakeMidPriceHistorySource{histories: histories}
 	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "snapshot-quarantine",
@@ -586,7 +557,7 @@ func TestRunSkipsQuarantinedBindingWhileOtherBindingSubmits(t *testing.T) {
 			},
 		}},
 		PositionSource: positionSource, OrderBookSource: &fakeOrderBookSource{books: books},
-		MidPriceSource: midPriceSource, Strategy: strategy,
+		Strategy: strategy,
 		Recorder: recorder, Executor: executor, SubmitEnabled: true,
 		SubmissionDisabledAccounts:   []string{"account-quarantined"},
 		RequireCompleteModelCoverage: true,
@@ -621,8 +592,8 @@ func TestRunSkipsQuarantinedBindingWhileOtherBindingSubmits(t *testing.T) {
 		t.Fatalf("quarantined run = %#v, want skipped binding and no error", result.Runs[1])
 	}
 	if len(positionSource.calls) != 1 || positionSource.calls[0] != "account-active" ||
-		strategy.request.Context.ExecutionAccountID != "account-active" || midPriceSource.calls != 0 {
-		t.Fatalf("quarantined dependencies were called: positions=%#v strategy=%#v history_calls=%d", positionSource.calls, strategy.request.Context, midPriceSource.calls)
+		strategy.request.Context.ExecutionAccountID != "account-active" {
+		t.Fatalf("quarantined dependencies were called: positions=%#v strategy=%#v", positionSource.calls, strategy.request.Context)
 	}
 }
 
@@ -650,7 +621,6 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 	predictions := []domain.Prediction{echoPrediction, maskedPrediction}
 	bindings := fourWalletBindings()
 	bookSource := &fakeOrderBookSource{}
-	midPriceSource := &fakeMidPriceHistorySource{}
 	strategy := &matrixStrategy{}
 	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
@@ -661,7 +631,6 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              bookSource,
-		MidPriceSource:               midPriceSource,
 		Strategy:                     strategy,
 		Recorder:                     &fakeRecorder{},
 		Executor:                     &fakeExecutor{},
@@ -683,9 +652,6 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 	}
 	if len(bookSource.targets) != 4 {
 		t.Fatalf("independent orderbook targets = %d, want four outcome tokens", len(bookSource.targets))
-	}
-	if len(midPriceSource.targets) != 4 {
-		t.Fatalf("independent mid-price targets = %d, want four outcome tokens", len(midPriceSource.targets))
 	}
 	seenAccounts := make(map[string]struct{}, 4)
 	for _, request := range strategy.requests {
@@ -727,7 +693,6 @@ func TestRunStillCallsAllFourWalletsWhenOneModelHasNoMarket(t *testing.T) {
 		}},
 		PositionSource:  fakePositionSource{},
 		OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource:  &fakeMidPriceHistorySource{},
 		Strategy:        strategy,
 		Recorder:        &fakeRecorder{},
 		Bindings:        fourWalletBindings(),
@@ -782,7 +747,6 @@ func TestRunRoutesAvailableModelWithoutBlockingOnMissingOtherModel(t *testing.T)
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     strategy,
 		Recorder:                     &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
@@ -860,7 +824,7 @@ func TestSourceModeMismatchSubmitsExitButNeverBuy(t *testing.T) {
 			},
 		}},
 		PositionSource: positions, OrderBookSource: &fakeOrderBookSource{books: books},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: recorder,
+		Strategy: strategy, Recorder: recorder,
 		Executor: executor, SubmitEnabled: true, RequireCompleteModelCoverage: true,
 		Bindings: bindings, Venue: "polymarket-paper", Now: func() time.Time { return decisionAt.Add(2 * time.Second) },
 	})
@@ -930,7 +894,7 @@ func TestAccountEntryGateCallsMainStrategyWithPositionAndSubmitsExitButNeverBuy(
 			},
 		}},
 		PositionSource: positions, OrderBookSource: &fakeOrderBookSource{books: books},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: recorder,
+		Strategy: strategy, Recorder: recorder,
 		Executor: executor, SubmitEnabled: true, EntryDisabledAccounts: []string{"main"},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{{
@@ -990,7 +954,6 @@ func TestAccountEntryGateRoutesOnlyGeminiPredictionsToWallet6AndWallet7(t *testi
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     strategy,
 		Recorder:                     &fakeRecorder{},
 		Executor:                     &fakeExecutor{},
@@ -1055,7 +1018,6 @@ func TestRunSelectsLatestPITProbabilityForSameMarketAndModel(t *testing.T) {
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     strategy,
 		Recorder:                     &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
@@ -1099,7 +1061,7 @@ func TestRunRoutesLatestCompletedResultWithoutManifestDependency(t *testing.T) {
 			ExpectedPredictions: []domain.PredictionExpectation{completedPredictionExpectation(expected, 1, 1)},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{{
 			PredictionModelID: "echo-producer-v7", ModelID: "echo",
@@ -1140,7 +1102,7 @@ func TestRunDirectModeIgnoresNewerSandboxResult(t *testing.T) {
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{direct, sandbox},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{{
 			PredictionModelID: "echo-producer-v7", ModelID: "echo",
@@ -1185,7 +1147,7 @@ func TestRunSandboxModeIgnoresNewerDirectResult(t *testing.T) {
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{sandbox, direct},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{{
 			PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked",
@@ -1223,7 +1185,7 @@ func TestRunDirectModeSandboxOnlyResultBlocksEntryForCoverage(t *testing.T) {
 			DecisionAt: decisionAt, Predictions: []domain.Prediction{sandbox},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{{
 			PredictionModelID: "echo-producer-v7", ModelID: "echo",
@@ -1290,7 +1252,7 @@ func TestRunRoutesCompletedResultsForDifferentModelsWithoutSyntheticPairs(t *tes
 			},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{
 			{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main"},
@@ -1348,7 +1310,7 @@ func TestRunUsesCompletedResultWhileNewerTaskIsPending(t *testing.T) {
 			},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{{
 			PredictionModelID: "echo-producer-v7", ModelID: "echo",
@@ -1393,7 +1355,7 @@ func TestRunRoutesIndependentCompletedGenerations(t *testing.T) {
 			},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{
 			{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main"},
@@ -1432,7 +1394,7 @@ func TestRunCompletedTaskOlderThanPredictionLookbackCannotAuthorizeEntry(t *test
 			ExpectedPredictions: []domain.PredictionExpectation{completedPredictionExpectation(stale, 1, 1)},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: &fakeMidPriceHistorySource{}, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		PredictionLookback: 3 * time.Hour, RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{{
 			PredictionModelID: "echo-producer-v7", ModelID: "echo",
@@ -1469,7 +1431,6 @@ func TestRunFailsClosedWhenInputCannotBeRecorded(t *testing.T) {
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     strategy,
 		Recorder:                     recorder,
 		Executor:                     executor,
@@ -1519,7 +1480,6 @@ func TestRunRejectsStrategyResponseThatOmitsAnOutcome(t *testing.T) {
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     strategy,
 		Recorder:                     recorder,
 		Executor:                     executor,
@@ -1551,7 +1511,6 @@ func TestRunRejectsStrategyResponseThatChangesExecutionAccount(t *testing.T) {
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     contextHijackStrategy{},
 		Recorder:                     &fakeRecorder{},
 		Executor:                     &fakeExecutor{},
@@ -1586,7 +1545,6 @@ func TestRunRejectsFutureStrategyDecisionTime(t *testing.T) {
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     strategy,
 		Recorder:                     recorder,
 		Executor:                     &fakeExecutor{},
@@ -1616,7 +1574,6 @@ func TestNewRejectsDuplicateAccountBinding(t *testing.T) {
 		PredictionSource:             fakePredictionSource{},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     &fakeStrategy{},
 		Recorder:                     &fakeRecorder{},
 		Executor:                     &fakeExecutor{},
@@ -1635,7 +1592,6 @@ func TestNewRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
 		PredictionSource: fakePredictionSource{},
 		PositionSource:   fakePositionSource{},
 		OrderBookSource:  &fakeOrderBookSource{},
-		MidPriceSource:   &fakeMidPriceHistorySource{},
 		Strategy:         &fakeStrategy{},
 		Recorder:         &fakeRecorder{},
 		Bindings: []domain.StrategyExecutionBinding{
@@ -1654,7 +1610,6 @@ func TestNewRejectsSubmissionWithoutCompleteModelCoverage(t *testing.T) {
 		PredictionSource: fakePredictionSource{},
 		PositionSource:   fakePositionSource{},
 		OrderBookSource:  &fakeOrderBookSource{},
-		MidPriceSource:   &fakeMidPriceHistorySource{},
 		Strategy:         &fakeStrategy{},
 		Recorder:         &fakeRecorder{},
 		Executor:         &fakeExecutor{},
@@ -1692,7 +1647,6 @@ func TestNewRejectsInvalidPredictionSourceModes(t *testing.T) {
 				PredictionSource:      fakePredictionSource{},
 				PositionSource:        fakePositionSource{},
 				OrderBookSource:       &fakeOrderBookSource{},
-				MidPriceSource:        &fakeMidPriceHistorySource{},
 				Strategy:              &fakeStrategy{},
 				Recorder:              &fakeRecorder{},
 				Bindings:              []domain.StrategyExecutionBinding{testExecutionBinding()},
@@ -1712,7 +1666,6 @@ func TestNewRejectsQuarantiningEveryBinding(t *testing.T) {
 		PredictionSource:             fakePredictionSource{},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     &fakeStrategy{},
 		Recorder:                     &fakeRecorder{},
 		Executor:                     &fakeExecutor{},
@@ -1733,7 +1686,6 @@ func TestRunRejectsNonBoundaryTime(t *testing.T) {
 		PredictionSource:             fakePredictionSource{},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
-		MidPriceSource:               &fakeMidPriceHistorySource{},
 		Strategy:                     &fakeStrategy{},
 		Recorder:                     &fakeRecorder{},
 		Executor:                     &fakeExecutor{},
@@ -1750,12 +1702,9 @@ func TestRunRejectsNonBoundaryTime(t *testing.T) {
 	}
 }
 
-// TestBuildEntryIntentRequiresUsableMidPriceHistory 验证 Build Entry Intent Requires Usable Mid Price History 场景下的行为。
-func TestBuildEntryIntentRequiresUsableMidPriceHistory(t *testing.T) {
+func TestMultfactorV2EntryDoesNotRequireMidPriceHistory(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
-	history := validMidPriceHistory(prediction, 0, decisionAt)
-	history.Status = domain.MidPriceHistoryStatusPartial
 	request := domain.StrategyDecisionRequest{
 		Context:              testBinding(),
 		DecisionAt:           decisionAt,
@@ -1768,7 +1717,6 @@ func TestBuildEntryIntentRequiresUsableMidPriceHistory(t *testing.T) {
 			Bids: []domain.PriceLevel{{Price: "0.48", Size: "10"}},
 			Asks: []domain.PriceLevel{{Price: "0.50", Size: "10"}},
 		}},
-		MidPriceHistories: []domain.MidPriceHistory{history},
 	}
 	evaluation := domain.StrategyEvaluation{
 		DecisionID: "decision-1", PredictionID: prediction.PredictionID,
@@ -1778,8 +1726,47 @@ func TestBuildEntryIntentRequiresUsableMidPriceHistory(t *testing.T) {
 			Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.50", Size: "10", TimeInForce: domain.TimeInForceFOK,
 		},
 	}
-	if _, err := buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket"); err == nil {
-		t.Fatal("buildEntryIntent() error = nil, want unusable mid-price history rejection")
+	if _, err := buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket"); err != nil {
+		t.Fatalf("buildEntryIntent() error = %v, want v2 to use strategy-owned price history", err)
+	}
+	if reason := inputFailureReason(request, prediction.Outcomes[0].TokenID); reason != "" {
+		t.Fatalf("inputFailureReason() = %q, want no history-derived failure", reason)
+	}
+}
+
+func TestMultfactorV2MissingHistoryDoesNotForceStaleData(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	books := make([]domain.OrderBookSnapshot, 0, len(prediction.Outcomes))
+	evaluations := make([]domain.StrategyEvaluation, 0, len(prediction.Outcomes))
+	for _, outcome := range prediction.Outcomes {
+		books = append(books, domain.OrderBookSnapshot{
+			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID,
+			Status: domain.OrderBookStatusOK, SourceAt: decisionAt, ObservedAt: decisionAt,
+			DepthLimit: domain.StrategyOrderBookDepth, MinOrderSize: "1",
+			Bids: []domain.PriceLevel{{Price: "0.48", Size: "10"}},
+			Asks: []domain.PriceLevel{{Price: "0.50", Size: "10"}},
+		})
+		evaluations = append(evaluations, domain.StrategyEvaluation{
+			DecisionID: fmt.Sprintf("decision-%d", outcome.Index), PredictionID: prediction.PredictionID,
+			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID,
+			Action: domain.StrategyActionSkip, ReasonCode: domain.StrategyReasonEdgeTooLow,
+			Evidence: domain.StrategyEvidence{Probability: outcome.Probability},
+		})
+	}
+	request := domain.StrategyDecisionRequest{
+		SchemaVersion: domain.StrategyInputSchemaVersion, CycleID: "cycle-no-history", InputID: "input-no-history",
+		Context: testBinding(), DecisionAt: decisionAt, Predictions: []domain.Prediction{prediction}, OrderBooks: books,
+		ExecutionConstraints: domain.DefaultStrategyExecutionConstraints(),
+	}
+	response := domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion, CycleID: request.CycleID, InputID: request.InputID,
+		Context: request.Context, DecidedAt: decisionAt.Add(time.Second), Evaluations: evaluations, Exits: []domain.StrategyExit{},
+	}
+	if _, err := validateResponse(request, response, "polymarket"); err != nil {
+		t.Fatalf("validateResponse() error = %v, want no history-derived STALE_DATA requirement", err)
 	}
 }
 
@@ -1799,9 +1786,6 @@ func TestMultfactorV1EntryDoesNotRequireMidPriceHistory(t *testing.T) {
 			Bids: []domain.PriceLevel{{Price: "0.48", Size: "10"}},
 			Asks: []domain.PriceLevel{{Price: "0.50", Size: "10"}},
 		}},
-		MidPriceHistories: []domain.MidPriceHistory{{
-			TokenID: prediction.Outcomes[0].TokenID, Status: domain.MidPriceHistoryStatusPartial,
-		}},
 	}
 	evaluation := domain.StrategyEvaluation{
 		DecisionID: "decision-v1", PredictionID: prediction.PredictionID,
@@ -1819,10 +1803,9 @@ func TestMultfactorV1EntryDoesNotRequireMidPriceHistory(t *testing.T) {
 	}
 }
 
-func TestV1OnlyCycleDoesNotCallMidPriceSource(t *testing.T) {
+func TestV1OnlyCycleBuildsRequestWithoutMidPriceHistories(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
-	historySource := &fakeMidPriceHistorySource{err: errors.New("history source must not be called")}
 	strategy := &matrixStrategy{}
 	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
@@ -1831,7 +1814,7 @@ func TestV1OnlyCycleDoesNotCallMidPriceSource(t *testing.T) {
 			Predictions: []domain.Prediction{prediction},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: historySource, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		Bindings: []domain.StrategyExecutionBinding{{
 			ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-v1",
 		}},
@@ -1844,20 +1827,14 @@ func TestV1OnlyCycleDoesNotCallMidPriceSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if historySource.calls != 0 || len(strategy.requests) != 1 || len(result.Runs) != 1 {
-		t.Fatalf("history calls=%d strategy requests=%d runs=%d", historySource.calls, len(strategy.requests), len(result.Runs))
-	}
-	histories := strategy.requests[0].MidPriceHistories
-	if len(histories) != 2 || histories[0].Status != domain.MidPriceHistoryStatusMissing ||
-		histories[0].ErrorCode != "NOT_REQUIRED_FOR_MULTFACTOR_V1" {
-		t.Fatalf("v1 history placeholders = %#v", histories)
+	if len(strategy.requests) != 1 || len(result.Runs) != 1 {
+		t.Fatalf("strategy requests=%d runs=%d", len(strategy.requests), len(result.Runs))
 	}
 }
 
-func TestMixedCycleHistoryFailureDoesNotBlockV1Binding(t *testing.T) {
+func TestMixedCycleCallsV1AndV2WithoutMidPriceHistoryDependency(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)
-	historySource := &fakeMidPriceHistorySource{err: errors.New("history unavailable")}
 	strategy := &matrixStrategy{}
 	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
@@ -1866,7 +1843,7 @@ func TestMixedCycleHistoryFailureDoesNotBlockV1Binding(t *testing.T) {
 			Predictions: []domain.Prediction{prediction},
 		}},
 		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
-		MidPriceSource: historySource, Strategy: strategy, Recorder: &fakeRecorder{},
+		Strategy: strategy, Recorder: &fakeRecorder{},
 		Bindings: []domain.StrategyExecutionBinding{
 			{ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-v1"},
 			{ModelID: "test", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "account-v2"},
@@ -1877,13 +1854,14 @@ func TestMixedCycleHistoryFailureDoesNotBlockV1Binding(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, runErr := service.Run(context.Background(), decisionAt)
-	if runErr == nil {
-		t.Fatal("Run() error = nil, want v2 history failure")
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
 	}
-	if historySource.calls != 1 || len(strategy.requests) != 1 ||
-		strategy.requests[0].Context.StrategyID != domain.StrategyIDMultfactorV1 || len(result.Runs) != 2 ||
-		result.Runs[0].Error != nil || result.Runs[1].Error == nil || result.Runs[1].PredictionCount != 1 {
-		t.Fatalf("mixed result=%#v history calls=%d strategy requests=%#v", result, historySource.calls, strategy.requests)
+	if len(strategy.requests) != 2 || len(result.Runs) != 2 ||
+		strategy.requests[0].Context.StrategyID != domain.StrategyIDMultfactorV1 ||
+		strategy.requests[1].Context.StrategyID != domain.StrategyIDMultfactorV2 ||
+		result.Runs[0].Error != nil || result.Runs[1].Error != nil {
+		t.Fatalf("mixed result=%#v strategy requests=%#v", result, strategy.requests)
 	}
 }
 
@@ -2371,22 +2349,6 @@ func completedPredictionExpectations(predictions []domain.Prediction, selectionI
 		result[index] = completedPredictionExpectation(prediction, selectionID, selectionRunID)
 	}
 	return result
-}
-
-// validMidPriceHistory 构建测试使用的合法输入。
-func validMidPriceHistory(prediction domain.Prediction, outcomeIndex int, decisionAt time.Time) domain.MidPriceHistory {
-	windowStart := decisionAt.Add(-48 * time.Hour)
-	first := windowStart.Add(time.Minute)
-	last := decisionAt.Add(-time.Minute)
-	return domain.MidPriceHistory{
-		MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
-		OutcomeIndex: outcomeIndex, TokenID: prediction.Outcomes[outcomeIndex].TokenID,
-		Status: domain.MidPriceHistoryStatusOK, WindowStart: windowStart, WindowEnd: decisionAt,
-		FidelitySeconds: 60, Sampling: domain.MidPriceSamplingUpstreamRaw,
-		MissingValues: domain.MidPriceMissingValuePolicyNoFill, TimestampSemantics: domain.MidPriceTimestampSemanticsIntervalEndUTC,
-		FetchedAt: decisionAt.Add(3 * time.Second), CoverageStart: first, CoverageEnd: last,
-		MidPrices: []domain.MidPricePoint{{IntervalEndAt: first, P: "0.49"}, {IntervalEndAt: last, P: "0.50"}},
-	}
 }
 
 // testBinding 实现当前测试场景所需的辅助行为。

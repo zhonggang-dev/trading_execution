@@ -234,9 +234,6 @@ func newPipelineFixture(t *testing.T, submitEnabled ...bool) *pipelineFixture {
 			Bids: []domain.PriceLevel{{Price: "0.48", Size: "10"}},
 			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
 		}}},
-		MidPriceSource: &fakeMidPriceHistorySource{histories: []domain.MidPriceHistory{
-			validMidPriceHistory(prediction, 0, decisionAt),
-		}},
 		Strategy: strategy, Recorder: recorder, Executor: executor, SubmitEnabled: enabled,
 		RequireCompleteModelCoverage: enabled,
 		Bindings:                     []domain.StrategyExecutionBinding{testExecutionBinding()}, Venue: "polymarket-paper",
