@@ -408,17 +408,20 @@ func (client *Client) PrepareOrder(intent domain.OrderIntent) (PreparedOrder, er
 // must explicitly enable it; dry-run and tests remain fail-closed by default.
 func (client *Client) SubmitPrepared(ctx context.Context, order PreparedOrder) (SubmittedOrder, error) {
 	if !client.liveTradingEnabled {
-		return SubmittedOrder{}, fmt.Errorf("Kalshi live trading is disabled")
+		return SubmittedOrder{}, kalshiInvalidError("KALSHI_LIVE_TRADING_DISABLED", "Kalshi live trading is disabled", nil)
 	}
 	if len(order.body) == 0 || strings.TrimSpace(order.Request.ClientOrderID) == "" || order.Fingerprint() == "" {
-		return SubmittedOrder{}, fmt.Errorf("Kalshi prepared order is invalid")
+		return SubmittedOrder{}, kalshiInvalidError("KALSHI_PREPARED_ORDER_INVALID", "Kalshi prepared order is invalid", nil)
 	}
 	var response SubmittedOrder
 	if err := client.doAuthenticated(ctx, http.MethodPost, "/trade-api/v2/portfolio/events/orders", order.body, &response); err != nil {
 		return SubmittedOrder{}, err
 	}
 	if response.OrderID == "" || response.ClientOrderID != order.Request.ClientOrderID {
-		return SubmittedOrder{}, fmt.Errorf("Kalshi order acknowledgement identity is invalid")
+		return SubmittedOrder{}, kalshiAmbiguousError(
+			"KALSHI_INVALID_POST_RESPONSE",
+			fmt.Errorf("Kalshi order acknowledgement identity is invalid"),
+		)
 	}
 	return response, nil
 }
@@ -426,7 +429,7 @@ func (client *Client) SubmitPrepared(ctx context.Context, order PreparedOrder) (
 func (client *Client) doAuthenticated(ctx context.Context, method, requestPath string, body []byte, target any) error {
 	endpoint, err := client.baseURL.Parse(requestPath)
 	if err != nil {
-		return err
+		return kalshiLocalFailure("KALSHI_INVALID_REQUEST_PATH", "Kalshi API request path is invalid", err)
 	}
 	timestamp := fmt.Sprintf("%d", client.now().UTC().UnixMilli())
 	message := timestamp + method + endpoint.EscapedPath()
@@ -435,11 +438,11 @@ func (client *Client) doAuthenticated(ctx context.Context, method, requestPath s
 		SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA256,
 	})
 	if err != nil {
-		return fmt.Errorf("sign Kalshi request: %w", err)
+		return kalshiLocalFailure("KALSHI_SIGN_FAILED", "sign Kalshi request", err)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return kalshiLocalFailure("KALSHI_REQUEST_BUILD_FAILED", "build Kalshi API request", err)
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("KALSHI-ACCESS-KEY", client.apiKeyID)
@@ -450,21 +453,25 @@ func (client *Client) doAuthenticated(ctx context.Context, method, requestPath s
 	}
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return fmt.Errorf("request Kalshi API: %w", err)
+		return kalshiTransportFailure(method, err)
 	}
 	defer response.Body.Close()
 	payload, err := io.ReadAll(io.LimitReader(response.Body, maxAuthenticatedResponseBytes+1))
 	if err != nil {
-		return err
-	}
-	if len(payload) > maxAuthenticatedResponseBytes {
-		return fmt.Errorf("Kalshi response exceeds %d bytes", maxAuthenticatedResponseBytes)
+		return kalshiResponseFailure(method, "KALSHI_RESPONSE_READ_FAILED", "read Kalshi response", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("Kalshi HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(payload)))
+		return mapKalshiHTTPError(method, response.StatusCode, response.Header, payload)
+	}
+	if len(payload) > maxAuthenticatedResponseBytes {
+		return kalshiResponseFailure(
+			method, "KALSHI_RESPONSE_TOO_LARGE",
+			fmt.Sprintf("Kalshi response exceeds %d bytes", maxAuthenticatedResponseBytes),
+			fmt.Errorf("response body exceeded limit"),
+		)
 	}
 	if err := json.Unmarshal(payload, target); err != nil {
-		return fmt.Errorf("decode Kalshi response: %w", err)
+		return kalshiResponseFailure(method, "KALSHI_INVALID_RESPONSE", "decode Kalshi response", err)
 	}
 	return nil
 }

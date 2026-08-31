@@ -7,13 +7,19 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
+	"github.com/UniPat-AI/trading_execution/internal/adapter/paper"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 )
 
 func TestClientSignsReadRequestsAndProbesScopes(t *testing.T) {
@@ -104,6 +110,120 @@ func TestSubmitPreparedIsIndependentAndFailClosed(t *testing.T) {
 		t.Fatalf("response = %#v, requests = %d", response, requests)
 	}
 }
+
+func TestSubmitPreparedClassifiesFOKHTTPFailureAsDefinitiveRejection(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		verifySignature(t, request, "key", &privateKey.PublicKey)
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusBadRequest)
+		_, _ = writer.Write([]byte(`{"error":{"code":"fill_or_kill_failed","message":"fill_or_kill order could not be filled"}}`))
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, true)
+	prepared, err := client.PrepareOrder(validKalshiIntent(domain.SideBuy, "YES"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, submitErr := client.SubmitPrepared(context.Background(), prepared)
+	var venueError *port.VenueError
+	if !errors.As(submitErr, &venueError) || venueError.Kind != port.VenueErrorRejected ||
+		venueError.Code != "KALSHI_FOK_NOT_FILLED" || venueError.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("SubmitPrepared() error = %#v, venue error = %#v", submitErr, venueError)
+	}
+}
+
+func TestVenueKeepsMutatingServerFailureAmbiguousWithClientOrderID(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		verifySignature(t, request, "key", &privateKey.PublicKey)
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = writer.Write([]byte(`{"error":{"code":"service_unavailable","message":"matching engine unavailable"}}`))
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, true)
+	venue, err := NewVenue(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validKalshiIntent(domain.SideBuy, "YES")
+	_, placeErr := venue.Place(context.Background(), domain.Order{ID: "order-1", Intent: intent})
+	var venueError *port.VenueError
+	if !errors.As(placeErr, &venueError) || venueError.Kind != port.VenueErrorAmbiguous ||
+		venueError.Code != "KALSHI_SERVER_ERROR" || venueError.VenueOrderID != intent.ClientOrderID {
+		t.Fatalf("Place() error = %#v, venue error = %#v", placeErr, venueError)
+	}
+}
+
+func TestKalshiFOKRejectionReleasesReservationAndAllowsNextSubmission(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		verifySignature(t, request, "key", &privateKey.PublicKey)
+		var submitted OrderRequestV2
+		if err := json.NewDecoder(request.Body).Decode(&submitted); err != nil {
+			t.Errorf("decode submitted order: %v", err)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusBadRequest)
+		_, _ = writer.Write([]byte(`{"error":{"code":"fill_or_kill_failed","message":"not enough liquidity to fill_or_kill"}}`))
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, true)
+	venue, err := NewVenue(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations := paper.NewReservationManager()
+	sequence := 0
+	service, err := execution.New(execution.Params{
+		Repository: memory.NewOrderRepository(), Venue: venue,
+		Guard: kalshiAllowGuard{}, MarketValidator: kalshiAllowMarketValidator{}, Reservations: reservations,
+		RequirePreparedPlacement: true, AccountScope: kalshiAllowAccountScope{},
+		Now: func() time.Time { return time.Date(2026, 8, 31, 0, 0, sequence, 0, time.UTC) },
+		NewID: func() string {
+			sequence++
+			return fmt.Sprintf("kalshi-order-%d", sequence)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstIntent := validKalshiIntent(domain.SideBuy, "YES")
+	first, firstErr := service.Submit(context.Background(), firstIntent)
+	if firstErr == nil || first.Order.Status != domain.OrderStatusRejected || first.Order.FailureCode != "KALSHI_FOK_NOT_FILLED" {
+		t.Fatalf("first Submit() = %#v, %v", first, firstErr)
+	}
+	reservation, found := reservations.Get(first.Order.ID)
+	if !found || reservation.Status != domain.ReservationStatusReleased {
+		t.Fatalf("first reservation = %#v, found=%v; want RELEASED", reservation, found)
+	}
+
+	secondIntent := validKalshiIntent(domain.SideBuy, "YES")
+	secondIntent.ClientOrderID = "client-order-2"
+	secondIntent.SignalID = "signal-2"
+	second, secondErr := service.Submit(context.Background(), secondIntent)
+	if secondErr == nil || second.Order.Status != domain.OrderStatusRejected || requests != 2 {
+		t.Fatalf("second Submit() = %#v, %v, requests=%d; want a fresh venue submission", second, secondErr, requests)
+	}
+}
+
+type kalshiAllowGuard struct{}
+
+func (kalshiAllowGuard) Check(context.Context, domain.OrderIntent) error { return nil }
+
+type kalshiAllowMarketValidator struct{}
+
+func (kalshiAllowMarketValidator) Validate(context.Context, domain.OrderIntent) (domain.MarketValidation, error) {
+	return domain.MarketValidation{Mode: "TEST"}, nil
+}
+
+type kalshiAllowAccountScope struct{}
+
+func (kalshiAllowAccountScope) IsActive(string) bool  { return true }
+func (kalshiAllowAccountScope) IsManaged(string) bool { return true }
 
 func TestBalanceSupportsCurrentCentResponse(t *testing.T) {
 	if got := (Balance{Balance: 12345}).AvailableDollars(); got != "123.45" {

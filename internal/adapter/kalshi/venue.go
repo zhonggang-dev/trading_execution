@@ -2,6 +2,7 @@ package kalshi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -46,6 +47,10 @@ func (venue *Venue) PlacePrepared(ctx context.Context, _ domain.Order, raw port.
 	}
 	order, err := venue.client.SubmitPrepared(ctx, placement.order)
 	if err != nil {
+		var venueError *port.VenueError
+		if errors.As(err, &venueError) && venueError.Kind == port.VenueErrorAmbiguous && strings.TrimSpace(venueError.VenueOrderID) == "" {
+			venueError.VenueOrderID = strings.TrimSpace(placement.order.Request.ClientOrderID)
+		}
 		return port.VenueOrder{}, err
 	}
 	return submittedVenueOrder(order), nil
