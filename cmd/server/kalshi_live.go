@@ -93,13 +93,13 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 	if err != nil {
 		return builtKalshiLiveRoute{}, fmt.Errorf("read Kalshi balance: %w", err)
 	}
-	availableBalance := balance.AvailableDollars()
-	availableSign, signErr := availableBalance.Sign()
+	cashBalance := balance.AvailableDollars()
+	cashSign, signErr := cashBalance.Sign()
 	if signErr != nil {
-		return builtKalshiLiveRoute{}, fmt.Errorf("Kalshi available balance is invalid")
+		return builtKalshiLiveRoute{}, fmt.Errorf("Kalshi cash balance is invalid")
 	}
 	internalID := "kalshi:" + binding.ExecutionAccountID
-	if err := syncKalshiExecutionAccount(ctx, database, internalID, binding.APIKeyID, availableBalance); err != nil {
+	if err := syncKalshiExecutionAccount(ctx, database, internalID, binding.APIKeyID, cashBalance); err != nil {
 		return builtKalshiLiveRoute{}, err
 	}
 	venue, err := kalshi.NewVenue(client)
@@ -137,7 +137,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 	return builtKalshiLiveRoute{
 		route:             executionrouter.Route{ModelID: binding.ModelID, StrategyID: binding.StrategyID, LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID, Execution: service},
 		positionRoute:     positionsource.Route{LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID},
-		internalAccountID: internalID, buyFunded: availableSign > 0,
+		internalAccountID: internalID, buyFunded: cashSign > 0,
 	}, nil
 }
 
@@ -168,16 +168,17 @@ func syncKalshiExecutionAccount(ctx context.Context, database *sql.DB, accountID
 		INSERT INTO execution_accounts (execution_account_id,wallet_address,collateral_asset,total_balance,available_balance,reserved_balance,reconciled_at)
 		VALUES ($1,$2,'USD',$3::numeric,$3::numeric,0,clock_timestamp())
 		ON CONFLICT (execution_account_id) DO UPDATE
-		SET total_balance=$3::numeric+execution_accounts.reserved_balance,
-			available_balance=$3::numeric,
+		SET total_balance=$3::numeric,
+			available_balance=$3::numeric-execution_accounts.reserved_balance,
 			reconciled_at=clock_timestamp(), updated_at=clock_timestamp(), version=execution_accounts.version+1
-		WHERE execution_accounts.wallet_address=$2 AND execution_accounts.collateral_asset='USD'`,
+		WHERE execution_accounts.wallet_address=$2 AND execution_accounts.collateral_asset='USD'
+		  AND $3::numeric>=execution_accounts.reserved_balance`,
 		accountID, "kalshi:"+apiKeyID, balance.String())
 	if err != nil {
 		return fmt.Errorf("sync Kalshi execution account: %w", err)
 	}
 	if rows, _ := result.RowsAffected(); rows != 1 {
-		return fmt.Errorf("Kalshi account identity changed")
+		return fmt.Errorf("Kalshi account identity changed or cash balance is below local reservations")
 	}
 	return nil
 }
