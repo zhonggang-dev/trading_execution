@@ -15,6 +15,7 @@ type Execution interface {
 	Get(context.Context, string) (domain.Order, error)
 	Refresh(context.Context, string) (domain.Order, error)
 	Cancel(context.Context, string) (domain.Order, error)
+	FinalizeCancellation(context.Context, string) (domain.Order, error)
 	Events(context.Context, string) ([]domain.OrderEvent, error)
 	Attempts(context.Context, string) ([]domain.OrderAttempt, error)
 }
@@ -119,6 +120,13 @@ func (service *Service) Cancel(ctx context.Context, id string) (domain.Order, er
 		return domain.Order{}, err
 	}
 	return e.Cancel(ctx, id)
+}
+func (service *Service) FinalizeCancellation(ctx context.Context, id string) (domain.Order, error) {
+	e, err := service.executionForOrder(ctx, id)
+	if err != nil {
+		return domain.Order{}, err
+	}
+	return e.FinalizeCancellation(ctx, id)
 }
 func (service *Service) Events(ctx context.Context, id string) ([]domain.OrderEvent, error) {
 	e, err := service.executionForOrder(ctx, id)

@@ -59,10 +59,34 @@ func TestSweepDoesNotRefreshRetiredAccount(t *testing.T) {
 	}
 }
 
+func TestSweepFinalizesCancelledOrderAfterVenueFillGrace(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 10, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	createOrder(t, repository, domain.Order{
+		ID: "cancelled", Intent: domain.OrderIntent{ClientOrderID: "cancelled"},
+		Status: domain.OrderStatusCancelled, FilledSize: "0",
+		CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute), Revision: 1,
+	})
+	execution := &fakeExecution{}
+	coordinator, err := ordercoordinator.New(ordercoordinator.Params{
+		Repository: repository, Execution: execution, PollInterval: time.Second,
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Sweep(context.Background())
+	if result.Selected != 1 || result.Finalized != 1 || len(result.Errors) != 0 ||
+		len(execution.finalized) != 1 || execution.finalized[0] != "cancelled" {
+		t.Fatalf("Sweep()=%#v finalized=%#v", result, execution.finalized)
+	}
+}
+
 // fakeExecution 表示后端使用的 fakeExecution 类型。
 type fakeExecution struct {
 	refreshed []string
 	cancelled []string
+	finalized []string
 }
 
 // Refresh 记录模拟订单刷新。
@@ -80,6 +104,11 @@ func (execution *fakeExecution) Resume(_ context.Context, orderID string) (domai
 // Cancel 记录模拟订单撤销。
 func (execution *fakeExecution) Cancel(_ context.Context, orderID string) (domain.Order, error) {
 	execution.cancelled = append(execution.cancelled, orderID)
+	return domain.Order{ID: orderID}, nil
+}
+
+func (execution *fakeExecution) FinalizeCancellation(_ context.Context, orderID string) (domain.Order, error) {
+	execution.finalized = append(execution.finalized, orderID)
 	return domain.Order{ID: orderID}, nil
 }
 

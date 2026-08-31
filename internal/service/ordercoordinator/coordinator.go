@@ -17,6 +17,7 @@ type Execution interface {
 	Resume(context.Context, string) (domain.Order, error)
 	Refresh(context.Context, string) (domain.Order, error)
 	Cancel(context.Context, string) (domain.Order, error)
+	FinalizeCancellation(context.Context, string) (domain.Order, error)
 }
 
 // Params 表示后端使用的 Params 类型。
@@ -45,6 +46,7 @@ type SweepResult struct {
 	Resumed   int
 	Refreshed int
 	Cancelled int
+	Finalized int
 	Errors    []error
 }
 
@@ -56,6 +58,7 @@ const (
 	sweepActionResume
 	sweepActionRefresh
 	sweepActionCancel
+	sweepActionFinalizeCancellation
 )
 
 // New 校验依赖和配置后创建当前服务实例。
@@ -153,9 +156,21 @@ func (coordinator *Coordinator) processOrder(ctx context.Context, order domain.O
 		domain.OrderStatusUnknown, domain.OrderStatusCancelPending,
 		domain.OrderStatusReconciling:
 		return coordinator.refreshOrder(ctx, order)
+	case domain.OrderStatusCancelled:
+		return coordinator.finalizeCancellation(ctx, order)
 	default:
 		return sweepActionNone, nil
 	}
+}
+
+func (coordinator *Coordinator) finalizeCancellation(ctx context.Context, order domain.Order) (sweepAction, error) {
+	if _, err := coordinator.execution.FinalizeCancellation(ctx, order.ID); err != nil {
+		if errors.Is(err, port.ErrCancelFinalityPending) {
+			return sweepActionNone, nil
+		}
+		return sweepActionNone, fmt.Errorf("finalize cancelled order %s: %w", order.ID, err)
+	}
+	return sweepActionFinalizeCancellation, nil
 }
 
 // cancelOrder 撤销一张已经过期的活动订单。
@@ -199,6 +214,8 @@ func (result *SweepResult) record(action sweepAction) {
 		result.Refreshed++
 	case sweepActionCancel:
 		result.Cancelled++
+	case sweepActionFinalizeCancellation:
+		result.Finalized++
 	}
 }
 

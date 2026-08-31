@@ -270,7 +270,7 @@ func coordinatorEligible(order domain.Order) bool {
 		domain.OrderStatusSubmitting, domain.OrderStatusAcknowledged,
 		domain.OrderStatusLive, domain.OrderStatusPartiallyFilled,
 		domain.OrderStatusUnknown, domain.OrderStatusCancelPending,
-		domain.OrderStatusReconciling:
+		domain.OrderStatusReconciling, domain.OrderStatusCancelled:
 		return true
 	default:
 		return false

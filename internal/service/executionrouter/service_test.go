@@ -52,6 +52,9 @@ func (*fakeExecution) Refresh(context.Context, string) (domain.Order, error) {
 func (*fakeExecution) Cancel(context.Context, string) (domain.Order, error) {
 	return domain.Order{}, nil
 }
+func (*fakeExecution) FinalizeCancellation(context.Context, string) (domain.Order, error) {
+	return domain.Order{}, nil
+}
 func (*fakeExecution) Events(context.Context, string) ([]domain.OrderEvent, error) { return nil, nil }
 func (*fakeExecution) Attempts(context.Context, string) ([]domain.OrderAttempt, error) {
 	return nil, nil

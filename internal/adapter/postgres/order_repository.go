@@ -341,9 +341,16 @@ func (repository *OrderRepository) listPending(
 		arguments = append(arguments, executionAccountIDs)
 	}
 	rows, err := repository.db.QueryContext(ctx, selectOrderColumns+`
-		WHERE status IN ('RECEIVED', 'VALIDATING', 'RESERVED',
-		                 'SUBMITTING', 'ACKNOWLEDGED', 'LIVE', 'PARTIALLY_FILLED',
-		                 'UNKNOWN', 'CANCEL_PENDING', 'RECONCILING')
+		WHERE (
+			status IN ('RECEIVED', 'VALIDATING', 'RESERVED',
+			           'SUBMITTING', 'ACKNOWLEDGED', 'LIVE', 'PARTIALLY_FILLED',
+			           'UNKNOWN', 'CANCEL_PENDING', 'RECONCILING')
+			OR (status='CANCELLED' AND EXISTS (
+				SELECT 1 FROM asset_reservations AS reservation
+				WHERE reservation.order_id=execution_orders.order_id
+				  AND reservation.status IN ('ACTIVE','RECONCILIATION_REQUIRED')
+			))
+		)
 		  AND NOT (
 			status = 'UNKNOWN'
 			AND failure_code IN ('CLOB_FILL_DETAILS_UNAVAILABLE', 'VENUE_FILL_EVIDENCE_PENDING')

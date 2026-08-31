@@ -31,6 +31,9 @@ func (*routeTestExecution) Refresh(context.Context, string) (domain.Order, error
 func (*routeTestExecution) Cancel(context.Context, string) (domain.Order, error) {
 	return domain.Order{}, nil
 }
+func (*routeTestExecution) FinalizeCancellation(context.Context, string) (domain.Order, error) {
+	return domain.Order{}, nil
+}
 func (*routeTestExecution) Events(context.Context, string) ([]domain.OrderEvent, error) {
 	return nil, nil
 }
