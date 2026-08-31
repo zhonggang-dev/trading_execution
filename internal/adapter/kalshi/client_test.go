@@ -210,6 +210,127 @@ func TestKalshiFOKRejectionReleasesReservationAndAllowsNextSubmission(t *testing
 	}
 }
 
+func TestKalshiSuccessfulSubmissionAdoptsAuthoritativeOrderID(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	const authoritativeID = "01a056df-authoritative"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		verifySignature(t, request, "key", &privateKey.PublicKey)
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/trade-api/v2/portfolio/events/orders":
+			var submitted OrderRequestV2
+			if err := json.NewDecoder(request.Body).Decode(&submitted); err != nil {
+				t.Errorf("decode submitted order: %v", err)
+			}
+			_, _ = fmt.Fprintf(writer, `{"order_id":%q,"client_order_id":%q,"fill_count":"0","remaining_count":"2","ts_ms":1787673600000}`, authoritativeID, submitted.ClientOrderID)
+		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/fills":
+			if request.URL.Query().Get("order_id") != authoritativeID {
+				t.Errorf("fill lookup order_id = %q", request.URL.Query().Get("order_id"))
+			}
+			_, _ = writer.Write([]byte(`{"fills":[],"cursor":""}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, true)
+	venue, err := NewVenue(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := memory.NewOrderRepository()
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue,
+		Guard: kalshiAllowGuard{}, MarketValidator: kalshiAllowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		RequirePreparedPlacement: true, AccountScope: kalshiAllowAccountScope{},
+		Now:   func() time.Time { return time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC) },
+		NewID: func() string { return "kalshi-order-success" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validKalshiIntent(domain.SideBuy, "YES")
+	intent.ClientOrderID = "strategy-order-success"
+	result, err := service.Submit(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if result.Order.Status != domain.OrderStatusAcknowledged || result.Order.VenueOrderID != authoritativeID {
+		t.Fatalf("submitted order = %#v", result.Order)
+	}
+	attempts, err := repository.Attempts(context.Background(), result.Order.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].VenueOrderID != authoritativeID || attempts[0].Outcome != domain.AttemptOutcomeSucceeded {
+		t.Fatalf("attempts = %#v, err = %v", attempts, err)
+	}
+}
+
+func TestKalshiUnknownSubmissionRecoversByClientOrderIDAndReleasesReservation(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	const authoritativeID = "01a056df-recovered"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		verifySignature(t, request, "key", &privateKey.PublicKey)
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/trade-api/v2/portfolio/events/orders":
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = writer.Write([]byte(`{"error":{"code":"service_unavailable","message":"matching engine unavailable"}}`))
+		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/orders":
+			_, _ = fmt.Fprintf(writer, `{"orders":[{"order_id":%q,"client_order_id":"strategy-order-recovery","ticker":"TEST-MARKET","status":"canceled","fill_count_fp":"0","remaining_count_fp":"0","initial_count_fp":"2","last_update_time":"2026-08-31T00:10:00Z"}],"cursor":""}`, authoritativeID)
+		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/fills":
+			if request.URL.Query().Get("order_id") != authoritativeID {
+				t.Errorf("fill lookup order_id = %q", request.URL.Query().Get("order_id"))
+			}
+			_, _ = writer.Write([]byte(`{"fills":[],"cursor":""}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, true)
+	venue, err := NewVenue(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations := paper.NewReservationManager()
+	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
+	service, err := execution.New(execution.Params{
+		Repository: memory.NewOrderRepository(), Venue: venue,
+		Guard: kalshiAllowGuard{}, MarketValidator: kalshiAllowMarketValidator{}, Reservations: reservations,
+		RequirePreparedPlacement: true, AccountScope: kalshiAllowAccountScope{},
+		CancelFillFinalityGrace: 30 * time.Second,
+		Now:                     func() time.Time { return now },
+		NewID:                   func() string { return "kalshi-recovery-order" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validKalshiIntent(domain.SideBuy, "YES")
+	intent.ClientOrderID = "strategy-order-recovery"
+	result, submitErr := service.Submit(context.Background(), intent)
+	if submitErr == nil || result.Order.Status != domain.OrderStatusUnknown || result.Order.VenueOrderID != intent.ClientOrderID {
+		t.Fatalf("ambiguous Submit() = %#v, %v", result, submitErr)
+	}
+	recovered, err := service.Refresh(context.Background(), result.Order.ID)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if recovered.Status != domain.OrderStatusCancelled || recovered.VenueOrderID != authoritativeID {
+		t.Fatalf("recovered order = %#v", recovered)
+	}
+	reservation, found := reservations.Get(result.Order.ID)
+	if !found || reservation.Status != domain.ReservationStatusReconciliationRequired {
+		t.Fatalf("recovered reservation = %#v, found=%v; want finality hold", reservation, found)
+	}
+	now = time.Date(2026, 8, 31, 0, 10, 31, 0, time.UTC)
+	if _, err := service.FinalizeCancellation(context.Background(), result.Order.ID); err != nil {
+		t.Fatalf("FinalizeCancellation() error = %v", err)
+	}
+	reservation, found = reservations.Get(result.Order.ID)
+	if !found || reservation.Status != domain.ReservationStatusReleased {
+		t.Fatalf("final reservation = %#v, found=%v; want RELEASED", reservation, found)
+	}
+}
+
 type kalshiAllowGuard struct{}
 
 func (kalshiAllowGuard) Check(context.Context, domain.OrderIntent) error { return nil }

@@ -90,7 +90,12 @@ func applyVenueObservation(order *domain.Order, transition Transition) error {
 	venueOrderID := strings.TrimSpace(transition.VenueOrderID)
 	if venueOrderID != "" {
 		if order.VenueOrderID != "" && order.VenueOrderID != venueOrderID {
-			return fmt.Errorf("%w: venue order id changed from %q to %q", ErrInvalidObservation, order.VenueOrderID, venueOrderID)
+			clientOrderID := strings.TrimSpace(order.Intent.ClientOrderID)
+			canAdoptAuthoritativeID := strings.EqualFold(strings.TrimSpace(order.Intent.Venue), "kalshi") &&
+				clientOrderID != "" && order.VenueOrderID == clientOrderID
+			if !canAdoptAuthoritativeID {
+				return fmt.Errorf("%w: venue order id changed from %q to %q", ErrInvalidObservation, order.VenueOrderID, venueOrderID)
+			}
 		}
 		order.VenueOrderID = venueOrderID
 	}

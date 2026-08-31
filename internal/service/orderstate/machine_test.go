@@ -106,6 +106,56 @@ func TestUnknownMustPassThroughReconciling(t *testing.T) {
 	}
 }
 
+func TestKalshiClientOrderIDCanAdoptAuthoritativeVenueOrderIDOnce(t *testing.T) {
+	order := baseOrder(domain.OrderStatusSubmitting)
+	order.Intent.Venue = "kalshi"
+	order.Intent.ClientOrderID = "strategy-order-1"
+	order.VenueOrderID = order.Intent.ClientOrderID
+
+	next, _, err := orderstate.Apply(order, orderstate.Transition{
+		EventID:      "event-acknowledged",
+		To:           domain.OrderStatusAcknowledged,
+		Trigger:      domain.TransitionTriggerVenueResponse,
+		VenueOrderID: "01a056df-authoritative",
+		FilledSize:   "0",
+		At:           order.UpdatedAt.Add(time.Second),
+	})
+	if err != nil || next.VenueOrderID != "01a056df-authoritative" {
+		t.Fatalf("authoritative Kalshi id adoption = %#v, %v", next, err)
+	}
+
+	_, _, err = orderstate.Apply(next, orderstate.Transition{
+		EventID:      "event-id-changed-again",
+		To:           domain.OrderStatusLive,
+		Trigger:      domain.TransitionTriggerVenueObserve,
+		VenueOrderID: "different-authoritative-id",
+		FilledSize:   "0",
+		At:           next.UpdatedAt.Add(time.Second),
+	})
+	if !errors.Is(err, orderstate.ErrInvalidObservation) {
+		t.Fatalf("second venue id change error = %v, want ErrInvalidObservation", err)
+	}
+}
+
+func TestNonKalshiClientOrderIDCannotAdoptDifferentVenueOrderID(t *testing.T) {
+	order := baseOrder(domain.OrderStatusSubmitting)
+	order.Intent.Venue = "polymarket"
+	order.Intent.ClientOrderID = "client-order-1"
+	order.VenueOrderID = order.Intent.ClientOrderID
+
+	_, _, err := orderstate.Apply(order, orderstate.Transition{
+		EventID:      "event-acknowledged",
+		To:           domain.OrderStatusAcknowledged,
+		Trigger:      domain.TransitionTriggerVenueResponse,
+		VenueOrderID: "different-venue-order-id",
+		FilledSize:   "0",
+		At:           order.UpdatedAt.Add(time.Second),
+	})
+	if !errors.Is(err, orderstate.ErrInvalidObservation) {
+		t.Fatalf("non-Kalshi venue id change error = %v, want ErrInvalidObservation", err)
+	}
+}
+
 // baseOrder 构建测试使用的基础领域对象。
 func baseOrder(status domain.OrderStatus) domain.Order {
 	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)

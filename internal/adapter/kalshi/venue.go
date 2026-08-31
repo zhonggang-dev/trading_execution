@@ -85,10 +85,28 @@ func (venue *Venue) Cancel(ctx context.Context, order domain.Order) (port.VenueO
 }
 
 func (venue *Venue) remoteOrder(ctx context.Context, order domain.Order) (Order, error) {
-	if strings.HasPrefix(order.VenueOrderID, "strategy-order-") {
-		return venue.client.FindOrderByClientOrderID(ctx, order.VenueOrderID)
+	storedID := strings.TrimSpace(order.VenueOrderID)
+	clientOrderID := strings.TrimSpace(order.Intent.ClientOrderID)
+	var (
+		remote Order
+		err    error
+	)
+	if storedID != "" && storedID == clientOrderID {
+		remote, err = venue.client.FindOrderByClientOrderID(ctx, clientOrderID)
+	} else {
+		remote, err = venue.client.GetOrder(ctx, storedID)
 	}
-	return venue.client.GetOrder(ctx, order.VenueOrderID)
+	if err != nil {
+		return Order{}, err
+	}
+	if strings.TrimSpace(remote.OrderID) == "" || strings.TrimSpace(remote.ClientOrderID) != clientOrderID ||
+		strings.TrimSpace(remote.Ticker) != strings.TrimSpace(order.Intent.MarketID) {
+		return Order{}, fmt.Errorf("Kalshi order identity does not match local intent")
+	}
+	if storedID != clientOrderID && strings.TrimSpace(remote.OrderID) != storedID {
+		return Order{}, fmt.Errorf("Kalshi venue order id does not match local order")
+	}
+	return remote, nil
 }
 
 func submittedVenueOrder(order SubmittedOrder) port.VenueOrder {

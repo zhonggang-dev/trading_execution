@@ -258,8 +258,9 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 		if stored.VenueOrderID != "" && stored.VenueOrderID != expectedVenueOrderID {
 			return service.finishPrepareError(ctx, stored, fmt.Errorf("prepared venue order id changed from %q to %q", stored.VenueOrderID, expectedVenueOrderID), created)
 		}
-		// StartAttempt atomically writes this hash to both execution_orders and
-		// execution_order_attempts before PlacePrepared can issue the POST.
+		// StartAttempt atomically writes this deterministic pre-submit identity to
+		// both execution_orders and execution_order_attempts before PlacePrepared
+		// can issue the POST. Some venues later replace it with an authoritative ID.
 		stored.VenueOrderID = expectedVenueOrderID
 	}
 	attempt, err := service.startAttempt(ctx, &stored, domain.OrderStatusSubmitting, domain.OrderAttemptSubmit, domain.TransitionTriggerSubmit)
