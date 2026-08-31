@@ -167,15 +167,17 @@ func syncKalshiExecutionAccount(ctx context.Context, database *sql.DB, accountID
 	result, err := database.ExecContext(ctx, `
 		INSERT INTO execution_accounts (execution_account_id,wallet_address,collateral_asset,total_balance,available_balance,reserved_balance,reconciled_at)
 		VALUES ($1,$2,'USD',$3::numeric,$3::numeric,0,clock_timestamp())
-		ON CONFLICT (execution_account_id) DO UPDATE SET total_balance=$3::numeric, available_balance=$3::numeric,
+		ON CONFLICT (execution_account_id) DO UPDATE
+		SET total_balance=$3::numeric+execution_accounts.reserved_balance,
+			available_balance=$3::numeric,
 			reconciled_at=clock_timestamp(), updated_at=clock_timestamp(), version=execution_accounts.version+1
-		WHERE execution_accounts.wallet_address=$2 AND execution_accounts.collateral_asset='USD' AND execution_accounts.reserved_balance=0`,
+		WHERE execution_accounts.wallet_address=$2 AND execution_accounts.collateral_asset='USD'`,
 		accountID, "kalshi:"+apiKeyID, balance.String())
 	if err != nil {
 		return fmt.Errorf("sync Kalshi execution account: %w", err)
 	}
 	if rows, _ := result.RowsAffected(); rows != 1 {
-		return fmt.Errorf("Kalshi account identity changed or has an active reservation")
+		return fmt.Errorf("Kalshi account identity changed")
 	}
 	return nil
 }
