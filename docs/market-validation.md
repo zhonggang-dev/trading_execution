@@ -65,6 +65,10 @@ Python Strategy / SUBMIT
 `outcomes` 找到权威 `token_id`，然后要求名称和 token 与意图完全对应；不能依赖 “Yes 永远
 是数组第一个” 之外的猜测，也不能直接信任 Python 回传的 token。
 
+`market_snapshot_at` 标识策略实际引用的冻结盘口，仅作为不可变决策审计证据；它的年龄不再
+充当执行价格门禁。提交前 Trading Execution 会重新抓取官方订单簿，并使用
+`latest_book_source_at` 校验执行价格的新鲜度、盘口深度和策略给出的 `worst_price` 保护边界。
+
 ## Market Universe Service 契约
 
 Trading Execution 的 adapter 使用：
@@ -106,7 +110,7 @@ Venue。`observed_at` 是这份市场元数据的观察时间，不应拿业务�
 | code | 条件 |
 | --- | --- |
 | `MARKET_CONTEXT_REQUIRED` | 执行上下文字段缺失 |
-| `MARKET_SNAPSHOT_STALE` | 策略引用的盘口快照超过最大年龄 |
+| `MARKET_SNAPSHOT_FUTURE` | 策略审计快照时间超过允许的未来时钟偏差 |
 | `MARKET_NOT_FOUND` | condition_id 不存在 |
 | `MARKET_IDENTITY_MISMATCH` | condition_id 对应的 market_id 已不一致 |
 | `MARKET_METADATA_INVALID` | 权威二元 outcome/token 映射不完整或重复 |

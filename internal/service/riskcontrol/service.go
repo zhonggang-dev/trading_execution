@@ -60,7 +60,10 @@ func (service *Service) Check(ctx context.Context, intent domain.OrderIntent) er
 	if err := checkControls(snapshot.Controls); err != nil {
 		return err
 	}
-	if err := checkTimestamp("PRICE", intent.MarketSnapshotAt, now, snapshot.Limits.MaxPriceAge, service.maxFutureSkew); err != nil {
+	// market_snapshot_at identifies the immutable strategy evidence. Its age is
+	// deliberately not an execution-price gate: the live market validator
+	// captures and validates a fresh official book before assets are reserved.
+	if err := checkTimestampNotFuture("PRICE", intent.MarketSnapshotAt, now, service.maxFutureSkew); err != nil {
 		return err
 	}
 	if err := checkTimestamp("SIGNAL", intent.SignalAt, now, snapshot.Limits.MaxSignalAge, service.maxFutureSkew); err != nil {
@@ -219,6 +222,18 @@ func checkTimestamp(prefix string, value *time.Time, now time.Time, maxAge, maxF
 	}
 	if now.Sub(timestamp) > maxAge {
 		return reject(prefix+"_STALE", strings.ToLower(prefix)+" is older than the hard-risk freshness limit")
+	}
+	return nil
+}
+
+// checkTimestampNotFuture validates immutable audit timestamps without
+// applying an execution freshness window to them.
+func checkTimestampNotFuture(prefix string, value *time.Time, now time.Time, maxFutureSkew time.Duration) error {
+	if value == nil || value.IsZero() {
+		return reject(prefix+"_TIMESTAMP_REQUIRED", strings.ToLower(prefix)+" timestamp is required")
+	}
+	if value.UTC().After(now.Add(maxFutureSkew)) {
+		return reject(prefix+"_TIMESTAMP_FUTURE", strings.ToLower(prefix)+" timestamp exceeds the allowed clock skew")
 	}
 	return nil
 }

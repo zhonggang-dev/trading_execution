@@ -54,6 +54,27 @@ func TestValidateAcceptsCurrentTradableMarket(t *testing.T) {
 	}
 }
 
+// TestValidateAcceptsOldStrategySnapshotWithFreshOfficialBook verifies that
+// the immutable strategy snapshot remains audit evidence while execution uses
+// the newly captured official order book for freshness.
+func TestValidateAcceptsOldStrategySnapshotWithFreshOfficialBook(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	strategySnapshotAt := now.Add(-4 * time.Hour)
+	intent.MarketSnapshotAt = &strategySnapshotAt
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if !validation.StrategySnapshotAt.Equal(strategySnapshotAt) {
+		t.Fatalf("StrategySnapshotAt = %s, want %s", validation.StrategySnapshotAt, strategySnapshotAt)
+	}
+	if !validation.LatestBookSourceAt.Equal(book.SourceAt) {
+		t.Fatalf("LatestBookSourceAt = %s, want %s", validation.LatestBookSourceAt, book.SourceAt)
+	}
+}
+
 // TestValidateFailsClosed 验证 Validate Fails Closed 场景下的行为。
 func TestValidateFailsClosed(t *testing.T) {
 	tests := []struct {
@@ -62,10 +83,10 @@ func TestValidateFailsClosed(t *testing.T) {
 		mutate func(*domain.OrderIntent, *domain.MarketSnapshot, *domain.OrderBookSnapshot, time.Time)
 	}{
 		{
-			name: "stale strategy snapshot", code: "MARKET_SNAPSHOT_STALE",
+			name: "future strategy snapshot", code: "MARKET_SNAPSHOT_FUTURE",
 			mutate: func(intent *domain.OrderIntent, _ *domain.MarketSnapshot, _ *domain.OrderBookSnapshot, now time.Time) {
-				stale := now.Add(-3 * time.Minute)
-				intent.MarketSnapshotAt = &stale
+				future := now.Add(3 * time.Second)
+				intent.MarketSnapshotAt = &future
 			},
 		},
 		{

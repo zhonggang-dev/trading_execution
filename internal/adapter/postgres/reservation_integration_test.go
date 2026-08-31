@@ -690,6 +690,50 @@ func TestAtomicLiveRiskPostgresIntegration(t *testing.T) {
 		assertAccount(t, db, accountID, "1000", "900", "100")
 	})
 
+	t.Run("old strategy snapshot uses latest validated book for reservation and submit", func(t *testing.T) {
+		accountID := "account-live-latest-book"
+		insertAccount(t, db, accountID, "0xlivelatestbook", "100", "100", "0")
+		provisionLiveRisk(t, db, liveRiskFixture{
+			accountID: accountID, now: now, binding: true,
+			maxOrder: "100", maxMarket: "100", maxStrategy: "100",
+			maxWallet: "100", maxDaily: "100",
+		})
+		repository, err := NewOrderRepository(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		order := liveIntegrationOrder("latest-book", accountID, "token-latest-book", "10", "0.5", now)
+		oldStrategySnapshotAt := now.Add(-4 * time.Hour)
+		order.Intent.MarketSnapshotAt = &oldStrategySnapshotAt
+		order.MarketValidation.StrategySnapshotAt = oldStrategySnapshotAt
+		order.Status = domain.OrderStatusReceived
+		order.CreatedAt, order.UpdatedAt, order.Revision = now, now, 1
+		stored, created, err := repository.Create(context.Background(), order)
+		if err != nil || !created {
+			t.Fatalf("create live order: created=%v err=%v", created, err)
+		}
+		stored, event := applyIntegrationTransition(t, stored, domain.OrderStatusValidating, domain.TransitionTriggerValidation, now, "")
+		if err := repository.Transition(context.Background(), stored, event); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.Reserve(context.Background(), stored); err != nil {
+			t.Fatalf("reserve using latest validated book: %v", err)
+		}
+		stored, event = applyIntegrationTransition(t, stored, domain.OrderStatusReserved, domain.TransitionTriggerReservation, now, "")
+		if err := repository.Transition(context.Background(), stored, event); err != nil {
+			t.Fatal(err)
+		}
+		attempt := domain.OrderAttempt{
+			ID: "attempt:latest-book:1", OrderID: stored.ID, Sequence: 1,
+			Kind: domain.OrderAttemptSubmit, Outcome: domain.AttemptOutcomeStarted,
+			StartedAt: now,
+		}
+		stored, event = applyIntegrationTransition(t, stored, domain.OrderStatusSubmitting, domain.TransitionTriggerSubmit, now, attempt.ID)
+		if err := repository.StartAttempt(context.Background(), stored, event, attempt); err != nil {
+			t.Fatalf("submit gate rejected old strategy snapshot despite fresh validated book: %v", err)
+		}
+	})
+
 	t.Run("submit trigger rechecks kill switch after reservation", func(t *testing.T) {
 		accountID := "account-live-submit-gate"
 		insertAccount(t, db, accountID, "0xlivesubmitgate", "100", "100", "0")
@@ -799,11 +843,14 @@ func provisionLiveRisk(t *testing.T, db *sql.DB, fixture liveRiskFixture) {
 func liveIntegrationOrder(orderID, accountID, tokenID, size, worstPrice string, now time.Time) domain.Order {
 	order := integrationOrder(orderID, accountID, tokenID, domain.SideBuy, size, worstPrice)
 	marketAt := now.Add(-time.Second)
+	latestBookAt := now.Add(-time.Second)
 	signalAt := now.Add(-time.Second)
 	order.Intent.MarketSnapshotAt = &marketAt
 	order.Intent.SignalAt = &signalAt
 	order.MarketValidation = &domain.MarketValidation{
-		Mode: liveMarketValidationMode, ValidatedAt: now, WorstPrice: order.Intent.WorstPrice,
+		Mode: liveMarketValidationMode, ValidatedAt: now,
+		StrategySnapshotAt: marketAt, LatestBookSourceAt: latestBookAt,
+		WorstPrice: order.Intent.WorstPrice,
 	}
 	return order
 }
@@ -2356,7 +2403,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 	db := stdlib.OpenDB(*testConfig)
 	db.SetMaxOpenConns(8)
 	t.Cleanup(func() { _ = db.Close() })
-	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql", "0014_external_position_ownership_baselines.sql", "0015_position_lot_model_routes.sql", "0016_external_position_dispositions.sql", "0017_enabled_strategy_binding_uniqueness.sql", "0018_execution_wallet_migrations.sql"} {
+	for _, name := range []string{"0001_asset_reservations.sql", "0002_order_lifecycle.sql", "0003_fills_positions_ledger.sql", "0004_lot_addressed_strategy_exits.sql", "0005_position_exit_cycles.sql", "0006_reconciliation.sql", "0007_trade_history_read_model.sql", "0008_buy_fee_reservation_guard.sql", "0009_atomic_live_risk.sql", "0010_v2_settlement_evidence.sql", "0011_live_operations.sql", "0012_strategy_decision_cycles.sql", "0013_strategy_intent_deliveries.sql", "0014_external_position_ownership_baselines.sql", "0015_position_lot_model_routes.sql", "0016_external_position_dispositions.sql", "0017_enabled_strategy_binding_uniqueness.sql", "0018_execution_wallet_migrations.sql", "0019_edge_distribution_read_index.sql", "0020_latest_validated_book_risk_freshness.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatalf("read migration %s: %v", name, err)

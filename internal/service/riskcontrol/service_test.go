@@ -38,6 +38,19 @@ func TestCheckAcceptsSafeBuyWithoutMutatingStrategyIntent(t *testing.T) {
 	}
 }
 
+// TestCheckAcceptsOldStrategySnapshot defers execution-price freshness to the
+// official book captured by the live market validator.
+func TestCheckAcceptsOldStrategySnapshot(t *testing.T) {
+	now, intent, snapshot := validRiskFixtures()
+	oldSnapshotAt := now.Add(-4 * time.Hour)
+	intent.MarketSnapshotAt = &oldSnapshotAt
+	service := newRiskService(t, now, &fakeRiskSource{snapshot: snapshot})
+
+	if err := service.Check(context.Background(), intent); err != nil {
+		t.Fatalf("Check() error = %v", err)
+	}
+}
+
 // TestCheckRejectsUnsafeOrders 验证 Check Rejects Unsafe Orders 场景下的行为。
 func TestCheckRejectsUnsafeOrders(t *testing.T) {
 	tests := []struct {
@@ -62,10 +75,6 @@ func TestCheckRejectsUnsafeOrders(t *testing.T) {
 		}},
 		{name: "signal timestamp required", code: "SIGNAL_TIMESTAMP_REQUIRED", mutate: func(intent *domain.OrderIntent, _ *domain.HardRiskSnapshot, _ time.Time) {
 			intent.SignalAt = nil
-		}},
-		{name: "stale price", code: "PRICE_STALE", mutate: func(intent *domain.OrderIntent, _ *domain.HardRiskSnapshot, now time.Time) {
-			stale := now.Add(-2 * time.Minute)
-			intent.MarketSnapshotAt = &stale
 		}},
 		{name: "future price", code: "PRICE_TIMESTAMP_FUTURE", mutate: func(intent *domain.OrderIntent, _ *domain.HardRiskSnapshot, now time.Time) {
 			future := now.Add(3 * time.Second)

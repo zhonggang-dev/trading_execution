@@ -54,7 +54,7 @@ func (manager *ReservationManager) authorizeLiveRisk(
 	reserveUnitPrice domain.Decimal,
 	excludeOrderID string,
 ) (liveRiskAuthorization, error) {
-	if err := validateLiveRiskTimestamps(order.Intent, observedAt); err != nil {
+	if err := validateLiveRiskTimestamps(order, observedAt); err != nil {
 		return liveRiskAuthorization{}, err
 	}
 	if err := checkGlobalRiskControl(ctx, tx); err != nil {
@@ -70,7 +70,7 @@ func (manager *ReservationManager) authorizeLiveRisk(
 	if err := checkLiveRiskBindingAndControls(ctx, tx, order.Intent); err != nil {
 		return liveRiskAuthorization{}, err
 	}
-	if err := checkRiskTimestamp("PRICE", order.Intent.MarketSnapshotAt, observedAt, policy.maxPriceAge); err != nil {
+	if err := checkRiskTimestamp("PRICE", &order.MarketValidation.LatestBookSourceAt, observedAt, policy.maxPriceAge); err != nil {
 		return liveRiskAuthorization{}, err
 	}
 	if err := checkRiskTimestamp("SIGNAL", order.Intent.SignalAt, observedAt, policy.maxSignalAge); err != nil {
@@ -299,9 +299,13 @@ func checkLiveRiskState(ctx context.Context, tx *sql.Tx, accountID string, now t
 	return nil
 }
 
-func validateLiveRiskTimestamps(intent domain.OrderIntent, now time.Time) error {
+func validateLiveRiskTimestamps(order domain.Order, now time.Time) error {
+	intent := order.Intent
 	if intent.MarketSnapshotAt == nil || intent.MarketSnapshotAt.IsZero() {
 		return reject("PRICE_TIMESTAMP_REQUIRED", "live order requires market_snapshot_at")
+	}
+	if order.MarketValidation == nil || order.MarketValidation.LatestBookSourceAt.IsZero() {
+		return reject("PRICE_TIMESTAMP_REQUIRED", "live order requires the latest validated orderbook timestamp")
 	}
 	if intent.SignalAt == nil || intent.SignalAt.IsZero() {
 		return reject("SIGNAL_TIMESTAMP_REQUIRED", "live order requires signal_at")

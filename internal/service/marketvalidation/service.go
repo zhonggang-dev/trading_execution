@@ -11,41 +11,35 @@ import (
 )
 
 const (
-	defaultMaxStrategySnapshotAge = 2 * time.Minute
-	defaultMaxUniverseAge         = 5 * time.Minute
-	defaultMaxLatestBookAge       = 10 * time.Second
-	defaultMaxFutureSkew          = 2 * time.Second
+	defaultMaxUniverseAge   = 5 * time.Minute
+	defaultMaxLatestBookAge = 10 * time.Second
+	defaultMaxFutureSkew    = 2 * time.Second
 )
 
 // Params 表示后端使用的 Params 类型。
 type Params struct {
-	Universe               port.MarketUniverse
-	OrderBooks             port.OrderBookSource
-	MaxStrategySnapshotAge time.Duration
-	MaxUniverseAge         time.Duration
-	MaxLatestBookAge       time.Duration
-	MaxFutureSkew          time.Duration
-	Now                    func() time.Time
+	Universe         port.MarketUniverse
+	OrderBooks       port.OrderBookSource
+	MaxUniverseAge   time.Duration
+	MaxLatestBookAge time.Duration
+	MaxFutureSkew    time.Duration
+	Now              func() time.Time
 }
 
 // Service 使用权威 Market 元数据和最新订单簿执行失败关闭校验，不包含任何策略规则。
 type Service struct {
-	universe               port.MarketUniverse
-	orderBooks             port.OrderBookSource
-	maxStrategySnapshotAge time.Duration
-	maxUniverseAge         time.Duration
-	maxLatestBookAge       time.Duration
-	maxFutureSkew          time.Duration
-	now                    func() time.Time
+	universe         port.MarketUniverse
+	orderBooks       port.OrderBookSource
+	maxUniverseAge   time.Duration
+	maxLatestBookAge time.Duration
+	maxFutureSkew    time.Duration
+	now              func() time.Time
 }
 
 // New 校验依赖和配置后创建当前服务实例。
 func New(params Params) (*Service, error) {
 	if params.Universe == nil || params.OrderBooks == nil {
 		return nil, fmt.Errorf("market universe and orderbook source are required")
-	}
-	if params.MaxStrategySnapshotAge == 0 {
-		params.MaxStrategySnapshotAge = defaultMaxStrategySnapshotAge
 	}
 	if params.MaxUniverseAge == 0 {
 		params.MaxUniverseAge = defaultMaxUniverseAge
@@ -56,21 +50,19 @@ func New(params Params) (*Service, error) {
 	if params.MaxFutureSkew == 0 {
 		params.MaxFutureSkew = defaultMaxFutureSkew
 	}
-	if params.MaxStrategySnapshotAge < 0 || params.MaxUniverseAge < 0 ||
-		params.MaxLatestBookAge < 0 || params.MaxFutureSkew < 0 {
+	if params.MaxUniverseAge < 0 || params.MaxLatestBookAge < 0 || params.MaxFutureSkew < 0 {
 		return nil, fmt.Errorf("market validation durations must not be negative")
 	}
 	if params.Now == nil {
 		params.Now = time.Now
 	}
 	return &Service{
-		universe:               params.Universe,
-		orderBooks:             params.OrderBooks,
-		maxStrategySnapshotAge: params.MaxStrategySnapshotAge,
-		maxUniverseAge:         params.MaxUniverseAge,
-		maxLatestBookAge:       params.MaxLatestBookAge,
-		maxFutureSkew:          params.MaxFutureSkew,
-		now:                    params.Now,
+		universe:         params.Universe,
+		orderBooks:       params.OrderBooks,
+		maxUniverseAge:   params.MaxUniverseAge,
+		maxLatestBookAge: params.MaxLatestBookAge,
+		maxFutureSkew:    params.MaxFutureSkew,
+		now:              params.Now,
 	}, nil
 }
 
@@ -81,7 +73,10 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		return domain.MarketValidation{}, err
 	}
 	now := service.now().UTC()
-	if err := validateAge("MARKET_SNAPSHOT", *intent.MarketSnapshotAt, now, service.maxStrategySnapshotAge, service.maxFutureSkew); err != nil {
+	// The strategy snapshot is immutable audit evidence, not the execution
+	// quote. Execution freshness is enforced against the official order book
+	// captured below, so an old strategy snapshot must not block a fresh order.
+	if err := validateNotFuture("MARKET_SNAPSHOT", *intent.MarketSnapshotAt, now, service.maxFutureSkew); err != nil {
 		return domain.MarketValidation{}, err
 	}
 
@@ -295,6 +290,18 @@ func validateAge(prefix string, observedAt, now time.Time, maxAge, maxFutureSkew
 	}
 	if now.Sub(observedAt) > maxAge {
 		return reject(prefix+"_STALE", "timestamp is older than the configured maximum age")
+	}
+	return nil
+}
+
+// validateNotFuture keeps the strategy timestamp honest for audit without
+// treating it as the execution-time market quote.
+func validateNotFuture(prefix string, observedAt, now time.Time, maxFutureSkew time.Duration) error {
+	if observedAt.IsZero() {
+		return reject(prefix+"_MISSING", "required timestamp is missing")
+	}
+	if observedAt.UTC().After(now.Add(maxFutureSkew)) {
+		return reject(prefix+"_FUTURE", "timestamp is later than the allowed clock skew")
 	}
 	return nil
 }
