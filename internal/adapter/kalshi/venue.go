@@ -69,7 +69,9 @@ func (venue *Venue) Get(ctx context.Context, order domain.Order) (port.VenueOrde
 	if err != nil {
 		return port.VenueOrder{}, err
 	}
-	return observedVenueOrder(remote), nil
+	observed := observedVenueOrder(remote)
+	observed.ObservedAt = venue.client.now().UTC()
+	return observed, nil
 }
 
 func (venue *Venue) Cancel(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
@@ -81,7 +83,9 @@ func (venue *Venue) Cancel(ctx context.Context, order domain.Order) (port.VenueO
 	if err != nil {
 		return port.VenueOrder{}, err
 	}
-	return observedVenueOrder(remote), nil
+	observed := observedVenueOrder(remote)
+	observed.ObservedAt = venue.client.now().UTC()
+	return observed, nil
 }
 
 func (venue *Venue) remoteOrder(ctx context.Context, order domain.Order) (Order, error) {

@@ -267,6 +267,7 @@ func TestKalshiSuccessfulSubmissionAdoptsAuthoritativeOrderID(t *testing.T) {
 func TestKalshiUnknownSubmissionRecoversByClientOrderIDAndReleasesReservation(t *testing.T) {
 	privateKey := testPrivateKey(t)
 	const authoritativeID = "01a056df-recovered"
+	now := time.Date(2026, 8, 31, 0, 10, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		verifySignature(t, request, "key", &privateKey.PublicKey)
 		writer.Header().Set("Content-Type", "application/json")
@@ -275,7 +276,7 @@ func TestKalshiUnknownSubmissionRecoversByClientOrderIDAndReleasesReservation(t 
 			writer.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = writer.Write([]byte(`{"error":{"code":"service_unavailable","message":"matching engine unavailable"}}`))
 		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/orders":
-			_, _ = fmt.Fprintf(writer, `{"orders":[{"order_id":%q,"client_order_id":"strategy-order-recovery","ticker":"TEST-MARKET","status":"canceled","fill_count_fp":"0","remaining_count_fp":"0","initial_count_fp":"2","last_update_time":"2026-08-31T00:10:00Z"}],"cursor":""}`, authoritativeID)
+			_, _ = fmt.Fprintf(writer, `{"orders":[{"order_id":%q,"client_order_id":"strategy-order-recovery","ticker":"TEST-MARKET","status":"canceled","fill_count_fp":"0","remaining_count_fp":"0","initial_count_fp":"2","last_update_time":"2026-08-31T00:00:01Z"}],"cursor":""}`, authoritativeID)
 		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/fills":
 			if request.URL.Query().Get("order_id") != authoritativeID {
 				t.Errorf("fill lookup order_id = %q", request.URL.Query().Get("order_id"))
@@ -286,13 +287,18 @@ func TestKalshiUnknownSubmissionRecoversByClientOrderIDAndReleasesReservation(t 
 		}
 	}))
 	t.Cleanup(server.Close)
-	client := testClient(t, server.URL, "key", privateKey, true)
+	client, err := NewClient(ClientParams{
+		BaseURL: server.URL, APIKeyID: "key", PrivateKey: privateKey,
+		HTTPClient: &http.Client{Timeout: time.Second}, Now: func() time.Time { return now }, LiveTradingEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	venue, err := NewVenue(client)
 	if err != nil {
 		t.Fatal(err)
 	}
 	reservations := paper.NewReservationManager()
-	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	service, err := execution.New(execution.Params{
 		Repository: memory.NewOrderRepository(), Venue: venue,
 		Guard: kalshiAllowGuard{}, MarketValidator: kalshiAllowMarketValidator{}, Reservations: reservations,
@@ -321,7 +327,7 @@ func TestKalshiUnknownSubmissionRecoversByClientOrderIDAndReleasesReservation(t 
 	if !found || reservation.Status != domain.ReservationStatusReconciliationRequired {
 		t.Fatalf("recovered reservation = %#v, found=%v; want finality hold", reservation, found)
 	}
-	now = time.Date(2026, 8, 31, 0, 10, 31, 0, time.UTC)
+	now = now.Add(31 * time.Second)
 	if _, err := service.FinalizeCancellation(context.Background(), result.Order.ID); err != nil {
 		t.Fatalf("FinalizeCancellation() error = %v", err)
 	}
