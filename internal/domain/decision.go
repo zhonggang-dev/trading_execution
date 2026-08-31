@@ -681,14 +681,23 @@ type StrategyExecutionConstraints struct {
 	MinimumBuyNotional    Decimal       `json:"minimum_buy_notional"`
 	AllowedTimeInForce    []TimeInForce `json:"allowed_time_in_force"`
 	PriceProtectionPolicy string        `json:"price_protection_policy"`
+	MaxPriceSlippageTicks int           `json:"max_price_slippage_ticks"`
 }
+
+const (
+	// StrategyPriceProtectionDepthAwareLimit permits a strategy limit through
+	// visible snapshot depth while bounding how far it may move from the top.
+	StrategyPriceProtectionDepthAwareLimit = "DEPTH_AWARE_LIMIT"
+	DefaultStrategyMaxPriceSlippageTicks   = 2
+)
 
 // DefaultStrategyExecutionConstraints 返回策略下单协议的默认执行约束。
 func DefaultStrategyExecutionConstraints() StrategyExecutionConstraints {
 	return StrategyExecutionConstraints{
 		SizeUnit: "SHARES", SizeDecimalPlaces: 2, BuyNotionalDecimals: 4,
 		MinimumBuyNotional: "1", AllowedTimeInForce: []TimeInForce{TimeInForceFOK},
-		PriceProtectionPolicy: "EXACT_TOP_OF_BOOK",
+		PriceProtectionPolicy: StrategyPriceProtectionDepthAwareLimit,
+		MaxPriceSlippageTicks: DefaultStrategyMaxPriceSlippageTicks,
 	}
 }
 

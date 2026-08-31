@@ -400,6 +400,7 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		SourceAt:     decisionAt.Add(2 * time.Second),
 		ObservedAt:   decisionAt.Add(3 * time.Second),
 		DepthLimit:   domain.StrategyOrderBookDepth,
+		TickSize:     "0.01",
 		MinOrderSize: "1",
 		Bids:         []domain.PriceLevel{{Price: "0.48", Size: "10"}},
 		Asks:         []domain.PriceLevel{{Price: "0.50", Size: "20"}},
@@ -512,7 +513,7 @@ func TestRunSkipsQuarantinedBindingWhileOtherBindingSubmits(t *testing.T) {
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
 			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, Status: domain.OrderBookStatusOK,
 			SourceAt: decisionAt, ObservedAt: decisionAt.Add(time.Second),
-			DepthLimit: domain.StrategyOrderBookDepth, MinOrderSize: "1",
+			DepthLimit: domain.StrategyOrderBookDepth, TickSize: "0.01", MinOrderSize: "1",
 			Bids: []domain.PriceLevel{{Price: "0.48", Size: "20"}},
 			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
 		})
@@ -807,7 +808,7 @@ func TestSourceModeMismatchSubmitsExitButNeverBuy(t *testing.T) {
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
 			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, Status: domain.OrderBookStatusOK,
 			SourceAt: decisionAt, ObservedAt: decisionAt.Add(time.Second),
-			DepthLimit: domain.StrategyOrderBookDepth, MinOrderSize: "1",
+			DepthLimit: domain.StrategyOrderBookDepth, TickSize: "0.01", MinOrderSize: "1",
 			Bids: []domain.PriceLevel{{Price: "0.49", Size: "20"}},
 			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
 		})
@@ -877,7 +878,7 @@ func TestAccountEntryGateCallsMainStrategyWithPositionAndSubmitsExitButNeverBuy(
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
 			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, Status: domain.OrderBookStatusOK,
 			SourceAt: decisionAt, ObservedAt: decisionAt.Add(time.Second),
-			DepthLimit: domain.StrategyOrderBookDepth, MinOrderSize: "1",
+			DepthLimit: domain.StrategyOrderBookDepth, TickSize: "0.01", MinOrderSize: "1",
 			Bids: []domain.PriceLevel{{Price: "0.49", Size: "20"}},
 			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
 		})
@@ -1714,8 +1715,9 @@ func TestMultfactorV2EntryDoesNotRequireMidPriceHistory(t *testing.T) {
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: 0,
 			TokenID: prediction.Outcomes[0].TokenID, Status: domain.OrderBookStatusOK,
 			SourceAt: decisionAt, ObservedAt: decisionAt, DepthLimit: domain.StrategyOrderBookDepth,
-			Bids: []domain.PriceLevel{{Price: "0.48", Size: "10"}},
-			Asks: []domain.PriceLevel{{Price: "0.50", Size: "10"}},
+			TickSize: "0.01",
+			Bids:     []domain.PriceLevel{{Price: "0.48", Size: "10"}},
+			Asks:     []domain.PriceLevel{{Price: "0.50", Size: "10"}},
 		}},
 	}
 	evaluation := domain.StrategyEvaluation{
@@ -1744,7 +1746,7 @@ func TestMultfactorV2MissingHistoryDoesNotForceStaleData(t *testing.T) {
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
 			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID,
 			Status: domain.OrderBookStatusOK, SourceAt: decisionAt, ObservedAt: decisionAt,
-			DepthLimit: domain.StrategyOrderBookDepth, MinOrderSize: "1",
+			DepthLimit: domain.StrategyOrderBookDepth, TickSize: "0.01", MinOrderSize: "1",
 			Bids: []domain.PriceLevel{{Price: "0.48", Size: "10"}},
 			Asks: []domain.PriceLevel{{Price: "0.50", Size: "10"}},
 		})
@@ -1783,8 +1785,9 @@ func TestMultfactorV1EntryDoesNotRequireMidPriceHistory(t *testing.T) {
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: 0,
 			TokenID: prediction.Outcomes[0].TokenID, Status: domain.OrderBookStatusOK,
 			SourceAt: decisionAt, ObservedAt: decisionAt, DepthLimit: domain.StrategyOrderBookDepth,
-			Bids: []domain.PriceLevel{{Price: "0.48", Size: "10"}},
-			Asks: []domain.PriceLevel{{Price: "0.50", Size: "10"}},
+			TickSize: "0.01",
+			Bids:     []domain.PriceLevel{{Price: "0.48", Size: "10"}},
+			Asks:     []domain.PriceLevel{{Price: "0.50", Size: "10"}},
 		}},
 	}
 	evaluation := domain.StrategyEvaluation{
@@ -2192,7 +2195,7 @@ func TestValidateResponseBuildsLotAddressedFOKExit(t *testing.T) {
 		OrderBooks: []domain.OrderBookSnapshot{{
 			MarketID: "market-1", ConditionID: "condition-1", OutcomeIndex: 0, TokenID: "yes-token",
 			Status: domain.OrderBookStatusOK, SourceAt: decisionAt, ObservedAt: decisionAt,
-			DepthLimit: domain.StrategyOrderBookDepth, MinOrderSize: "1",
+			DepthLimit: domain.StrategyOrderBookDepth, TickSize: "0.01", MinOrderSize: "1",
 			Bids: []domain.PriceLevel{{Price: "0.49", Size: "20"}},
 			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
 		}},
@@ -2237,14 +2240,14 @@ func TestCoverageEntryGateBlocksMalformedBuyButPreservesValidExit(t *testing.T) 
 				MarketID: prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: 0,
 				TokenID: prediction.Outcomes[0].TokenID, Status: domain.OrderBookStatusOK,
 				SourceAt: decisionAt, ObservedAt: decisionAt, DepthLimit: domain.StrategyOrderBookDepth,
-				MinOrderSize: "1", Bids: []domain.PriceLevel{{Price: "0.49", Size: "20"}},
+				TickSize: "0.01", MinOrderSize: "1", Bids: []domain.PriceLevel{{Price: "0.49", Size: "20"}},
 				Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
 			},
 			{
 				MarketID: prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: 1,
 				TokenID: prediction.Outcomes[1].TokenID, Status: domain.OrderBookStatusOK,
 				SourceAt: decisionAt, ObservedAt: decisionAt, DepthLimit: domain.StrategyOrderBookDepth,
-				MinOrderSize: "1", Bids: []domain.PriceLevel{{Price: "0.49", Size: "20"}},
+				TickSize: "0.01", MinOrderSize: "1", Bids: []domain.PriceLevel{{Price: "0.49", Size: "20"}},
 				Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
 			},
 		},

@@ -2,6 +2,7 @@ package decisioncycle
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,8 +53,11 @@ func TestBuildEntryIntentRoundsBuySharesBeforeNotionalValidation(t *testing.T) {
 		OrderBooks: []domain.OrderBookSnapshot{{
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: 0,
 			TokenID: prediction.Outcomes[0].TokenID, Status: domain.OrderBookStatusOK,
-			SourceAt: decisionAt, MinOrderSize: "5",
-			Asks: []domain.PriceLevel{{Price: "0.501", Size: "100"}},
+			SourceAt: decisionAt, MinOrderSize: "5", TickSize: "0.001",
+			Asks: []domain.PriceLevel{
+				{Price: "0.500", Size: "5"},
+				{Price: "0.501", Size: "95"},
+			},
 		}},
 		ExecutionConstraints: domain.DefaultStrategyExecutionConstraints(),
 	}
@@ -75,6 +79,10 @@ func TestBuildEntryIntentRoundsBuySharesBeforeNotionalValidation(t *testing.T) {
 	}
 	if intent.Metadata["strategy_requested_size"] != "19.96" {
 		t.Fatalf("strategy_requested_size = %q, want 19.96", intent.Metadata["strategy_requested_size"])
+	}
+	if !intent.Price.Equal("0.501") || !intent.WorstPrice.Equal("0.501") ||
+		intent.Metadata["strategy_reference_price"] != "0.500" || intent.Metadata["strategy_worst_price"] != "0.501" {
+		t.Fatalf("depth-aware intent price context = %#v", intent)
 	}
 }
 
@@ -162,7 +170,7 @@ func TestValidateStrategyOrderRejectsBuyThatRoundsToZero(t *testing.T) {
 	order := domain.StrategyOrderParams{
 		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.50", Size: "0.49", TimeInForce: domain.TimeInForceFOK,
 	}
-	err := validateStrategyOrder(order, domain.SideBuy, "0.50", domain.OrderBookSnapshot{}, domain.DefaultStrategyExecutionConstraints())
+	err := validateStrategyOrder(order, domain.SideBuy, domain.OrderBookSnapshot{}, domain.DefaultStrategyExecutionConstraints())
 	if err == nil || err.Error() != "BUY order.size rounds below one whole share" {
 		t.Fatalf("validateStrategyOrder() error = %v", err)
 	}
@@ -174,10 +182,11 @@ func TestValidateStrategyOrderRejectsRoundedBuyBeyondBestAskLiquidity(t *testing
 		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.501", Size: "19.96", TimeInForce: domain.TimeInForceFOK,
 	}
 	book := domain.OrderBookSnapshot{
-		Asks: []domain.PriceLevel{{Price: "0.501", Size: "19.99"}},
+		TickSize: "0.001",
+		Asks:     []domain.PriceLevel{{Price: "0.501", Size: "19.99"}},
 	}
-	err := validateStrategyOrder(order, domain.SideBuy, "0.501", book, domain.DefaultStrategyExecutionConstraints())
-	if err == nil || err.Error() != "rounded BUY order.size exceeds best-ask liquidity" {
+	err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints())
+	if err == nil || err.Error() != "BUY order.size exceeds protected-price liquidity" {
 		t.Fatalf("validateStrategyOrder() error = %v", err)
 	}
 }
@@ -188,13 +197,14 @@ func TestValidateStrategyOrderSumsDuplicateBestAskLevels(t *testing.T) {
 		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.50", Size: "19.96", TimeInForce: domain.TimeInForceFOK,
 	}
 	book := domain.OrderBookSnapshot{
+		TickSize: "0.01",
 		Asks: []domain.PriceLevel{
 			{Price: "0.50", Size: "10"},
 			{Price: "0.50", Size: "10"},
 			{Price: "0.51", Size: "100"},
 		},
 	}
-	if err := validateStrategyOrder(order, domain.SideBuy, "0.50", book, domain.DefaultStrategyExecutionConstraints()); err != nil {
+	if err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints()); err != nil {
 		t.Fatalf("validateStrategyOrder() error = %v", err)
 	}
 }
@@ -205,9 +215,10 @@ func TestValidateStrategyOrderAllowsFourDecimalBuyNotional(t *testing.T) {
 		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.5001", Size: "18.60", TimeInForce: domain.TimeInForceFOK,
 	}
 	book := domain.OrderBookSnapshot{
-		Asks: []domain.PriceLevel{{Price: "0.5001", Size: "100"}},
+		TickSize: "0.0001",
+		Asks:     []domain.PriceLevel{{Price: "0.5001", Size: "100"}},
 	}
-	if err := validateStrategyOrder(order, domain.SideBuy, "0.5001", book, domain.DefaultStrategyExecutionConstraints()); err != nil {
+	if err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints()); err != nil {
 		t.Fatalf("validateStrategyOrder() error = %v", err)
 	}
 }
@@ -218,10 +229,148 @@ func TestValidateStrategyOrderRejectsBuyNotionalBeyondFourDecimals(t *testing.T)
 		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.50001", Size: "18.60", TimeInForce: domain.TimeInForceFOK,
 	}
 	book := domain.OrderBookSnapshot{
-		Asks: []domain.PriceLevel{{Price: "0.50001", Size: "100"}},
+		TickSize: "0.00001",
+		Asks:     []domain.PriceLevel{{Price: "0.50001", Size: "100"}},
 	}
-	err := validateStrategyOrder(order, domain.SideBuy, "0.50001", book, domain.DefaultStrategyExecutionConstraints())
+	err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints())
 	if err == nil || err.Error() != "BUY price*size exceeds 4 decimal places" {
 		t.Fatalf("validateStrategyOrder() error = %v", err)
+	}
+}
+
+func TestDefaultStrategyExecutionConstraintsUseDepthAwareLimit(t *testing.T) {
+	constraints := domain.DefaultStrategyExecutionConstraints()
+	if constraints.PriceProtectionPolicy != domain.StrategyPriceProtectionDepthAwareLimit ||
+		constraints.MaxPriceSlippageTicks != 2 {
+		t.Fatalf("default execution constraints = %#v", constraints)
+	}
+	if err := validateExecutionConstraints(constraints); err != nil {
+		t.Fatalf("validateExecutionConstraints() error = %v", err)
+	}
+}
+
+// TestValidateStrategyOrderAllowsDepthAwareBuyWithinTwoTicks verifies that a
+// protected BUY can consume cumulative visible ask depth through two ticks.
+func TestValidateStrategyOrderAllowsDepthAwareBuyWithinTwoTicks(t *testing.T) {
+	order := domain.StrategyOrderParams{
+		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.52", Size: "20", TimeInForce: domain.TimeInForceFOK,
+	}
+	book := domain.OrderBookSnapshot{
+		TickSize: "0.01",
+		Asks: []domain.PriceLevel{
+			{Price: "0.50", Size: "4"},
+			{Price: "0.51", Size: "6"},
+			{Price: "0.52", Size: "10"},
+			{Price: "0.53", Size: "100"},
+		},
+	}
+	if err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints()); err != nil {
+		t.Fatalf("validateStrategyOrder() error = %v", err)
+	}
+}
+
+func TestValidateStrategyOrderRejectsBuyBeyondTwoTicks(t *testing.T) {
+	order := domain.StrategyOrderParams{
+		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.53", Size: "10", TimeInForce: domain.TimeInForceFOK,
+	}
+	book := domain.OrderBookSnapshot{
+		TickSize: "0.01",
+		Asks:     []domain.PriceLevel{{Price: "0.50", Size: "10"}, {Price: "0.53", Size: "100"}},
+	}
+	err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints())
+	if err == nil || !strings.Contains(err.Error(), "at most 2 ticks worse") {
+		t.Fatalf("validateStrategyOrder() error = %v", err)
+	}
+}
+
+func TestValidateStrategyOrderRejectsUnmarketableOrOffTickBuy(t *testing.T) {
+	book := domain.OrderBookSnapshot{
+		TickSize: "0.01",
+		Asks:     []domain.PriceLevel{{Price: "0.50", Size: "100"}},
+	}
+	for _, test := range []struct {
+		name       string
+		worstPrice domain.Decimal
+		want       string
+	}{
+		{name: "below best ask", worstPrice: "0.49", want: "at or above"},
+		{name: "off tick", worstPrice: "0.505", want: "exact multiple"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			order := domain.StrategyOrderParams{
+				Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: test.worstPrice, Size: "10", TimeInForce: domain.TimeInForceFOK,
+			}
+			err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints())
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateStrategyOrder() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateStrategyOrderRejectsBuyBeyondProtectedDepth(t *testing.T) {
+	order := domain.StrategyOrderParams{
+		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.52", Size: "11", TimeInForce: domain.TimeInForceFOK,
+	}
+	book := domain.OrderBookSnapshot{
+		TickSize: "0.01",
+		Asks: []domain.PriceLevel{
+			{Price: "0.50", Size: "4"},
+			{Price: "0.51", Size: "6"},
+			{Price: "0.53", Size: "100"},
+		},
+	}
+	err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints())
+	if err == nil || err.Error() != "BUY order.size exceeds protected-price liquidity" {
+		t.Fatalf("validateStrategyOrder() error = %v", err)
+	}
+}
+
+func TestValidateStrategyOrderAllowsDepthAwareSellWithinTwoTicks(t *testing.T) {
+	order := domain.StrategyOrderParams{
+		Side: domain.SideSell, Type: domain.OrderTypeLimit, WorstPrice: "0.53", Size: "12", TimeInForce: domain.TimeInForceFOK,
+	}
+	book := domain.OrderBookSnapshot{
+		TickSize: "0.01",
+		Bids: []domain.PriceLevel{
+			{Price: "0.55", Size: "4"},
+			{Price: "0.54", Size: "4"},
+			{Price: "0.53", Size: "4"},
+			{Price: "0.52", Size: "100"},
+		},
+	}
+	if err := validateStrategyOrder(order, domain.SideSell, book, domain.DefaultStrategyExecutionConstraints()); err != nil {
+		t.Fatalf("validateStrategyOrder() error = %v", err)
+	}
+}
+
+func TestValidateStrategyOrderRejectsSellBeyondTwoTicksOrProtectedDepth(t *testing.T) {
+	book := domain.OrderBookSnapshot{
+		TickSize: "0.01",
+		Bids: []domain.PriceLevel{
+			{Price: "0.55", Size: "4"},
+			{Price: "0.54", Size: "4"},
+			{Price: "0.53", Size: "4"},
+			{Price: "0.52", Size: "100"},
+		},
+	}
+	for _, test := range []struct {
+		name       string
+		worstPrice domain.Decimal
+		size       domain.Decimal
+		want       string
+	}{
+		{name: "three ticks", worstPrice: "0.52", size: "12", want: "at most 2 ticks worse"},
+		{name: "insufficient depth", worstPrice: "0.53", size: "13", want: "SELL order.size exceeds protected-price liquidity"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			order := domain.StrategyOrderParams{
+				Side: domain.SideSell, Type: domain.OrderTypeLimit, WorstPrice: test.worstPrice, Size: test.size, TimeInForce: domain.TimeInForceFOK,
+			}
+			err := validateStrategyOrder(order, domain.SideSell, book, domain.DefaultStrategyExecutionConstraints())
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateStrategyOrder() error = %v", err)
+			}
+		})
 	}
 }

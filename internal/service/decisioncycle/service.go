@@ -1141,7 +1141,9 @@ func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleI
 // validateExecutionConstraints 校验 Execution Constraints 的字段和业务约束。
 func validateExecutionConstraints(constraints domain.StrategyExecutionConstraints) error {
 	if constraints.SizeUnit != "SHARES" || constraints.SizeDecimalPlaces != 2 || constraints.BuyNotionalDecimals != 4 ||
-		constraints.PriceProtectionPolicy != "EXACT_TOP_OF_BOOK" || len(constraints.AllowedTimeInForce) != 1 ||
+		constraints.PriceProtectionPolicy != domain.StrategyPriceProtectionDepthAwareLimit ||
+		constraints.MaxPriceSlippageTicks < 1 || constraints.MaxPriceSlippageTicks > domain.DefaultStrategyMaxPriceSlippageTicks ||
+		len(constraints.AllowedTimeInForce) != 1 ||
 		constraints.AllowedTimeInForce[0] != domain.TimeInForceFOK {
 		return fmt.Errorf("unsupported strategy execution constraint set")
 	}
@@ -1314,7 +1316,7 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 	if !found || book.Status != domain.OrderBookStatusOK {
 		return domain.OrderIntent{}, fmt.Errorf("SUBMIT requires an OK orderbook")
 	}
-	if err := validateStrategyOrder(order, domain.SideBuy, book.Asks[0].Price, book, request.ExecutionConstraints); err != nil {
+	if err := validateStrategyOrder(order, domain.SideBuy, book, request.ExecutionConstraints); err != nil {
 		return domain.OrderIntent{}, err
 	}
 	roundedSize, err := roundBuyShares(order.Size)
@@ -1407,7 +1409,7 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 	if exit.Order == nil {
 		return domain.OrderIntent{}, fmt.Errorf("exit requires order parameters")
 	}
-	if err := validateStrategyOrder(*exit.Order, domain.SideSell, book.Bids[0].Price, book, request.ExecutionConstraints); err != nil {
+	if err := validateStrategyOrder(*exit.Order, domain.SideSell, book, request.ExecutionConstraints); err != nil {
 		return domain.OrderIntent{}, err
 	}
 	if comparison, err := exit.Order.Size.Compare(lot.Shares); err != nil || comparison > 0 {
@@ -1448,12 +1450,9 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 }
 
 // validateStrategyOrder 校验 Strategy Order 的字段和业务约束。
-func validateStrategyOrder(order domain.StrategyOrderParams, side domain.Side, topPrice domain.Decimal, book domain.OrderBookSnapshot, constraints domain.StrategyExecutionConstraints) error {
+func validateStrategyOrder(order domain.StrategyOrderParams, side domain.Side, book domain.OrderBookSnapshot, constraints domain.StrategyExecutionConstraints) error {
 	if order.Side != side || order.Type != domain.OrderTypeLimit || order.TimeInForce != domain.TimeInForceFOK || order.ExpiresAt != nil {
 		return fmt.Errorf("order must be a %s LIMIT FOK without expires_at", side)
-	}
-	if !order.WorstPrice.Equal(topPrice) {
-		return fmt.Errorf("order.worst_price must equal the strategy snapshot top-of-book price")
 	}
 	if sign, err := order.Size.Sign(); err != nil || sign <= 0 {
 		return fmt.Errorf("order.size must be positive shares")
@@ -1477,18 +1476,25 @@ func validateStrategyOrder(order domain.StrategyOrderParams, side domain.Side, t
 			return fmt.Errorf("order.size is below orderbook min_order_size")
 		}
 	}
+	if err := validateStrategyProtectedPrice(order.WorstPrice, side, book, constraints.MaxPriceSlippageTicks); err != nil {
+		return err
+	}
+	levels := book.Asks
+	if side == domain.SideSell {
+		levels = book.Bids
+	}
+	availableShares, err := protectedPriceLiquidity(levels, side, order.WorstPrice)
+	if err != nil {
+		return fmt.Errorf("calculate %s protected-price liquidity: %w", side, err)
+	}
+	requestedShares, err := effectiveSize.Multiply("1")
+	if err != nil {
+		return fmt.Errorf("calculate effective %s shares: %w", side, err)
+	}
+	if requestedShares.Cmp(availableShares) > 0 {
+		return fmt.Errorf("%s order.size exceeds protected-price liquidity", side)
+	}
 	if side == domain.SideBuy {
-		availableShares, err := protectedPriceLiquidity(book.Asks, order.WorstPrice)
-		if err != nil {
-			return fmt.Errorf("calculate best-ask liquidity: %w", err)
-		}
-		requestedShares, err := effectiveSize.Multiply("1")
-		if err != nil {
-			return fmt.Errorf("calculate rounded BUY shares: %w", err)
-		}
-		if len(book.Asks) > 0 && requestedShares.Cmp(availableShares) > 0 {
-			return fmt.Errorf("rounded BUY order.size exceeds best-ask liquidity")
-		}
 		notional, err := order.WorstPrice.Multiply(effectiveSize)
 		if err != nil {
 			return fmt.Errorf("calculate BUY notional: %w", err)
@@ -1504,12 +1510,85 @@ func validateStrategyOrder(order domain.StrategyOrderParams, side domain.Side, t
 	return nil
 }
 
-// protectedPriceLiquidity 汇总保护价上的 shares，兼容订单簿中连续的重复同价档。
-func protectedPriceLiquidity(levels []domain.PriceLevel, protectedPrice domain.Decimal) (*big.Rat, error) {
+// validateStrategyProtectedPrice 校验策略保护价位于盘口可成交方向，且最多偏离最优价指定 tick 数。
+func validateStrategyProtectedPrice(protectedPrice domain.Decimal, side domain.Side, book domain.OrderBookSnapshot, maxSlippageTicks int) error {
+	if maxSlippageTicks < 1 || maxSlippageTicks > domain.DefaultStrategyMaxPriceSlippageTicks {
+		return fmt.Errorf("max_price_slippage_ticks must be between 1 and %d", domain.DefaultStrategyMaxPriceSlippageTicks)
+	}
+	if book.TickSize.IsEmpty() {
+		return fmt.Errorf("DEPTH_AWARE_LIMIT requires orderbook tick_size")
+	}
+	if sign, err := book.TickSize.Sign(); err != nil || sign <= 0 {
+		return fmt.Errorf("orderbook tick_size must be positive")
+	}
+	if sign, err := protectedPrice.Sign(); err != nil || sign <= 0 {
+		return fmt.Errorf("order.worst_price must be positive")
+	}
+	if comparison, err := protectedPrice.Compare("1"); err != nil || comparison > 0 {
+		return fmt.Errorf("order.worst_price must not exceed one")
+	}
+	if multiple, err := protectedPrice.IsMultipleOf(book.TickSize); err != nil || !multiple {
+		return fmt.Errorf("order.worst_price must be an exact multiple of orderbook tick_size")
+	}
+
+	var topPrice domain.Decimal
+	switch side {
+	case domain.SideBuy:
+		if len(book.Asks) == 0 {
+			return fmt.Errorf("BUY price protection requires an ask")
+		}
+		topPrice = book.Asks[0].Price
+		if comparison, err := protectedPrice.Compare(topPrice); err != nil || comparison < 0 {
+			return fmt.Errorf("BUY order.worst_price must be at or above the strategy snapshot best ask")
+		}
+	case domain.SideSell:
+		if len(book.Bids) == 0 {
+			return fmt.Errorf("SELL price protection requires a bid")
+		}
+		topPrice = book.Bids[0].Price
+		if comparison, err := protectedPrice.Compare(topPrice); err != nil || comparison > 0 {
+			return fmt.Errorf("SELL order.worst_price must be at or below the strategy snapshot best bid")
+		}
+	default:
+		return fmt.Errorf("unsupported strategy order side %q", side)
+	}
+
+	protectedValue, err := protectedPrice.Multiply("1")
+	if err != nil {
+		return fmt.Errorf("parse order.worst_price: %w", err)
+	}
+	topValue, err := topPrice.Multiply("1")
+	if err != nil {
+		return fmt.Errorf("parse strategy snapshot top-of-book price: %w", err)
+	}
+	distance := new(big.Rat)
+	if side == domain.SideBuy {
+		distance.Sub(protectedValue, topValue)
+	} else {
+		distance.Sub(topValue, protectedValue)
+	}
+	tickValue, err := book.TickSize.Multiply("1")
+	if err != nil {
+		return fmt.Errorf("parse orderbook tick_size: %w", err)
+	}
+	maximumDistance := new(big.Rat).Mul(tickValue, big.NewRat(int64(maxSlippageTicks), 1))
+	if distance.Cmp(maximumDistance) > 0 {
+		return fmt.Errorf("%s order.worst_price may be at most %d ticks worse than the strategy snapshot top-of-book price", side, maxSlippageTicks)
+	}
+	return nil
+}
+
+// protectedPriceLiquidity 汇总保护价范围内可由 FOK 限价单成交的可见 shares。
+func protectedPriceLiquidity(levels []domain.PriceLevel, side domain.Side, protectedPrice domain.Decimal) (*big.Rat, error) {
 	total := new(big.Rat)
 	for _, level := range levels {
-		if !level.Price.Equal(protectedPrice) {
-			break
+		comparison, err := level.Price.Compare(protectedPrice)
+		if err != nil {
+			return nil, err
+		}
+		executable := side == domain.SideBuy && comparison <= 0 || side == domain.SideSell && comparison >= 0
+		if !executable {
+			continue
 		}
 		size, err := level.Size.Multiply("1")
 		if err != nil {
