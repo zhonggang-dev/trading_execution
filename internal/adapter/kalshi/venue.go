@@ -33,7 +33,11 @@ func NewVenue(client *Client) (*Venue, error) {
 func (venue *Venue) Name() string { return "kalshi" }
 
 func (venue *Venue) PreparePlace(_ context.Context, order domain.Order) (port.PreparedPlacement, error) {
-	prepared, err := venue.client.PrepareOrder(order.Intent)
+	intent, err := kalshiPlacementIntent(order)
+	if err != nil {
+		return nil, err
+	}
+	prepared, err := venue.client.PrepareOrder(intent)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +85,11 @@ func (venue *Venue) Cancel(ctx context.Context, order domain.Order) (port.VenueO
 	if preCancelObservation.State == port.VenueOrderCancelled || preCancelObservation.State == port.VenueOrderFilled {
 		return preCancelObservation, nil
 	}
-	prepared, err := venue.client.PrepareOrder(order.Intent)
+	placementIntent, err := kalshiPlacementIntent(order)
+	if err != nil {
+		return port.VenueOrder{}, fmt.Errorf("rebuild Kalshi cancellation route: %w", err)
+	}
+	prepared, err := venue.client.PrepareOrder(placementIntent)
 	if err != nil {
 		return port.VenueOrder{}, fmt.Errorf("rebuild Kalshi cancellation route: %w", err)
 	}
@@ -164,7 +172,11 @@ func (venue *Venue) validateFetchedRemoteOrder(remote Order, local domain.Order,
 	if strings.TrimSpace(remote.OrderID) != strings.TrimSpace(authoritativeID) {
 		return fmt.Errorf("Kalshi venue order id does not match the authoritative order")
 	}
-	prepared, err := venue.client.PrepareOrder(local.Intent)
+	placementIntent, err := kalshiPlacementIntent(local)
+	if err != nil {
+		return fmt.Errorf("rebuild Kalshi order identity: %w", err)
+	}
+	prepared, err := venue.client.PrepareOrder(placementIntent)
 	if err != nil {
 		return fmt.Errorf("rebuild Kalshi order identity: %w", err)
 	}
@@ -172,6 +184,35 @@ func (venue *Venue) validateFetchedRemoteOrder(remote Order, local domain.Order,
 		return err
 	}
 	return nil
+}
+
+// kalshiPlacementIntent applies the immutable execution-time depth cap to the
+// wire quantity only. The persisted OrderIntent remains the strategy request,
+// so partial IOC execution and reservation release are still measured against
+// the original requested quantity.
+func kalshiPlacementIntent(order domain.Order) (domain.OrderIntent, error) {
+	intent := order.Intent.Normalize()
+	if intent.TimeInForce != domain.TimeInForceIOC || order.MarketValidation == nil ||
+		order.MarketValidation.ExecutableSize.IsEmpty() {
+		return intent, nil
+	}
+	validation := *order.MarketValidation
+	if strings.TrimSpace(validation.Mode) != "KALSHI_LIVE_CHECK" {
+		return domain.OrderIntent{}, fmt.Errorf("Kalshi IOC executable size requires KALSHI_LIVE_CHECK evidence")
+	}
+	if sign, err := validation.ExecutableSize.Sign(); err != nil || sign <= 0 {
+		return domain.OrderIntent{}, fmt.Errorf("Kalshi IOC executable size is invalid")
+	}
+	if comparison, err := validation.ExecutableSize.Compare(intent.Size); err != nil || comparison > 0 {
+		return domain.OrderIntent{}, fmt.Errorf("Kalshi IOC executable size exceeds strategy requested size")
+	}
+	if !validation.MinOrderSize.IsEmpty() {
+		if comparison, err := validation.ExecutableSize.Compare(validation.MinOrderSize); err != nil || comparison < 0 {
+			return domain.OrderIntent{}, fmt.Errorf("Kalshi IOC executable size is below min_order_size")
+		}
+	}
+	intent.Size = validation.ExecutableSize
+	return intent, nil
 }
 
 func validateRemoteOrderIdentity(order Order, expected OrderRequestV2) error {

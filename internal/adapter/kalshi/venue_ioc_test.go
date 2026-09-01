@@ -36,6 +36,60 @@ func TestSubmittedIOCStateUsesRequestedCount(t *testing.T) {
 	}
 }
 
+func TestKalshiPreparedIOCUsesValidatedExecutableDepth(t *testing.T) {
+	client := testClient(t, "https://example.com", "key", testPrivateKey(t), false)
+	venue, err := NewVenue(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validKalshiIntent(domain.SideBuy, "YES")
+	intent.Size = "12"
+	intent.TimeInForce = domain.TimeInForceIOC
+	order := domain.Order{Intent: intent, MarketValidation: &domain.MarketValidation{
+		Mode: "KALSHI_LIVE_CHECK", MinOrderSize: "1", ExecutableSize: "4.25",
+	}}
+	raw, err := venue.PreparePlace(nil, order)
+	if err != nil {
+		t.Fatalf("PreparePlace() error = %v", err)
+	}
+	placement, ok := raw.(preparedPlacement)
+	if !ok {
+		t.Fatalf("PreparePlace() = %T", raw)
+	}
+	if placement.order.Request.Count != "4.25" || placement.order.Request.TimeInForce != "immediate_or_cancel" {
+		t.Fatalf("prepared IOC request = %#v", placement.order.Request)
+	}
+
+	remote := Order{
+		OrderID: "venue-order", ClientOrderID: intent.ClientOrderID, Ticker: intent.MarketID,
+		OutcomeSide: "yes", BookSide: "bid", Type: "limit", TimeInForce: "immediate_or_cancel",
+		Status: "canceled", YesPrice: "0.6000", InitialCount: "4.25", FillCount: "0", RemainingCount: "0",
+	}
+	if err := venue.validateFetchedRemoteOrder(remote, order, "venue-order"); err != nil {
+		t.Fatalf("validateFetchedRemoteOrder() error = %v", err)
+	}
+}
+
+func TestKalshiPreparedIOCFailsClosedForInvalidExecutableDepthEvidence(t *testing.T) {
+	client := testClient(t, "https://example.com", "key", testPrivateKey(t), false)
+	venue, err := NewVenue(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validKalshiIntent(domain.SideBuy, "YES")
+	intent.Size = "2"
+	intent.TimeInForce = domain.TimeInForceIOC
+	for _, validation := range []domain.MarketValidation{
+		{Mode: "OTHER", MinOrderSize: "1", ExecutableSize: "1"},
+		{Mode: "KALSHI_LIVE_CHECK", MinOrderSize: "1", ExecutableSize: "3"},
+		{Mode: "KALSHI_LIVE_CHECK", MinOrderSize: "1", ExecutableSize: "0.50"},
+	} {
+		if _, err := venue.PreparePlace(nil, domain.Order{Intent: intent, MarketValidation: &validation}); err == nil {
+			t.Fatalf("PreparePlace() accepted invalid validation %#v", validation)
+		}
+	}
+}
+
 func TestDetailedOrderRejectsInconsistentTerminalCounts(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string

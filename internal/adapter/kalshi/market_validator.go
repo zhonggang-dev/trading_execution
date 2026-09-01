@@ -43,14 +43,16 @@ func (validator *MarketValidator) Validate(ctx context.Context, intent domain.Or
 	if now.Sub(book.SourceAt.UTC()) > 10*time.Second || book.SourceAt.After(now.Add(2*time.Second)) {
 		return domain.MarketValidation{}, &port.Rejection{Code: "KALSHI_BOOK_STALE", Reason: "latest Kalshi orderbook is stale"}
 	}
-	if err := validateKalshiDepthAwareLimit(intent, book); err != nil {
+	executableSize, err := validateKalshiDepthAwareLimit(intent, book)
+	if err != nil {
 		return domain.MarketValidation{}, err
 	}
 	return (domain.MarketValidationParams{Mode: "KALSHI_LIVE_CHECK", ValidatedAt: now,
 		MarketObservedAt: book.SourceAt, StrategySnapshotAt: intent.MarketSnapshotAt.UTC(), LatestBookSourceAt: book.SourceAt,
 		LatestBookObservedAt: book.ObservedAt, OutcomeIndex: *intent.OutcomeIndex, OutcomeName: strings.TrimSpace(intent.OutcomeName),
 		TokenID: intent.TokenID, NegRisk: *intent.ExpectedNegRisk, TickSize: book.TickSize, MinOrderSize: book.MinOrderSize,
-		BestBid: book.Bids[0].Price, BestAsk: book.Asks[0].Price, WorstPrice: intent.WorstPrice}).Build()
+		BestBid: book.Bids[0].Price, BestAsk: book.Asks[0].Price, WorstPrice: intent.WorstPrice,
+		ExecutableSize: executableSize}).Build()
 }
 
 // validateKalshiDepthAwareLimit keeps the strategy's immutable protection
@@ -59,29 +61,29 @@ func (validator *MarketValidator) Validate(ctx context.Context, intent domain.Or
 // orders use IOC, so the venue may fill that protected subset and cancel the
 // remainder. A price move in the trader's favour is allowed; an adverse move
 // beyond the strategy worst price or zero protected liquidity fails closed.
-func validateKalshiDepthAwareLimit(intent domain.OrderIntent, book domain.OrderBookSnapshot) error {
+func validateKalshiDepthAwareLimit(intent domain.OrderIntent, book domain.OrderBookSnapshot) (domain.Decimal, error) {
 	if book.TickSize.IsEmpty() {
-		return kalshiMarketRejection("KALSHI_TICK_SIZE_INVALID", "latest Kalshi orderbook omitted tick_size")
+		return "", kalshiMarketRejection("KALSHI_TICK_SIZE_INVALID", "latest Kalshi orderbook omitted tick_size")
 	}
 	if sign, err := book.TickSize.Sign(); err != nil || sign <= 0 {
-		return kalshiMarketRejection("KALSHI_TICK_SIZE_INVALID", "latest Kalshi orderbook tick_size is invalid")
+		return "", kalshiMarketRejection("KALSHI_TICK_SIZE_INVALID", "latest Kalshi orderbook tick_size is invalid")
 	}
 	if multiple, err := intent.WorstPrice.IsMultipleOf(book.TickSize); err != nil || !multiple {
-		return kalshiMarketRejection("KALSHI_PRICE_TICK_MISMATCH", "strategy worst price is not an exact multiple of the latest Kalshi tick_size")
+		return "", kalshiMarketRejection("KALSHI_PRICE_TICK_MISMATCH", "strategy worst price is not an exact multiple of the latest Kalshi tick_size")
 	}
 	referencePrice, ok := intent.Metadata["strategy_reference_price"]
 	if !ok || strings.TrimSpace(referencePrice) == "" {
-		return kalshiMarketRejection("KALSHI_STRATEGY_REFERENCE_PRICE_REQUIRED", "strategy reference price is required for DEPTH_AWARE_LIMIT")
+		return "", kalshiMarketRejection("KALSHI_STRATEGY_REFERENCE_PRICE_REQUIRED", "strategy reference price is required for DEPTH_AWARE_LIMIT")
 	}
 	reference := domain.Decimal(strings.TrimSpace(referencePrice))
 	if sign, err := reference.Sign(); err != nil || sign <= 0 {
-		return kalshiMarketRejection("KALSHI_STRATEGY_REFERENCE_PRICE_INVALID", "strategy reference price is invalid")
+		return "", kalshiMarketRejection("KALSHI_STRATEGY_REFERENCE_PRICE_INVALID", "strategy reference price is invalid")
 	}
 	if multiple, err := reference.IsMultipleOf(book.TickSize); err != nil || !multiple {
-		return kalshiMarketRejection("KALSHI_STRATEGY_REFERENCE_PRICE_INVALID", "strategy reference price is not an exact multiple of the latest Kalshi tick_size")
+		return "", kalshiMarketRejection("KALSHI_STRATEGY_REFERENCE_PRICE_INVALID", "strategy reference price is not an exact multiple of the latest Kalshi tick_size")
 	}
 	if err := validateKalshiProtectionRange(intent.Side, reference, intent.WorstPrice); err != nil {
-		return err
+		return "", err
 	}
 
 	levels := book.Asks
@@ -92,17 +94,17 @@ func validateKalshiDepthAwareLimit(intent domain.OrderIntent, book domain.OrderB
 	}
 	comparison, err := top.Compare(intent.WorstPrice)
 	if err != nil {
-		return kalshiMarketRejection("KALSHI_PRICE_INVALID", "latest Kalshi top of book cannot be compared with the strategy worst price")
+		return "", kalshiMarketRejection("KALSHI_PRICE_INVALID", "latest Kalshi top of book cannot be compared with the strategy worst price")
 	}
 	if intent.Side == domain.SideBuy && comparison > 0 || intent.Side == domain.SideSell && comparison < 0 {
-		return kalshiMarketRejection("KALSHI_PRICE_MOVED", "latest Kalshi top of book moved beyond the strategy worst price")
+		return "", kalshiMarketRejection("KALSHI_PRICE_MOVED", "latest Kalshi top of book moved beyond the strategy worst price")
 	}
 
 	available := new(big.Rat)
 	for _, level := range levels {
 		comparison, err := level.Price.Compare(intent.WorstPrice)
 		if err != nil {
-			return kalshiMarketRejection("KALSHI_LATEST_BOOK_INVALID", "latest Kalshi orderbook contains an invalid price")
+			return "", kalshiMarketRejection("KALSHI_LATEST_BOOK_INVALID", "latest Kalshi orderbook contains an invalid price")
 		}
 		executable := intent.Side == domain.SideBuy && comparison <= 0 || intent.Side == domain.SideSell && comparison >= 0
 		if !executable {
@@ -110,24 +112,48 @@ func validateKalshiDepthAwareLimit(intent domain.OrderIntent, book domain.OrderB
 		}
 		size, err := level.Size.Multiply("1")
 		if err != nil || size.Sign() <= 0 {
-			return kalshiMarketRejection("KALSHI_LATEST_BOOK_INVALID", "latest Kalshi orderbook contains an invalid size")
+			return "", kalshiMarketRejection("KALSHI_LATEST_BOOK_INVALID", "latest Kalshi orderbook contains an invalid size")
 		}
 		available.Add(available, size)
 	}
 	requested, err := intent.Size.Multiply("1")
 	if err != nil || requested.Sign() <= 0 {
-		return kalshiMarketRejection("KALSHI_ORDER_SIZE_INVALID", "Kalshi order size is invalid")
+		return "", kalshiMarketRejection("KALSHI_ORDER_SIZE_INVALID", "Kalshi order size is invalid")
 	}
 	if intent.TimeInForce == domain.TimeInForceIOC {
 		if available.Sign() <= 0 {
-			return kalshiMarketRejection("KALSHI_NO_EXECUTABLE_VISIBLE_DEPTH", "latest Kalshi orderbook has no executable depth within the strategy worst price")
+			return "", kalshiMarketRejection("KALSHI_NO_EXECUTABLE_VISIBLE_DEPTH", "latest Kalshi orderbook has no executable depth within the strategy worst price")
 		}
-		return nil
+		if available.Cmp(requested) > 0 {
+			available.Set(requested)
+		}
+		executableSize, err := exactKalshiContractCount(available)
+		if err != nil {
+			return "", kalshiMarketRejection("KALSHI_LATEST_BOOK_INVALID", err.Error())
+		}
+		if !book.MinOrderSize.IsEmpty() {
+			if comparison, err := executableSize.Compare(book.MinOrderSize); err != nil || comparison < 0 {
+				return "", kalshiMarketRejection("KALSHI_INSUFFICIENT_VISIBLE_DEPTH", "latest Kalshi executable depth is below min_order_size")
+			}
+		}
+		return executableSize, nil
 	}
 	if available.Cmp(requested) < 0 {
-		return kalshiMarketRejection("KALSHI_INSUFFICIENT_VISIBLE_DEPTH", "latest Kalshi orderbook lacks cumulative depth within the strategy worst price")
+		return "", kalshiMarketRejection("KALSHI_INSUFFICIENT_VISIBLE_DEPTH", "latest Kalshi orderbook lacks cumulative depth within the strategy worst price")
 	}
-	return nil
+	return "", nil
+}
+
+func exactKalshiContractCount(value *big.Rat) (domain.Decimal, error) {
+	if value == nil || value.Sign() <= 0 {
+		return "", fmt.Errorf("latest Kalshi executable depth is invalid")
+	}
+	formatted := value.FloatString(2)
+	roundTrip, ok := new(big.Rat).SetString(formatted)
+	if !ok || roundTrip.Cmp(value) != 0 {
+		return "", fmt.Errorf("latest Kalshi executable depth exceeds two contract decimals")
+	}
+	return domain.Decimal(formatted), nil
 }
 
 func validateKalshiProtectionRange(side domain.Side, reference, worst domain.Decimal) error {
