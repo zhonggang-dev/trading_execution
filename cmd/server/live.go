@@ -29,7 +29,6 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/readiness"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliationtrigger"
-	"github.com/UniPat-AI/trading_execution/internal/service/timeexit"
 )
 
 const polymarketCollateralAsset = "pUSD"
@@ -44,7 +43,6 @@ type liveRuntime struct {
 	runner         *reconciliation.Runner
 	operations     *liveoperations.Service
 	decisionRunner *decisionrunner.Runner
-	timeExitRunner *timeexit.Runner
 	activeAccounts []string
 }
 
@@ -449,24 +447,6 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
-	var timeExitRunner *timeexit.Runner
-	if cfg.TimeExit.Enabled {
-		timeExitService, buildErr := timeexit.New(timeexit.Params{
-			Trades: fillLedger, Markets: marketUniverse, OrderBooks: orderBooks,
-			Executor: executionService, Accounts: reconciliationAccountIDs,
-			Venue: cfg.Execution.Venue,
-		})
-		if buildErr != nil {
-			return nil, fmt.Errorf("build 48-hour position exit service: %w", buildErr)
-		}
-		timeExitRunner, buildErr = timeexit.NewRunner(timeexit.RunnerParams{
-			Service: timeExitService, Interval: cfg.TimeExit.Interval,
-			Timeout: cfg.TimeExit.Timeout, Logger: logger,
-		})
-		if buildErr != nil {
-			return nil, fmt.Errorf("build 48-hour position exit runner: %w", buildErr)
-		}
-	}
 
 	readinessChecks := []readiness.NamedChecker{
 		readiness.NamedChecker{Name: "postgres", Checker: databaseReadiness},
@@ -480,9 +460,6 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	}
 	if decisionRunner != nil {
 		readinessChecks = append(readinessChecks, readiness.NamedChecker{Name: "decision_cycle", Checker: decisionRunner})
-	}
-	if timeExitRunner != nil {
-		readinessChecks = append(readinessChecks, readiness.NamedChecker{Name: "time_exit", Checker: timeExitRunner})
 	}
 	combinedReadiness, err := readiness.NewAll(readinessChecks...)
 	if err != nil {
@@ -505,7 +482,6 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		repository: repository, execution: kalshiRuntime.execution,
 		reconciliation: reconciliationService, readiness: combinedReadiness,
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
-		timeExitRunner: timeExitRunner,
 		activeAccounts: append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
 	}, nil
 }
@@ -796,22 +772,6 @@ func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Lo
 			return ctx.Err()
 		}
 	}
-	var timeExitErrors <-chan error
-	if runtime.timeExitRunner != nil {
-		timeExitReady := make(chan struct{})
-		errorsChannel := make(chan error, 1)
-		timeExitErrors = errorsChannel
-		go func() {
-			errorsChannel <- runtime.timeExitRunner.RunReady(ctx, timeExitReady)
-		}()
-		select {
-		case <-timeExitReady:
-		case err := <-errorsChannel:
-			return fmt.Errorf("start 48-hour position exit loop: %w", err)
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
 	go func() {
 		if err := <-runnerErrors; err != nil && ctx.Err() == nil {
 			logger.Error("Polymarket reconciliation loop stopped", "error", err)
@@ -826,13 +786,6 @@ func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Lo
 		go func() {
 			if err := <-decisionErrors; err != nil && ctx.Err() == nil {
 				logger.Error("decision cycle loop stopped", "error", err)
-			}
-		}()
-	}
-	if timeExitErrors != nil {
-		go func() {
-			if err := <-timeExitErrors; err != nil && ctx.Err() == nil {
-				logger.Error("48-hour position exit loop stopped", "error", err)
 			}
 		}()
 	}
