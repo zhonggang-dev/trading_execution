@@ -116,10 +116,10 @@ func TestKalshiMarketValidatorRejectsUnsafeDepthAwarePriceOrDepth(t *testing.T) 
 			},
 		},
 		{
-			name: "strategy protection exceeds two ticks", code: "KALSHI_PRICE_PROTECTION_EXCEEDED",
+			name: "buy protection is better than strategy reference", code: "KALSHI_PRICE_PROTECTION_INVALID",
 			mutate: func(intent *domain.OrderIntent, _ *domain.OrderBookSnapshot) {
-				intent.Price = "0.53"
-				intent.WorstPrice = "0.53"
+				intent.Price = "0.49"
+				intent.WorstPrice = "0.49"
 			},
 		},
 		{
@@ -158,6 +158,50 @@ func TestKalshiMarketValidatorRejectsUnsafeDepthAwarePriceOrDepth(t *testing.T) 
 			validator := newKalshiValidatorForTest(t, now, book)
 			assertKalshiRejectionCode(t, validator, intent, test.code)
 		})
+	}
+}
+
+func TestKalshiMarketValidatorAllowsSparseDepthBeyondTwoTicks(t *testing.T) {
+	now, intent, book := validKalshiValidationFixtures(domain.SideBuy)
+	intent.Price = "0.42"
+	intent.WorstPrice = "0.42"
+	intent.Size = "12"
+	intent.Metadata["strategy_reference_price"] = "0.39"
+	book.BestAsk = "0.39"
+	book.Asks = []domain.PriceLevel{
+		{Price: "0.39", Size: "7.73"},
+		{Price: "0.42", Size: "15"},
+		{Price: "0.43", Size: "50"},
+	}
+	validator := newKalshiValidatorForTest(t, now, book)
+	validation, err := validator.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if validation.BestAsk != "0.39" || validation.WorstPrice != "0.42" {
+		t.Fatalf("Validate() = %#v", validation)
+	}
+}
+
+func TestKalshiMarketValidatorAllowsSparseSellDepthBeyondTwoTicks(t *testing.T) {
+	now, intent, book := validKalshiValidationFixtures(domain.SideSell)
+	intent.Price = "0.58"
+	intent.WorstPrice = "0.58"
+	intent.Size = "12"
+	intent.Metadata["strategy_reference_price"] = "0.61"
+	book.BestBid = "0.61"
+	book.Bids = []domain.PriceLevel{
+		{Price: "0.61", Size: "7.73"},
+		{Price: "0.58", Size: "15"},
+		{Price: "0.57", Size: "50"},
+	}
+	validator := newKalshiValidatorForTest(t, now, book)
+	validation, err := validator.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if validation.BestBid != "0.61" || validation.WorstPrice != "0.58" {
+		t.Fatalf("Validate() = %#v", validation)
 	}
 }
 
