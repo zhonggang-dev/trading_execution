@@ -2,12 +2,17 @@ package executionrouter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/domain/orderstate"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
+
+var ErrMaintenanceOnly = errors.New("Kalshi execution route is maintenance-only")
 
 type Execution interface {
 	Submit(context.Context, domain.OrderIntent) (port.OrderSubmitResult, error)
@@ -23,6 +28,9 @@ type Execution interface {
 type Route struct {
 	ModelID, StrategyID, LogicalAccountID, InternalAccountID string
 	Execution                                                Execution
+	// MaintenanceOnly keeps historical orders routable while preventing new
+	// strategy deliveries after a degraded Kalshi startup preflight.
+	MaintenanceOnly bool
 }
 
 type Service struct {
@@ -54,8 +62,8 @@ func New(repository port.OrderRepository, primary Execution, routes []Route) (*S
 }
 
 func (service *Service) KalshiEnabled(intent domain.OrderIntent) bool {
-	_, ok := service.routes[routeKey(intent.ModelID, intent.StrategyID, intent.ExecutionAccountID)]
-	return intent.MarketSource.Normalize() == domain.MarketSourceKalshi && ok
+	route, ok := service.routes[routeKey(intent.ModelID, intent.StrategyID, intent.ExecutionAccountID)]
+	return intent.MarketSource.Normalize() == domain.MarketSourceKalshi && ok && !route.MaintenanceOnly
 }
 
 func (service *Service) Enabled(intent domain.OrderIntent) bool {
@@ -70,7 +78,7 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 		return service.primary.Submit(ctx, intent)
 	}
 	route, ok := service.routes[routeKey(intent.ModelID, intent.StrategyID, intent.ExecutionAccountID)]
-	if !ok {
+	if !ok || route.MaintenanceOnly {
 		return port.OrderSubmitResult{}, fmt.Errorf("Kalshi live route is not enabled for binding")
 	}
 	intent.ExecutionAccountID = route.InternalAccountID
@@ -101,6 +109,31 @@ func (service *Service) Get(ctx context.Context, id string) (domain.Order, error
 	return service.repository.Get(ctx, strings.TrimSpace(id))
 }
 func (service *Service) Resume(ctx context.Context, id string) (domain.Order, error) {
+	order, lookupErr := service.repository.Get(ctx, strings.TrimSpace(id))
+	if lookupErr != nil {
+		return domain.Order{}, lookupErr
+	}
+	if order.Intent.MarketSource.Normalize() == domain.MarketSourceKalshi {
+		for _, route := range service.routes {
+			if route.InternalAccountID == order.Intent.ExecutionAccountID && route.MaintenanceOnly {
+				next, event, deferErr := orderstate.Apply(order, orderstate.Transition{
+					EventID:    fmt.Sprintf("event:%s:%d", order.ID, order.Revision+1),
+					To:         order.Status,
+					Trigger:    domain.TransitionTriggerMaintenance,
+					ReasonCode: "KALSHI_ROUTE_MAINTENANCE",
+					Reason:     "Kalshi preflight is unavailable; pre-venue recovery is deferred without submission",
+					At:         time.Now().UTC(),
+				})
+				if deferErr == nil {
+					deferErr = service.repository.Transition(ctx, next, event)
+				}
+				if deferErr != nil {
+					return order, errors.Join(ErrMaintenanceOnly, deferErr)
+				}
+				return next, ErrMaintenanceOnly
+			}
+		}
+	}
 	e, err := service.executionForOrder(ctx, id)
 	if err != nil {
 		return domain.Order{}, err

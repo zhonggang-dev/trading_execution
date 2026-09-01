@@ -2,6 +2,7 @@ package executionrouter
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -10,7 +11,10 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
-type fakeExecution struct{ submitted []domain.OrderIntent }
+type fakeExecution struct {
+	submitted []domain.OrderIntent
+	resumed   []string
+}
 
 func (fake *fakeExecution) Submit(_ context.Context, intent domain.OrderIntent) (port.OrderSubmitResult, error) {
 	fake.submitted = append(fake.submitted, intent)
@@ -42,8 +46,9 @@ func TestPolymarketSubmissionRemainsOnPrimaryWithoutMutation(t *testing.T) {
 		t.Fatalf("Polymarket intent mutated\n got: %#v\nwant: %#v", primary.submitted[0], want)
 	}
 }
-func (*fakeExecution) Resume(context.Context, string) (domain.Order, error) {
-	return domain.Order{}, nil
+func (fake *fakeExecution) Resume(_ context.Context, orderID string) (domain.Order, error) {
+	fake.resumed = append(fake.resumed, orderID)
+	return domain.Order{ID: orderID}, nil
 }
 func (*fakeExecution) Get(context.Context, string) (domain.Order, error) { return domain.Order{}, nil }
 func (*fakeExecution) Refresh(context.Context, string) (domain.Order, error) {
@@ -85,5 +90,55 @@ func TestExactBindingRoutesKalshiToIsolatedAccount(t *testing.T) {
 	}
 	if _, err := router.Submit(context.Background(), wrong); err == nil {
 		t.Fatal("mismatched model submission must fail closed")
+	}
+}
+
+func TestMaintenanceRouteRejectsNewIntentButStillRoutesHistoricalOrder(t *testing.T) {
+	repository := memory.NewOrderRepository()
+	primary, kalshiExecution := &fakeExecution{}, &fakeExecution{}
+	router, err := New(repository, primary, []Route{{
+		ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2,
+		LogicalAccountID: "main", InternalAccountID: "kalshi:main",
+		Execution: kalshiExecution, MaintenanceOnly: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newIntent := domain.OrderIntent{
+		ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main",
+		MarketSource: domain.MarketSourceKalshi,
+	}
+	if router.Enabled(newIntent) {
+		t.Fatal("maintenance-only Kalshi route accepted a new strategy intent")
+	}
+	if _, err := router.Submit(context.Background(), newIntent); err == nil {
+		t.Fatal("maintenance-only Kalshi route submitted a new strategy intent")
+	}
+	historical := domain.Order{
+		ID: "historical-kalshi-order",
+		Intent: domain.OrderIntent{
+			ClientOrderID: "historical-client", ExecutionAccountID: "kalshi:main",
+			Venue: "kalshi", MarketSource: domain.MarketSourceKalshi, Size: "1",
+		},
+		Status: domain.OrderStatusUnknown, FilledSize: "0", FilledNotional: "0", TotalFees: "0", Revision: 1,
+	}
+	if _, created, createErr := repository.Create(context.Background(), historical); createErr != nil || !created {
+		t.Fatalf("create historical order = %t, %v", created, createErr)
+	}
+	if _, err := router.Refresh(context.Background(), historical.ID); err != nil {
+		t.Fatalf("refresh through maintenance route: %v", err)
+	}
+	historical.Status = domain.OrderStatusReserved
+	historical.Revision++
+	if updateErr := repository.Update(context.Background(), historical); updateErr != nil {
+		t.Fatalf("mark historical order reserved: %v", updateErr)
+	}
+	deferred, err := router.Resume(context.Background(), historical.ID)
+	if !errors.Is(err, ErrMaintenanceOnly) || len(kalshiExecution.resumed) != 0 {
+		t.Fatalf("maintenance route resumed a pre-venue order: resumed=%#v err=%v", kalshiExecution.resumed, err)
+	}
+	if deferred.Status != domain.OrderStatusReserved || deferred.Revision != historical.Revision+1 ||
+		deferred.FailureCode != "KALSHI_ROUTE_MAINTENANCE" || deferred.UpdatedAt.IsZero() {
+		t.Fatalf("maintenance deferral was not durably audited: %#v", deferred)
 	}
 }

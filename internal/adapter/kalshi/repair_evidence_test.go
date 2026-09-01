@@ -100,7 +100,7 @@ func TestRepairEvidenceRejectsIncompleteFillsEnvelope(t *testing.T) {
 				case "/trade-api/v2/portfolio/orders":
 					_, _ = fmt.Fprint(writer, `{"orders":[{"order_id":"venue-authoritative","client_order_id":"client-legacy","ticker":"KXTEST-YES"}],"cursor":""}`)
 				case "/trade-api/v2/portfolio/orders/venue-authoritative":
-					_, _ = fmt.Fprint(writer, `{"order":{"order_id":"venue-authoritative","client_order_id":"client-legacy","ticker":"KXTEST-YES"}}`)
+					_, _ = fmt.Fprint(writer, `{"order":{"order_id":"venue-authoritative","client_order_id":"client-legacy","ticker":"KXTEST-YES","status":"canceled","fill_count_fp":"0","remaining_count_fp":"0","initial_count_fp":"20","last_update_time":"2026-09-01T07:00:00Z"}}`)
 				case "/trade-api/v2/portfolio/fills":
 					_, _ = fmt.Fprint(writer, testCase.response)
 				}

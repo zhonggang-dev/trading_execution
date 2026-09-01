@@ -123,6 +123,8 @@ is_dust          = true/false（取决于配置和 mark）
 一个订单可以有多次 Fill，每次确认后更新累计值：未完全成交为 `PARTIALLY_FILLED`，完全成交为
 `FILLED`。IOC/FAK 的部分成交会先记录 `PARTIALLY_FILLED`，再记录 `CANCELLED`；未成交预占保持
 `RECONCILIATION_REQUIRED`，等 Fill finality/grace 后才释放。
+对 Kalshi IOC，POST 的 `fill_count` 只用于确定初始订单终态，真正的成交 shares、金额和费用仍必须来自官方
+fills API；官方 order 累计值与本地 fill ledger 不一致时不释放剩余预留。
 已取消订单后来出现确认 Fill 时，允许修正累计成交；如果累计达到全部数量，状态修正为 `FILLED`。
 `MANUAL_REVIEW` 后出现部分确认 Fill 时仍保持 `MANUAL_REVIEW` 和预占；累计全部成交时可修正为
 `FILLED`，保证“自动对账放弃”不会阻止真实成交入账。

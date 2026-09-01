@@ -440,6 +440,40 @@ func TestRunRejectsGTCExitBeforeExecution(t *testing.T) {
 	}
 }
 
+func TestBuildSellIntentUsesIOCForKalshiVenue(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 1, 6, 0, 0, 0, time.UTC)
+	request := domain.PositionExitRequest{
+		CycleID: "exit-cycle-kalshi", InputID: "exit-input-kalshi",
+		Context:    domain.StrategyExecutionContext{ModelID: "model-a", StrategyID: "multfactor_v1", ExecutionAccountID: "wallet-kalshi"},
+		DecisionAt: decisionAt, ExecutionConstraints: domain.DefaultPositionExitExecutionConstraints(),
+	}
+	trade := domain.PositionExitTrade{
+		LotID: "lot-kalshi", VenueTradeID: "fill-kalshi", OpeningOrderID: "order-kalshi",
+		MarketID: "KXTEST", ConditionID: "kalshi:KXTEST", OutcomeIndex: 0, OutcomeName: "YES",
+		TokenID: "kalshi:KXTEST:YES", AvailableShares: "12", NegRisk: false,
+	}
+	evaluation := domain.PositionExitEvaluation{
+		DecisionID: "decision-kalshi", LotID: trade.LotID, Action: domain.PositionExitActionSell,
+		ReasonCode: domain.PositionExitReasonTimeExit48H, Evidence: domain.PositionExitEvidence{BestBid: "0.49"},
+		Order: &domain.StrategyOrderParams{
+			Side: domain.SideSell, Type: domain.OrderTypeLimit, WorstPrice: "0.49", Size: "12", TimeInForce: domain.TimeInForceFOK,
+		},
+	}
+	intent, err := buildSellIntent(buildSellIntentParams{
+		request: request, signalAt: decisionAt.Add(time.Second), evaluation: evaluation, trade: trade,
+		marketData: domain.PositionExitMarketData{OrderBook: domain.OrderBookSnapshot{
+			SourceAt: decisionAt, BestBid: "0.49", MinOrderSize: "1", Bids: []domain.PriceLevel{{Price: "0.49", Size: "5"}},
+		}}, venue: "kalshi",
+	})
+	if err != nil {
+		t.Fatalf("buildSellIntent() error = %v", err)
+	}
+	if intent.Venue != "kalshi" || intent.TimeInForce != domain.TimeInForceIOC ||
+		intent.Metadata["strategy_time_in_force"] != "FOK" || intent.Metadata["execution_time_in_force"] != "IOC" {
+		t.Fatalf("Kalshi position exit intent = %#v", intent)
+	}
+}
+
 // fixture 表示后端使用的 fixture 类型。
 type fixture struct {
 	decisionAt       time.Time

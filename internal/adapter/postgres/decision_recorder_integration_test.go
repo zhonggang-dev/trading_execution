@@ -2,7 +2,9 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"testing"
 	"time"
@@ -10,6 +12,76 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
+
+func TestDecisionRecorderGrandfathersFrozenKalshiFOKDeliveryPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	decisionAt := time.Date(2026, 9, 1, 9, 20, 0, 0, time.UTC)
+	now := decisionAt.Add(time.Minute)
+	recorder, err := NewDecisionRecorder(db, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := integrationDecisionRequest(t, decisionAt, "snapshot-kalshi-ioc-rollout", decisionAt.Add(time.Second))
+	if _, _, err := recorder.ClaimInput(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	response := domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion, CycleID: request.CycleID,
+		InputID: request.InputID, Context: request.Context, DecidedAt: decisionAt.Add(2 * time.Second),
+		Evaluations: []domain.StrategyEvaluation{}, Exits: []domain.StrategyExit{},
+	}
+	legacy := integrationDecisionIntentWithID(t, request, decisionAt, "kalshi-decision", "kalshi-client-order")
+	legacy.Venue = "kalshi"
+	legacy.MarketSource = domain.MarketSourceKalshi
+	legacy.MarketID = "KXTEST"
+	legacy.ConditionID = "kalshi:KXTEST"
+	legacy.OutcomeID = "YES"
+	legacy.TokenID = "kalshi:KXTEST:YES"
+	legacy.TimeInForce = domain.TimeInForceFOK
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("legacy Kalshi intent: %v", err)
+	}
+	current := legacy
+	current.TimeInForce = domain.TimeInForceIOC
+	current.Metadata = maps.Clone(legacy.Metadata)
+	current.Metadata["strategy_time_in_force"] = "FOK"
+	current.Metadata["execution_time_in_force"] = "IOC"
+	if _, created, err := recorder.ClaimOutput(context.Background(), response, []domain.OrderIntent{legacy}, true); err != nil || !created {
+		t.Fatalf("create legacy output = created %t, error %v", created, err)
+	}
+
+	assertReplay := func(status string) {
+		t.Helper()
+		if _, created, err := recorder.ClaimOutput(context.Background(), response, []domain.OrderIntent{current}, true); err != nil || created {
+			t.Fatalf("replay %s output = created %t, error %v", status, created, err)
+		}
+		var payload []byte
+		if err := db.QueryRow(`SELECT intent_payload FROM strategy_order_intent_deliveries WHERE client_order_id=$1`, legacy.ClientOrderID).Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		var stored domain.OrderIntent
+		if err := json.Unmarshal(payload, &stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored.TimeInForce != domain.TimeInForceFOK || stored.Metadata["strategy_time_in_force"] != "" ||
+			stored.Metadata["execution_time_in_force"] != "" {
+			t.Fatalf("%s replay mutated frozen delivery: %#v", status, stored)
+		}
+	}
+	assertReplay("PENDING")
+	if _, err := db.Exec(`UPDATE strategy_order_intent_deliveries SET status='SUBMITTING',attempt_count=1,claimed_at=$2,updated_at=$2 WHERE client_order_id=$1`, legacy.ClientOrderID, now); err != nil {
+		t.Fatal(err)
+	}
+	assertReplay("SUBMITTING")
+	if _, err := db.Exec(`UPDATE strategy_order_intent_deliveries SET status='SUBMITTED',completed_at=$2,order_id='order-legacy-fok',order_status='ACKNOWLEDGED',updated_at=$2 WHERE client_order_id=$1`, legacy.ClientOrderID, now); err != nil {
+		t.Fatal(err)
+	}
+	assertReplay("SUBMITTED")
+}
 
 func TestDecisionRecorderPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")

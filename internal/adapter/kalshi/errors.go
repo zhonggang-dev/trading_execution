@@ -29,6 +29,16 @@ func kalshiAmbiguousError(code string, cause error) error {
 	}
 }
 
+func kalshiAmbiguousOrderError(code, orderID string, cause error) error {
+	return &port.VenueError{
+		Kind:         port.VenueErrorAmbiguous,
+		Code:         code,
+		Message:      "Kalshi request outcome is unknown and must be reconciled before another state-changing call",
+		VenueOrderID: strings.TrimSpace(orderID),
+		Cause:        cause,
+	}
+}
+
 // mapKalshiHTTPError distinguishes an explicit HTTP rejection from a write
 // whose outcome may be unknown. A received 4xx proves ordinary order
 // validation/FOK failures were not accepted. A conflict remains ambiguous for
@@ -42,7 +52,8 @@ func mapKalshiHTTPError(method string, status int, headers http.Header, body []b
 	if kalshiMethodMayMutate(method) && (status == http.StatusRequestTimeout ||
 		(status == http.StatusConflict && code != "KALSHI_FOK_NOT_FILLED") || status >= 500) {
 		kind = port.VenueErrorAmbiguous
-	} else if status >= 500 {
+	} else if !kalshiMethodMayMutate(method) &&
+		(status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500) {
 		kind = port.VenueErrorUnavailable
 	}
 	return &port.VenueError{

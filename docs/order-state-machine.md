@@ -59,6 +59,11 @@ Kalshi 的 HTTP `409` 默认也属于不确定结果，不能释放预留。唯�
 `REJECTED / KALSHI_FOK_NOT_FILLED`，在同一拒单流程中释放剩余预留。仅出现 `409`、`conflict`
 或泛化的 FOK 文本仍保持 `UNKNOWN/RECONCILING`。
 
+新的 Kalshi 执行 intent 使用 IOC。POST 成功后 `remaining_count=0`：零成交和部分成交都是正常的终态
+`CANCELLED`，全部成交为 `FILLED`。部分成交的真实 fills 先通过官方 fills API 入账，再经过
+finality grace 释放未成交的剩余预留。GET/fills 的短暂 `404`、限流、超时或 5xx 不记入人工处理重试上限，
+也不释放预留。
+
 ## Cancel Race
 
 撤单前先持久化 `CANCEL_PENDING + STARTED attempt`：

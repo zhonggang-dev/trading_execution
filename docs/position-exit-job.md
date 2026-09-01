@@ -291,6 +291,10 @@ Python must return one evaluation for every input lot:
   available_shares`, and Python sets `worst_price` to the snapshot best bid
   exactly. Go validates and forwards that exact value; it never overwrites or
   computes `worst_price`.
+- For a newly created Kalshi execution intent, Go preserves the exact
+  `worst_price` and requested shares but maps the protocol FOK to venue IOC.
+  The immediately available protected quantity may fill and Kalshi cancels the
+  remainder. Polymarket and frozen legacy Kalshi FOK deliveries are unchanged.
 - `held_seconds` equals `decision_at - entered_at` exactly.
 - `best_bid` is mandatory for SELL and equals the snapshot best bid.
 - HOLD reasons: `HOLD_NOT_DUE`, `HOLD_SIGNAL`, `LIQUIDITY_TOO_LOW`,

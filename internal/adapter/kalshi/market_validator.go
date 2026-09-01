@@ -55,9 +55,10 @@ func (validator *MarketValidator) Validate(ctx context.Context, intent domain.Or
 
 // validateKalshiDepthAwareLimit keeps the strategy's immutable protection
 // range anchored to the strategy snapshot while requiring the current,
-// authoritative book to remain executable for the complete FOK size. A price
-// move in the trader's favour is therefore allowed; an adverse move beyond the
-// strategy worst price or insufficient visible depth fails closed.
+// authoritative book to contain some immediately executable liquidity. Kalshi
+// orders use IOC, so the venue may fill that protected subset and cancel the
+// remainder. A price move in the trader's favour is allowed; an adverse move
+// beyond the strategy worst price or zero protected liquidity fails closed.
 func validateKalshiDepthAwareLimit(intent domain.OrderIntent, book domain.OrderBookSnapshot) error {
 	if book.TickSize.IsEmpty() {
 		return kalshiMarketRejection("KALSHI_TICK_SIZE_INVALID", "latest Kalshi orderbook omitted tick_size")
@@ -116,6 +117,12 @@ func validateKalshiDepthAwareLimit(intent domain.OrderIntent, book domain.OrderB
 	requested, err := intent.Size.Multiply("1")
 	if err != nil || requested.Sign() <= 0 {
 		return kalshiMarketRejection("KALSHI_ORDER_SIZE_INVALID", "Kalshi order size is invalid")
+	}
+	if intent.TimeInForce == domain.TimeInForceIOC {
+		if available.Sign() <= 0 {
+			return kalshiMarketRejection("KALSHI_NO_EXECUTABLE_VISIBLE_DEPTH", "latest Kalshi orderbook has no executable depth within the strategy worst price")
+		}
+		return nil
 	}
 	if available.Cmp(requested) < 0 {
 		return kalshiMarketRejection("KALSHI_INSUFFICIENT_VISIBLE_DEPTH", "latest Kalshi orderbook lacks cumulative depth within the strategy worst price")

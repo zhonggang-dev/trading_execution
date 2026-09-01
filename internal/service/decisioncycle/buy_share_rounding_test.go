@@ -132,6 +132,10 @@ func TestKalshiPredictionBuildsVenueIntentButStaysOutOfPolymarketDelivery(t *tes
 	if intent.Venue != "kalshi" || intent.MarketSource != domain.MarketSourceKalshi || intent.OutcomeID != "YES" {
 		t.Fatalf("intent = %#v", intent)
 	}
+	if intent.TimeInForce != domain.TimeInForceIOC || intent.Metadata["strategy_time_in_force"] != "FOK" ||
+		intent.Metadata["execution_time_in_force"] != "IOC" {
+		t.Fatalf("Kalshi execution time-in-force = %#v", intent)
+	}
 	if !intent.Size.Equal("12") || !intent.WorstPrice.Equal("0.42") || intent.Metadata["strategy_reference_price"] != "0.39" {
 		t.Fatalf("sparse-depth intent = %#v", intent)
 	}
@@ -310,6 +314,32 @@ func TestValidateStrategyOrderAllowsKalshiSparseDepthBeyondTwoTicks(t *testing.T
 		order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourceKalshi,
 	); err != nil {
 		t.Fatalf("validateStrategyOrderForMarket() error = %v", err)
+	}
+}
+
+func TestValidateStrategyOrderAllowsKalshiPartialIOCDepth(t *testing.T) {
+	order := domain.StrategyOrderParams{
+		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.40", Size: "30", TimeInForce: domain.TimeInForceFOK,
+	}
+	book := domain.OrderBookSnapshot{
+		MarketSource: domain.MarketSourceKalshi,
+		TickSize:     "0.01",
+		MinOrderSize: "1",
+		Asks: []domain.PriceLevel{
+			{Price: "0.39", Size: "7.73"},
+			{Price: "0.40", Size: "15"},
+			{Price: "0.41", Size: "50"},
+		},
+	}
+	if err := validateStrategyOrderForMarket(
+		order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourceKalshi,
+	); err != nil {
+		t.Fatalf("validateStrategyOrderForMarket() error = %v", err)
+	}
+	if err := validateStrategyOrderForMarket(
+		order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourcePolymarket,
+	); err == nil || !strings.Contains(err.Error(), "protected-price liquidity") {
+		t.Fatalf("Polymarket full-depth validation error = %v", err)
 	}
 }
 

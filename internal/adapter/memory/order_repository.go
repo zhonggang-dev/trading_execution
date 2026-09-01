@@ -256,10 +256,11 @@ func normalizePendingAccounts(accountIDs []string) (map[string]struct{}, error) 
 	return result, nil
 }
 
-// coordinatorEligible 判断当前业务条件是否成立。等待权威成交明细的 UNKNOWN
-// 由低频 scheduled reconciliation 持续处理，避免快速协调器每轮重复刷新同一状态。
+// coordinatorEligible 判断当前业务条件是否成立。Polymarket 等待权威成交
+// 明细的 UNKNOWN 由低频 scheduled reconciliation 处理。Kalshi 没有该独立 runner，
+// 因此必须保留在快速协调器中，否则延迟可见的 IOC fill 会永久卡住。
 func coordinatorEligible(order domain.Order) bool {
-	if order.Status == domain.OrderStatusUnknown {
+	if order.Status == domain.OrderStatusUnknown && !isKalshiOrder(order) {
 		switch order.FailureCode {
 		case "CLOB_FILL_DETAILS_UNAVAILABLE", "VENUE_FILL_EVIDENCE_PENDING":
 			return false
@@ -275,4 +276,9 @@ func coordinatorEligible(order domain.Order) bool {
 	default:
 		return false
 	}
+}
+
+func isKalshiOrder(order domain.Order) bool {
+	return order.Intent.MarketSource.Normalize() == domain.MarketSourceKalshi ||
+		strings.EqualFold(strings.TrimSpace(order.Intent.Venue), "kalshi")
 }

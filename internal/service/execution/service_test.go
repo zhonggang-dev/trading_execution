@@ -16,6 +16,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain/orderstate"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
+	"github.com/UniPat-AI/trading_execution/internal/service/ordercoordinator"
 )
 
 // TestSubmitIsIdempotentBeforeVenue 验证 Submit Is Idempotent Before Venue 场景下的行为。
@@ -37,6 +38,36 @@ func TestSubmitIsIdempotentBeforeVenue(t *testing.T) {
 	}
 	if calls := venue.placeCalls.Load(); calls != 1 {
 		t.Fatalf("venue place calls = %d, want 1", calls)
+	}
+}
+
+func TestSubmitGrandfathersExistingKalshiFOKOrderDuringIOCRollout(t *testing.T) {
+	venue := &fakeVenue{name: "kalshi"}
+	service := newService(t, venue, allowGuard{})
+	legacy := validKalshiExecutionIntent("client-kalshi-rollout")
+	first, err := service.Submit(context.Background(), legacy)
+	if err != nil {
+		t.Fatalf("legacy FOK Submit() error = %v", err)
+	}
+	current := legacy
+	current.TimeInForce = domain.TimeInForceIOC
+	current.Metadata = map[string]string{
+		"strategy_time_in_force":  "FOK",
+		"execution_time_in_force": "IOC",
+	}
+	replayed, err := service.Submit(context.Background(), current)
+	if err != nil || replayed.Created || replayed.Order.ID != first.Order.ID ||
+		replayed.Order.Intent.TimeInForce != domain.TimeInForceFOK {
+		t.Fatalf("rollout replay = %#v, %v", replayed, err)
+	}
+	if venue.placeCalls.Load() != 1 {
+		t.Fatalf("venue placement calls = %d, want one historical placement", venue.placeCalls.Load())
+	}
+
+	changed := current
+	changed.Size = "11"
+	if _, err := service.Submit(context.Background(), changed); !errors.Is(err, execution.ErrIdempotencyConflict) {
+		t.Fatalf("changed IOC replay error = %v, want strict conflict", err)
 	}
 }
 
@@ -1006,6 +1037,58 @@ func TestSubmitDoesNotBookVenueSizeMatchedWithoutConfirmedFill(t *testing.T) {
 	}
 }
 
+func TestKalshiFullIOCWithDelayedFillEvidenceIsRecoveredByCoordinator(t *testing.T) {
+	now := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+	currentTime := now
+	repository := memory.NewOrderRepository()
+	venueOrder := port.VenueOrder{
+		ID: "venue-kalshi-full-ioc", State: port.VenueOrderFilled, RawStatus: "executed",
+		FilledSize: "10", ObservedAt: now,
+	}
+	venue := &fakeVenue{name: "kalshi", placeOrder: &venueOrder, getOrder: &venueOrder}
+	fillVisible := false
+	synchronizer := &fakeFillSynchronizer{sync: func(ctx context.Context, orderID string) error {
+		if !fillVisible {
+			return nil
+		}
+		return persistConfirmedFill(ctx, repository, orderID, domain.OrderStatusFilled, "10", "0.5")
+	}}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		Now: func() time.Time { return currentTime }, NewID: func() string { return "ord-kalshi-full-ioc" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validKalshiExecutionIntent("client-kalshi-full-ioc")
+	intent.TimeInForce = domain.TimeInForceIOC
+	result, err := service.Submit(context.Background(), intent)
+	if err != nil || result.Order.Status != domain.OrderStatusUnknown ||
+		result.Order.FailureCode != "VENUE_FILL_EVIDENCE_PENDING" {
+		t.Fatalf("initial full IOC = %#v, %v", result, err)
+	}
+
+	fillVisible = true
+	currentTime = now.Add(2 * time.Second)
+	coordinator, err := ordercoordinator.New(ordercoordinator.Params{
+		Repository: repository, Execution: service, PollInterval: time.Second,
+		Accounts: []string{intent.ExecutionAccountID}, Now: func() time.Time { return currentTime },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sweep := coordinator.Sweep(context.Background())
+	if sweep.Selected != 1 || sweep.Refreshed != 1 || len(sweep.Errors) != 0 {
+		t.Fatalf("coordinator sweep = %#v", sweep)
+	}
+	recovered, err := repository.Get(context.Background(), result.Order.ID)
+	if err != nil || recovered.Status != domain.OrderStatusFilled || !recovered.FilledSize.Equal("10") {
+		t.Fatalf("recovered full IOC = %#v, %v", recovered, err)
+	}
+}
+
 func TestSubmitTreatsNonTerminalTradeEvidenceAsDurablePending(t *testing.T) {
 	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
 	repository := memory.NewOrderRepository()
@@ -1291,6 +1374,83 @@ func TestRefreshFillDetailsUnavailableStaysRecoverableWithoutUsingGenericRetryBu
 	}
 }
 
+func TestKalshiOrderVisibilityPendingNeverConsumesGenericRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: paper.NewReservationManager(), MaxReconcileAttempts: 1,
+		Now: func() time.Time { return now }, NewID: func() string { return "ord-kalshi-visibility-pending" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(ctx, validIntent("client-kalshi-visibility-pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	venue.getErr = &port.VenueError{
+		Kind: port.VenueErrorUnavailable, Code: "KALSHI_ORDER_VISIBILITY_PENDING",
+		Message: "Kalshi order is not yet visible by client_order_id",
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		refreshed, refreshErr := service.Refresh(ctx, result.Order.ID)
+		if refreshErr == nil || refreshed.Status != domain.OrderStatusUnknown ||
+			refreshed.FailureCode != "KALSHI_ORDER_VISIBILITY_PENDING" {
+			t.Fatalf("Refresh() #%d = %#v, %v; want recoverable UNKNOWN", attempt+1, refreshed, refreshErr)
+		}
+	}
+	attempts, err := repository.Attempts(ctx, result.Order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 5 {
+		t.Fatalf("attempt count = %d, want submit plus four visibility reconciliations", len(attempts))
+	}
+	for index, attempt := range attempts[1:] {
+		if attempt.Outcome != domain.AttemptOutcomeUnknown || attempt.ErrorCode != "KALSHI_ORDER_VISIBILITY_PENDING" {
+			t.Fatalf("visibility attempt #%d = %#v", index+1, attempt)
+		}
+	}
+}
+
+func TestRetryableKalshiReadFailuresNeverConsumeGenericRetryBudget(t *testing.T) {
+	for _, code := range []string{
+		"KALSHI_SERVER_ERROR",
+		"KALSHI_RATE_LIMITED",
+		"KALSHI_TRANSPORT_FAILED",
+		"KALSHI_INVALID_ORDER_RESPONSE",
+	} {
+		t.Run(code, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+			repository := memory.NewOrderRepository()
+			venue := &fakeVenue{}
+			service, err := execution.New(execution.Params{
+				Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+				Reservations: paper.NewReservationManager(), MaxReconcileAttempts: 1,
+				Now: func() time.Time { return now }, NewID: func() string { return "ord-" + strings.ToLower(code) },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := service.Submit(ctx, validIntent("client-"+strings.ToLower(code)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			venue.getErr = &port.VenueError{Kind: port.VenueErrorUnavailable, Code: code, Message: "retryable read failure"}
+			for attempt := 0; attempt < 3; attempt++ {
+				refreshed, refreshErr := service.Refresh(ctx, result.Order.ID)
+				if refreshErr == nil || refreshed.Status != domain.OrderStatusUnknown || refreshed.FailureCode != code {
+					t.Fatalf("Refresh() #%d = %#v, %v; want retryable UNKNOWN", attempt+1, refreshed, refreshErr)
+				}
+			}
+		})
+	}
+}
+
 func TestRefreshFillDetailsUnavailableReturnsOrderReloadedFromFillLedger(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
@@ -1411,6 +1571,105 @@ func TestCancelSyncsConfirmedFillsBeforeHoldingFinality(t *testing.T) {
 	if synchronizer.calls.Load() != 1 || reservations.reconcileCalls.Load() != 0 || reservations.uncertainCalls.Load() != 1 {
 		t.Fatalf("sync/reconcile/uncertain calls = %d/%d/%d, want 1/0/1",
 			synchronizer.calls.Load(), reservations.reconcileCalls.Load(), reservations.uncertainCalls.Load())
+	}
+}
+
+func TestFinalizeCancellationRequiresMatchingAuthoritativeFillTotal(t *testing.T) {
+	now := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+	currentTime := now
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	applyFill := false
+	synchronizer := &fakeFillSynchronizer{sync: func(ctx context.Context, orderID string) error {
+		if !applyFill {
+			return nil
+		}
+		return persistConfirmedFill(ctx, repository, orderID, domain.OrderStatusCancelled, "3", "0.5")
+	}}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		CancelFillFinalityGrace: 30 * time.Second,
+		Now:                     func() time.Time { return currentTime }, NewID: func() string { return "ord-ioc-finality" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validIntent("client-ioc-finality")
+	intent.TimeInForce = domain.TimeInForceIOC
+	result, err := service.Submit(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := service.Cancel(context.Background(), result.Order.ID)
+	if err != nil || cancelled.Status != domain.OrderStatusCancelled {
+		t.Fatalf("Cancel() = %#v, %v", cancelled, err)
+	}
+	currentTime = now.Add(31 * time.Second)
+	venue.getOrder = &port.VenueOrder{
+		ID: cancelled.VenueOrderID, State: port.VenueOrderCancelled, RawStatus: "canceled",
+		FilledSize: "3", AverageFillPrice: "0.5", ObservedAt: now,
+	}
+	if _, err := service.FinalizeCancellation(context.Background(), cancelled.ID); !errors.Is(err, execution.ErrCancelFinalityPending) {
+		t.Fatalf("FinalizeCancellation(missing fill) error = %v", err)
+	}
+	reservation, found := reservations.delegate.(*paper.ReservationManager).Get(cancelled.ID)
+	if !found || reservation.Status != domain.ReservationStatusReconciliationRequired || reservations.reconcileCalls.Load() != 0 {
+		t.Fatalf("reservation before fill sync = %#v, found=%v, reconcile=%d", reservation, found, reservations.reconcileCalls.Load())
+	}
+
+	applyFill = true
+	finalized, err := service.FinalizeCancellation(context.Background(), cancelled.ID)
+	if err != nil {
+		t.Fatalf("FinalizeCancellation(confirmed fill) error = %v", err)
+	}
+	if finalized.Status != domain.OrderStatusCancelled || !finalized.FilledSize.Equal("3") {
+		t.Fatalf("finalized order = %#v", finalized)
+	}
+	reservation, found = reservations.delegate.(*paper.ReservationManager).Get(cancelled.ID)
+	if !found || reservation.Status != domain.ReservationStatusReleased || reservations.reconcileCalls.Load() != 1 {
+		t.Fatalf("final reservation = %#v, found=%v, reconcile=%d", reservation, found, reservations.reconcileCalls.Load())
+	}
+}
+
+func TestFinalizeCancellationKeepsReservationWhenVenueReadFails(t *testing.T) {
+	now := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	currentTime := now
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	synchronizer := &fakeFillSynchronizer{}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		CancelFillFinalityGrace: 30 * time.Second,
+		Now:                     func() time.Time { return currentTime }, NewID: func() string { return "ord-ioc-finality-read" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(context.Background(), validIntent("client-ioc-finality-read"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := service.Cancel(context.Background(), result.Order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentTime = now.Add(31 * time.Second)
+	venue.getErr = errors.New("Kalshi order endpoint unavailable")
+	deferred, err := service.FinalizeCancellation(context.Background(), cancelled.ID)
+	if err == nil {
+		t.Fatal("FinalizeCancellation() error = nil while venue evidence is unavailable")
+	}
+	if deferred.Status != domain.OrderStatusCancelled || deferred.Revision != cancelled.Revision+1 ||
+		deferred.FailureCode != "CANCEL_FINALITY_ORDER_READ_FAILED" || !deferred.UpdatedAt.Equal(currentTime) {
+		t.Fatalf("failed finality read was not durably deferred: %#v", deferred)
+	}
+	reservation, found := reservations.delegate.(*paper.ReservationManager).Get(cancelled.ID)
+	if !found || reservation.Status != domain.ReservationStatusReconciliationRequired || reservations.reconcileCalls.Load() != 0 {
+		t.Fatalf("reservation after failed finality read = %#v, found=%v", reservation, found)
 	}
 }
 
@@ -1699,6 +1958,17 @@ func validIntent(clientOrderID string) domain.OrderIntent {
 	}
 }
 
+func validKalshiExecutionIntent(clientOrderID string) domain.OrderIntent {
+	return domain.OrderIntent{
+		ModelID: "model-1", StrategyID: "strategy-1", ExecutionAccountID: "kalshi:account-1",
+		SignalID: "signal-1", ClientOrderID: clientOrderID, Venue: "kalshi",
+		MarketSource: domain.MarketSourceKalshi, MarketID: "TEST-MARKET", ConditionID: "kalshi:TEST-MARKET",
+		OutcomeID: "YES", TokenID: "kalshi:TEST-MARKET:YES", Side: domain.SideBuy,
+		Type: domain.OrderTypeLimit, Price: "0.5", WorstPrice: "0.5", Size: "10",
+		TimeInForce: domain.TimeInForceFOK,
+	}
+}
+
 // allowGuard 表示后端使用的 allowGuard 类型。
 type allowGuard struct{}
 
@@ -1772,6 +2042,7 @@ func (trigger *reconciliationTrigger) Trigger(accountID string, reason domain.Re
 
 // fakeVenue 表示后端使用的 fakeVenue 类型。
 type fakeVenue struct {
+	name              string
 	placeCalls        atomic.Int64
 	cancelCalls       atomic.Int64
 	getCalls          atomic.Int64
@@ -1850,7 +2121,12 @@ func (venue *preparedTestVenue) Get(_ context.Context, order domain.Order) (port
 }
 
 // Name 返回模拟组件名称。
-func (venue *fakeVenue) Name() string { return "polymarket-paper" }
+func (venue *fakeVenue) Name() string {
+	if strings.TrimSpace(venue.name) != "" {
+		return venue.name
+	}
+	return "polymarket-paper"
+}
 
 // Place 模拟交易所下单。
 func (venue *fakeVenue) Place(_ context.Context, order domain.Order) (port.VenueOrder, error) {

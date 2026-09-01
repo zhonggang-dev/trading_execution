@@ -603,6 +603,15 @@ func (service *Service) deliverPending(ctx context.Context, cycleID string) ([]I
 				result := IntentResult{
 					Intent: delivery.Intent, DeliveryStatus: delivery.Status, DeliveryAttempt: delivery.Attempt,
 				}
+				// A persisted delivery may predate a venue route entering
+				// maintenance-only mode. Keep the lease durable without creating a
+				// new execution order or failing process startup; a later healthy
+				// restart requeues and resumes the exact frozen intent.
+				if service.submissionPolicy != nil && !service.submissionPolicy.Enabled(delivery.Intent) {
+					result.SubmissionDisabled = true
+					results = append(results, result)
+					continue
+				}
 				result.Result, result.Error = service.executor.Submit(ctx, delivery.Intent)
 				completion, complete := decisionIntentCompletion(result.Result, result.Error)
 				if complete {
@@ -1357,6 +1366,12 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		"market_source":            string(prediction.MarketSource.Normalize()),
 		"outcome_id":               prediction.Outcomes[outcomeIndex].OutcomeID,
 	}
+	executionTimeInForce := order.TimeInForce
+	if prediction.MarketSource.Normalize() == domain.MarketSourceKalshi {
+		executionTimeInForce = domain.TimeInForceIOC
+		metadata["strategy_time_in_force"] = string(order.TimeInForce)
+		metadata["execution_time_in_force"] = string(executionTimeInForce)
+	}
 	if !evaluation.Evidence.Edge.IsEmpty() {
 		metadata["strategy_edge"] = evaluation.Evidence.Edge.String()
 	}
@@ -1385,7 +1400,7 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		Price:              limitPrice,
 		WorstPrice:         order.WorstPrice,
 		Size:               order.Size,
-		TimeInForce:        order.TimeInForce,
+		TimeInForce:        executionTimeInForce,
 		ExpiresAt:          order.ExpiresAt,
 		Metadata:           metadata,
 	}).Build()
@@ -1420,6 +1435,10 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 		return domain.OrderIntent{}, fmt.Errorf("exit size must not exceed the selected lot's remaining shares")
 	}
 	outcomeIndex := lot.OutcomeIndex
+	outcomeID, err := executionOutcomeID(lot.MarketSource, lot.ConditionID, lot.TokenID)
+	if err != nil {
+		return domain.OrderIntent{}, err
+	}
 	expectedNegRisk := lot.NegRisk
 	marketSnapshotAt := book.SourceAt
 	signalAt = signalAt.UTC()
@@ -1434,6 +1453,12 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 		"model_id":                 request.Context.ModelID,
 		"execution_account_id":     request.Context.ExecutionAccountID,
 	}
+	executionTimeInForce := exit.Order.TimeInForce
+	if lot.MarketSource.Normalize() == domain.MarketSourceKalshi {
+		executionTimeInForce = domain.TimeInForceIOC
+		metadata["strategy_time_in_force"] = string(exit.Order.TimeInForce)
+		metadata["execution_time_in_force"] = string(executionTimeInForce)
+	}
 	intentVenue, err := lot.MarketSource.Venue(venue)
 	if err != nil {
 		return domain.OrderIntent{}, err
@@ -1443,14 +1468,29 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 		ExecutionAccountID: request.Context.ExecutionAccountID,
 		SignalID:           exit.DecisionID, ClientOrderID: clientOrderID(request.CycleID, exit.DecisionID),
 		Venue: intentVenue, MarketSource: lot.MarketSource, MarketID: lot.MarketID, ConditionID: lot.ConditionID,
-		OutcomeIndex: &outcomeIndex, OutcomeName: lot.OutcomeName, TokenID: lot.TokenID,
+		OutcomeIndex: &outcomeIndex, OutcomeName: lot.OutcomeName, OutcomeID: outcomeID, TokenID: lot.TokenID,
 		TargetLotID: lot.LotID, ExpectedNegRisk: &expectedNegRisk,
 		MarketSnapshotAt: &marketSnapshotAt, SignalAt: &signalAt,
 		Side: domain.SideSell, Type: exit.Order.Type, Price: exit.Order.WorstPrice,
 		WorstPrice: exit.Order.WorstPrice, Size: exit.Order.Size,
-		TimeInForce: exit.Order.TimeInForce, ExpiresAt: exit.Order.ExpiresAt, Metadata: metadata,
+		TimeInForce: executionTimeInForce, ExpiresAt: exit.Order.ExpiresAt, Metadata: metadata,
 	}).Build()
 	return intent, err
+}
+
+func executionOutcomeID(source domain.MarketSource, conditionID, tokenID string) (string, error) {
+	if source.Normalize() != domain.MarketSourceKalshi {
+		return "", nil
+	}
+	prefix := strings.TrimSpace(conditionID) + ":"
+	if !strings.HasPrefix(strings.TrimSpace(tokenID), prefix) {
+		return "", fmt.Errorf("Kalshi position token does not match its condition")
+	}
+	outcomeID := strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(tokenID), prefix)))
+	if outcomeID != "YES" && outcomeID != "NO" {
+		return "", fmt.Errorf("Kalshi position token has an invalid outcome")
+	}
+	return outcomeID, nil
 }
 
 // validateStrategyOrder 校验 Strategy Order 的字段和业务约束。
@@ -1512,7 +1552,11 @@ func validateStrategyOrderForMarket(
 	if err != nil {
 		return fmt.Errorf("calculate effective %s shares: %w", side, err)
 	}
-	if requestedShares.Cmp(availableShares) > 0 {
+	if marketSource.Normalize() == domain.MarketSourceKalshi {
+		if availableShares.Sign() <= 0 {
+			return fmt.Errorf("%s order has no protected-price liquidity", side)
+		}
+	} else if requestedShares.Cmp(availableShares) > 0 {
 		return fmt.Errorf("%s order.size exceeds protected-price liquidity", side)
 	}
 	if side == domain.SideBuy {

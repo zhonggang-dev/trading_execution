@@ -129,27 +129,6 @@ func TestKalshiMarketValidatorRejectsUnsafeDepthAwarePriceOrDepth(t *testing.T) 
 				intent.WorstPrice = "0.515"
 			},
 		},
-		{
-			name: "latest cumulative depth is insufficient", code: "KALSHI_INSUFFICIENT_VISIBLE_DEPTH",
-			mutate: func(_ *domain.OrderIntent, book *domain.OrderBookSnapshot) {
-				book.Asks = []domain.PriceLevel{
-					{Price: "0.51", Size: "4"}, {Price: "0.52", Size: "5"},
-					{Price: "0.53", Size: "100"},
-				}
-				book.BestAsk = "0.51"
-			},
-		},
-		{
-			name: "latest cumulative sell depth is insufficient", code: "KALSHI_INSUFFICIENT_VISIBLE_DEPTH",
-			mutate: func(intent *domain.OrderIntent, book *domain.OrderBookSnapshot) {
-				configureKalshiSellIntent(intent)
-				book.Bids = []domain.PriceLevel{
-					{Price: "0.49", Size: "4"}, {Price: "0.48", Size: "5"},
-					{Price: "0.47", Size: "100"},
-				}
-				book.BestBid = "0.49"
-			},
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -157,6 +136,44 @@ func TestKalshiMarketValidatorRejectsUnsafeDepthAwarePriceOrDepth(t *testing.T) 
 			test.mutate(&intent, &book)
 			validator := newKalshiValidatorForTest(t, now, book)
 			assertKalshiRejectionCode(t, validator, intent, test.code)
+		})
+	}
+}
+
+func TestKalshiMarketValidatorAllowsPartialIOCDepth(t *testing.T) {
+	for _, side := range []domain.Side{domain.SideBuy, domain.SideSell} {
+		t.Run(string(side), func(t *testing.T) {
+			now, intent, book := validKalshiValidationFixtures(side)
+			intent.TimeInForce = domain.TimeInForceIOC
+			if side == domain.SideBuy {
+				book.Asks = []domain.PriceLevel{{Price: "0.51", Size: "4"}, {Price: "0.52", Size: "5"}, {Price: "0.53", Size: "100"}}
+				book.BestAsk = "0.51"
+			} else {
+				book.Bids = []domain.PriceLevel{{Price: "0.49", Size: "4"}, {Price: "0.48", Size: "5"}, {Price: "0.47", Size: "100"}}
+				book.BestBid = "0.49"
+			}
+			validator := newKalshiValidatorForTest(t, now, book)
+			if _, err := validator.Validate(context.Background(), intent); err != nil {
+				t.Fatalf("Validate() error = %v, want protected partial depth to pass IOC", err)
+			}
+		})
+	}
+}
+
+func TestKalshiMarketValidatorStillRequiresFullDepthForNonIOCOrders(t *testing.T) {
+	for _, side := range []domain.Side{domain.SideBuy, domain.SideSell} {
+		t.Run(string(side), func(t *testing.T) {
+			now, intent, book := validKalshiValidationFixtures(side)
+			intent.TimeInForce = domain.TimeInForceFOK
+			if side == domain.SideBuy {
+				book.Asks = []domain.PriceLevel{{Price: "0.51", Size: "4"}, {Price: "0.52", Size: "5"}, {Price: "0.53", Size: "100"}}
+				book.BestAsk = "0.51"
+			} else {
+				book.Bids = []domain.PriceLevel{{Price: "0.49", Size: "4"}, {Price: "0.48", Size: "5"}, {Price: "0.47", Size: "100"}}
+				book.BestBid = "0.49"
+			}
+			validator := newKalshiValidatorForTest(t, now, book)
+			assertKalshiRejectionCode(t, validator, intent, "KALSHI_INSUFFICIENT_VISIBLE_DEPTH")
 		})
 	}
 }

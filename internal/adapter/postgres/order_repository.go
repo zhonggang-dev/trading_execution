@@ -354,6 +354,7 @@ func (repository *OrderRepository) listPending(
 		  AND NOT (
 			status = 'UNKNOWN'
 			AND failure_code IN ('CLOB_FILL_DETAILS_UNAVAILABLE', 'VENUE_FILL_EVIDENCE_PENDING')
+			AND LOWER(BTRIM(venue)) <> 'kalshi'
 		  )
 		  AND updated_at <= $1`+accountClause+`
 		ORDER BY updated_at, order_id

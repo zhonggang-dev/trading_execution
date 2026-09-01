@@ -97,8 +97,8 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 `tick_size` 的整数倍；执行时仍以 `worst_price` 作为限价，不允许无限追价。
 
 Kalshi 盘口可能跳过中间 tick，因此不套用固定的两 tick 距离上限。策略仍必须基于冻结快照给出明确的
-`worst_price`，价格方向正确、位于 tick 上，且保护价范围内的累计可见深度必须覆盖完整 FOK shares；
-下单前 Go 还会用最新官方盘口重复校验最优价没有越过保护线且深度仍然充足。
+`worst_price`，价格方向正确、位于 tick 上，且保护价范围内至少有可见的可成交 shares。
+下单前 Go 还会用最新官方盘口重复校验最优价没有越过保护线且保护价内仍有正数深度。
 
 `predictions` 每个周期发送当前 binding 所属模型的全部当前有效 Market。一条 Market/Model 预测仍包含两个按原始
 Outcome 顺序对齐且和为 1 的概率和 token，而不是只传一个脱离 Outcome 的 `prob`。
@@ -135,6 +135,10 @@ Trading 不再抓取或发送 `mid_price_histories`。`multfactor_v2` 计算 MOM
 
 策略必须原样回显可信 `context`，并为每个 `(prediction_id, token_id)` 返回一条买入 `SKIP` 或 `SUBMIT`
 evaluation；按手卖出通过 `exits[].lot_id` 返回。entry 和 exit 都只能使用 `LIMIT + FOK`。
+这个 FOK 是 Python 策略协议的稳定值：Trading 为新的 Kalshi 订单构建执行 intent 时会转成
+`LIMIT + IOC`，在 `worst_price` 内立即成交当时可获得的数量，剩余数量由 Kalshi 立即取消。
+Polymarket 仍按策略返回的 FOK 执行。已经冻结持久化的历史 Kalshi FOK delivery 保留原语义恢复，
+不会在重启或重放时被改成 IOC。
 完整 HTTP 请求、响应字段、业务校验和错误码见
 [`python-algorithm-http-api.md`](python-algorithm-http-api.md)。Trading Execution 根据 `SUBMIT` 的订单
 参数生成内部 `OrderIntent`；venue 和 `client_order_id` 不由策略服务指定。

@@ -1077,6 +1077,74 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	}
 }
 
+func TestIOCMultipleFillsCorrectCancelledOrderToFilledPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	insertAccount(t, db, "account-ioc-multi-fill", "0xiocmultifill", "100", "100", "0")
+	repository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations, err := NewReservationManager(ReservationManagerParams{DB: db, MaxBuyFeeRateBPS: "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := NewFillLedger(FillLedgerParams{DB: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor, err := fillprocessor.New(fillprocessor.Params{Orders: repository, Source: noFillsSource{}, Ledger: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	order := integrationOrder("ioc-multi-fill", "account-ioc-multi-fill", "token-ioc-multi", domain.SideBuy, "2", "0.6")
+	order.Intent.Venue = "paper"
+	order.Intent.TimeInForce = domain.TimeInForceIOC
+	order = createAcknowledgedIntegrationOrder(t, ctx, repository, reservations, order, "venue-ioc-multi", now)
+
+	confirmedFill := func(id, shares string, at time.Time) domain.Fill {
+		confirmedAt := at
+		notional, err := domain.Decimal(shares).Multiply("0.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return domain.Fill{
+			VenueFillID: id, LiquidityRole: domain.LiquidityRoleTaker,
+			Status: domain.FillStatusConfirmed, Shares: domain.Decimal(shares), Price: "0.5",
+			GrossNotional: domain.Decimal(notional.FloatString(8)), FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+			PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0", FeeSource: "TEST_KALSHI_IOC",
+			MatchedAt: at, VenueUpdatedAt: at, ObservedAt: at, ConfirmedAt: &confirmedAt,
+		}
+	}
+	firstFill := confirmedFill("ioc-fill-1", "1", now.Add(10*time.Second))
+	first, err := processor.Process(ctx, order, firstFill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Order.Status != domain.OrderStatusCancelled || !first.Order.FilledSize.Equal("1") {
+		t.Fatalf("first IOC fill = %#v", first.Order)
+	}
+	duplicate, err := processor.Process(ctx, first.Order, firstFill)
+	if err != nil || !duplicate.Duplicate || duplicate.Applied {
+		t.Fatalf("duplicate IOC fill = %#v err=%v", duplicate, err)
+	}
+	second, err := processor.Process(ctx, duplicate.Order, confirmedFill("ioc-fill-2", "1", now.Add(11*time.Second)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Order.Status != domain.OrderStatusFilled || !second.Order.FilledSize.Equal("2") ||
+		!second.Order.FilledNotional.Equal("1") {
+		t.Fatalf("completed IOC order = %#v", second.Order)
+	}
+	assertAccount(t, db, "account-ioc-multi-fill", "99", "99", "0")
+	assertPosition(t, db, "account-ioc-multi-fill", "token-ioc-multi", "2", "2", "0")
+}
+
 func TestExternalPositionBaselinePostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
 	if databaseURL == "" {

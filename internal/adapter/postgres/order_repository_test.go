@@ -53,6 +53,7 @@ func TestOrderRepositoryRecoverySelectionPostgresIntegration(t *testing.T) {
 		side              domain.Side
 		status            domain.OrderStatus
 		failureCode       string
+		venue             string
 		updatedAt         time.Time
 		reservationStatus domain.ReservationStatus
 		emptyReservation  bool
@@ -61,6 +62,7 @@ func TestOrderRepositoryRecoverySelectionPostgresIntegration(t *testing.T) {
 	}{
 		{name: "fill-pending-clob", side: domain.SideBuy, status: domain.OrderStatusUnknown, failureCode: "CLOB_FILL_DETAILS_UNAVAILABLE", updatedAt: old, wantReconcile: true},
 		{name: "fill-pending-durable", side: domain.SideBuy, status: domain.OrderStatusUnknown, failureCode: "VENUE_FILL_EVIDENCE_PENDING", updatedAt: old, wantReconcile: true},
+		{name: "fill-pending-kalshi", side: domain.SideBuy, status: domain.OrderStatusUnknown, failureCode: "VENUE_FILL_EVIDENCE_PENDING", venue: "kalshi", updatedAt: old, wantPending: true, wantReconcile: true},
 		{name: "ordinary-unknown", side: domain.SideBuy, status: domain.OrderStatusUnknown, failureCode: "CLOB_ORDER_NOT_FOUND", updatedAt: old, wantPending: true, wantReconcile: true},
 		{name: "old-manual-unprotected", side: domain.SideBuy, status: domain.OrderStatusManualReview, updatedAt: old},
 		{name: "old-manual-active-buy", side: domain.SideBuy, status: domain.OrderStatusManualReview, failureCode: "CLOB_FILL_DETAILS_UNAVAILABLE", updatedAt: old, reservationStatus: domain.ReservationStatusActive, wantReconcile: true},
@@ -79,6 +81,10 @@ func TestOrderRepositoryRecoverySelectionPostgresIntegration(t *testing.T) {
 	for _, fixture := range fixtures {
 		tokenID := "token-" + fixture.name
 		order := integrationOrder("reconcile-"+fixture.name, accountID, tokenID, fixture.side, "1", "0.5")
+		if fixture.venue != "" {
+			order.Intent.Venue = fixture.venue
+			order.Intent.MarketSource = domain.MarketSourceKalshi
+		}
 		order.Status = fixture.status
 		order.FailureCode = fixture.failureCode
 		order.VenueOrderID = "venue-" + fixture.name

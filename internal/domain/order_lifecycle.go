@@ -15,6 +15,7 @@ const (
 	TransitionTriggerFill           OrderTransitionTrigger = "FILL"
 	TransitionTriggerCancel         OrderTransitionTrigger = "CANCEL"
 	TransitionTriggerReconciliation OrderTransitionTrigger = "RECONCILIATION"
+	TransitionTriggerMaintenance    OrderTransitionTrigger = "MAINTENANCE"
 	TransitionTriggerOperator       OrderTransitionTrigger = "OPERATOR"
 )
 

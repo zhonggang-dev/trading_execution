@@ -45,7 +45,7 @@ func TestOrderRepositoryUsesClientOrderIDAndRevision(t *testing.T) {
 	}
 }
 
-func TestListPendingDefersDurableFillEvidenceStatesToReconciliation(t *testing.T) {
+func TestListPendingDefersPolymarketFillEvidenceButKeepsKalshiCoordinatorEligible(t *testing.T) {
 	repository := NewOrderRepository()
 	now := time.Now().UTC()
 	for index, failureCode := range []string{
@@ -63,13 +63,25 @@ func TestListPendingDefersDurableFillEvidenceStatesToReconciliation(t *testing.T
 			t.Fatal(err)
 		}
 	}
+	kalshi := domain.Order{
+		ID: "order-kalshi-fill-pending",
+		Intent: domain.OrderIntent{
+			ClientOrderID: "client-kalshi-fill-pending", Venue: "kalshi",
+			MarketSource: domain.MarketSourceKalshi,
+		},
+		Status: domain.OrderStatusUnknown, FailureCode: "VENUE_FILL_EVIDENCE_PENDING",
+		Revision: 1, CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Second),
+	}
+	if _, _, err := repository.Create(context.Background(), kalshi); err != nil {
+		t.Fatal(err)
+	}
 
 	orders, err := repository.ListPending(context.Background(), now.Add(time.Minute), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(orders) != 1 || orders[0].FailureCode != "CLOB_ORDER_NOT_FOUND" {
-		t.Fatalf("ListPending() = %#v, want only ordinary UNKNOWN", orders)
+	if len(orders) != 2 || orders[0].ID != kalshi.ID && orders[1].ID != kalshi.ID {
+		t.Fatalf("ListPending() = %#v, want ordinary UNKNOWN plus Kalshi fill-pending", orders)
 	}
 }
 

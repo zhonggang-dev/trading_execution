@@ -25,10 +25,11 @@ var (
 )
 
 const (
-	clobFillDetailsUnavailableCode = "CLOB_FILL_DETAILS_UNAVAILABLE"
-	venueFillEvidencePendingCode   = "VENUE_FILL_EVIDENCE_PENDING"
-	accountNotActiveCode           = "EXECUTION_ACCOUNT_NOT_ACTIVE"
-	accountNotManagedCode          = "EXECUTION_ACCOUNT_NOT_MANAGED"
+	clobFillDetailsUnavailableCode   = "CLOB_FILL_DETAILS_UNAVAILABLE"
+	kalshiOrderVisibilityPendingCode = "KALSHI_ORDER_VISIBILITY_PENDING"
+	venueFillEvidencePendingCode     = "VENUE_FILL_EVIDENCE_PENDING"
+	accountNotActiveCode             = "EXECUTION_ACCOUNT_NOT_ACTIVE"
+	accountNotManagedCode            = "EXECUTION_ACCOUNT_NOT_MANAGED"
 )
 
 // Params 表示后端使用的 Params 类型。
@@ -164,7 +165,7 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 		return SubmitResult{}, err
 	}
 	if existing, err := service.repository.GetByClientOrderID(ctx, intent.ClientOrderID); err == nil {
-		if !existing.Intent.Equivalent(intent) {
+		if !executionIntentReplayEquivalent(existing.Intent, intent) {
 			return SubmitResult{}, ErrIdempotencyConflict
 		}
 		return SubmitResult{Order: existing, Created: false}, nil
@@ -185,7 +186,7 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 		return SubmitResult{}, fmt.Errorf("claim order intent: %w", err)
 	}
 	if !created {
-		if !stored.Intent.Equivalent(intent) {
+		if !executionIntentReplayEquivalent(stored.Intent, intent) {
 			return SubmitResult{}, ErrIdempotencyConflict
 		}
 		return SubmitResult{Order: stored, Created: false}, nil
@@ -366,6 +367,33 @@ func entrySubmissionDisabledError() *port.Rejection {
 	}
 }
 
+// executionIntentReplayEquivalent preserves an order that was already claimed
+// with Kalshi FOK before the IOC rollout. A retry with the same client order id
+// must return that exact historical order instead of either changing its venue
+// semantics or failing idempotency forever. The compatibility is deliberately
+// directional and limited to the two rollout metadata markers; every other
+// field still uses the strict domain equivalence contract.
+func executionIntentReplayEquivalent(stored, proposed domain.OrderIntent) bool {
+	if stored.Equivalent(proposed) {
+		return true
+	}
+	stored = stored.Normalize()
+	proposed = proposed.Normalize()
+	if stored.MarketSource.Normalize() != domain.MarketSourceKalshi ||
+		proposed.MarketSource.Normalize() != domain.MarketSourceKalshi ||
+		stored.Venue != "kalshi" || proposed.Venue != "kalshi" ||
+		stored.Type != domain.OrderTypeLimit || proposed.Type != domain.OrderTypeLimit ||
+		stored.TimeInForce != domain.TimeInForceFOK || proposed.TimeInForce != domain.TimeInForceIOC ||
+		proposed.Metadata["strategy_time_in_force"] != string(domain.TimeInForceFOK) ||
+		proposed.Metadata["execution_time_in_force"] != string(domain.TimeInForceIOC) {
+		return false
+	}
+	proposed.TimeInForce = domain.TimeInForceFOK
+	delete(proposed.Metadata, "strategy_time_in_force")
+	delete(proposed.Metadata, "execution_time_in_force")
+	return stored.Equivalent(proposed)
+}
+
 func normalizeEntryDisabledAccounts(accounts []string) (map[string]struct{}, error) {
 	result := make(map[string]struct{}, len(accounts))
 	for index, rawAccountID := range accounts {
@@ -536,9 +564,10 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 	if getErr != nil {
 		code := errorCode(getErr, "RECONCILE_FAILED")
 		fillEvidencePending := strings.EqualFold(strings.TrimSpace(code), clobFillDetailsUnavailableCode)
+		retryableReadFailure := nonBudgetedReconcileError(getErr, code)
 		target := domain.OrderStatusUnknown
 		outcome := domain.AttemptOutcomeUnknown
-		if !fillEvidencePending && service.reconcileAttemptCount(ctx, order.ID) >= service.maxReconcileAttempts {
+		if !retryableReadFailure && service.reconcileAttemptCount(ctx, order.ID) >= service.maxReconcileAttempts {
 			target = domain.OrderStatusManualReview
 			outcome = domain.AttemptOutcomeFailed
 		}
@@ -717,14 +746,85 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 	if order.Status != domain.OrderStatusCancelled {
 		return order, fmt.Errorf("order status %s is not awaiting cancel finality", order.Status)
 	}
-	if order.VenueLastObservedAt == nil || service.now().UTC().Sub(order.VenueLastObservedAt.UTC()) < service.cancelFillFinalityGrace {
-		return order, ErrCancelFinalityPending
+	if !service.authoritativeFills {
+		if order.VenueLastObservedAt == nil || service.now().UTC().Sub(order.VenueLastObservedAt.UTC()) < service.cancelFillFinalityGrace {
+			deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_GRACE_PENDING", "cancellation fill-finality grace period has not elapsed")
+			return order, errors.Join(ErrCancelFinalityPending, deferErr)
+		}
+		if _, err := service.reservations.Reconcile(ctx, order); err != nil {
+			uncertainErr := service.reservations.MarkUncertain(ctx, order, "CANCEL_FINALITY_RECONCILIATION_FAILED: "+err.Error())
+			deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_RECONCILIATION_FAILED", err.Error())
+			return order, errors.Join(fmt.Errorf("finalize cancelled reservation: %w", err), uncertainErr, deferErr)
+		}
+		return order, nil
+	}
+
+	// IOC cancellation is a normal terminal result and may race the venue's fill
+	// feed. Before releasing any remainder, re-read the official terminal order,
+	// synchronize every authoritative fill, and require both cumulative views to
+	// agree exactly. Any uncertainty keeps the reservation frozen for a later
+	// coordinator pass.
+	observed, err := service.venue.Get(ctx, order)
+	if err != nil {
+		uncertainErr := service.reservations.MarkUncertain(ctx, order, "CANCEL_FINALITY_ORDER_READ_FAILED: "+err.Error())
+		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_ORDER_READ_FAILED", err.Error())
+		return order, errors.Join(fmt.Errorf("read cancelled venue order before finality: %w", err), uncertainErr, deferErr)
+	}
+	if err := validateVenueOrder(observed, order.Intent.Size); err != nil {
+		uncertainErr := service.reservations.MarkUncertain(ctx, order, "CANCEL_FINALITY_INVALID_ORDER_EVIDENCE: "+err.Error())
+		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_INVALID_ORDER_EVIDENCE", err.Error())
+		return order, errors.Join(fmt.Errorf("validate cancelled venue order before finality: %w", err), uncertainErr, deferErr)
+	}
+	if observed.State != port.VenueOrderCancelled && observed.State != port.VenueOrderFilled {
+		_ = service.reservations.MarkUncertain(ctx, order, "CANCEL_FINALITY_VENUE_NOT_TERMINAL")
+		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_VENUE_NOT_TERMINAL", "venue order has not reached a terminal state")
+		return order, errors.Join(ErrCancelFinalityPending, deferErr)
+	}
+	pending, syncErr := service.syncObservedFills(ctx, &order, observed)
+	if syncErr != nil {
+		uncertainErr := service.reservations.MarkUncertain(ctx, order, "CANCEL_FINALITY_FILL_SYNC_FAILED: "+syncErr.Error())
+		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_FILL_SYNC_FAILED", syncErr.Error())
+		return order, errors.Join(fmt.Errorf("sync cancelled venue order fills: %w", syncErr), uncertainErr, deferErr)
+	}
+	if pending {
+		_ = service.reservations.MarkUncertain(ctx, order, venueFillEvidencePendingCode)
+		deferErr := service.deferCancellationFinality(ctx, &order, venueFillEvidencePendingCode, "authoritative fill details are not visible yet")
+		return order, errors.Join(ErrCancelFinalityPending, deferErr)
+	}
+	venueFilled := observed.FilledSize
+	if venueFilled.IsEmpty() {
+		venueFilled = "0"
+	}
+	localFilled := order.FilledSize
+	if localFilled.IsEmpty() {
+		localFilled = "0"
+	}
+	if comparison, compareErr := venueFilled.Compare(localFilled); compareErr != nil || comparison != 0 {
+		_ = service.reservations.MarkUncertain(ctx, order, "CANCEL_FINALITY_FILL_TOTAL_MISMATCH")
+		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_FILL_TOTAL_MISMATCH", "venue and local cumulative fill totals do not match")
+		return order, errors.Join(ErrCancelFinalityPending, deferErr)
+	}
+	if order.Status == domain.OrderStatusFilled {
+		return order, nil
+	}
+	if order.Status != domain.OrderStatusCancelled || observed.ObservedAt.IsZero() ||
+		service.now().UTC().Sub(observed.ObservedAt.UTC()) < service.cancelFillFinalityGrace {
+		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_GRACE_PENDING", "authoritative venue observation is still inside the fill-finality grace period")
+		return order, errors.Join(ErrCancelFinalityPending, deferErr)
 	}
 	if _, err := service.reservations.Reconcile(ctx, order); err != nil {
 		uncertainErr := service.reservations.MarkUncertain(ctx, order, "CANCEL_FINALITY_RECONCILIATION_FAILED: "+err.Error())
-		return order, errors.Join(fmt.Errorf("finalize cancelled reservation: %w", err), uncertainErr)
+		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_RECONCILIATION_FAILED", err.Error())
+		return order, errors.Join(fmt.Errorf("finalize cancelled reservation: %w", err), uncertainErr, deferErr)
 	}
 	return order, nil
+}
+
+func (service *Service) deferCancellationFinality(ctx context.Context, order *domain.Order, code, reason string) error {
+	return service.transition(ctx, order, domain.OrderStatusCancelled, domain.TransitionTriggerReconciliation, transitionDetails{
+		reasonCode: strings.TrimSpace(code),
+		reason:     strings.TrimSpace(reason),
+	})
 }
 
 func (service *Service) requireActiveAccount(executionAccountID string) error {
@@ -1117,12 +1217,36 @@ func (service *Service) reconcileAttemptCount(ctx context.Context, orderID strin
 	}
 	count := 0
 	for _, attempt := range attempts {
-		if attempt.Kind == domain.OrderAttemptReconcile &&
-			!strings.EqualFold(strings.TrimSpace(attempt.ErrorCode), clobFillDetailsUnavailableCode) {
+		if attempt.Kind == domain.OrderAttemptReconcile && !nonBudgetedReconcileCode(attempt.ErrorCode) {
 			count++
 		}
 	}
 	return count
+}
+
+func nonBudgetedReconcileError(err error, code string) bool {
+	if nonBudgetedReconcileCode(code) {
+		return true
+	}
+	var venueError *port.VenueError
+	return errors.As(err, &venueError) && venueError.Kind == port.VenueErrorUnavailable
+}
+
+func nonBudgetedReconcileCode(code string) bool {
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case clobFillDetailsUnavailableCode,
+		kalshiOrderVisibilityPendingCode,
+		"KALSHI_RATE_LIMITED",
+		"KALSHI_SERVER_ERROR",
+		"KALSHI_TRANSPORT_FAILED",
+		"KALSHI_RESPONSE_READ_FAILED",
+		"KALSHI_INVALID_RESPONSE",
+		"KALSHI_INVALID_ORDER_RESPONSE",
+		"KALSHI_RESPONSE_TOO_LARGE":
+		return true
+	default:
+		return false
+	}
 }
 
 // statusForVenue 将外部或订单状态映射为目标领域状态。

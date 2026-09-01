@@ -97,10 +97,24 @@ Data API `/positions` 使用 `sizeThreshold=0&includeArchived=true` 分页读取
 事务中更新订单审计、释放预留并关闭该订单的问题。远端证据还必须和本地 intent 的 canonical
 `outcome_side/book_side`、LIMIT 类型、YES-book 价格及 subaccount 完全一致。已弃用的
 `action/side` 不作为身份依据；当前 GET Orders 不一定
-返回 `time_in_force`，因此远端仅在该字段存在时核对 FOK，但本地 intent 始终强制为 LIMIT/FOK。
+返回 `time_in_force`，因此远端仅在该字段存在时核对 FOK。该手工工具只处理上线 IOC 之前已冻结的
+LIMIT/FOK 订单；新的 Kalshi IOC 订单由常规 order coordinator、官方 order/fills 查询和 finality grace 自动收敛，
+不进入这个 legacy no-fill repair。
 `self_trade_prevention_type` 与 `cancel_order_on_pause` 可能不回显，只保留为观测字段，不参与
 terminal cancelled + zero-fill 的身份判断或幂等指纹。
 工具禁止广扫，也不会从远端余额推断订单结果。
+
+Kalshi 启动时读到的 `balance` 是交易所当前可用现金，不是可以无条件覆盖本地累计账的总账基线。
+只要该账户存在 `ACTIVE/RECONCILIATION_REQUIRED` reservation 或非零本地预留，启动就保留本地
+`total/available/reserved` 不变，先由 order/fills 恢复链路应用真实成交，避免“外部余额已经反映成交，本地 fill 又记一次”。
+只有本地没有未决交易资产时才更新外部现金基线。
+
+若已存在的 Kalshi 账户在启动时遇到短暂远端 preflight 失败，进程保留 maintenance-only route：
+禁止新的策略 intent，但该账户仍在 coordinator 扫描范围内，历史订单可继续 `Refresh/FinalizeCancellation`。
+尚未发到交易所的历史订单不会在 maintenance-only 状态下自动提交；每次延后都会写入 `MAINTENANCE`
+审计事件并刷新重试时间。取消终局所需的 order/fills 证据暂不可用时也会持久化退避，避免坏订单长期占满恢复批次。
+如果本地凭据/配置错误导致连 maintenance route 都无法构建，且账户仍有未决 reservation，服务启动失败关闭，
+不会带着失管订单假健康上线。
 
 ## 异常处理覆盖
 

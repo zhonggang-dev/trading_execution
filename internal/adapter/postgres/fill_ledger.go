@@ -188,7 +188,8 @@ func (ledger *FillLedger) recordOnce(ctx context.Context, expected domain.Order,
 		target = domain.OrderStatusFilled
 	} else if order.Status == domain.OrderStatusManualReview {
 		target = domain.OrderStatusManualReview
-	} else if order.Status == domain.OrderStatusCancelled || order.Intent.TimeInForce == domain.TimeInForceFAK {
+	} else if order.Status == domain.OrderStatusCancelled || order.Intent.TimeInForce == domain.TimeInForceFAK ||
+		order.Intent.TimeInForce == domain.TimeInForceIOC {
 		target = domain.OrderStatusCancelled
 	}
 

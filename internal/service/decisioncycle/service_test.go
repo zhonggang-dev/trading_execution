@@ -330,6 +330,10 @@ type fixedResultExecutor struct {
 	err    error
 }
 
+type fixedSubmissionPolicy bool
+
+func (policy fixedSubmissionPolicy) Enabled(domain.OrderIntent) bool { return bool(policy) }
+
 func (executor fixedResultExecutor) Submit(context.Context, domain.OrderIntent) (port.OrderSubmitResult, error) {
 	return executor.result, executor.err
 }
@@ -1994,6 +1998,30 @@ func TestDeliverPendingLeavesMissingOrderOwnershipLeasedAndUnhealthy(t *testing.
 	}
 }
 
+func TestRecoverStartupDefersFrozenDeliveryWhileVenueRouteIsMaintenanceOnly(t *testing.T) {
+	intent := domain.OrderIntent{
+		ClientOrderID: "client-maintenance", ExecutionAccountID: "account-active",
+		Venue: "kalshi", MarketSource: domain.MarketSourceKalshi,
+	}
+	recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{{
+		CycleID: "old-cycle", ClientOrderID: intent.ClientOrderID,
+		Intent: intent, Status: domain.DecisionIntentSubmitting, Attempt: 1,
+	}}}
+	executor := &fakeExecutor{}
+	service := &Service{
+		recorder: recorder, executor: executor, submissionPolicy: fixedSubmissionPolicy(false), submitEnabled: true,
+		activeExecutionAccountIDs:       []string{"account-active"},
+		entryEnabledExecutionAccountIDs: []string{"account-active"},
+		now:                             func() time.Time { return time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC) },
+	}
+	if err := service.RecoverStartup(context.Background()); err != nil {
+		t.Fatalf("RecoverStartup() maintenance deferral error = %v", err)
+	}
+	if len(executor.intents) != 0 || recorder.deliveries[0].Status != domain.DecisionIntentSubmitting {
+		t.Fatalf("maintenance recovery submitted or completed frozen delivery: executor=%#v delivery=%#v", executor.intents, recorder.deliveries[0])
+	}
+}
+
 func TestRecoverStartupDrainsMoreThanOneClaimBatchBeforeNewSchedule(t *testing.T) {
 	deliveries := make([]domain.DecisionIntentDelivery, 201)
 	for index := range deliveries {
@@ -2218,6 +2246,45 @@ func TestValidateResponseBuildsLotAddressedFOKExit(t *testing.T) {
 	if len(intents) != 1 || intents[0].Side != domain.SideSell || intents[0].TargetLotID != "lot-1" ||
 		intents[0].ExpectedNegRisk == nil || !*intents[0].ExpectedNegRisk || intents[0].TimeInForce != domain.TimeInForceFOK {
 		t.Fatalf("exit intents = %#v", intents)
+	}
+}
+
+func TestValidateResponseBuildsKalshiIOCExit(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 1, 4, 20, 0, 0, time.UTC)
+	request := domain.StrategyDecisionRequest{
+		SchemaVersion: domain.StrategyInputSchemaVersion, CycleID: "cycle-kalshi-exit", InputID: "input-kalshi-exit",
+		Context: testBinding(), DecisionAt: decisionAt,
+		Positions: []domain.StrategyPositionLot{{
+			LotID: "lot-kalshi", MarketSource: domain.MarketSourceKalshi, MarketID: "KXTEST",
+			ConditionID: "kalshi:KXTEST", OutcomeIndex: 0, OutcomeName: "Yes",
+			TokenID: "kalshi:KXTEST:YES", EnteredAt: decisionAt.Add(-49 * time.Hour), Shares: "12", EntryPrice: "0.40",
+		}},
+		OrderBooks: []domain.OrderBookSnapshot{{
+			MarketSource: domain.MarketSourceKalshi, MarketID: "KXTEST", ConditionID: "kalshi:KXTEST",
+			OutcomeIndex: 0, OutcomeID: "YES", TokenID: "kalshi:KXTEST:YES", Status: domain.OrderBookStatusOK,
+			SourceAt: decisionAt, ObservedAt: decisionAt, DepthLimit: domain.StrategyOrderBookDepth,
+			TickSize: "0.01", MinOrderSize: "1", Bids: []domain.PriceLevel{{Price: "0.49", Size: "5"}},
+			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
+		}},
+		ExecutionConstraints: domain.DefaultStrategyExecutionConstraints(),
+	}
+	response := domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion, CycleID: request.CycleID, InputID: request.InputID,
+		Context: request.Context, DecidedAt: decisionAt.Add(time.Second), Evaluations: []domain.StrategyEvaluation{},
+		Exits: []domain.StrategyExit{{
+			DecisionID: "exit-kalshi", LotID: "lot-kalshi", TokenID: "kalshi:KXTEST:YES", ReasonCode: domain.StrategyReasonHold48H,
+			Order: &domain.StrategyOrderParams{
+				Side: domain.SideSell, Type: domain.OrderTypeLimit, WorstPrice: "0.49", Size: "12", TimeInForce: domain.TimeInForceFOK,
+			},
+		}},
+	}
+	intents, err := validateResponse(request, response, "polymarket")
+	if err != nil {
+		t.Fatalf("validateResponse() error = %v", err)
+	}
+	if len(intents) != 1 || intents[0].Venue != "kalshi" || intents[0].TimeInForce != domain.TimeInForceIOC ||
+		intents[0].Metadata["strategy_time_in_force"] != "FOK" || intents[0].Metadata["execution_time_in_force"] != "IOC" {
+		t.Fatalf("Kalshi exit intent = %#v", intents)
 	}
 }
 

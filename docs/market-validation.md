@@ -37,12 +37,13 @@ Python Strategy / SUBMIT
 - LIMIT 的实际 `price` 使用 `worst_price`，避免订单在校验与发送之间失去价格保护；
 - MARKET 订单也必须带 `worst_price`，供后续真实 Venue adapter 做保护型 FOK/FAK 转换。
 
-Kalshi 使用 `DEPTH_AWARE_LIMIT`：策略快照的最优价作为 `strategy_reference_price`，
-`worst_price` 必须处于可成交方向并由冻结盘口在该保护价内的累计深度覆盖完整 FOK shares。Kalshi
-盘口可能跳过中间 tick，因此不额外套用固定两 tick 距离上限。实际提交前 Go 会重新读取不超过
-10 秒的官方盘口，允许价格向有利方向移动，也允许仍在 `worst_price` 内的不利移动；同时再次要求
-保护价范围内的累计可见深度覆盖完整 FOK shares。最新最优价越过保护线、深度不足、价格不在 tick
-上或参考价缺失时均 fail closed，Go 不会自行扩大策略给出的限价。
+Kalshi 使用 `DEPTH_AWARE_LIMIT + IOC`：策略快照的最优价作为
+`strategy_reference_price`，`worst_price` 必须处于可成交方向，且冻结盘口在该保护价内至少有正数可见深度。
+Kalshi 盘口可能跳过中间 tick，因此不额外套用固定两 tick 距离上限。实际提交前 Go 会重新读取不超过
+10 秒的官方盘口，允许价格向有利方向移动，也允许仍在 `worst_price` 内的不利移动。对新的 IOC intent，保护价内有正数深度
+即可提交；当时能成交多少就成交多少，剩余由 venue 取消。对恢复中的历史 FOK intent，仍要求可见深度覆盖全部 shares。
+最新最优价越过保护线、保护价内零深度、价格不在 tick 上或参考价缺失时均 fail closed，
+Go 不会自行扩大策略给出的限价。
 
 ## OrderIntent 的市场上下文
 

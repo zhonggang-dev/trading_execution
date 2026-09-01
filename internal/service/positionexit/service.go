@@ -745,29 +745,47 @@ func buildSellIntent(params buildSellIntentParams) (domain.OrderIntent, error) {
 		}
 	}
 	outcomeIndex := trade.OutcomeIndex
+	outcomeID := ""
+	if strings.EqualFold(strings.TrimSpace(params.venue), "kalshi") {
+		prefix := strings.TrimSpace(trade.ConditionID) + ":"
+		if !strings.HasPrefix(strings.TrimSpace(trade.TokenID), prefix) {
+			return domain.OrderIntent{}, fmt.Errorf("Kalshi position token does not match its condition")
+		}
+		outcomeID = strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(trade.TokenID), prefix)))
+		if outcomeID != "YES" && outcomeID != "NO" {
+			return domain.OrderIntent{}, fmt.Errorf("Kalshi position token has an invalid outcome")
+		}
+	}
 	negRisk := trade.NegRisk
 	snapshotAt := book.SourceAt.UTC()
 	signalAt := params.signalAt.UTC()
+	executionTimeInForce := domain.TimeInForceFOK
+	metadata := map[string]string{
+		"position_exit_cycle_id":    request.CycleID,
+		"position_exit_input_id":    request.InputID,
+		"position_exit_decision_id": evaluation.DecisionID,
+		"position_exit_reason_code": string(evaluation.ReasonCode),
+		"strategy_reference_price":  order.WorstPrice.String(),
+		"target_lot_id":             trade.LotID,
+		"opening_venue_trade_id":    trade.VenueTradeID,
+	}
+	if strings.EqualFold(strings.TrimSpace(params.venue), "kalshi") {
+		executionTimeInForce = domain.TimeInForceIOC
+		metadata["strategy_time_in_force"] = string(order.TimeInForce)
+		metadata["execution_time_in_force"] = string(executionTimeInForce)
+	}
 	intent, err := (domain.OrderIntentParams{
 		ModelID: request.Context.ModelID, StrategyID: request.Context.StrategyID,
 		ExecutionAccountID: request.Context.ExecutionAccountID,
 		SignalID:           evaluation.DecisionID, ClientOrderID: clientOrderID(request.CycleID, evaluation.LotID, evaluation.DecisionID),
 		Venue: params.venue, MarketID: trade.MarketID, ConditionID: trade.ConditionID,
-		OutcomeIndex: &outcomeIndex, OutcomeName: trade.OutcomeName, TokenID: trade.TokenID,
+		OutcomeIndex: &outcomeIndex, OutcomeName: trade.OutcomeName, OutcomeID: outcomeID, TokenID: trade.TokenID,
 		TargetLotID: trade.LotID, ExpectedNegRisk: &negRisk,
 		MarketSnapshotAt: &snapshotAt, SignalAt: &signalAt,
 		Side: domain.SideSell, Type: domain.OrderTypeLimit,
 		Price: order.WorstPrice, WorstPrice: order.WorstPrice, Size: order.Size,
-		TimeInForce: domain.TimeInForceFOK,
-		Metadata: map[string]string{
-			"position_exit_cycle_id":    request.CycleID,
-			"position_exit_input_id":    request.InputID,
-			"position_exit_decision_id": evaluation.DecisionID,
-			"position_exit_reason_code": string(evaluation.ReasonCode),
-			"strategy_reference_price":  order.WorstPrice.String(),
-			"target_lot_id":             trade.LotID,
-			"opening_venue_trade_id":    trade.VenueTradeID,
-		},
+		TimeInForce: executionTimeInForce,
+		Metadata:    metadata,
 	}).Build()
 	return intent, err
 }

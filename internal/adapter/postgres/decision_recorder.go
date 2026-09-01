@@ -268,11 +268,37 @@ func verifyStoredDecisionIntents(ctx context.Context, tx *sql.Tx, cycleID string
 	for index := range actual {
 		var actualIntent, expectedIntent domain.OrderIntent
 		if json.Unmarshal(actual[index], &actualIntent) != nil || json.Unmarshal(expected[index], &expectedIntent) != nil ||
-			!actualIntent.Equivalent(expectedIntent) {
+			!decisionIntentReplayEquivalent(actualIntent, expectedIntent) {
 			return port.ErrDecisionConflict
 		}
 	}
 	return nil
+}
+
+// decisionIntentReplayEquivalent grandfathers only already-frozen Kalshi FOK
+// deliveries across the IOC rollout. Historical PENDING/SUBMITTING payloads
+// retain their original execution semantics; new cycles persist IOC. Keeping
+// this compatibility directional avoids weakening OrderIntent.Equivalent or
+// mutating an intent that may already have reached the venue.
+func decisionIntentReplayEquivalent(stored, proposed domain.OrderIntent) bool {
+	if stored.Equivalent(proposed) {
+		return true
+	}
+	stored = stored.Normalize()
+	proposed = proposed.Normalize()
+	if stored.MarketSource.Normalize() != domain.MarketSourceKalshi ||
+		proposed.MarketSource.Normalize() != domain.MarketSourceKalshi ||
+		stored.Venue != "kalshi" || proposed.Venue != "kalshi" ||
+		stored.Type != domain.OrderTypeLimit || proposed.Type != domain.OrderTypeLimit ||
+		stored.TimeInForce != domain.TimeInForceFOK || proposed.TimeInForce != domain.TimeInForceIOC ||
+		proposed.Metadata["strategy_time_in_force"] != string(domain.TimeInForceFOK) ||
+		proposed.Metadata["execution_time_in_force"] != string(domain.TimeInForceIOC) {
+		return false
+	}
+	proposed.TimeInForce = domain.TimeInForceFOK
+	delete(proposed.Metadata, "strategy_time_in_force")
+	delete(proposed.Metadata, "execution_time_in_force")
+	return stored.Equivalent(proposed)
 }
 
 // CountUnresolvedIntentsForAccounts prevents startup or cadence recovery from

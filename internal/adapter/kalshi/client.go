@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
 const maxAuthenticatedResponseBytes = 8 << 20
@@ -97,6 +99,13 @@ type SubmittedOrder struct {
 	TimestampMS      int64          `json:"ts_ms"`
 	AverageFillPrice domain.Decimal `json:"average_fill_price,omitempty"`
 	AverageFeePaid   domain.Decimal `json:"average_fee_paid,omitempty"`
+}
+
+type CancelledOrder struct {
+	OrderID       string         `json:"order_id"`
+	ClientOrderID string         `json:"client_order_id,omitempty"`
+	ReducedBy     domain.Decimal `json:"reduced_by"`
+	TimestampMS   int64          `json:"ts_ms"`
 }
 
 type Order struct {
@@ -189,13 +198,25 @@ func (balance Balance) AvailableDollars() domain.Decimal {
 
 func (client *Client) GetOrder(ctx context.Context, orderID string) (Order, error) {
 	var envelope struct {
-		Order Order `json:"order"`
+		Order json.RawMessage `json:"order"`
 	}
 	requestPath := "/trade-api/v2/portfolio/orders/" + url.PathEscape(strings.TrimSpace(orderID))
 	if err := client.doAuthenticated(ctx, http.MethodGet, requestPath, nil, &envelope); err != nil {
+		var venueError *port.VenueError
+		if errors.As(err, &venueError) && venueError.Code == "KALSHI_ORDER_NOT_FOUND" {
+			return Order{}, kalshiUnavailableError(
+				"KALSHI_ORDER_VISIBILITY_PENDING",
+				"Kalshi order is not yet visible by order_id",
+				err,
+			)
+		}
 		return Order{}, err
 	}
-	return envelope.Order, nil
+	order, err := decodeDetailedOrder(envelope.Order)
+	if err != nil {
+		return Order{}, kalshiUnavailableError("KALSHI_INVALID_ORDER_RESPONSE", "Kalshi order response is incomplete", err)
+	}
+	return order, nil
 }
 
 func (client *Client) FindOrderByClientOrderID(ctx context.Context, clientOrderID string) (Order, error) {
@@ -219,7 +240,11 @@ func (client *Client) FindOrderByClientOrderID(ctx context.Context, clientOrderI
 		}
 		next := strings.TrimSpace(envelope.Cursor)
 		if next == "" {
-			return Order{}, fmt.Errorf("Kalshi order for client_order_id was not found")
+			return Order{}, kalshiUnavailableError(
+				"KALSHI_ORDER_VISIBILITY_PENDING",
+				"Kalshi order is not yet visible by client_order_id",
+				fmt.Errorf("Kalshi order for client_order_id was not found"),
+			)
 		}
 		if next == cursor {
 			return Order{}, fmt.Errorf("Kalshi orders cursor did not advance")
@@ -229,18 +254,105 @@ func (client *Client) FindOrderByClientOrderID(ctx context.Context, clientOrderI
 	return Order{}, fmt.Errorf("Kalshi order lookup exceeded pagination limit")
 }
 
-func (client *Client) CancelOrder(ctx context.Context, orderID string) (Order, error) {
+func (client *Client) CancelOrder(ctx context.Context, orderID, marketTicker string, subaccount int) (Order, error) {
 	if !client.liveTradingEnabled {
 		return Order{}, fmt.Errorf("Kalshi live trading is disabled")
 	}
-	var envelope struct {
-		Order Order `json:"order"`
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return Order{}, kalshiInvalidError("KALSHI_ORDER_ID_REQUIRED", "Kalshi order id is required", nil)
 	}
-	requestPath := "/trade-api/v2/portfolio/events/orders/" + url.PathEscape(strings.TrimSpace(orderID))
-	if err := client.doAuthenticated(ctx, http.MethodDelete, requestPath, nil, &envelope); err != nil {
+	var payload json.RawMessage
+	marketTicker = strings.TrimSpace(marketTicker)
+	if marketTicker == "" || subaccount < 0 {
+		return Order{}, kalshiInvalidError("KALSHI_CANCEL_ROUTE_REQUIRED", "Kalshi cancel market ticker and subaccount are required", nil)
+	}
+	query := url.Values{
+		"market_ticker": []string{marketTicker},
+		"subaccount":    []string{fmt.Sprintf("%d", subaccount)},
+	}
+	requestPath := "/trade-api/v2/portfolio/events/orders/" + url.PathEscape(orderID) + "?" + query.Encode()
+	if err := client.doAuthenticated(ctx, http.MethodDelete, requestPath, nil, &payload); err != nil {
 		return Order{}, err
 	}
-	return envelope.Order, nil
+	acknowledgement, err := decodeCancelledOrder(payload)
+	if err != nil {
+		return Order{}, kalshiAmbiguousOrderError("KALSHI_INVALID_CANCEL_RESPONSE", orderID, err)
+	}
+	if acknowledgement.OrderID != orderID {
+		return Order{}, kalshiAmbiguousOrderError(
+			"KALSHI_INVALID_CANCEL_RESPONSE", orderID,
+			fmt.Errorf("Kalshi cancel acknowledgement order_id does not match the requested order"),
+		)
+	}
+	if sign, parseErr := acknowledgement.ReducedBy.Sign(); parseErr != nil || sign < 0 || acknowledgement.TimestampMS <= 0 {
+		return Order{}, kalshiAmbiguousOrderError(
+			"KALSHI_INVALID_CANCEL_RESPONSE", orderID,
+			fmt.Errorf("Kalshi cancel acknowledgement reduced_by or ts_ms is invalid"),
+		)
+	}
+
+	// Cancel Order V2 returns only a cancellation acknowledgement, not the
+	// canonical order. Re-read the order before exposing a result so callers do
+	// not mistake a zero-value nested `order` for authoritative terminal state.
+	remote, err := client.GetOrder(ctx, acknowledgement.OrderID)
+	if err != nil {
+		return Order{}, kalshiAmbiguousOrderError("KALSHI_CANCEL_CONFIRMATION_PENDING", orderID, err)
+	}
+	if remote.LastUpdateTime.IsZero() {
+		remote.LastUpdateTime = time.UnixMilli(acknowledgement.TimestampMS).UTC()
+	}
+	if acknowledgement.ClientOrderID != "" && acknowledgement.ClientOrderID != remote.ClientOrderID {
+		return Order{}, kalshiAmbiguousOrderError(
+			"KALSHI_CANCEL_CONFIRMATION_PENDING", orderID,
+			fmt.Errorf("Kalshi cancel acknowledgement client_order_id does not match the canonical order"),
+		)
+	}
+	if comparison, compareErr := acknowledgement.ReducedBy.Compare(remote.InitialCount); compareErr != nil || comparison > 0 {
+		return Order{}, kalshiAmbiguousOrderError(
+			"KALSHI_CANCEL_CONFIRMATION_PENDING", orderID,
+			fmt.Errorf("Kalshi cancel acknowledgement reduced_by exceeds the canonical initial count"),
+		)
+	}
+	filled, _ := remote.FillCount.Multiply("1")
+	reduced, _ := acknowledgement.ReducedBy.Multiply("1")
+	initial, _ := remote.InitialCount.Multiply("1")
+	if new(big.Rat).Add(filled, reduced).Cmp(initial) > 0 {
+		return Order{}, kalshiAmbiguousOrderError(
+			"KALSHI_CANCEL_CONFIRMATION_PENDING", orderID,
+			fmt.Errorf("Kalshi cancel acknowledgement fill_count plus reduced_by exceeds the canonical initial count"),
+		)
+	}
+	switch strings.ToLower(strings.TrimSpace(remote.Status)) {
+	case "canceled", "cancelled", "executed":
+		return remote, nil
+	default:
+		return Order{}, kalshiAmbiguousOrderError(
+			"KALSHI_CANCEL_CONFIRMATION_PENDING", orderID,
+			fmt.Errorf("Kalshi canonical order has not reached a terminal status after cancellation"),
+		)
+	}
+}
+
+func decodeCancelledOrder(payload json.RawMessage) (CancelledOrder, error) {
+	if len(payload) == 0 || string(payload) == "null" {
+		return CancelledOrder{}, fmt.Errorf("Kalshi cancel acknowledgement is missing")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return CancelledOrder{}, fmt.Errorf("decode Kalshi cancel acknowledgement fields: %w", err)
+	}
+	for _, name := range []string{"order_id", "reduced_by", "ts_ms"} {
+		value, found := fields[name]
+		if !found || len(value) == 0 || string(value) == "null" {
+			return CancelledOrder{}, fmt.Errorf("Kalshi cancel acknowledgement omitted %s", name)
+		}
+	}
+	var acknowledgement CancelledOrder
+	if err := json.Unmarshal(payload, &acknowledgement); err != nil {
+		return CancelledOrder{}, fmt.Errorf("decode Kalshi cancel acknowledgement: %w", err)
+	}
+	return acknowledgement, nil
 }
 
 func (client *Client) ListFills(ctx context.Context, orderID string) ([]Fill, error) {
@@ -422,8 +534,14 @@ func (client *Client) PrepareOrder(intent domain.OrderIntent) (PreparedOrder, er
 	}
 	switch intent.TimeInForce {
 	case domain.TimeInForceFOK:
+		if intent.ExpiresAt != nil {
+			return PreparedOrder{}, fmt.Errorf("Kalshi FOK order must not contain expires_at")
+		}
 		request.TimeInForce = "fill_or_kill"
 	case domain.TimeInForceIOC:
+		if intent.ExpiresAt != nil {
+			return PreparedOrder{}, fmt.Errorf("Kalshi IOC order must not contain expires_at")
+		}
 		request.TimeInForce = "immediate_or_cancel"
 	case domain.TimeInForceGTC:
 		request.TimeInForce = "good_till_canceled"
@@ -454,17 +572,165 @@ func (client *Client) SubmitPrepared(ctx context.Context, order PreparedOrder) (
 	if len(order.body) == 0 || strings.TrimSpace(order.Request.ClientOrderID) == "" || order.Fingerprint() == "" {
 		return SubmittedOrder{}, kalshiInvalidError("KALSHI_PREPARED_ORDER_INVALID", "Kalshi prepared order is invalid", nil)
 	}
-	var response SubmittedOrder
-	if err := client.doAuthenticated(ctx, http.MethodPost, "/trade-api/v2/portfolio/events/orders", order.body, &response); err != nil {
-		return SubmittedOrder{}, err
+	var payload json.RawMessage
+	if err := client.doAuthenticated(ctx, http.MethodPost, "/trade-api/v2/portfolio/events/orders", order.body, &payload); err != nil {
+		return SubmittedOrder{}, classifyPreparedSubmitError(order, err)
 	}
-	if response.OrderID == "" || response.ClientOrderID != order.Request.ClientOrderID {
+	response, err := decodeSubmittedOrder(payload)
+	if err != nil {
+		return SubmittedOrder{}, kalshiAmbiguousError("KALSHI_INVALID_POST_RESPONSE", err)
+	}
+	if response.OrderID == "" || response.ClientOrderID != "" && response.ClientOrderID != order.Request.ClientOrderID {
 		return SubmittedOrder{}, kalshiAmbiguousError(
 			"KALSHI_INVALID_POST_RESPONSE",
 			fmt.Errorf("Kalshi order acknowledgement identity is invalid"),
 		)
 	}
+	if err := validateSubmittedOrderCounts(response, order.Request); err != nil {
+		return SubmittedOrder{}, kalshiAmbiguousError("KALSHI_INVALID_POST_RESPONSE", err)
+	}
 	return response, nil
+}
+
+func decodeSubmittedOrder(payload json.RawMessage) (SubmittedOrder, error) {
+	if len(payload) == 0 || string(payload) == "null" {
+		return SubmittedOrder{}, fmt.Errorf("Kalshi order acknowledgement is missing")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return SubmittedOrder{}, fmt.Errorf("decode Kalshi order acknowledgement fields: %w", err)
+	}
+	for _, name := range []string{"order_id", "fill_count", "remaining_count", "ts_ms"} {
+		value, found := fields[name]
+		if !found || len(value) == 0 || string(value) == "null" {
+			return SubmittedOrder{}, fmt.Errorf("Kalshi order acknowledgement omitted %s", name)
+		}
+	}
+	var order SubmittedOrder
+	if err := json.Unmarshal(payload, &order); err != nil {
+		return SubmittedOrder{}, fmt.Errorf("decode Kalshi order acknowledgement: %w", err)
+	}
+	return order, nil
+}
+
+func decodeDetailedOrder(payload json.RawMessage) (Order, error) {
+	if len(payload) == 0 || string(payload) == "null" {
+		return Order{}, fmt.Errorf("Kalshi order detail is missing")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return Order{}, fmt.Errorf("decode Kalshi order detail fields: %w", err)
+	}
+	for _, name := range []string{
+		"order_id", "client_order_id", "ticker", "status", "fill_count_fp",
+		"remaining_count_fp", "initial_count_fp",
+	} {
+		value, found := fields[name]
+		if !found || len(value) == 0 || string(value) == "null" {
+			return Order{}, fmt.Errorf("Kalshi order detail omitted %s", name)
+		}
+	}
+	var order Order
+	if err := json.Unmarshal(payload, &order); err != nil {
+		return Order{}, fmt.Errorf("decode Kalshi order detail: %w", err)
+	}
+	for name, value := range map[string]domain.Decimal{
+		"fill_count_fp": order.FillCount, "remaining_count_fp": order.RemainingCount, "initial_count_fp": order.InitialCount,
+	} {
+		if sign, err := value.Sign(); err != nil || sign < 0 {
+			return Order{}, fmt.Errorf("Kalshi order detail %s is invalid", name)
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(order.Status)) {
+	case "resting", "canceled", "executed":
+	default:
+		return Order{}, fmt.Errorf("Kalshi order detail status is invalid")
+	}
+	filled, _ := order.FillCount.Multiply("1")
+	remaining, _ := order.RemainingCount.Multiply("1")
+	initial, _ := order.InitialCount.Multiply("1")
+	if new(big.Rat).Add(new(big.Rat).Set(filled), remaining).Cmp(initial) > 0 {
+		return Order{}, fmt.Errorf("Kalshi order detail fill_count_fp plus remaining_count_fp exceeds initial_count_fp")
+	}
+	remainingSign := remaining.Sign()
+	switch strings.ToLower(strings.TrimSpace(order.Status)) {
+	case "resting":
+		if remainingSign <= 0 {
+			return Order{}, fmt.Errorf("resting Kalshi order detail has no remaining count")
+		}
+	case "canceled":
+		if remainingSign != 0 {
+			return Order{}, fmt.Errorf("cancelled Kalshi order detail retained a remaining count")
+		}
+		// A positive-size order whose entire effective quantity filled must be
+		// reported as executed. Treating that contradictory payload as canceled
+		// would release a reservation before the fill ledger can prove the trade.
+		if initial.Sign() > 0 && filled.Cmp(initial) == 0 {
+			return Order{}, fmt.Errorf("cancelled Kalshi order detail is fully filled")
+		}
+	case "executed":
+		if remainingSign != 0 || filled.Cmp(initial) != 0 {
+			return Order{}, fmt.Errorf("executed Kalshi order detail is not fully filled")
+		}
+	}
+	return order, nil
+}
+
+func validateSubmittedOrderCounts(order SubmittedOrder, request OrderRequestV2) error {
+	requested := domain.Decimal(request.Count)
+	if sign, err := requested.Sign(); err != nil || sign <= 0 {
+		return fmt.Errorf("prepared Kalshi order count is invalid")
+	}
+	for name, value := range map[string]domain.Decimal{"fill_count": order.FillCount, "remaining_count": order.RemainingCount} {
+		if sign, err := value.Sign(); err != nil || sign < 0 {
+			return fmt.Errorf("Kalshi order acknowledgement %s is invalid", name)
+		}
+		if comparison, err := value.Compare(requested); err != nil || comparison > 0 {
+			return fmt.Errorf("Kalshi order acknowledgement %s exceeds requested count", name)
+		}
+	}
+	filledComparison, err := order.FillCount.Compare(requested)
+	if err != nil {
+		return fmt.Errorf("compare Kalshi acknowledged fill count: %w", err)
+	}
+	remainingSign, err := order.RemainingCount.Sign()
+	if err != nil {
+		return fmt.Errorf("parse Kalshi acknowledged remaining count: %w", err)
+	}
+	if filledComparison == 0 && remainingSign != 0 {
+		return fmt.Errorf("fully filled Kalshi acknowledgement retained a remaining count")
+	}
+	filled, _ := order.FillCount.Multiply("1")
+	remaining, _ := order.RemainingCount.Multiply("1")
+	requestedValue, _ := requested.Multiply("1")
+	if new(big.Rat).Add(filled, remaining).Cmp(requestedValue) > 0 {
+		return fmt.Errorf("Kalshi order acknowledgement fill_count plus remaining_count exceeds requested count")
+	}
+	if request.TimeInForce == "immediate_or_cancel" && remainingSign != 0 {
+		return fmt.Errorf("Kalshi IOC acknowledgement retained an active remaining count")
+	}
+	if request.TimeInForce == "fill_or_kill" && (!request.ReduceOnly && filledComparison != 0 || remainingSign != 0) {
+		return fmt.Errorf("successful Kalshi FOK acknowledgement was not fully filled")
+	}
+	if order.TimestampMS <= 0 {
+		return fmt.Errorf("Kalshi order acknowledgement ts_ms is invalid")
+	}
+	return nil
+}
+
+func classifyPreparedSubmitError(order PreparedOrder, err error) error {
+	if order.Request.TimeInForce == "fill_or_kill" {
+		return err
+	}
+	var venueError *port.VenueError
+	if !errors.As(err, &venueError) || venueError.Code != "KALSHI_FOK_NOT_FILLED" {
+		return err
+	}
+	copy := *venueError
+	copy.Kind = port.VenueErrorAmbiguous
+	copy.Code = "KALSHI_ORDER_CONFLICT"
+	copy.Message = "Kalshi returned FOK-specific evidence for a non-FOK submission; the order outcome must be reconciled"
+	return &copy
 }
 
 func (client *Client) doAuthenticated(ctx context.Context, method, requestPath string, body []byte, target any) error {
