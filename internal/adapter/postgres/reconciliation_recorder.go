@@ -131,8 +131,22 @@ func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain
 		return fmt.Errorf("begin reconciliation run completion: %w", err)
 	}
 	defer tx.Rollback()
-	if run.Status == domain.ReconciliationRunCompleted && run.Summary["fills_applied"] > 0 {
+	if run.Status == domain.ReconciliationRunCompleted {
 		resolved, resolveErr := resolveFillLagDriftIssues(ctx, tx, run)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if resolved > 0 {
+			if run.Summary == nil {
+				run.Summary = make(map[string]int)
+			}
+			run.Summary["issues_total"] += resolved
+			run.Summary["issues_resolved"] += resolved
+			run.Summary["issues_automatic"] += resolved
+		}
+	}
+	if run.Status == domain.ReconciliationRunCompleted {
+		resolved, resolveErr := resolvePolymarketPositionPrecisionIssues(ctx, tx, run)
 		if resolveErr != nil {
 			return resolveErr
 		}
@@ -381,10 +395,10 @@ func resolveWalletMigrationIssues(ctx context.Context, tx *sql.Tx, run domain.Re
 	return int(resolved), nil
 }
 
-// resolveFillLagDriftIssues closes only stale drift observations whose exact
-// remote value is now represented by the authoritative ledger after at least
-// one finalized fill was applied in this completed run. Unrelated manual
-// issues and discrepancies reproduced by the current run remain fail-closed.
+// resolveFillLagDriftIssues closes only stale drift observations now represented
+// by the authoritative ledger after a finalized fill. The fill may have been
+// applied by an earlier attention-required run; a later fully healthy sweep is
+// what proves that the temporary drift disappeared.
 func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
 	const resolvedDetails = "; automatically resolved after finalized fill evidence made the local ledger match the previously observed remote value"
 	resolved := 0
@@ -406,14 +420,15 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		    WHERE event.execution_account_id=issue.execution_account_id
 		      AND event.total_balance_after=issue.remote_value
 		      AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
-		      AND fill.applied_at BETWEEN $5 AND $3
+		      AND fill.applied_at>issue.observed_at
+		      AND fill.applied_at<=$3
 		  )
 		  AND NOT EXISTS (
 		    SELECT 1 FROM reconciliation_issues reproduced
 		    WHERE reproduced.execution_account_id=issue.execution_account_id
 		      AND reproduced.run_id=$2 AND reproduced.status='OPEN'
 		      AND reproduced.issue_type=issue.issue_type
-		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, run.StartedAt.UTC())
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails)
 	if err != nil {
 		return 0, fmt.Errorf("resolve finalized-fill balance drift issues: %w", err)
 	}
@@ -435,13 +450,20 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		  AND position.execution_account_id=issue.execution_account_id
 		  AND position.token_id=issue.token_id
 		  AND issue.remote_value IS NOT NULL
-		  AND position.total_shares=issue.remote_value
+		  AND (
+		    position.total_shares=issue.remote_value
+		    OR (
+		      issue.source='POLYMARKET_DATA_API'
+		      AND abs(position.total_shares-issue.remote_value)<=0.001
+		    )
+		  )
 		  AND EXISTS (
 		    SELECT 1 FROM execution_fills fill
 		    WHERE fill.execution_account_id=issue.execution_account_id
 		      AND fill.token_id=issue.token_id
 		      AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
-		      AND fill.applied_at BETWEEN $5 AND $3
+		      AND fill.applied_at>issue.observed_at
+		      AND fill.applied_at<=$3
 		  )
 		  AND NOT EXISTS (
 		    SELECT 1 FROM reconciliation_issues reproduced
@@ -449,7 +471,7 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		      AND reproduced.run_id=$2 AND reproduced.status='OPEN'
 		      AND reproduced.issue_type=issue.issue_type
 		      AND reproduced.token_id=issue.token_id
-		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, run.StartedAt.UTC())
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails)
 	if err != nil {
 		return 0, fmt.Errorf("resolve finalized-fill position drift issues: %w", err)
 	}
@@ -458,4 +480,50 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		return 0, fmt.Errorf("count finalized-fill position drift issues: %w", err)
 	}
 	return resolved + int(affected), nil
+}
+
+// resolvePolymarketPositionPrecisionIssues closes only a stale managed
+// POSITION_DRIFT that a later healthy sweep no longer reproduces and whose
+// values differ by no more than the Polymarket Data API's millishare display
+// precision. It never changes the position ledger or resolves identity drift.
+func resolvePolymarketPositionPrecisionIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
+	const resolvedDetails = "; automatically resolved after a clean reconciliation proved the difference was within Polymarket Data API millishare precision"
+	result, err := tx.ExecContext(ctx, `
+		UPDATE reconciliation_issues issue
+		SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+		    details=issue.details || $4
+		FROM execution_positions position
+		WHERE issue.execution_account_id=$1
+		  AND issue.status='OPEN'
+		  AND issue.resolution='MANUAL_REVIEW'
+		  AND issue.issue_type='POSITION_DRIFT'
+		  AND issue.run_id<>$2
+		  AND issue.source='POLYMARKET_DATA_API'
+		  AND issue.market_id<>'' AND issue.condition_id<>'' AND issue.token_id<>''
+		  AND issue.local_value IS NOT NULL AND issue.remote_value IS NOT NULL
+		  AND abs(issue.local_value-issue.remote_value)<=0.001
+		  AND position.execution_account_id=issue.execution_account_id
+		  AND position.market_id=issue.market_id
+		  AND position.condition_id=issue.condition_id
+		  AND position.token_id=issue.token_id
+		  AND position.total_shares=issue.local_value
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM reconciliation_issues reproduced
+		    WHERE reproduced.execution_account_id=issue.execution_account_id
+		      AND reproduced.run_id=$2
+		      AND reproduced.status='OPEN'
+		      AND reproduced.issue_type='POSITION_DRIFT'
+		      AND reproduced.market_id=issue.market_id
+		      AND reproduced.condition_id=issue.condition_id
+		      AND reproduced.token_id=issue.token_id
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails)
+	if err != nil {
+		return 0, fmt.Errorf("resolve Polymarket position precision issues: %w", err)
+	}
+	resolved, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count resolved Polymarket position precision issues: %w", err)
+	}
+	return int(resolved), nil
 }

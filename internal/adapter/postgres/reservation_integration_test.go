@@ -459,6 +459,14 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 			Details: "fill reached the position source before the local ledger", ObservedAt: now,
 		},
 		{
+			IssueID: "issue-position-display-precision", RunID: firstRun.RunID, Fingerprint: "position-display-precision",
+			ExecutionAccountID: accountID, Type: domain.ReconciliationIssuePositionDrift,
+			Resolution: domain.ReconciliationResolutionManual, Status: domain.ReconciliationIssueOpen,
+			MarketID: "market-fill-lag", ConditionID: "condition-fill-lag", TokenID: "token-fill-lag",
+			LocalValue: "5", RemoteValue: "4.999", Source: "POLYMARKET_DATA_API",
+			Details: "position source rounded the authoritative ledger quantity", ObservedAt: now.Add(2750 * time.Millisecond),
+		},
+		{
 			IssueID: "issue-unrelated-external-trade", RunID: firstRun.RunID, Fingerprint: "unrelated-external-trade",
 			ExecutionAccountID: accountID, Type: domain.ReconciliationIssueExternalTrade,
 			Resolution: domain.ReconciliationResolutionManual, Status: domain.ReconciliationIssueOpen,
@@ -530,7 +538,7 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 	}
 	secondRun, err := (domain.ReconciliationRunParams{
 		RunID: "run-fill-lag-resolved", ExecutionAccountID: accountID,
-		Trigger: domain.ReconciliationTriggerScheduled, StartedAt: now.Add(2 * time.Second),
+		Trigger: domain.ReconciliationTriggerScheduled, StartedAt: now.Add(3 * time.Second),
 	}).Build()
 	if err != nil {
 		t.Fatal(err)
@@ -538,9 +546,8 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 	if err := recorder.Start(context.Background(), secondRun); err != nil {
 		t.Fatal(err)
 	}
-	secondCompleted := now.Add(3 * time.Second)
+	secondCompleted := now.Add(4 * time.Second)
 	secondRun.Status, secondRun.CompletedAt = domain.ReconciliationRunCompleted, &secondCompleted
-	secondRun.Summary["fills_applied"] = 1
 	if err := recorder.Complete(context.Background(), secondRun); err != nil {
 		t.Fatal(err)
 	}
@@ -567,6 +574,7 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 	}
 	for _, issueType := range []domain.ReconciliationIssueType{
 		domain.ReconciliationIssueBalanceDrift, domain.ReconciliationIssuePhantomPosition,
+		domain.ReconciliationIssuePositionDrift,
 	} {
 		if got := statuses[issueType]; got != [2]string{"RESOLVED", "AUTOMATIC"} {
 			t.Fatalf("%s status = %v, want RESOLVED/AUTOMATIC", issueType, got)
@@ -583,8 +591,8 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 	if err := json.Unmarshal(summaryJSON, &summary); err != nil {
 		t.Fatal(err)
 	}
-	if summary["issues_resolved"] != 2 || summary["issues_automatic"] != 2 || summary["issues_total"] != 2 {
-		t.Fatalf("resolution summary = %#v, want two automatic resolutions", summary)
+	if summary["issues_resolved"] != 3 || summary["issues_automatic"] != 3 || summary["issues_total"] != 3 {
+		t.Fatalf("resolution summary = %#v, want three automatic resolutions", summary)
 	}
 }
 
