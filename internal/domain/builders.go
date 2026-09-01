@@ -271,6 +271,16 @@ func (params MarketValidationParams) Build() (MarketValidation, error) {
 			return MarketValidation{}, fmt.Errorf("market validation min_order_size must be positive")
 		}
 	}
+	if !validation.ExecutableSize.IsEmpty() {
+		if sign, err := validation.ExecutableSize.Sign(); err != nil || sign <= 0 {
+			return MarketValidation{}, fmt.Errorf("market validation executable_size must be positive")
+		}
+		if !validation.MinOrderSize.IsEmpty() {
+			if comparison, err := validation.ExecutableSize.Compare(validation.MinOrderSize); err != nil || comparison < 0 {
+				return MarketValidation{}, fmt.Errorf("market validation executable_size is below min_order_size")
+			}
+		}
+	}
 	return validation, nil
 }
 

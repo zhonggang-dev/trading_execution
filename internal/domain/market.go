@@ -42,4 +42,9 @@ type MarketValidation struct {
 	BestBid              Decimal   `json:"best_bid,omitempty"`
 	BestAsk              Decimal   `json:"best_ask,omitempty"`
 	WorstPrice           Decimal   `json:"worst_price,omitempty"`
+	// ExecutableSize is the venue-visible quantity inside WorstPrice at
+	// validation time. Venues that support partial immediate execution may use
+	// it to cap the submitted quantity while retaining the strategy-requested
+	// size on OrderIntent for audit and reservation finality.
+	ExecutableSize Decimal `json:"executable_size,omitempty"`
 }

@@ -153,11 +153,39 @@ func TestKalshiMarketValidatorAllowsPartialIOCDepth(t *testing.T) {
 				book.BestBid = "0.49"
 			}
 			validator := newKalshiValidatorForTest(t, now, book)
-			if _, err := validator.Validate(context.Background(), intent); err != nil {
+			validation, err := validator.Validate(context.Background(), intent)
+			if err != nil {
 				t.Fatalf("Validate() error = %v, want protected partial depth to pass IOC", err)
+			}
+			if validation.ExecutableSize != "9.00" {
+				t.Fatalf("executable_size = %q, want 9.00", validation.ExecutableSize)
 			}
 		})
 	}
+}
+
+func TestKalshiMarketValidatorCapsIOCDepthAtRequestedSize(t *testing.T) {
+	now, intent, book := validKalshiValidationFixtures(domain.SideBuy)
+	intent.TimeInForce = domain.TimeInForceIOC
+	book.Asks = []domain.PriceLevel{{Price: "0.51", Size: "7.25"}, {Price: "0.52", Size: "8.75"}}
+	book.BestAsk = "0.51"
+	validator := newKalshiValidatorForTest(t, now, book)
+	validation, err := validator.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if validation.ExecutableSize != "10.00" {
+		t.Fatalf("executable_size = %q, want requested size 10.00", validation.ExecutableSize)
+	}
+}
+
+func TestKalshiMarketValidatorRejectsIOCDepthBelowMinimum(t *testing.T) {
+	now, intent, book := validKalshiValidationFixtures(domain.SideBuy)
+	intent.TimeInForce = domain.TimeInForceIOC
+	book.Asks = []domain.PriceLevel{{Price: "0.51", Size: "0.50"}}
+	book.BestAsk = "0.51"
+	validator := newKalshiValidatorForTest(t, now, book)
+	assertKalshiRejectionCode(t, validator, intent, "KALSHI_INSUFFICIENT_VISIBLE_DEPTH")
 }
 
 func TestKalshiMarketValidatorStillRequiresFullDepthForNonIOCOrders(t *testing.T) {
