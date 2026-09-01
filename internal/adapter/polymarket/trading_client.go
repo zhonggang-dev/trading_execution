@@ -1621,6 +1621,7 @@ func applyFillFeeEvidence(
 	fill.BuilderFee = builderFee
 	fill.TotalFee = totalFee
 	fill.FeeSource = v2OrderFilledFeeSource
+	fill.PriceTickSize = tickSize
 	fill.SettlementEvidence = &domain.SettlementEvidence{
 		SchemaVersion:        domain.SettlementEvidenceSchemaV1,
 		Source:               domain.FeeSourcePolygonV2OrderFilled,
@@ -1719,51 +1720,7 @@ func validateEventGross(
 	tickSize domain.Decimal,
 	decimals uint8,
 ) error {
-	sharesRat, err := decimalRat(shares)
-	if err != nil || sharesRat.Sign() <= 0 {
-		return fmt.Errorf("CLOB fill shares must be positive")
-	}
-	priceRat, err := decimalRat(price)
-	if err != nil || priceRat.Sign() <= 0 {
-		return fmt.Errorf("CLOB fill price must be positive")
-	}
-	eventRat, err := decimalRat(eventGross)
-	if err != nil || eventRat.Sign() < 0 {
-		return fmt.Errorf("OrderFilled gross amount must be non-negative")
-	}
-	tickRat, err := decimalRat(tickSize)
-	if err != nil || tickRat.Sign() <= 0 {
-		return fmt.Errorf("persisted CLOB tick size must be positive for OrderFilled amount validation")
-	}
-	computedGross := new(big.Rat).Mul(sharesRat, priceRat)
-	difference := new(big.Rat).Sub(computedGross, eventRat)
-	if difference.Sign() < 0 {
-		difference.Neg(difference)
-	}
-	oneBaseUnit := new(big.Rat).SetFrac(big.NewInt(1), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
-	// A confirmed CLOB trade can report the order's price bucket while the V2
-	// OrderFilled amounts expose the exact price improvement. Treat half of the
-	// persisted market tick as the rounding interval and add one collateral
-	// base unit for the contract's integer amount quantization. The on-chain
-	// amount remains authoritative after this bounded identity check.
-	priceBucketTolerance := new(big.Rat).Quo(tickRat, big.NewRat(2, 1))
-	tolerance := new(big.Rat).Mul(sharesRat, priceBucketTolerance)
-	tolerance.Add(tolerance, oneBaseUnit)
-	if difference.Cmp(tolerance) > 0 {
-		return fmt.Errorf(
-			"CLOB shares/price do not match OrderFilled base-unit amounts: shares=%s price=%s event_gross=%s computed_gross=%s difference=%s tolerance=%s tick_size=%s",
-			shares, price, eventGross, ratDiagnosticDecimal(computedGross), ratDiagnosticDecimal(difference),
-			ratDiagnosticDecimal(tolerance), tickSize,
-		)
-	}
-	return nil
-}
-
-func ratDiagnosticDecimal(value *big.Rat) string {
-	if value == nil {
-		return ""
-	}
-	return canonicalDecimalText(value.FloatString(18))
+	return domain.ValidateSettlementEventGross(shares, price, eventGross, tickSize, decimals)
 }
 
 func subtractDecimal(left domain.Decimal, right domain.Decimal) (domain.Decimal, error) {

@@ -113,6 +113,22 @@ func (evidence SettlementEvidence) ValidateAgainst(fill Fill) error {
 	if !shares.Equal(fill.Shares) || !gross.Equal(fill.GrossNotional) {
 		return fmt.Errorf("settlement evidence amounts do not match the fill")
 	}
+	if fill.Price.IsEmpty() {
+		// ValidateAgainst is also used for identity-only evidence checks. The
+		// full ledger boundary always supplies a price and performs the bounded
+		// display-price comparison below.
+	} else if fill.PriceTickSize.IsEmpty() {
+		// Evidence written before price_tick_size was added used the original
+		// sub-base-unit rule. Keep those immutable rows verifiable while all new
+		// Polygon evidence records the market tick used for bounded validation.
+		if err := validateLegacySettlementGross(fill.Shares, fill.Price, fill.GrossNotional, evidence.CollateralDecimals); err != nil {
+			return err
+		}
+	} else if err := ValidateSettlementEventGross(
+		fill.Shares, fill.Price, fill.GrossNotional, fill.PriceTickSize, evidence.CollateralDecimals,
+	); err != nil {
+		return err
+	}
 	totalFee, err := evidenceBaseUnitDecimal(evidence.TotalFeeBaseUnits, evidence.CollateralDecimals)
 	if err != nil {
 		return fmt.Errorf("settlement total fee: %w", err)
@@ -135,6 +151,98 @@ func (evidence SettlementEvidence) ValidateAgainst(fill Fill) error {
 		return fmt.Errorf("non-zero builder evidence requires an authoritative allocation source")
 	}
 	return nil
+}
+
+// ValidateSettlementEventGross bounds the difference between the CLOB display
+// price and the authoritative on-chain cash amount. A confirmed trade may be
+// reported at its market price bucket even when price improvement inside that
+// bucket changes the exact OrderFilled ratio. Half a tick covers that bucket;
+// one collateral base unit covers integer contract quantization.
+func ValidateSettlementEventGross(
+	shares Decimal,
+	price Decimal,
+	gross Decimal,
+	tickSize Decimal,
+	collateralDecimals uint8,
+) error {
+	sharesRat, err := shares.rat()
+	if err != nil || sharesRat.Sign() <= 0 {
+		return fmt.Errorf("fill shares must be positive")
+	}
+	priceRat, err := price.rat()
+	if err != nil || priceRat.Sign() <= 0 {
+		return fmt.Errorf("fill price must be positive")
+	}
+	grossRat, err := gross.rat()
+	if err != nil || grossRat.Sign() < 0 {
+		return fmt.Errorf("settlement gross amount must be non-negative")
+	}
+	tickRat, err := tickSize.rat()
+	if err != nil || tickRat.Sign() <= 0 || tickRat.Cmp(big.NewRat(1, 1)) >= 0 {
+		return fmt.Errorf("settlement price_tick_size must be positive and below 1")
+	}
+	if collateralDecimals > 18 {
+		return fmt.Errorf("settlement collateral decimals exceed supported precision")
+	}
+
+	computedGross := new(big.Rat).Mul(sharesRat, priceRat)
+	difference := new(big.Rat).Sub(computedGross, grossRat)
+	if difference.Sign() < 0 {
+		difference.Neg(difference)
+	}
+	oneBaseUnit := new(big.Rat).SetFrac(
+		big.NewInt(1),
+		new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(collateralDecimals)), nil),
+	)
+	tolerance := new(big.Rat).Mul(sharesRat, new(big.Rat).Quo(tickRat, big.NewRat(2, 1)))
+	tolerance.Add(tolerance, oneBaseUnit)
+	if difference.Cmp(tolerance) > 0 {
+		return fmt.Errorf(
+			"settlement gross differs from shares multiplied by display price beyond tick/precision tolerance: shares=%s price=%s gross=%s computed_gross=%s difference=%s tolerance=%s tick_size=%s",
+			shares, price, gross, settlementRatDecimal(computedGross), settlementRatDecimal(difference),
+			settlementRatDecimal(tolerance), tickSize,
+		)
+	}
+	return nil
+}
+
+func validateLegacySettlementGross(shares Decimal, price Decimal, gross Decimal, collateralDecimals uint8) error {
+	sharesRat, err := shares.rat()
+	if err != nil {
+		return err
+	}
+	priceRat, err := price.rat()
+	if err != nil {
+		return err
+	}
+	grossRat, err := gross.rat()
+	if err != nil {
+		return err
+	}
+	difference := new(big.Rat).Sub(new(big.Rat).Mul(sharesRat, priceRat), grossRat)
+	if difference.Sign() < 0 {
+		difference.Neg(difference)
+	}
+	oneBaseUnit := new(big.Rat).SetFrac(
+		big.NewInt(1),
+		new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(collateralDecimals)), nil),
+	)
+	if difference.Cmp(oneBaseUnit) >= 0 {
+		return fmt.Errorf("legacy settlement gross differs from shares multiplied by price by at least one collateral base unit")
+	}
+	return nil
+}
+
+func settlementRatDecimal(value *big.Rat) string {
+	if value == nil {
+		return ""
+	}
+	text := value.FloatString(18)
+	text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	if text == "" || text == "-0" {
+		return "0"
+	}
+	return text
 }
 
 func (evidence SettlementEvidence) CanonicalJSON() ([]byte, error) {

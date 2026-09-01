@@ -46,7 +46,11 @@ type Fill struct {
 	Status             FillStatus    `json:"status"`
 	Shares             Decimal       `json:"shares"`
 	Price              Decimal       `json:"price"`
-	GrossNotional      Decimal       `json:"gross_notional"`
+	// PriceTickSize comes from the order's persisted market validation. It is
+	// intentionally not part of public fill JSON or settlement evidence: every
+	// reconciliation reconstructs it from the immutable order context.
+	PriceTickSize Decimal `json:"-"`
+	GrossNotional Decimal `json:"gross_notional"`
 	// FeeRateBPS is the CLOB trade response metadata. V2 final fee accounting
 	// uses PlatformFeeRate and FeeExponent from /clob-markets instead.
 	FeeRateBPS        Decimal    `json:"fee_rate_bps"`
@@ -87,6 +91,7 @@ func (fill Fill) Normalize() Fill {
 	fill.Status = NormalizeFillStatus(fill.Status)
 	fill.TransactionHash = strings.TrimSpace(fill.TransactionHash)
 	fill.FeeSource = strings.ToUpper(strings.TrimSpace(fill.FeeSource))
+	fill.PriceTickSize = Decimal(strings.TrimSpace(fill.PriceTickSize.String()))
 	fill.RawPayloadSHA256 = strings.ToLower(strings.TrimSpace(fill.RawPayloadSHA256))
 	if fill.SettlementEvidence != nil {
 		value := fill.SettlementEvidence.Normalize()
@@ -173,24 +178,6 @@ func (fill Fill) ValidateAccounting() error {
 	if !exponent.IsInt() {
 		return fmt.Errorf("fee_exponent must be an integer")
 	}
-	shares, _ := fill.Shares.rat()
-	price, _ := fill.Price.rat()
-	gross, _ := fill.GrossNotional.rat()
-	calculatedGross := new(big.Rat).Mul(shares, price)
-	difference := new(big.Rat).Sub(calculatedGross, gross)
-	if difference.Sign() < 0 {
-		difference.Neg(difference)
-	}
-	if fill.FeeSource == FeeSourcePolygonV2OrderFilled {
-		// V2 CalculatorHelper floors integer takingAmount arithmetic. The CLOB
-		// display price may therefore differ from the event cash amount, but by
-		// strictly less than one six-decimal pUSD base unit.
-		if difference.Cmp(big.NewRat(1, 1_000_000)) >= 0 {
-			return fmt.Errorf("gross_notional differs from shares multiplied by price by at least one pUSD base unit")
-		}
-	} else if difference.Sign() != 0 {
-		return fmt.Errorf("gross_notional must equal shares multiplied by price")
-	}
 	if fill.FeeSource == FeeSourcePolygonV2OrderFilled {
 		if fill.SettlementEvidence == nil {
 			return fmt.Errorf("Polygon V2 fill requires durable settlement evidence")
@@ -200,7 +187,15 @@ func (fill Fill) ValidateAccounting() error {
 		}
 	} else if fill.SettlementEvidence != nil {
 		return fmt.Errorf("settlement evidence is only supported for authoritative Polygon V2 fills")
+	} else {
+		shares, _ := fill.Shares.rat()
+		price, _ := fill.Price.rat()
+		gross, _ := fill.GrossNotional.rat()
+		if new(big.Rat).Mul(shares, price).Cmp(gross) != 0 {
+			return fmt.Errorf("gross_notional must equal shares multiplied by price")
+		}
 	}
+	gross, _ := fill.GrossNotional.rat()
 	platformFee, _ := fill.PlatformFee.rat()
 	builderFee, _ := fill.BuilderFee.rat()
 	totalFee, _ := fill.TotalFee.rat()

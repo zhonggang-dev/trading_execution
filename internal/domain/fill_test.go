@@ -33,7 +33,8 @@ func TestFillValidateAccountingAllowsOnlySubBaseUnitEventRounding(t *testing.T) 
 		VenueOrderID: "0x" + repeatHex("22", 32), ExecutionAccountID: "account-1", MarketID: "market-1",
 		TokenID: "token-1", Side: SideSell, LiquidityRole: LiquidityRoleMaker,
 		Status: FillStatusConfirmed, Shares: "3", Price: "0.3333333", GrossNotional: "0.999999",
-		FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0", PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
+		PriceTickSize: "0.0000001",
+		FeeRateBPS:    "0", PlatformFeeRate: "0", FeeExponent: "0", PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
 		NetCashDelta: "0.999999", MatchedAt: now, ObservedAt: now, ConfirmedAt: &now,
 		FeeSource: FeeSourcePolygonV2OrderFilled, TransactionHash: "0x" + repeatHex("cd", 32),
 	}

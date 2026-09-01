@@ -1114,7 +1114,8 @@ func TestPolymarketBuyPriceImprovementCanSettleMoreSharesThanRequested(t *testin
 	confirmedAt := now.Add(10 * time.Second)
 	application, err := processor.Process(ctx, order, domain.Fill{
 		VenueFillID: "trade-wallet-6", LiquidityRole: domain.LiquidityRoleTaker,
-		Status: domain.FillStatusConfirmed, Shares: "30.147057", Price: "0.3383414507",
+		Status: domain.FillStatusConfirmed, Shares: "30.147057", Price: "0.34",
+		PriceTickSize: "0.01",
 		GrossNotional: "10.199999", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
 		PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
 		FeeSource: domain.FeeSourcePolygonV2OrderFilled, TransactionHash: transactionHash,

@@ -203,7 +203,7 @@ func calculateMoney(fill domain.Fill) (domain.Fill, error) {
 	if err != nil {
 		return domain.Fill{}, err
 	}
-	if err := validateGrossEvidence(shares, price, gross, fill.FeeSource); err != nil {
+	if err := validateGrossEvidence(fill, shares, price, gross); err != nil {
 		return domain.Fill{}, err
 	}
 
@@ -246,13 +246,22 @@ func calculateMoney(fill domain.Fill) (domain.Fill, error) {
 	return fill.Normalize(), nil
 }
 
-func validateGrossEvidence(shares, price, gross *big.Rat, source string) error {
+func validateGrossEvidence(fill domain.Fill, shares, price, gross *big.Rat) error {
 	calculated := new(big.Rat).Mul(shares, price)
 	difference := new(big.Rat).Sub(calculated, gross)
 	if difference.Sign() < 0 {
 		difference.Neg(difference)
 	}
-	if source == domain.FeeSourcePolygonV2OrderFilled {
+	if fill.FeeSource == domain.FeeSourcePolygonV2OrderFilled {
+		if fill.SettlementEvidence != nil && !fill.PriceTickSize.IsEmpty() {
+			return domain.ValidateSettlementEventGross(
+				fill.Shares, fill.Price, fill.GrossNotional,
+				fill.PriceTickSize, fill.SettlementEvidence.CollateralDecimals,
+			)
+		}
+		// Legacy unit and persisted fill observations predate durable tick
+		// metadata. Preserve their original sub-base-unit rule; new Polygon
+		// observations always carry PriceTickSize and take the branch above.
 		if difference.Cmp(big.NewRat(1, 1_000_000)) >= 0 {
 			return fmt.Errorf("OrderFilled gross_notional differs from shares multiplied by price by at least one pUSD base unit")
 		}

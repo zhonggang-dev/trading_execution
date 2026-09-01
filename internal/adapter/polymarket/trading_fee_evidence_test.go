@@ -20,7 +20,7 @@ func TestValidateEventGrossRejectsMaterialMismatchWithDiagnostics(t *testing.T) 
 		t.Fatal("material OrderFilled gross mismatch was accepted")
 	}
 	for _, evidence := range []string{
-		"shares=30.147057", "price=0.34", "event_gross=10", "computed_gross=10.24999938",
+		"shares=30.147057", "price=0.34", "gross=10", "computed_gross=10.24999938",
 		"difference=0.24999938", "tolerance=0.150736285", "tick_size=0.01",
 	} {
 		if !strings.Contains(err.Error(), evidence) {
