@@ -17,15 +17,17 @@ const maxWalletFileBytes = 4 << 20
 // WalletAccountSpec 表示 Trading Execution 接受的磁盘密钥结构，也兼容旧实盘 wallets.json 映射。
 // 映射键会转换为 execution_account_id，address 用作 funder_address；TradingAccount 创建后不再暴露敏感值，调用方不得记录该结构。
 type WalletAccountSpec struct {
-	ExecutionAccountID string  `json:"execution_account_id"`
-	Address            string  `json:"address"`
-	FunderAddress      string  `json:"funder_address"`
-	PrivateKey         string  `json:"private_key"`
-	SignatureType      *uint8  `json:"signature_type"`
-	APIKey             string  `json:"api_key"`
-	APISecret          string  `json:"api_secret"`
-	APIPassphrase      string  `json:"api_passphrase"`
-	APINonce           *uint64 `json:"api_nonce"`
+	ExecutionAccountID   string  `json:"execution_account_id"`
+	Address              string  `json:"address"`
+	FunderAddress        string  `json:"funder_address"`
+	PrivateKey           string  `json:"private_key"`
+	SignatureType        *uint8  `json:"signature_type"`
+	APIKey               string  `json:"api_key"`
+	APISecret            string  `json:"api_secret"`
+	APIPassphrase        string  `json:"api_passphrase"`
+	APINonce             *uint64 `json:"api_nonce"`
+	RelayerAPIKey        string  `json:"relayer_api_key"`
+	RelayerAPIKeyAddress string  `json:"relayer_api_key_address"`
 }
 
 // WalletLoadParams 表示后端使用的 WalletLoadParams 类型。
@@ -198,7 +200,11 @@ func buildTradingAccount(ctx context.Context, spec WalletAccountSpec, params Wal
 		FunderAddress:      funder,
 		SignatureType:      signatureType,
 		API:                credentials,
-		Signer:             signer,
+		Relayer: RelayerCredentials{
+			Key:     strings.TrimSpace(spec.RelayerAPIKey),
+			Address: strings.ToLower(strings.TrimSpace(spec.RelayerAPIKeyAddress)),
+		},
+		Signer: signer,
 	}
 	if err := account.validate(); err != nil {
 		return TradingAccount{}, err

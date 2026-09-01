@@ -371,6 +371,7 @@ func (state *runState) settlePositionIfNeeded(ctx context.Context, params settle
 		state.run.ExecutionAccountID,
 		params.tokenID,
 		params.external.Source+":"+params.external.ConditionID,
+		params.external.CurrentPrice,
 		params.external.ObservedAt,
 	)
 	if err != nil {

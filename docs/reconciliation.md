@@ -66,9 +66,15 @@ Content-Type: application/json
 | 已补 SELL Fill 后遗留旧 `POSITION_DRIFT` | 后续对账全部数据源成功、精确 account/market/condition/token 当前本地值等于旧 remote value，且 issue 后已确认 BUY/SELL fills 的净 shares 精确解释全部差额 | 仅把旧 issue 幂等改为 `RESOLVED + AUTOMATIC`；不创建第二笔 Fill，也不直接改仓位 |
 | 本地仍 LIVE、远端已取消 | CLOB 单订单查询明确返回 cancelled，且真实 Fill 已先同步 | 走订单状态机到 `CANCELLED`；保留预占，经过 Fill grace 并再查 Trades 后释放 |
 | Market 已结算 | 外部持仓源明确 `redeemable=true`，且多个已配置来源一致 | 仓位/lot 改为 `SETTLED_PENDING_REDEEM`；不清 shares、不提前记 payout |
+| 待赎回 condition | settlement price 已冻结为精确 `0/1`、所有 managed lot 的 `neg_risk` 一致、该 condition 无剩余 external baseline、adapter 授权已确认 | 先持久化 `*_SUBMITTING`，再提交精确 `redeemPositions`；只有 canonical `PositionsRedeemed` 回执达到确认深度后，才关闭 lot/position 并增加现金、实现 PnL |
 
 所有自动修改都复用现有的 PostgreSQL 事务边界和状态机。对账服务本身不能绕过 FillLedger 直接
 改余额、仓位数量或成交记录。
+
+Auto redeem 不使用“持有 48 小时”条件，也不使用 CLOB SELL。一次 condition 赎回会消耗钱包在该
+condition 下的完整 ERC-1155 余额，因此发现任何未消耗 ownership baseline、开放/预占 lot 或不一致的
+adapter identity 时都会进入 `MANUAL_REVIEW`。网络提交前先落 durable intent；若提交响应丢失，只能用
+Data API 找候选交易并用 Polygon 回执验证，禁止盲目重发。
 
 ## 必须人工核查
 

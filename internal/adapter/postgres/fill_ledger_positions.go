@@ -92,6 +92,12 @@ func (ledger *FillLedger) applyBuy(
 		              ELSE execution_positions.mark_price * (execution_positions.total_shares + EXCLUDED.total_shares) END) <= $10::numeric),
 		    lifecycle_status = CASE WHEN execution_positions.lifecycle_status = 'CLOSED' THEN 'OPEN'
 		                            ELSE execution_positions.lifecycle_status END,
+		    settlement_price = CASE WHEN execution_positions.lifecycle_status = 'CLOSED' THEN NULL
+		                            ELSE execution_positions.settlement_price END,
+		    settlement_source = CASE WHEN execution_positions.lifecycle_status = 'CLOSED' THEN ''
+		                             ELSE execution_positions.settlement_source END,
+		    settled_at = CASE WHEN execution_positions.lifecycle_status = 'CLOSED' THEN NULL
+		                      ELSE execution_positions.settled_at END,
 		    version = execution_positions.version + 1,
 		    updated_at = EXCLUDED.updated_at
 		WHERE execution_positions.market_id = EXCLUDED.market_id
@@ -504,7 +510,8 @@ const positionSelect = `
 	       total_shares::text, available_shares::text, reserved_shares::text,
 	       cost_basis::text, average_cost_price::text, realized_pnl::text,
 	       COALESCE(mark_price::text,''), market_value::text, unrealized_pnl::text,
-	       is_dust, lifecycle_status, last_marked_at, updated_at, version
+	       is_dust, lifecycle_status, COALESCE(settlement_price::text,''),
+	       settlement_source, settled_at, last_marked_at, updated_at, version
 	FROM execution_positions`
 
 // selectPosition 从 PostgreSQL 查询 Position。
@@ -522,13 +529,14 @@ func selectPosition(ctx context.Context, query interface {
 func scanPosition(row rowScanner) (domain.Position, error) {
 	var position domain.Position
 	var outcome sql.NullInt16
-	var marked sql.NullTime
+	var settled, marked sql.NullTime
 	err := row.Scan(
 		&position.ExecutionAccountID, &position.MarketID, &position.ConditionID, &position.TokenID,
 		&outcome, &position.OutcomeName, &position.TotalShares, &position.AvailableShares,
 		&position.ReservedShares, &position.CostBasis, &position.AverageCostPrice, &position.RealizedPnL,
 		&position.MarkPrice, &position.MarketValue, &position.UnrealizedPnL, &position.IsDust,
-		&position.LifecycleStatus, &marked, &position.UpdatedAt, &position.Revision,
+		&position.LifecycleStatus, &position.SettlementPrice, &position.SettlementSource,
+		&settled, &marked, &position.UpdatedAt, &position.Revision,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Position{}, port.ErrPositionNotFound
@@ -543,6 +551,10 @@ func scanPosition(row rowScanner) (domain.Position, error) {
 	if marked.Valid {
 		value := marked.Time.UTC()
 		position.LastMarkedAt = &value
+	}
+	if settled.Valid {
+		value := settled.Time.UTC()
+		position.SettledAt = &value
 	}
 	position.UpdatedAt = position.UpdatedAt.UTC()
 	return position, nil
@@ -890,13 +902,15 @@ func (ledger *FillLedger) ListPositions(ctx context.Context, accountID string) (
 func (ledger *FillLedger) MarkPositionSettled(
 	ctx context.Context,
 	accountID, tokenID, sourceReference string,
+	settlementPrice domain.Decimal,
 	observedAt time.Time,
 ) (domain.Position, error) {
 	accountID = strings.TrimSpace(accountID)
 	tokenID = strings.TrimSpace(tokenID)
 	sourceReference = strings.TrimSpace(sourceReference)
-	if accountID == "" || tokenID == "" || sourceReference == "" || observedAt.IsZero() {
-		return domain.Position{}, fmt.Errorf("account, token, settlement source, and observed_at are required")
+	if accountID == "" || tokenID == "" || sourceReference == "" || observedAt.IsZero() ||
+		(!settlementPrice.Equal("0") && !settlementPrice.Equal("1")) {
+		return domain.Position{}, fmt.Errorf("account, token, binary settlement price, settlement source, and observed_at are required")
 	}
 	tx, err := ledger.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -911,10 +925,37 @@ func (ledger *FillLedger) MarkPositionSettled(
 		return domain.Position{}, err
 	}
 	if before.LifecycleStatus == domain.PositionLifecycleSettledPendingRedeem {
+		if !before.SettlementPrice.IsEmpty() {
+			if !before.SettlementPrice.Equal(settlementPrice) {
+				return domain.Position{}, reject("POSITION_SETTLEMENT_EVIDENCE_CONFLICT", "settlement price changed after the position was marked settled")
+			}
+			if err := tx.Commit(); err != nil {
+				return domain.Position{}, err
+			}
+			return before, nil
+		}
+		observedAt = observedAt.UTC()
+		result, updateErr := tx.ExecContext(ctx, `
+			UPDATE execution_positions
+			SET settlement_price=$3::numeric, settlement_source=$4, settled_at=$5,
+			    version=version+1, updated_at=GREATEST(updated_at,$5)
+			WHERE execution_account_id=$1 AND token_id=$2
+			  AND lifecycle_status='SETTLED_PENDING_REDEEM' AND settlement_price IS NULL`,
+			accountID, tokenID, settlementPrice.String(), sourceReference, observedAt)
+		if updateErr != nil {
+			return domain.Position{}, fmt.Errorf("backfill position settlement evidence: %w", updateErr)
+		}
+		if !oneRow(result) {
+			return domain.Position{}, port.ErrPositionNotFound
+		}
+		backfilled, selectErr := selectPosition(ctx, tx, accountID, tokenID, false)
+		if selectErr != nil {
+			return domain.Position{}, selectErr
+		}
 		if err := tx.Commit(); err != nil {
 			return domain.Position{}, err
 		}
-		return before, nil
+		return backfilled, nil
 	}
 	if before.LifecycleStatus != domain.PositionLifecycleOpen {
 		return domain.Position{}, reject("POSITION_SETTLEMENT_STATE_INVALID", "only an OPEN position can be marked settled")
@@ -925,8 +966,10 @@ func (ledger *FillLedger) MarkPositionSettled(
 	observedAt = observedAt.UTC()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE execution_positions
-		SET lifecycle_status='SETTLED_PENDING_REDEEM', version=version+1, updated_at=$3
-		WHERE execution_account_id=$1 AND token_id=$2 AND lifecycle_status='OPEN'`, accountID, tokenID, observedAt)
+		SET lifecycle_status='SETTLED_PENDING_REDEEM', settlement_price=$4::numeric,
+		    settlement_source=$5, settled_at=$3, version=version+1, updated_at=$3
+		WHERE execution_account_id=$1 AND token_id=$2 AND lifecycle_status='OPEN'`,
+		accountID, tokenID, observedAt, settlementPrice.String(), sourceReference)
 	if err != nil {
 		return domain.Position{}, fmt.Errorf("mark position settled: %w", err)
 	}

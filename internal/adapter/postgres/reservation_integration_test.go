@@ -1065,7 +1065,7 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	}
 
 	settledAt := now.Add(50 * time.Second)
-	settled, err := ledger.MarkPositionSettled(ctx, "account-fill-ledger", "token-ledger", "data-api:condition-1", settledAt)
+	settled, err := ledger.MarkPositionSettled(ctx, "account-fill-ledger", "token-ledger", "data-api:condition-1", "1", settledAt)
 	if err != nil || settled.LifecycleStatus != domain.PositionLifecycleSettledPendingRedeem ||
 		!settled.TotalShares.Equal("6.001") || !settled.CostBasis.Equal("2.4005") {
 		t.Fatalf("settled position = %#v err=%v", settled, err)
@@ -1075,7 +1075,7 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 		lots[1].Status != domain.PositionLotSettledPendingRedeem {
 		t.Fatalf("settled lots = %#v err=%v", lots, err)
 	}
-	if _, err := ledger.MarkPositionSettled(ctx, "account-fill-ledger", "token-ledger", "data-api:condition-1", settledAt); err != nil {
+	if _, err := ledger.MarkPositionSettled(ctx, "account-fill-ledger", "token-ledger", "data-api:condition-1", "1", settledAt); err != nil {
 		t.Fatalf("idempotent settlement mark: %v", err)
 	}
 	events, err = ledger.ListPositionEvents(ctx, "account-fill-ledger", "token-ledger")

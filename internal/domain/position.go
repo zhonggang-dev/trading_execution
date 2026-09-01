@@ -21,6 +21,9 @@ type Position struct {
 	UnrealizedPnL      Decimal                 `json:"unrealized_pnl"`
 	IsDust             bool                    `json:"is_dust"`
 	LifecycleStatus    PositionLifecycleStatus `json:"lifecycle_status"`
+	SettlementPrice    Decimal                 `json:"settlement_price,omitempty"`
+	SettlementSource   string                  `json:"settlement_source,omitempty"`
+	SettledAt          *time.Time              `json:"settled_at,omitempty"`
 	LastMarkedAt       *time.Time              `json:"last_marked_at,omitempty"`
 	UpdatedAt          time.Time               `json:"updated_at"`
 	Revision           int64                   `json:"revision"`
@@ -65,11 +68,12 @@ type PositionLot struct {
 type PositionEventType string
 
 const (
-	PositionEventBought  PositionEventType = "BOUGHT"
-	PositionEventAdopted PositionEventType = "ADOPTED"
-	PositionEventSold    PositionEventType = "SOLD"
-	PositionEventMarked  PositionEventType = "MARKED"
-	PositionEventSettled PositionEventType = "SETTLED"
+	PositionEventBought   PositionEventType = "BOUGHT"
+	PositionEventAdopted  PositionEventType = "ADOPTED"
+	PositionEventSold     PositionEventType = "SOLD"
+	PositionEventMarked   PositionEventType = "MARKED"
+	PositionEventSettled  PositionEventType = "SETTLED"
+	PositionEventRedeemed PositionEventType = "REDEEMED"
 )
 
 // PositionEvent 表示后端使用的 PositionEvent 类型。

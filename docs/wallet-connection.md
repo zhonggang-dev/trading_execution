@@ -38,6 +38,11 @@ Go 实现沿用这个边界，并使用 `execution_account_id` 选择钱包。�
 }
 ```
 
+`signature_type=3` 的 Deposit Wallet 若启用 `POLYMARKET_AUTO_REDEEM_ENABLED=true`，还必须在同一个
+0600 secret record 中提供与 CLOB 凭据相互独立的 `relayer_api_key` 和
+`relayer_api_key_address`。服务不会把 CLOB `api_key/api_secret/api_passphrase` 当作 relayer 授权，
+也不会把这些字段写入日志或数据库。EOA 使用 Polygon RPC 直接广播，并需要少量 POL 支付 gas。
+
 也兼容旧实盘的 keyed `wallets.json`：
 
 ```json

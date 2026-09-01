@@ -158,7 +158,16 @@ type TradingAccount struct {
 	FunderAddress      string
 	SignatureType      SignatureType
 	API                APICredentials
+	Relayer            RelayerCredentials
 	Signer             DigestSigner
+}
+
+// RelayerCredentials authorize gasless Deposit Wallet transactions. They are
+// intentionally separate from CLOB L2 credentials and are optional unless
+// auto redemption is enabled for a Deposit Wallet account.
+type RelayerCredentials struct {
+	Key     string
+	Address string
 }
 
 // validate 校验 对应数据 的字段和业务约束。
@@ -193,6 +202,15 @@ func (account TradingAccount) validate() error {
 	if strings.TrimSpace(account.API.Key) == "" || strings.TrimSpace(account.API.Secret) == "" || strings.TrimSpace(account.API.Passphrase) == "" {
 		return fmt.Errorf("CLOB api key, secret, and passphrase are required")
 	}
+	relayerPresent := strings.TrimSpace(account.Relayer.Key) != "" || strings.TrimSpace(account.Relayer.Address) != ""
+	if relayerPresent {
+		if strings.TrimSpace(account.Relayer.Key) == "" {
+			return fmt.Errorf("relayer API key is required when its address is configured")
+		}
+		if _, ok := decodeAddress(account.Relayer.Address); !ok {
+			return fmt.Errorf("relayer API key address is invalid")
+		}
+	}
 	return nil
 }
 
@@ -219,6 +237,8 @@ func NewStaticCredentialProvider(accounts []TradingAccount) (*StaticCredentialPr
 		account.API.Key = strings.TrimSpace(account.API.Key)
 		account.API.Secret = strings.TrimSpace(account.API.Secret)
 		account.API.Passphrase = strings.TrimSpace(account.API.Passphrase)
+		account.Relayer.Key = strings.TrimSpace(account.Relayer.Key)
+		account.Relayer.Address = strings.ToLower(strings.TrimSpace(account.Relayer.Address))
 		if err := account.validate(); err != nil {
 			return nil, fmt.Errorf("account %q: %w", account.ExecutionAccountID, err)
 		}

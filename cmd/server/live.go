@@ -19,6 +19,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/accountscope"
+	"github.com/UniPat-AI/trading_execution/internal/service/autoredeem"
 	"github.com/UniPat-AI/trading_execution/internal/service/clobheartbeat"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
@@ -43,6 +44,7 @@ type liveRuntime struct {
 	runner         *reconciliation.Runner
 	operations     *liveoperations.Service
 	decisionRunner *decisionrunner.Runner
+	autoRedeem     *autoredeem.Service
 	activeAccounts []string
 }
 
@@ -118,6 +120,21 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.Polymarket.AutoRedeemEnabled {
+		autoRedeemAccounts := make(map[string]struct{}, len(reconciliationAccountIDs))
+		for _, accountID := range reconciliationAccountIDs {
+			autoRedeemAccounts[accountID] = struct{}{}
+		}
+		for _, account := range accounts {
+			if _, active := autoRedeemAccounts[account.ExecutionAccountID]; !active {
+				continue
+			}
+			if account.SignatureType == polymarket.SignatureTypePolyEIP1271 &&
+				(strings.TrimSpace(account.Relayer.Key) == "" || strings.TrimSpace(account.Relayer.Address) == "") {
+				return nil, fmt.Errorf("execution account %q requires relayer credentials when Polymarket auto redeem is enabled", account.ExecutionAccountID)
+			}
+		}
 	}
 	quarantinedAccountSet := make(map[string]struct{}, len(quarantinedAccountIDs))
 	for _, accountID := range quarantinedAccountIDs {
@@ -419,6 +436,42 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if triggerBridge.Dropped() != 0 {
 		return nil, fmt.Errorf("live startup dropped %d reconciliation trigger(s)", triggerBridge.Dropped())
 	}
+	var autoRedeemService *autoredeem.Service
+	if cfg.Polymarket.AutoRedeemEnabled {
+		redemptionStore, storeErr := postgresadapter.NewRedemptionStore(database, reconciliationAccountIDs)
+		if storeErr != nil {
+			return nil, storeErr
+		}
+		redemptionVenue, venueErr := polymarket.NewRedemptionClient(polymarket.RedemptionClientParams{
+			RelayerURL:            cfg.Polymarket.RelayerURL,
+			RPCURL:                cfg.Polymarket.PolygonRPCURL,
+			HTTPClient:            noRedirectHTTPClient(cfg.Polymarket.RequestTimeout),
+			Credentials:           provider,
+			RequestTimeout:        cfg.Polymarket.RequestTimeout,
+			RequiredConfirmations: uint64(cfg.Polymarket.OrderFilledConfirmations),
+		})
+		if venueErr != nil {
+			return nil, venueErr
+		}
+		redemptionEvidence, evidenceErr := evmrpc.NewRedemptionEvidenceReader(evmrpc.RedemptionEvidenceParams{
+			RPCURL:                cfg.Polymarket.PolygonRPCURL,
+			RequiredConfirmations: uint64(cfg.Polymarket.OrderFilledConfirmations),
+			HTTPClient:            noRedirectHTTPClient(cfg.Polymarket.RequestTimeout),
+		})
+		if evidenceErr != nil {
+			return nil, evidenceErr
+		}
+		autoRedeemService, err = autoredeem.New(autoredeem.Params{
+			Store: redemptionStore, Venue: redemptionVenue, Receipts: redemptionEvidence,
+			Activities: positionSource, PollInterval: cfg.Polymarket.AutoRedeemInterval,
+			RetryInterval:    cfg.Polymarket.AutoRedeemRetryInterval,
+			AmbiguityTimeout: cfg.Polymarket.AutoRedeemAmbiguityTimeout,
+			BatchSize:        cfg.Polymarket.AutoRedeemBatchSize, Logger: logger,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	liveOperationsRepository, err := postgresadapter.NewLiveOperationsRepository(database)
 	if err != nil {
 		return nil, err
@@ -482,6 +535,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		repository: repository, execution: kalshiRuntime.execution,
 		reconciliation: reconciliationService, readiness: combinedReadiness,
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
+		autoRedeem:     autoRedeemService,
 		activeAccounts: append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
 	}, nil
 }
@@ -782,6 +836,13 @@ func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Lo
 			logger.Error("live operations snapshot loop stopped", "error", err)
 		}
 	}()
+	if runtime.autoRedeem != nil {
+		go func() {
+			if err := runtime.autoRedeem.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("Polymarket auto redeem loop stopped", "error", err)
+			}
+		}()
+	}
 	if decisionErrors != nil {
 		go func() {
 			if err := <-decisionErrors; err != nil && ctx.Err() == nil {
