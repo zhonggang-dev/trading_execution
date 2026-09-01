@@ -79,7 +79,7 @@ func validateKalshiDepthAwareLimit(intent domain.OrderIntent, book domain.OrderB
 	if multiple, err := reference.IsMultipleOf(book.TickSize); err != nil || !multiple {
 		return kalshiMarketRejection("KALSHI_STRATEGY_REFERENCE_PRICE_INVALID", "strategy reference price is not an exact multiple of the latest Kalshi tick_size")
 	}
-	if err := validateKalshiProtectionRange(intent.Side, reference, intent.WorstPrice, book.TickSize); err != nil {
+	if err := validateKalshiProtectionRange(intent.Side, reference, intent.WorstPrice); err != nil {
 		return err
 	}
 
@@ -123,31 +123,23 @@ func validateKalshiDepthAwareLimit(intent domain.OrderIntent, book domain.OrderB
 	return nil
 }
 
-func validateKalshiProtectionRange(side domain.Side, reference, worst, tick domain.Decimal) error {
+func validateKalshiProtectionRange(side domain.Side, reference, worst domain.Decimal) error {
 	referenceValue, referenceErr := reference.Multiply("1")
 	worstValue, worstErr := worst.Multiply("1")
-	tickValue, tickErr := tick.Multiply("1")
-	if referenceErr != nil || worstErr != nil || tickErr != nil {
+	if referenceErr != nil || worstErr != nil {
 		return kalshiMarketRejection("KALSHI_PRICE_INVALID", "Kalshi DEPTH_AWARE_LIMIT prices are invalid")
 	}
-	distance := new(big.Rat)
 	switch side {
 	case domain.SideBuy:
 		if worstValue.Cmp(referenceValue) < 0 {
 			return kalshiMarketRejection("KALSHI_PRICE_PROTECTION_INVALID", "BUY worst price is better than the strategy reference ask")
 		}
-		distance.Sub(worstValue, referenceValue)
 	case domain.SideSell:
 		if worstValue.Cmp(referenceValue) > 0 {
 			return kalshiMarketRejection("KALSHI_PRICE_PROTECTION_INVALID", "SELL worst price is better than the strategy reference bid")
 		}
-		distance.Sub(referenceValue, worstValue)
 	default:
 		return kalshiMarketRejection("KALSHI_SIDE_INVALID", "Kalshi order side is invalid")
-	}
-	maximum := new(big.Rat).Mul(tickValue, big.NewRat(domain.DefaultStrategyMaxPriceSlippageTicks, 1))
-	if distance.Cmp(maximum) > 0 {
-		return kalshiMarketRejection("KALSHI_PRICE_PROTECTION_EXCEEDED", "strategy worst price exceeds the two-tick DEPTH_AWARE_LIMIT range")
 	}
 	return nil
 }

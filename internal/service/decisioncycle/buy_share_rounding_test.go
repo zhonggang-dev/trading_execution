@@ -107,8 +107,12 @@ func TestKalshiPredictionBuildsVenueIntentButStaysOutOfPolymarketDelivery(t *tes
 			MarketID:     prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: 0,
 			OutcomeID: "YES", TokenID: prediction.Outcomes[0].TokenID, Status: domain.OrderBookStatusOK,
 			SourceAt: decisionAt, MinOrderSize: "1", TickSize: "0.01",
-			Bids: []domain.PriceLevel{{Price: "0.59", Size: "100"}},
-			Asks: []domain.PriceLevel{{Price: "0.60", Size: "100"}},
+			Bids: []domain.PriceLevel{{Price: "0.37", Size: "100"}},
+			Asks: []domain.PriceLevel{
+				{Price: "0.39", Size: "7.73"},
+				{Price: "0.42", Size: "15"},
+				{Price: "0.43", Size: "50"},
+			},
 		}},
 		ExecutionConstraints: domain.DefaultStrategyExecutionConstraints(),
 	}
@@ -118,7 +122,7 @@ func TestKalshiPredictionBuildsVenueIntentButStaysOutOfPolymarketDelivery(t *tes
 		OutcomeIndex: 0, TokenID: prediction.Outcomes[0].TokenID,
 		Evidence: domain.StrategyEvidence{Probability: 0.7},
 		Order: &domain.StrategyOrderParams{
-			Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.60", Size: "2", TimeInForce: domain.TimeInForceFOK,
+			Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.42", Size: "12", TimeInForce: domain.TimeInForceFOK,
 		},
 	}
 	intent, err := buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket")
@@ -127,6 +131,9 @@ func TestKalshiPredictionBuildsVenueIntentButStaysOutOfPolymarketDelivery(t *tes
 	}
 	if intent.Venue != "kalshi" || intent.MarketSource != domain.MarketSourceKalshi || intent.OutcomeID != "YES" {
 		t.Fatalf("intent = %#v", intent)
+	}
+	if !intent.Size.Equal("12") || !intent.WorstPrice.Equal("0.42") || intent.Metadata["strategy_reference_price"] != "0.39" {
+		t.Fatalf("sparse-depth intent = %#v", intent)
 	}
 	deliverable, dryRun := (&Service{}).submissionIntents([]domain.OrderIntent{intent})
 	if len(deliverable) != 0 || len(dryRun) != 1 || dryRun[0].ClientOrderID != intent.ClientOrderID {
@@ -185,7 +192,9 @@ func TestValidateStrategyOrderRejectsRoundedBuyBeyondBestAskLiquidity(t *testing
 		TickSize: "0.001",
 		Asks:     []domain.PriceLevel{{Price: "0.501", Size: "19.99"}},
 	}
-	err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints())
+	err := validateStrategyOrderForMarket(
+		order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourcePolymarket,
+	)
 	if err == nil || err.Error() != "BUY order.size exceeds protected-price liquidity" {
 		t.Fatalf("validateStrategyOrder() error = %v", err)
 	}
@@ -280,6 +289,48 @@ func TestValidateStrategyOrderRejectsBuyBeyondTwoTicks(t *testing.T) {
 	err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints())
 	if err == nil || !strings.Contains(err.Error(), "at most 2 ticks worse") {
 		t.Fatalf("validateStrategyOrder() error = %v", err)
+	}
+}
+
+func TestValidateStrategyOrderAllowsKalshiSparseDepthBeyondTwoTicks(t *testing.T) {
+	order := domain.StrategyOrderParams{
+		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.42", Size: "12", TimeInForce: domain.TimeInForceFOK,
+	}
+	book := domain.OrderBookSnapshot{
+		MarketSource: domain.MarketSourceKalshi,
+		TickSize:     "0.01",
+		MinOrderSize: "1",
+		Asks: []domain.PriceLevel{
+			{Price: "0.39", Size: "7.73"},
+			{Price: "0.42", Size: "15"},
+			{Price: "0.43", Size: "50"},
+		},
+	}
+	if err := validateStrategyOrderForMarket(
+		order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourceKalshi,
+	); err != nil {
+		t.Fatalf("validateStrategyOrderForMarket() error = %v", err)
+	}
+}
+
+func TestValidateStrategyOrderAllowsKalshiSparseSellDepthBeyondTwoTicks(t *testing.T) {
+	order := domain.StrategyOrderParams{
+		Side: domain.SideSell, Type: domain.OrderTypeLimit, WorstPrice: "0.58", Size: "12", TimeInForce: domain.TimeInForceFOK,
+	}
+	book := domain.OrderBookSnapshot{
+		MarketSource: domain.MarketSourceKalshi,
+		TickSize:     "0.01",
+		MinOrderSize: "1",
+		Bids: []domain.PriceLevel{
+			{Price: "0.61", Size: "7.73"},
+			{Price: "0.58", Size: "15"},
+			{Price: "0.57", Size: "50"},
+		},
+	}
+	if err := validateStrategyOrderForMarket(
+		order, domain.SideSell, book, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourceKalshi,
+	); err != nil {
+		t.Fatalf("validateStrategyOrderForMarket() error = %v", err)
 	}
 }
 

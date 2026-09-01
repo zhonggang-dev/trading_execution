@@ -38,10 +38,11 @@ Python Strategy / SUBMIT
 - MARKET 订单也必须带 `worst_price`，供后续真实 Venue adapter 做保护型 FOK/FAK 转换。
 
 Kalshi 使用 `DEPTH_AWARE_LIMIT`：策略快照的最优价作为 `strategy_reference_price`，
-`worst_price` 最多只能向不利方向放宽 2 个 tick。实际提交前 Go 会重新读取不超过 10 秒的官方
-盘口，允许价格向有利方向移动，也允许仍在 `worst_price` 内的不利移动；同时要求保护价范围内的
-累计可见深度覆盖完整 FOK shares。最新最优价越过保护线、深度不足、价格不在 tick 上或参考价
-缺失时均 fail closed，Go 不会自行扩大策略给出的限价。
+`worst_price` 必须处于可成交方向并由冻结盘口在该保护价内的累计深度覆盖完整 FOK shares。Kalshi
+盘口可能跳过中间 tick，因此不额外套用固定两 tick 距离上限。实际提交前 Go 会重新读取不超过
+10 秒的官方盘口，允许价格向有利方向移动，也允许仍在 `worst_price` 内的不利移动；同时再次要求
+保护价范围内的累计可见深度覆盖完整 FOK shares。最新最优价越过保护线、深度不足、价格不在 tick
+上或参考价缺失时均 fail closed，Go 不会自行扩大策略给出的限价。
 
 ## OrderIntent 的市场上下文
 

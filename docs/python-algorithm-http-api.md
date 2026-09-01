@@ -328,7 +328,7 @@ type StrategyDecisionSuccess = {
 - `evidence.probability` 必须与输入对应 outcome 的 probability 完全一致；
 - `SKIP` 不能带 `order`；
 - `SUBMIT` 必须是 `BUY + LIMIT + FOK`，`reason_code` 必须为 `ENTRY_SIGNAL`；
-- 决策接口使用 `DEPTH_AWARE_LIMIT`：BUY `worst_price` 可从 `best_ask` 向上最多 2 个 tick，SELL 可从 `best_bid` 向下最多 2 个 tick；价格必须是 `tick_size` 的整数倍；
+- 决策接口使用 `DEPTH_AWARE_LIMIT`：Polymarket 的 BUY `worst_price` 可从 `best_ask` 向上最多 2 个 tick，SELL 可从 `best_bid` 向下最多 2 个 tick；Kalshi 稀疏盘口不使用固定 tick 距离上限，但保护价方向必须正确且范围内累计深度必须覆盖完整 FOK shares；所有价格必须是 `tick_size` 的整数倍；
 - `size` 单位为 shares，输入最多 2 位小数；Trading 会在 BUY 下单前四舍五入为整数 shares，再校验 BUY 的 `ask.price <= worst_price` 或 SELL 的 `bid.price >= worst_price` 的累计可见深度足以覆盖 FOK 数量；BUY 还要求 `worst_price * size` 最多 4 位小数且不少于 1 美元；
 - `multfactor_v1` SUBMIT 的 `evidence.metrics` 必须包含
   `best_ask/near_logdiff_usd/rel_spread`，MOM/MACD 可选；`multfactor_v2` 必须完整包含五项；
@@ -726,7 +726,7 @@ type AlgorithmErrorResponse = {
 - 所有金额、价格、shares、edge和metrics使用字符串小数；
 - 入场接口逐prediction outcome返回评价，退出接口逐 `lot_id` 返回评价；
 - 只允许 `LIMIT + FOK`，不返回GTC、IOC或MARKET；
-- Python负责填写 `worst_price`；决策接口按 `DEPTH_AWARE_LIMIT` 允许向不利方向最多 2 个 tick，独立 Position Exit 接口仍要求 SELL 严格等于冻结 best bid；
+- Python负责填写 `worst_price`；Polymarket 决策接口按 `DEPTH_AWARE_LIMIT` 允许向不利方向最多 2 个 tick；Kalshi 允许跨越空价档，但冻结及最新官方盘口在保护价范围内都必须有完整 FOK 深度；独立 Position Exit 接口仍要求 SELL 严格等于冻结 best bid；
 - 算法做Edge、因子、止盈止损和持有期规则；Go做余额、预占、最大仓位、重复订单、Kill Switch、
   Market状态和最新价格漂移等硬风控；
 - 同一幂等键重试必须返回同一决策，不得产生新的 `decision_id`。

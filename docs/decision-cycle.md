@@ -88,13 +88,17 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 转为整数 shares，然后使用转换后的数量执行最小下单量、保护价卖盘流动性、BUY notional 精度和风控校验。
 如果数量发生变化，原始值会记录在 intent metadata 的 `strategy_requested_size`。
 
-`DEPTH_AWARE_LIMIT` 允许策略把 `worst_price` 设在同轮盘口最优价到更差最多
+对于 Polymarket，`DEPTH_AWARE_LIMIT` 允许策略把 `worst_price` 设在同轮盘口最优价到更差最多
 `max_price_slippage_ticks`（当前为 2）个 tick 的范围内。BUY 必须满足
 `best_ask <= worst_price <= best_ask + 2*tick_size`，并由所有
 `ask.price <= worst_price` 的可见档位累计覆盖 FOK shares；SELL 必须满足
 `best_bid - 2*tick_size <= worst_price <= best_bid`，并由所有
 `bid.price >= worst_price` 的可见档位累计覆盖 FOK shares。保护价必须是
 `tick_size` 的整数倍；执行时仍以 `worst_price` 作为限价，不允许无限追价。
+
+Kalshi 盘口可能跳过中间 tick，因此不套用固定的两 tick 距离上限。策略仍必须基于冻结快照给出明确的
+`worst_price`，价格方向正确、位于 tick 上，且保护价范围内的累计可见深度必须覆盖完整 FOK shares；
+下单前 Go 还会用最新官方盘口重复校验最优价没有越过保护线且深度仍然充足。
 
 `predictions` 每个周期发送当前 binding 所属模型的全部当前有效 Market。一条 Market/Model 预测仍包含两个按原始
 Outcome 顺序对齐且和为 1 的概率和 token，而不是只传一个脱离 Outcome 的 `prob`。
