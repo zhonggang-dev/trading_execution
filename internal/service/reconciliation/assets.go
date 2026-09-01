@@ -66,6 +66,8 @@ type baselineDriftParams struct {
 	details       string
 }
 
+const polymarketDataAPIShareEpsilon = domain.Decimal("0.001")
+
 // reconcilePositions 在成交补录后重新读取并核对本地与外部持仓。
 func (state *runState) reconcilePositions(ctx context.Context, executionAccountID, walletAddress string) error {
 	positions, err := state.service.ledger.ListPositions(ctx, executionAccountID)
@@ -301,7 +303,7 @@ func (state *runState) compareExternalPosition(ctx context.Context, params compa
 		})
 		return
 	}
-	sharesMatch := within(position.TotalShares, params.external.Shares, state.service.positionEpsilon)
+	sharesMatch := managedPositionSharesMatch(position.TotalShares, params.external, state.service.positionEpsilon)
 	state.settlePositionIfNeeded(ctx, settlePositionParams{tokenID: params.tokenID, position: position, external: params.external, sharesMatch: sharesMatch})
 	if sharesMatch {
 		return
@@ -313,6 +315,21 @@ func (state *runState) compareExternalPosition(ctx context.Context, params compa
 		LocalValue: position.TotalShares, RemoteValue: params.external.Shares, Source: params.external.Source,
 		Details: "position quantity still differs after confirmed-fill recovery; do not guess an accounting event",
 	})
+}
+
+func managedPositionSharesMatch(local domain.Decimal, external domain.ExternalPosition, configured domain.Decimal) bool {
+	tolerance := configured
+	// Polymarket's Data API position snapshot reports outcome shares at
+	// millishare precision even though confirmed OrderFilled events and the
+	// ERC-1155 ledger retain six decimals. Bound only this read-model source to
+	// one displayed quantum; the fill ledger remains exact and authoritative.
+	if strings.EqualFold(strings.TrimSpace(external.Source), "POLYMARKET_DATA_API") {
+		comparison, err := tolerance.Compare(polymarketDataAPIShareEpsilon)
+		if err != nil || comparison < 0 {
+			tolerance = polymarketDataAPIShareEpsilon
+		}
+	}
+	return within(local, external.Shares, tolerance)
 }
 
 func managedPositionMatchesExternal(executionAccountID string, position domain.Position, external domain.ExternalPosition) bool {

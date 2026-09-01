@@ -486,6 +486,44 @@ func TestManagedPositionIdentityMismatchFailsClosed(t *testing.T) {
 	}
 }
 
+func TestManagedPolymarketPositionAllowsOnlyDataAPIMillisharePrecision(t *testing.T) {
+	position := domain.Position{
+		ExecutionAccountID: "account-1", MarketID: "market-1", ConditionID: "condition-1",
+		TokenID: "token-1", OutcomeIndex: intPointer(0), OutcomeName: "YES",
+		TotalShares: "30.147057", AvailableShares: "30.147057", ReservedShares: "0",
+		LifecycleStatus: domain.PositionLifecycleOpen,
+	}
+	for _, test := range []struct {
+		name       string
+		remote     domain.Decimal
+		wantStatus domain.ReconciliationRunStatus
+	}{
+		{name: "display precision", remote: "30.147", wantStatus: domain.ReconciliationRunCompleted},
+		{name: "material drift", remote: "30.145", wantStatus: domain.ReconciliationRunAttentionRequired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ledger := &fakeLedger{balance: testBalance("100"), positions: []domain.Position{position}}
+			external := domain.ExternalPosition{
+				ConditionID: "condition-1", TokenID: "token-1", OutcomeIndex: intPointer(0), OutcomeName: "YES",
+				Shares: test.remote, Source: "POLYMARKET_DATA_API", ObservedAt: testNow,
+			}
+			service := newPositionBaselineTestService(t, ledger, nil, []domain.ExternalPosition{external})
+			result, err := service.RunAccount(context.Background(), RunAccountParams{
+				ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+			})
+			if err != nil || result.Run.Status != test.wantStatus {
+				t.Fatalf("RunAccount() result/error = %#v/%v", result, err)
+			}
+			if test.wantStatus == domain.ReconciliationRunCompleted && len(result.Issues) != 0 {
+				t.Fatalf("display precision produced issues: %#v", result.Issues)
+			}
+			if test.wantStatus == domain.ReconciliationRunAttentionRequired {
+				assertIssue(t, result.Issues, domain.ReconciliationIssuePositionDrift, domain.ReconciliationIssueOpen)
+			}
+		})
+	}
+}
+
 func TestExternalPositionBaselineOnlyIsHealthyAndNeverBecomesManaged(t *testing.T) {
 	ledger := &fakeLedger{balance: testBalance("100")}
 	service := newPositionBaselineTestService(t, ledger, []domain.ExternalPositionBaseline{
