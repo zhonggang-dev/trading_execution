@@ -27,6 +27,40 @@ func TestLoadSafeDefaults(t *testing.T) {
 	if config.Kalshi.MarketDataEnabled {
 		t.Fatalf("Kalshi market data must be disabled without explicit credentials: %#v", config.Kalshi)
 	}
+	if config.TimeExit.Enabled || config.TimeExit.Interval != time.Minute || config.TimeExit.Timeout != 45*time.Second {
+		t.Fatalf("time exit safe defaults = %#v", config.TimeExit)
+	}
+}
+
+func TestLoadAcceptsExplicitLiveTimeExit(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	t.Setenv("TIME_EXIT_ENABLED", "true")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !config.TimeExit.Enabled || config.TimeExit.Interval != time.Minute || config.TimeExit.Timeout != 45*time.Second {
+		t.Fatalf("time exit config = %#v", config.TimeExit)
+	}
+}
+
+func TestLoadRejectsTimeExitOutsideLiveExecution(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("TIME_EXIT_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "TIME_EXIT_ENABLED") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadRejectsTimeExitTimeoutAtCadence(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	t.Setenv("TIME_EXIT_ENABLED", "true")
+	t.Setenv("TIME_EXIT_TIMEOUT", "1m")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "TIME_EXIT_TIMEOUT") {
+		t.Fatalf("Load() error = %v", err)
+	}
 }
 
 func TestLoadKalshiMarketDataRequiresCredentialFiles(t *testing.T) {
@@ -569,6 +603,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"EXECUTION_API_TOKEN", "POSITION_EXIT_JOB_TOKEN", "EXECUTION_MODE", "EXECUTION_VENUE", "EXECUTION_ALLOW_MARKET_ORDERS",
 		"EXECUTION_MAX_ORDER_NOTIONAL",
 		"ORDER_COORDINATOR_INTERVAL", "ORDER_COORDINATOR_BATCH_SIZE",
+		"TIME_EXIT_ENABLED", "TIME_EXIT_INTERVAL", "TIME_EXIT_TIMEOUT",
 		"POLYMARKET_LIVE_TRADING_ENABLED", "POLYMARKET_ACCOUNTS_FILE", "POLYMARKET_CLOB_URL",
 		"POLYMARKET_GEOBLOCK_URL", "POLYMARKET_FRONTEND_ONLY_API_COUNTRIES", "POLYMARKET_GAMMA_URL",
 		"POLYMARKET_DATA_API_URL", "POLYGON_RPC_URL", "POLYMARKET_REQUEST_TIMEOUT",

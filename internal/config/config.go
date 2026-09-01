@@ -26,6 +26,7 @@ type Config struct {
 	Kalshi         Kalshi
 	LiveOperations LiveOperations
 	DecisionCycle  DecisionCycle
+	TimeExit       TimeExit
 }
 
 // App 表示后端使用的 App 类型。
@@ -100,6 +101,14 @@ type Execution struct {
 	AllowMarketOrders    bool
 	CoordinatorInterval  time.Duration
 	CoordinatorBatchSize int
+}
+
+// TimeExit configures the independent live holding-period exit loop. It is
+// deliberately separate from the prediction/strategy decision cycle.
+type TimeExit struct {
+	Enabled  bool
+	Interval time.Duration
+	Timeout  time.Duration
 }
 
 // Polymarket 保存 fail-closed 实盘装配配置，钱包秘密只留在受限文件中。
@@ -193,6 +202,18 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	coordinatorBatchSize, err := integer("ORDER_COORDINATOR_BATCH_SIZE", 100, 1, 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	timeExitEnabled, err := boolean("TIME_EXIT_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	timeExitInterval, err := duration("TIME_EXIT_INTERVAL", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	timeExitTimeout, err := duration("TIME_EXIT_TIMEOUT", 45*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
@@ -366,6 +387,9 @@ func Load() (Config, error) {
 			MaxSnapshotAge: liveOperationsMaxAge, EventLimit: liveOperationsEventLimit,
 		},
 		DecisionCycle: decisionCycle,
+		TimeExit: TimeExit{
+			Enabled: timeExitEnabled, Interval: timeExitInterval, Timeout: timeExitTimeout,
+		},
 	}
 	if err := config.Validate(); err != nil {
 		return Config{}, err
@@ -459,6 +483,17 @@ func (config Config) Validate() error {
 	}
 	if config.DecisionCycle.OrderSubmissionEnabled && !config.DecisionCycle.Enabled {
 		return fmt.Errorf("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED requires DECISION_CYCLE_ENABLED=true")
+	}
+	if config.TimeExit.Enabled {
+		if config.Execution.Mode != "live" || !config.Polymarket.LiveTradingEnabled {
+			return fmt.Errorf("TIME_EXIT_ENABLED requires explicitly enabled Polymarket live execution")
+		}
+		if config.TimeExit.Interval < 10*time.Second || config.TimeExit.Interval > 10*time.Minute {
+			return fmt.Errorf("TIME_EXIT_INTERVAL must be between 10s and 10m")
+		}
+		if config.TimeExit.Timeout <= 0 || config.TimeExit.Timeout >= config.TimeExit.Interval {
+			return fmt.Errorf("TIME_EXIT_TIMEOUT must be positive and less than TIME_EXIT_INTERVAL")
+		}
 	}
 	if config.Kalshi.MarketDataEnabled {
 		if !secureExternalURL(config.Kalshi.APIURL) {
