@@ -26,7 +26,6 @@ type Config struct {
 	Kalshi         Kalshi
 	LiveOperations LiveOperations
 	DecisionCycle  DecisionCycle
-	TimeExit       TimeExit
 }
 
 // App 表示后端使用的 App 类型。
@@ -103,38 +102,36 @@ type Execution struct {
 	CoordinatorBatchSize int
 }
 
-// TimeExit configures the independent live holding-period exit loop. It is
-// deliberately separate from the prediction/strategy decision cycle.
-type TimeExit struct {
-	Enabled  bool
-	Interval time.Duration
-	Timeout  time.Duration
-}
-
 // Polymarket 保存 fail-closed 实盘装配配置，钱包秘密只留在受限文件中。
 type Polymarket struct {
-	LiveTradingEnabled       bool
-	AccountsFile             string
-	CLOBURL                  string
-	GeoblockURL              string
-	FrontendOnlyAPICountries []string
-	GammaURL                 string
-	DataAPIURL               string
-	PolygonRPCURL            string
-	RequestTimeout           time.Duration
-	StartupTimeout           time.Duration
-	MaxClockSkew             time.Duration
-	HeartbeatInterval        time.Duration
-	HeartbeatCallTimeout     time.Duration
-	HeartbeatStaleAfter      time.Duration
-	ReconciliationInterval   time.Duration
-	ReconciliationLookback   time.Duration
-	PositionEpsilon          domain.Decimal
-	BalanceEpsilon           domain.Decimal
-	CancelFillFinalityGrace  time.Duration
-	MaxReconcileAttempts     int
-	MaxBuyFeeRateBPS         domain.Decimal
-	OrderFilledConfirmations int
+	LiveTradingEnabled         bool
+	AutoRedeemEnabled          bool
+	AccountsFile               string
+	CLOBURL                    string
+	RelayerURL                 string
+	GeoblockURL                string
+	FrontendOnlyAPICountries   []string
+	GammaURL                   string
+	DataAPIURL                 string
+	PolygonRPCURL              string
+	RequestTimeout             time.Duration
+	StartupTimeout             time.Duration
+	MaxClockSkew               time.Duration
+	HeartbeatInterval          time.Duration
+	HeartbeatCallTimeout       time.Duration
+	HeartbeatStaleAfter        time.Duration
+	ReconciliationInterval     time.Duration
+	ReconciliationLookback     time.Duration
+	PositionEpsilon            domain.Decimal
+	BalanceEpsilon             domain.Decimal
+	CancelFillFinalityGrace    time.Duration
+	MaxReconcileAttempts       int
+	MaxBuyFeeRateBPS           domain.Decimal
+	OrderFilledConfirmations   int
+	AutoRedeemInterval         time.Duration
+	AutoRedeemRetryInterval    time.Duration
+	AutoRedeemAmbiguityTimeout time.Duration
+	AutoRedeemBatchSize        int
 }
 
 // Kalshi keeps authenticated market-data credentials outside the repository.
@@ -205,18 +202,6 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	timeExitEnabled, err := boolean("TIME_EXIT_ENABLED", false)
-	if err != nil {
-		return Config{}, err
-	}
-	timeExitInterval, err := duration("TIME_EXIT_INTERVAL", time.Minute)
-	if err != nil {
-		return Config{}, err
-	}
-	timeExitTimeout, err := duration("TIME_EXIT_TIMEOUT", 45*time.Second)
-	if err != nil {
-		return Config{}, err
-	}
 	liveTradingEnabled, err := boolean("POLYMARKET_LIVE_TRADING_ENABLED", false)
 	if err != nil {
 		return Config{}, err
@@ -230,6 +215,10 @@ func Load() (Config, error) {
 				return Config{}, fmt.Errorf("%s must be explicitly configured in live mode", key)
 			}
 		}
+	}
+	autoRedeemEnabled, err := boolean("POLYMARKET_AUTO_REDEEM_ENABLED", false)
+	if err != nil {
+		return Config{}, err
 	}
 	polymarketRequestTimeout, err := duration("POLYMARKET_REQUEST_TIMEOUT", 5*time.Second)
 	if err != nil {
@@ -299,6 +288,22 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	autoRedeemInterval, err := duration("POLYMARKET_AUTO_REDEEM_INTERVAL", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	autoRedeemRetryInterval, err := duration("POLYMARKET_AUTO_REDEEM_RETRY_INTERVAL", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	autoRedeemAmbiguityTimeout, err := duration("POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT", 15*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	autoRedeemBatchSize, err := integer("POLYMARKET_AUTO_REDEEM_BATCH_SIZE", 20, 1, 100)
+	if err != nil {
+		return Config{}, err
+	}
 	liveOperationsInterval, err := duration("LIVE_OPERATIONS_INTERVAL", 10*time.Second)
 	if err != nil {
 		return Config{}, err
@@ -349,30 +354,36 @@ func Load() (Config, error) {
 		},
 		Polymarket: Polymarket{
 			LiveTradingEnabled: liveTradingEnabled,
+			AutoRedeemEnabled:  autoRedeemEnabled,
 			AccountsFile:       strings.TrimSpace(os.Getenv("POLYMARKET_ACCOUNTS_FILE")),
 			CLOBURL:            env("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
+			RelayerURL:         env("POLYMARKET_RELAYER_URL", "https://relayer-v2.polymarket.com"),
 			GeoblockURL:        env("POLYMARKET_GEOBLOCK_URL", "https://polymarket.com/api/geoblock"),
 			// Empty by default so a deployment cannot silently keep an old policy
 			// exception. Production must opt in after checking the current official
 			// geographic-restrictions page.
-			FrontendOnlyAPICountries: commaSeparated(os.Getenv("POLYMARKET_FRONTEND_ONLY_API_COUNTRIES")),
-			GammaURL:                 env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"),
-			DataAPIURL:               env("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com"),
-			PolygonRPCURL:            strings.TrimSpace(os.Getenv("POLYGON_RPC_URL")),
-			RequestTimeout:           polymarketRequestTimeout,
-			StartupTimeout:           startupTimeout,
-			MaxClockSkew:             maxClockSkew,
-			HeartbeatInterval:        heartbeatInterval,
-			HeartbeatCallTimeout:     heartbeatCallTimeout,
-			HeartbeatStaleAfter:      heartbeatStaleAfter,
-			ReconciliationInterval:   reconciliationInterval,
-			ReconciliationLookback:   reconciliationLookback,
-			PositionEpsilon:          positionEpsilon,
-			BalanceEpsilon:           balanceEpsilon,
-			CancelFillFinalityGrace:  cancelFillFinalityGrace,
-			MaxReconcileAttempts:     maxReconcileAttempts,
-			MaxBuyFeeRateBPS:         maxBuyFeeRateBPS,
-			OrderFilledConfirmations: orderFilledConfirmations,
+			FrontendOnlyAPICountries:   commaSeparated(os.Getenv("POLYMARKET_FRONTEND_ONLY_API_COUNTRIES")),
+			GammaURL:                   env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"),
+			DataAPIURL:                 env("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com"),
+			PolygonRPCURL:              strings.TrimSpace(os.Getenv("POLYGON_RPC_URL")),
+			RequestTimeout:             polymarketRequestTimeout,
+			StartupTimeout:             startupTimeout,
+			MaxClockSkew:               maxClockSkew,
+			HeartbeatInterval:          heartbeatInterval,
+			HeartbeatCallTimeout:       heartbeatCallTimeout,
+			HeartbeatStaleAfter:        heartbeatStaleAfter,
+			ReconciliationInterval:     reconciliationInterval,
+			ReconciliationLookback:     reconciliationLookback,
+			PositionEpsilon:            positionEpsilon,
+			BalanceEpsilon:             balanceEpsilon,
+			CancelFillFinalityGrace:    cancelFillFinalityGrace,
+			MaxReconcileAttempts:       maxReconcileAttempts,
+			MaxBuyFeeRateBPS:           maxBuyFeeRateBPS,
+			OrderFilledConfirmations:   orderFilledConfirmations,
+			AutoRedeemInterval:         autoRedeemInterval,
+			AutoRedeemRetryInterval:    autoRedeemRetryInterval,
+			AutoRedeemAmbiguityTimeout: autoRedeemAmbiguityTimeout,
+			AutoRedeemBatchSize:        autoRedeemBatchSize,
 		},
 		Kalshi: Kalshi{
 			MarketDataEnabled: kalshiMarketDataEnabled,
@@ -387,9 +398,6 @@ func Load() (Config, error) {
 			MaxSnapshotAge: liveOperationsMaxAge, EventLimit: liveOperationsEventLimit,
 		},
 		DecisionCycle: decisionCycle,
-		TimeExit: TimeExit{
-			Enabled: timeExitEnabled, Interval: timeExitInterval, Timeout: timeExitTimeout,
-		},
 	}
 	if err := config.Validate(); err != nil {
 		return Config{}, err
@@ -454,6 +462,7 @@ func (config Config) Validate() error {
 			"POLYMARKET_GAMMA_URL":    config.Polymarket.GammaURL,
 			"POLYMARKET_DATA_API_URL": config.Polymarket.DataAPIURL,
 			"POLYGON_RPC_URL":         config.Polymarket.PolygonRPCURL,
+			"POLYMARKET_RELAYER_URL":  config.Polymarket.RelayerURL,
 		} {
 			if !secureExternalURL(value) {
 				return fmt.Errorf("%s must be an absolute HTTPS URL in live mode", name)
@@ -481,19 +490,25 @@ func (config Config) Validate() error {
 			return fmt.Errorf("LIVE_OPERATIONS_MAX_SNAPSHOT_AGE must be greater than LIVE_OPERATIONS_INTERVAL")
 		}
 	}
+	if config.Polymarket.AutoRedeemEnabled && config.Execution.Mode != "live" {
+		return fmt.Errorf("POLYMARKET_AUTO_REDEEM_ENABLED requires live execution mode")
+	}
+	if config.Polymarket.AutoRedeemEnabled {
+		if config.Polymarket.AutoRedeemInterval < 10*time.Second || config.Polymarket.AutoRedeemInterval > 10*time.Minute {
+			return fmt.Errorf("POLYMARKET_AUTO_REDEEM_INTERVAL must be between 10s and 10m")
+		}
+		if config.Polymarket.AutoRedeemRetryInterval < 5*time.Second || config.Polymarket.AutoRedeemRetryInterval > time.Hour {
+			return fmt.Errorf("POLYMARKET_AUTO_REDEEM_RETRY_INTERVAL must be between 5s and 1h")
+		}
+		if config.Polymarket.AutoRedeemAmbiguityTimeout < time.Minute || config.Polymarket.AutoRedeemAmbiguityTimeout > 24*time.Hour {
+			return fmt.Errorf("POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT must be between 1m and 24h")
+		}
+		if config.Polymarket.AutoRedeemBatchSize < 1 || config.Polymarket.AutoRedeemBatchSize > 100 {
+			return fmt.Errorf("POLYMARKET_AUTO_REDEEM_BATCH_SIZE must be between 1 and 100")
+		}
+	}
 	if config.DecisionCycle.OrderSubmissionEnabled && !config.DecisionCycle.Enabled {
 		return fmt.Errorf("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED requires DECISION_CYCLE_ENABLED=true")
-	}
-	if config.TimeExit.Enabled {
-		if config.Execution.Mode != "live" || !config.Polymarket.LiveTradingEnabled {
-			return fmt.Errorf("TIME_EXIT_ENABLED requires explicitly enabled Polymarket live execution")
-		}
-		if config.TimeExit.Interval < 10*time.Second || config.TimeExit.Interval > 10*time.Minute {
-			return fmt.Errorf("TIME_EXIT_INTERVAL must be between 10s and 10m")
-		}
-		if config.TimeExit.Timeout <= 0 || config.TimeExit.Timeout >= config.TimeExit.Interval {
-			return fmt.Errorf("TIME_EXIT_TIMEOUT must be positive and less than TIME_EXIT_INTERVAL")
-		}
 	}
 	if config.Kalshi.MarketDataEnabled {
 		if !secureExternalURL(config.Kalshi.APIURL) {

@@ -2288,19 +2288,6 @@ func TestValidateResponseBuildsKalshiIOCExit(t *testing.T) {
 	}
 }
 
-func TestIndependentTimeExitSuppressesStrategySellDelivery(t *testing.T) {
-	buy := domain.OrderIntent{ClientOrderID: "buy", Side: domain.SideBuy}
-	sell := domain.OrderIntent{ClientOrderID: "sell", Side: domain.SideSell}
-	kalshiSell := domain.OrderIntent{ClientOrderID: "kalshi-sell", Side: domain.SideSell, MarketSource: domain.MarketSourceKalshi}
-	intents := suppressPolymarketExitIntents([]domain.OrderIntent{buy, sell, kalshiSell}, true)
-	if len(intents) != 2 || intents[0].Side != domain.SideBuy || intents[1].MarketSource != domain.MarketSourceKalshi {
-		t.Fatalf("suppressed intents = %#v, want BUY and Kalshi SELL", intents)
-	}
-	if untouched := suppressPolymarketExitIntents([]domain.OrderIntent{buy, sell}, false); len(untouched) != 2 {
-		t.Fatalf("unsuppressed intents = %#v", untouched)
-	}
-}
-
 func TestCoverageEntryGateBlocksMalformedBuyButPreservesValidExit(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	prediction := validPrediction(decisionAt)

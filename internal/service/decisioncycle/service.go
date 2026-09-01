@@ -56,10 +56,6 @@ type Params struct {
 	// EntryDisabledAccounts keeps selected active bindings sell-only while the
 	// remaining bindings may emit and deliver BUY intents.
 	EntryDisabledAccounts []string
-	// ExitSubmissionDisabled keeps the external strategy response auditable but
-	// prevents its SELL intents from entering durable delivery. Production turns
-	// this on when the independent execution-owned 48-hour exit loop is active.
-	ExitSubmissionDisabled bool
 	// RequireCompleteModelCoverage keeps live BUY submission fail closed for a
 	// binding that has no fresh probability. Coverage is evaluated independently
 	// per configured source model; a Market is never required to have results
@@ -88,7 +84,6 @@ type Service struct {
 	entrySubmissionDisabled          bool
 	entryDisabledAccounts            []string
 	entryDisabledAccountSet          map[string]struct{}
-	exitSubmissionDisabled           bool
 	requireCompleteModelCoverage     bool
 	bindings                         []domain.StrategyExecutionBinding
 	predictionSourceModes            map[string]domain.PredictionSourceMode
@@ -212,7 +207,6 @@ func New(params Params) (*Service, error) {
 		entrySubmissionDisabled:          params.EntrySubmissionDisabled,
 		entryDisabledAccounts:            entryDisabledAccounts,
 		entryDisabledAccountSet:          entryDisabledAccountSet,
-		exitSubmissionDisabled:           params.ExitSubmissionDisabled,
 		requireCompleteModelCoverage:     params.RequireCompleteModelCoverage,
 		bindings:                         bindings,
 		predictionSourceModes:            predictionSourceModes,
@@ -464,7 +458,6 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, err
 	}
-	intents = suppressPolymarketExitIntents(intents, service.exitSubmissionDisabled)
 	deliverableIntents, venueDryRunIntents := service.submissionIntents(intents)
 	response, _, err = service.recorder.ClaimOutput(ctx, response, deliverableIntents, params.submitEnabled)
 	run.Response = response
@@ -475,7 +468,6 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	if err != nil {
 		return run, fmt.Errorf("validate recorded strategy output: %w", err)
 	}
-	intents = suppressPolymarketExitIntents(intents, service.exitSubmissionDisabled)
 	_, venueDryRunIntents = service.submissionIntents(intents)
 	if !params.submitEnabled {
 		run.Intents = make([]IntentResult, 0, len(intents))
@@ -668,19 +660,6 @@ func (service *Service) deliveryCohorts() []deliveryCohort {
 			executionAccountIDs: service.entryDisabledExecutionAccountIDs,
 			side:                domain.SideSell,
 		})
-	}
-	return result
-}
-
-func suppressPolymarketExitIntents(intents []domain.OrderIntent, disabled bool) []domain.OrderIntent {
-	if !disabled {
-		return intents
-	}
-	result := make([]domain.OrderIntent, 0, len(intents))
-	for _, intent := range intents {
-		if intent.Side != domain.SideSell || intent.MarketSource.Normalize() != domain.MarketSourcePolymarket {
-			result = append(result, intent)
-		}
 	}
 	return result
 }

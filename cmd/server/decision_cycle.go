@@ -96,7 +96,6 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		SubmissionDisabledAccounts:   cycleConfig.SubmissionDisabledAccounts,
 		EntrySubmissionDisabled:      cycleConfig.EntrySubmissionDisabled,
 		EntryDisabledAccounts:        cycleConfig.EntryDisabledAccounts,
-		ExitSubmissionDisabled:       params.cfg.TimeExit.Enabled,
 		RequireCompleteModelCoverage: cycleConfig.RequireCompleteModelCoverage,
 		Bindings:                     cycleConfig.Bindings,
 		PredictionSourceModes:        cycleConfig.PredictionSourceModes,

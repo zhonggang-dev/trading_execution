@@ -966,11 +966,12 @@ func (ledger *fakeLedger) ListPositions(context.Context, string) ([]domain.Posit
 }
 
 // MarkPositionSettled 记录模拟状态变更。
-func (ledger *fakeLedger) MarkPositionSettled(_ context.Context, _ string, tokenID, _ string, _ time.Time) (domain.Position, error) {
+func (ledger *fakeLedger) MarkPositionSettled(_ context.Context, _ string, tokenID, _ string, settlementPrice domain.Decimal, _ time.Time) (domain.Position, error) {
 	ledger.settled = append(ledger.settled, tokenID)
 	for index := range ledger.positions {
 		if ledger.positions[index].TokenID == tokenID {
 			ledger.positions[index].LifecycleStatus = domain.PositionLifecycleSettledPendingRedeem
+			ledger.positions[index].SettlementPrice = settlementPrice
 			return ledger.positions[index], nil
 		}
 	}

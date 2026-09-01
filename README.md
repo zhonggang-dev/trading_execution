@@ -105,8 +105,12 @@ PostgreSQL 订单/预占/Fill/仓位账本、启动与持续 reconciliation、he
    正确，并让每个确认 Fill 都取得足够确认数的链上 `OrderFilled` 证据；
 4. 使用专用小额空钱包完成一次人工批准的 BUY/SELL/Cancel canary 后再逐步放量。
 
-transactional outbox 会与账本同事务写入，但生产消息 publisher 仍需按部署环境注入；独立 Position Exit
-runner 和链上 redeem 仍未在 `cmd/server` 装配（OPEN-lot 退出当前由 decision cycle 处理）。策略周期已经使用 prediction_infra HTTP snapshot、
+transactional outbox 会与账本同事务写入，但生产消息 publisher 仍需按部署环境注入。OPEN-lot
+退出由 decision cycle 处理；已结算仓位则由可选的 Polymarket auto-redeem runner 处理。该 runner 不按持仓时长
+生成 SELL 单，而是只扫描 `SETTLED_PENDING_REDEEM`，按精确 condition 调用 standard/neg-risk adapter，
+等待 Polygon 回执达到配置确认数后再原子写入 payout/PnL。`POLYMARKET_AUTO_REDEEM_ENABLED` 默认 `false`；
+Deposit Wallet 还必须在受限钱包文件中配置独立 relayer key，缺少时 live 启动 fail closed。
+策略周期已经使用 prediction_infra HTTP snapshot、
 Python `/api/v4/decisions`、PostgreSQL 输入/输出审计和精确 UTC Runner 完成 live 装配，但默认
 `DECISION_CYCLE_ENABLED=false`，且独立的订单提交开关也默认关闭。订单提交还强制要求
 `DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true` 和精确的 2 模型 × 2 策略 × 4 钱包拓扑；

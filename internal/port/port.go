@@ -212,7 +212,37 @@ type ExternalBalanceSource interface {
 type ReconciliationLedger interface {
 	GetBalance(ctx context.Context, executionAccountID string) (domain.AccountBalance, error)
 	ListPositions(ctx context.Context, executionAccountID string) ([]domain.Position, error)
-	MarkPositionSettled(ctx context.Context, executionAccountID, tokenID, sourceReference string, observedAt time.Time) (domain.Position, error)
+	MarkPositionSettled(ctx context.Context, executionAccountID, tokenID, sourceReference string, settlementPrice domain.Decimal, observedAt time.Time) (domain.Position, error)
+}
+
+// RedemptionStore persists discovery, submit intent, venue identity, receipt
+// confirmation, and accounting application as separate idempotent transitions.
+type RedemptionStore interface {
+	SyncPendingRedemptions(ctx context.Context) error
+	ListDueRedemptions(ctx context.Context, limit int, now time.Time) ([]domain.Redemption, error)
+	BeginRedemptionSubmission(ctx context.Context, redemption domain.Redemption, kind domain.RedemptionSubmissionKind, startedAt time.Time) error
+	RecordRedemptionSubmission(ctx context.Context, redemption domain.Redemption, submission domain.RedemptionSubmission, submittedAt, nextAttemptAt time.Time) error
+	ResetRedemptionReady(ctx context.Context, redemption domain.Redemption, nextAttemptAt time.Time) error
+	RecordRedemptionTransaction(ctx context.Context, redemption domain.Redemption, transactionHash string, nextAttemptAt time.Time) error
+	RecordRedemptionConfirmed(ctx context.Context, redemption domain.Redemption, receipt domain.RedemptionReceipt, confirmedAt time.Time) error
+	ApplyRedemption(ctx context.Context, redemption domain.Redemption, appliedAt time.Time) error
+	RetryRedemption(ctx context.Context, redemption domain.Redemption, reason string, nextAttemptAt time.Time) error
+	ReviewRedemption(ctx context.Context, redemption domain.Redemption, reason string, reviewedAt time.Time) error
+}
+
+type RedeemActivitySource interface {
+	ListRedeemActivities(ctx context.Context, walletAddress, conditionID string, start time.Time) ([]domain.RedeemActivity, error)
+}
+
+type RedemptionReceiptSource interface {
+	ResolveRedemptionReceipt(ctx context.Context, transactionHash, walletAddress, conditionID string, negRisk bool) (domain.RedemptionReceipt, error)
+}
+
+type RedemptionVenue interface {
+	RedemptionApproved(ctx context.Context, walletAddress string, negRisk bool) (bool, error)
+	SubmitRedemptionApproval(ctx context.Context, executionAccountID string, negRisk bool) (domain.RedemptionSubmission, error)
+	SubmitRedemption(ctx context.Context, executionAccountID, conditionID string, negRisk bool) (domain.RedemptionSubmission, error)
+	ResolveRedemptionSubmission(ctx context.Context, executionAccountID string, submission domain.RedemptionSubmission) (domain.RedemptionSubmission, error)
 }
 
 // ReconciliationRecorder 表示后端使用的 ReconciliationRecorder 类型。
