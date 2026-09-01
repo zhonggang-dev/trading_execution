@@ -137,6 +137,58 @@ func TestRunAccountRepairsOnlyProvableFacts(t *testing.T) {
 	}
 }
 
+func TestRunAccountBackfillsSettlementEvidenceForPendingRedeemPosition(t *testing.T) {
+	ledger := &fakeLedger{
+		balance: testBalance("100"),
+		positions: []domain.Position{{
+			ExecutionAccountID: "account-1", MarketID: "market-1", ConditionID: "condition-1",
+			TokenID: "token-1", OutcomeName: "YES", TotalShares: "5", AvailableShares: "5", ReservedShares: "0",
+			CostBasis: "2.5", AverageCostPrice: "0.5", LifecycleStatus: domain.PositionLifecycleSettledPendingRedeem,
+		}},
+	}
+	service := newSettlementEvidenceTestService(t, ledger)
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil {
+		t.Fatalf("RunAccount() error = %v", err)
+	}
+	assertIssue(t, result.Issues, domain.ReconciliationIssuePositionSettled, domain.ReconciliationIssueResolved)
+	if len(ledger.settled) != 1 || ledger.settled[0] != "token-1" {
+		t.Fatalf("settled tokens = %#v, want token-1", ledger.settled)
+	}
+	position := ledger.positions[0]
+	if position.SettlementPrice != "1" || position.SettlementSource != "POLYMARKET_DATA_API:condition-1" ||
+		position.SettledAt == nil || !position.SettledAt.Equal(testNow) {
+		t.Fatalf("backfilled settlement evidence = %#v", position)
+	}
+}
+
+func TestRunAccountDoesNotRewriteExistingSettlementEvidence(t *testing.T) {
+	settledAt := testNow.Add(-time.Hour)
+	ledger := &fakeLedger{
+		balance: testBalance("100"),
+		positions: []domain.Position{{
+			ExecutionAccountID: "account-1", MarketID: "market-1", ConditionID: "condition-1",
+			TokenID: "token-1", OutcomeName: "YES", TotalShares: "5", AvailableShares: "5", ReservedShares: "0",
+			CostBasis: "2.5", AverageCostPrice: "0.5", LifecycleStatus: domain.PositionLifecycleSettledPendingRedeem,
+			SettlementPrice: "1", SettlementSource: "POLYMARKET_DATA_API:condition-1", SettledAt: &settledAt,
+		}},
+	}
+	service := newSettlementEvidenceTestService(t, ledger)
+
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil {
+		t.Fatalf("RunAccount() error = %v", err)
+	}
+	if len(ledger.settled) != 0 || hasIssue(result.Issues, domain.ReconciliationIssuePositionSettled) {
+		t.Fatalf("existing evidence was rewritten: settled=%#v issues=%#v", ledger.settled, result.Issues)
+	}
+}
+
 func TestStartupUsesExplicitAccountReconciliationBaselineForVenueTrades(t *testing.T) {
 	baseline := testNow.Add(-2 * time.Minute)
 	balance := testBalance("100")
@@ -966,12 +1018,14 @@ func (ledger *fakeLedger) ListPositions(context.Context, string) ([]domain.Posit
 }
 
 // MarkPositionSettled 记录模拟状态变更。
-func (ledger *fakeLedger) MarkPositionSettled(_ context.Context, _ string, tokenID, _ string, settlementPrice domain.Decimal, _ time.Time) (domain.Position, error) {
+func (ledger *fakeLedger) MarkPositionSettled(_ context.Context, _ string, tokenID, settlementSource string, settlementPrice domain.Decimal, settledAt time.Time) (domain.Position, error) {
 	ledger.settled = append(ledger.settled, tokenID)
 	for index := range ledger.positions {
 		if ledger.positions[index].TokenID == tokenID {
 			ledger.positions[index].LifecycleStatus = domain.PositionLifecycleSettledPendingRedeem
 			ledger.positions[index].SettlementPrice = settlementPrice
+			ledger.positions[index].SettlementSource = settlementSource
+			ledger.positions[index].SettledAt = &settledAt
 			return ledger.positions[index], nil
 		}
 	}
@@ -1137,6 +1191,23 @@ func testBalance(total domain.Decimal) domain.AccountBalance {
 		ExecutionAccountID: "account-1", WalletAddress: "0x1111111111111111111111111111111111111111",
 		CollateralAsset: "USDC", TotalBalance: total, AvailableBalance: total, ReservedBalance: "0",
 	}
+}
+
+func newSettlementEvidenceTestService(t *testing.T, ledger *fakeLedger) *Service {
+	t.Helper()
+	return newTestService(t, Params{
+		Orders: &fakeOrders{}, Venue: &fakeVenue{}, Ledger: ledger,
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{},
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return []domain.ExternalPosition{{
+				ConditionID: "condition-1", TokenID: "token-1", OutcomeName: "YES", Shares: "5",
+				CurrentPrice: "1", Redeemable: true, Source: "POLYMARKET_DATA_API", ObservedAt: testNow,
+			}}, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
 }
 
 func newPositionBaselineTestService(
