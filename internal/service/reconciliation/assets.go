@@ -363,7 +363,12 @@ func (state *runState) recordBaselineDrift(ctx context.Context, params baselineD
 
 // settlePositionIfNeeded 在数量一致且外部明确可赎回时推进本地持仓生命周期。
 func (state *runState) settlePositionIfNeeded(ctx context.Context, params settlePositionParams) {
-	if !params.external.Redeemable || !params.sharesMatch || params.position.LifecycleStatus != domain.PositionLifecycleOpen {
+	needsSettlementEvidence := params.position.LifecycleStatus == domain.PositionLifecycleSettledPendingRedeem &&
+		params.position.SettlementPrice.IsEmpty() &&
+		strings.TrimSpace(params.position.SettlementSource) == "" &&
+		params.position.SettledAt == nil
+	if !params.external.Redeemable || !params.sharesMatch ||
+		(params.position.LifecycleStatus != domain.PositionLifecycleOpen && !needsSettlementEvidence) {
 		return
 	}
 	settled, err := state.service.ledger.MarkPositionSettled(
