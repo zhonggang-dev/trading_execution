@@ -100,18 +100,29 @@ type SubmittedOrder struct {
 }
 
 type Order struct {
-	OrderID        string         `json:"order_id"`
-	ClientOrderID  string         `json:"client_order_id"`
-	Ticker         string         `json:"ticker"`
-	Status         string         `json:"status"`
-	FillCount      domain.Decimal `json:"fill_count_fp"`
-	RemainingCount domain.Decimal `json:"remaining_count_fp"`
-	InitialCount   domain.Decimal `json:"initial_count_fp"`
-	TakerFillCost  domain.Decimal `json:"taker_fill_cost_dollars"`
-	MakerFillCost  domain.Decimal `json:"maker_fill_cost_dollars"`
-	TakerFees      domain.Decimal `json:"taker_fees_dollars"`
-	MakerFees      domain.Decimal `json:"maker_fees_dollars"`
-	LastUpdateTime time.Time      `json:"last_update_time"`
+	OrderID                 string         `json:"order_id"`
+	ClientOrderID           string         `json:"client_order_id"`
+	Ticker                  string         `json:"ticker"`
+	Side                    string         `json:"side"`
+	Action                  string         `json:"action"`
+	OutcomeSide             string         `json:"outcome_side"`
+	BookSide                string         `json:"book_side"`
+	Type                    string         `json:"type"`
+	TimeInForce             string         `json:"time_in_force"`
+	Status                  string         `json:"status"`
+	YesPrice                domain.Decimal `json:"yes_price_dollars"`
+	NoPrice                 domain.Decimal `json:"no_price_dollars"`
+	FillCount               domain.Decimal `json:"fill_count_fp"`
+	RemainingCount          domain.Decimal `json:"remaining_count_fp"`
+	InitialCount            domain.Decimal `json:"initial_count_fp"`
+	TakerFillCost           domain.Decimal `json:"taker_fill_cost_dollars"`
+	MakerFillCost           domain.Decimal `json:"maker_fill_cost_dollars"`
+	TakerFees               domain.Decimal `json:"taker_fees_dollars"`
+	MakerFees               domain.Decimal `json:"maker_fees_dollars"`
+	SelfTradePreventionType string         `json:"self_trade_prevention_type"`
+	CancelOrderOnPause      *bool          `json:"cancel_order_on_pause"`
+	SubaccountNumber        *int           `json:"subaccount_number"`
+	LastUpdateTime          time.Time      `json:"last_update_time"`
 }
 
 type Fill struct {
@@ -120,6 +131,7 @@ type Fill struct {
 	Ticker       string         `json:"ticker"`
 	MarketTicker string         `json:"market_ticker"`
 	OutcomeSide  string         `json:"outcome_side"`
+	BookSide     string         `json:"book_side"`
 	Count        domain.Decimal `json:"count_fp"`
 	YesPrice     domain.Decimal `json:"yes_price_dollars"`
 	NoPrice      domain.Decimal `json:"no_price_dollars"`
@@ -236,8 +248,8 @@ func (client *Client) ListFills(ctx context.Context, orderID string) ([]Fill, er
 	result := make([]Fill, 0)
 	for page := 0; page < 100; page++ {
 		var envelope struct {
-			Fills  []Fill `json:"fills"`
-			Cursor string `json:"cursor"`
+			Fills  *[]Fill `json:"fills"`
+			Cursor *string `json:"cursor"`
 		}
 		query := url.Values{"order_id": []string{orderID}, "limit": []string{"1000"}}
 		if cursor != "" {
@@ -246,8 +258,14 @@ func (client *Client) ListFills(ctx context.Context, orderID string) ([]Fill, er
 		if err := client.doAuthenticated(ctx, http.MethodGet, "/trade-api/v2/portfolio/fills?"+query.Encode(), nil, &envelope); err != nil {
 			return nil, err
 		}
-		result = append(result, envelope.Fills...)
-		next := strings.TrimSpace(envelope.Cursor)
+		if envelope.Fills == nil {
+			return nil, fmt.Errorf("Kalshi fills response omitted the fills collection")
+		}
+		if envelope.Cursor == nil {
+			return nil, fmt.Errorf("Kalshi fills response omitted the pagination cursor")
+		}
+		result = append(result, (*envelope.Fills)...)
+		next := strings.TrimSpace(*envelope.Cursor)
 		if next == "" {
 			return result, nil
 		}
@@ -275,13 +293,16 @@ func (client *Client) ListOrderFills(ctx context.Context, order domain.Order) ([
 		if raw.OrderID != order.VenueOrderID || remoteTicker != order.Intent.MarketID {
 			return nil, fmt.Errorf("Kalshi fill identity does not match order")
 		}
-		if !strings.EqualFold(raw.OutcomeSide, order.Intent.OutcomeID) ||
-			!strings.EqualFold(raw.Action, string(order.Intent.Side)) {
-			return nil, fmt.Errorf("Kalshi fill outcome/action does not match order intent")
+		expectedIdentity, identityErr := domain.CanonicalKalshiOrderIdentity(
+			order.Intent.Side, order.Intent.OutcomeID, order.Intent.WorstPrice,
+		)
+		if identityErr != nil || !strings.EqualFold(raw.OutcomeSide, expectedIdentity.OutcomeSide) ||
+			!strings.EqualFold(raw.BookSide, expectedIdentity.BookSide) {
+			return nil, fmt.Errorf("Kalshi fill canonical direction does not match order intent")
 		}
-		price := raw.YesPrice
-		if strings.EqualFold(order.Intent.OutcomeID, "NO") {
-			price = raw.NoPrice
+		price, priceErr := kalshiOutcomeFillPrice(order.Intent.OutcomeID, raw.YesPrice)
+		if priceErr != nil {
+			return nil, priceErr
 		}
 		shares, priceRat, fee, ok := new(big.Rat), new(big.Rat), new(big.Rat), false
 		if shares, ok = shares.SetString(raw.Count.String()); !ok {
@@ -312,6 +333,26 @@ func (client *Client) ListOrderFills(ctx context.Context, order domain.Order) ([
 		})
 	}
 	return result, nil
+}
+
+// Kalshi V2 order/fill prices use the single YES-book scale. Local positions
+// remain outcome-denominated, so a NO fill is converted back to 1-YES price
+// before gross notional and P&L are recorded.
+func kalshiOutcomeFillPrice(outcomeID string, yesPrice domain.Decimal) (domain.Decimal, error) {
+	price, ok := new(big.Rat).SetString(yesPrice.String())
+	if !ok || price.Sign() <= 0 || price.Cmp(big.NewRat(1, 1)) >= 0 {
+		return "", fmt.Errorf("invalid Kalshi YES-book fill price")
+	}
+	switch strings.ToUpper(strings.TrimSpace(outcomeID)) {
+	case "YES":
+		return yesPrice, nil
+	case "NO":
+		// Get Fills may return six decimal places. Preserve that complete
+		// official precision when converting the YES-book quote to a NO price.
+		return domain.Decimal(new(big.Rat).Sub(big.NewRat(1, 1), price).FloatString(6)), nil
+	default:
+		return "", fmt.Errorf("invalid Kalshi fill outcome")
+	}
 }
 
 func (client *Client) GetAPIKeys(ctx context.Context) ([]APIKey, error) {
@@ -513,32 +554,11 @@ func loadPrivateKey(path string) (*rsa.PrivateKey, error) {
 }
 
 func mapBookSideAndPrice(side domain.Side, outcomeID, outcomePrice string) (string, string, error) {
-	outcomeID = strings.ToUpper(strings.TrimSpace(outcomeID))
-	if outcomeID != "YES" && outcomeID != "NO" {
-		return "", "", fmt.Errorf("Kalshi outcome_id must be YES or NO")
+	identity, err := domain.CanonicalKalshiOrderIdentity(side, outcomeID, domain.Decimal(outcomePrice))
+	if err != nil {
+		return "", "", err
 	}
-	bookSide := ""
-	complement := false
-	switch {
-	case side == domain.SideBuy && outcomeID == "YES":
-		bookSide = "bid"
-	case side == domain.SideBuy && outcomeID == "NO":
-		bookSide, complement = "ask", true
-	case side == domain.SideSell && outcomeID == "YES":
-		bookSide = "ask"
-	case side == domain.SideSell && outcomeID == "NO":
-		bookSide, complement = "bid", true
-	default:
-		return "", "", fmt.Errorf("unsupported Kalshi order side %q", side)
-	}
-	if !complement {
-		return bookSide, outcomePrice, nil
-	}
-	priceRat, ok := new(big.Rat).SetString(outcomePrice)
-	if !ok {
-		return "", "", fmt.Errorf("invalid Kalshi outcome price")
-	}
-	return bookSide, new(big.Rat).Sub(big.NewRat(1, 1), priceRat).FloatString(4), nil
+	return identity.BookSide, identity.OrderPrice.String(), nil
 }
 
 func fixedDecimal(value domain.Decimal, places int) (string, error) {

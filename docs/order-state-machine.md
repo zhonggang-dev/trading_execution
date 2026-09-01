@@ -54,6 +54,11 @@ stateDiagram-v2
 
 POST/DELETE 发生 timeout、断连、5xx、响应截断或无法解析时，结果可能已经在交易所生效，必须走 `SUBMITTING/CANCEL_PENDING → UNKNOWN → RECONCILING`。同一个 `client_order_id` 重放只返回原订单，不会第二次调用 CLOB。连续 reconciliation 达到配置上限仍无法证明结果时，进入 `MANUAL_REVIEW`，资金和 shares 保持预占。
 
+Kalshi 的 HTTP `409` 默认也属于不确定结果，不能释放预留。唯一例外是响应的结构化错误或正文
+明确证明 FOK 因 resting volume 不足而未成交；这种响应映射为
+`REJECTED / KALSHI_FOK_NOT_FILLED`，在同一拒单流程中释放剩余预留。仅出现 `409`、`conflict`
+或泛化的 FOK 文本仍保持 `UNKNOWN/RECONCILING`。
+
 ## Cancel Race
 
 撤单前先持久化 `CANCEL_PENDING + STARTED attempt`：
