@@ -63,6 +63,7 @@ Content-Type: application/json
 | --- | --- | --- |
 | 漏 BUY Fill | `/data/trades` 中属于本地 `venue_order_id` 的 `CONFIRMED` trade component | FillLedger 原子扣现金、增仓位/lot、更新订单和预占、写 outbox |
 | 漏 SELL Fill | 同上 | FillLedger 原子加现金、减少目标 lot、计算 PnL、更新订单和预占 |
+| 已补 SELL Fill 后遗留旧 `POSITION_DRIFT` | 后续对账全部数据源成功、精确 account/market/condition/token 当前本地值等于旧 remote value，且 issue 后已确认 BUY/SELL fills 的净 shares 精确解释全部差额 | 仅把旧 issue 幂等改为 `RESOLVED + AUTOMATIC`；不创建第二笔 Fill，也不直接改仓位 |
 | 本地仍 LIVE、远端已取消 | CLOB 单订单查询明确返回 cancelled，且真实 Fill 已先同步 | 走订单状态机到 `CANCELLED`；保留预占，经过 Fill grace 并再查 Trades 后释放 |
 | Market 已结算 | 外部持仓源明确 `redeemable=true`，且多个已配置来源一致 | 仓位/lot 改为 `SETTLED_PENDING_REDEEM`；不清 shares、不提前记 payout |
 
@@ -87,6 +88,19 @@ API/RPC 失败记录为 `SOURCE_UNAVAILABLE + RETRY_LATER`。查询接口可以�
 Data API `/positions` 使用 `sizeThreshold=0&includeArchived=true` 分页读取，避免默认阈值或 archived
 过滤把真实小仓位隐藏。官方上限是 150 次/10 秒；adapter 在所有钱包间共享一个默认 10 QPS 的
 节流器，对账周期不为每个 model/strategy 建立独立 client。
+
+历史 Kalshi `MANUAL_REVIEW + RECONCILIATION_REQUIRED` 只能使用 `cmd/kalshirepair` 做精确订单
+修复。工具默认 dry-run，强制指定 `kalshi:<logical-account>` 和本地 order ID；`--apply` 还必须
+提供完全相同的 `account/order` 确认串。只有 Kalshi 按 `client_order_id` 找到权威 order ID、
+再由单订单详情和该 order ID 的 fills 接口共同证明订单已取消、零成交且已过 finality grace 时，
+才在一个 PostgreSQL
+事务中更新订单审计、释放预留并关闭该订单的问题。远端证据还必须和本地 intent 的 canonical
+`outcome_side/book_side`、LIMIT 类型、YES-book 价格及 subaccount 完全一致。已弃用的
+`action/side` 不作为身份依据；当前 GET Orders 不一定
+返回 `time_in_force`，因此远端仅在该字段存在时核对 FOK，但本地 intent 始终强制为 LIMIT/FOK。
+`self_trade_prevention_type` 与 `cancel_order_on_pause` 可能不回显，只保留为观测字段，不参与
+terminal cancelled + zero-fill 的身份判断或幂等指纹。
+工具禁止广扫，也不会从远端余额推断订单结果。
 
 ## 异常处理覆盖
 

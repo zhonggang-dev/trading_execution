@@ -146,6 +146,27 @@ func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain
 		}
 	}
 	if run.Status == domain.ReconciliationRunCompleted {
+		// A confirmed SELL can be applied by the fast order coordinator after a
+		// position sweep has already recorded drift.  The next healthy sweep must
+		// be able to close that stale gate even though it did not itself apply the
+		// fill.  Resolution remains evidence-bound: the exact local identity and
+		// quantity must now match, the current run must not reproduce the issue,
+		// and finalized local-order fills after the observation must account for
+		// the complete share delta.
+		resolved, resolveErr := resolveRecoveredSellPositionDriftIssues(ctx, tx, run)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if resolved > 0 {
+			if run.Summary == nil {
+				run.Summary = make(map[string]int)
+			}
+			run.Summary["issues_total"] += resolved
+			run.Summary["issues_resolved"] += resolved
+			run.Summary["issues_automatic"] += resolved
+		}
+	}
+	if run.Status == domain.ReconciliationRunCompleted {
 		resolved, resolveErr := resolveWalletMigrationIssues(ctx, tx, run)
 		if resolveErr != nil {
 			return resolveErr
@@ -192,6 +213,105 @@ func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain
 		return fmt.Errorf("commit reconciliation run completion: %w", err)
 	}
 	return nil
+}
+
+// resolveRecoveredSellPositionDriftIssues closes a stale POSITION_DRIFT only
+// after a later, fully successful reconciliation proves that an exact set of
+// confirmed SELL-ledger applications already present before that sweep account
+// for the whole observed deficit.
+// It never creates an order or fill and cannot infer execution from a balance
+// or from the mere disappearance of a remote position.
+func resolveRecoveredSellPositionDriftIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
+	const resolvedDetails = "; automatically resolved after a clean reconciliation and finalized SELL fills exactly accounted for the observed position delta"
+	result, err := tx.ExecContext(ctx, `
+		UPDATE reconciliation_issues issue
+		SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+		    details=issue.details || $4
+		FROM execution_positions position
+		WHERE issue.execution_account_id=$1
+		  AND issue.status='OPEN'
+		  AND issue.resolution='MANUAL_REVIEW'
+		  AND issue.issue_type='POSITION_DRIFT'
+		  AND issue.run_id<>$2
+		  AND issue.source='POLYMARKET_DATA_API'
+		  AND issue.market_id<>'' AND issue.condition_id<>'' AND issue.token_id<>''
+		  AND issue.local_value IS NOT NULL AND issue.remote_value IS NOT NULL
+		  AND issue.local_value>issue.remote_value
+		  AND position.execution_account_id=issue.execution_account_id
+		  AND position.market_id=issue.market_id
+		  AND position.condition_id=issue.condition_id
+		  AND position.token_id=issue.token_id
+		  AND position.total_shares=issue.remote_value
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM reconciliation_issues reproduced
+		    WHERE reproduced.execution_account_id=issue.execution_account_id
+		      AND reproduced.run_id=$2
+		      AND reproduced.status='OPEN'
+		      AND reproduced.issue_type='POSITION_DRIFT'
+		      AND reproduced.market_id=issue.market_id
+		      AND reproduced.condition_id=issue.condition_id
+		      AND reproduced.token_id=issue.token_id
+		  )
+		  AND EXISTS (
+		    SELECT 1
+		    FROM execution_fills sell_fill
+		    JOIN execution_orders sell_order ON sell_order.order_id=sell_fill.order_id
+		    WHERE sell_fill.execution_account_id=issue.execution_account_id
+		      AND sell_fill.market_id=issue.market_id
+		      AND sell_fill.condition_id=issue.condition_id
+		      AND sell_fill.token_id=issue.token_id
+		      AND sell_fill.venue='polymarket'
+		      AND sell_fill.fee_source='POLYGON_V2_ORDER_FILLED'
+		      AND sell_fill.venue_fill_id<>'' AND sell_fill.venue_order_id<>'' AND sell_fill.order_id<>''
+		      AND sell_fill.side='SELL'
+		      AND sell_fill.status='CONFIRMED'
+		      AND sell_fill.applied_at IS NOT NULL
+		      AND sell_fill.applied_at>issue.observed_at
+		      AND sell_fill.applied_at<=$5
+		      AND sell_order.execution_account_id=issue.execution_account_id
+		      AND sell_order.venue='polymarket'
+		      AND sell_order.market_id=issue.market_id
+		      AND sell_order.token_id=issue.token_id
+		      AND sell_order.venue_order_id=sell_fill.venue_order_id
+		      AND sell_order.intent->>'condition_id'=sell_fill.condition_id
+		      AND sell_order.intent->>'side'='SELL'
+		  )
+		  AND (
+		    SELECT COALESCE(SUM(
+		      CASE WHEN fill.side='BUY' THEN fill.shares ELSE -fill.shares END
+		    ),0)
+		    FROM execution_fills fill
+		    JOIN execution_orders local_order ON local_order.order_id=fill.order_id
+		    WHERE fill.execution_account_id=issue.execution_account_id
+		      AND fill.market_id=issue.market_id
+		      AND fill.condition_id=issue.condition_id
+		      AND fill.token_id=issue.token_id
+		      AND fill.venue='polymarket'
+		      AND fill.fee_source='POLYGON_V2_ORDER_FILLED'
+		      AND fill.venue_fill_id<>'' AND fill.venue_order_id<>'' AND fill.order_id<>''
+		      AND fill.side IN ('BUY','SELL')
+		      AND fill.status='CONFIRMED'
+		      AND fill.applied_at IS NOT NULL
+		      AND fill.applied_at>issue.observed_at
+		      AND fill.applied_at<=$5
+		      AND local_order.execution_account_id=issue.execution_account_id
+		      AND local_order.venue='polymarket'
+		      AND local_order.market_id=issue.market_id
+		      AND local_order.token_id=issue.token_id
+		      AND local_order.venue_order_id=fill.venue_order_id
+		      AND local_order.intent->>'condition_id'=fill.condition_id
+		      AND local_order.intent->>'side'=fill.side
+		  )=issue.remote_value-issue.local_value`,
+		run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, run.StartedAt.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("resolve recovered SELL position drift issues: %w", err)
+	}
+	resolved, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count recovered SELL position drift issues: %w", err)
+	}
+	return int(resolved), nil
 }
 
 // resolveWalletMigrationIssues closes only discrepancies that are made stale

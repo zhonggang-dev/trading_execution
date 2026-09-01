@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -111,13 +112,13 @@ func TestSubmitPreparedIsIndependentAndFailClosed(t *testing.T) {
 	}
 }
 
-func TestSubmitPreparedClassifiesFOKHTTPFailureAsDefinitiveRejection(t *testing.T) {
+func TestSubmitPreparedClassifiesFOKHTTP409AsDefinitiveRejection(t *testing.T) {
 	privateKey := testPrivateKey(t)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		verifySignature(t, request, "key", &privateKey.PublicKey)
 		writer.Header().Set("Content-Type", "application/json")
-		writer.WriteHeader(http.StatusBadRequest)
-		_, _ = writer.Write([]byte(`{"error":{"code":"fill_or_kill_failed","message":"fill_or_kill order could not be filled"}}`))
+		writer.WriteHeader(http.StatusConflict)
+		_, _ = writer.Write([]byte(`{"error":{"code":"invalid_order","message":"fill_or_kill order would not be filled immediately due to insufficient resting volume"}}`))
 	}))
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL, "key", privateKey, true)
@@ -128,7 +129,29 @@ func TestSubmitPreparedClassifiesFOKHTTPFailureAsDefinitiveRejection(t *testing.
 	_, submitErr := client.SubmitPrepared(context.Background(), prepared)
 	var venueError *port.VenueError
 	if !errors.As(submitErr, &venueError) || venueError.Kind != port.VenueErrorRejected ||
-		venueError.Code != "KALSHI_FOK_NOT_FILLED" || venueError.HTTPStatus != http.StatusBadRequest {
+		venueError.Code != "KALSHI_FOK_NOT_FILLED" || venueError.HTTPStatus != http.StatusConflict {
+		t.Fatalf("SubmitPrepared() error = %#v, venue error = %#v", submitErr, venueError)
+	}
+}
+
+func TestSubmitPreparedKeepsUnknownHTTP409Ambiguous(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		verifySignature(t, request, "key", &privateKey.PublicKey)
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusConflict)
+		_, _ = writer.Write([]byte(`{"error":{"code":"conflict","message":"fill_or_kill client order id conflict"}}`))
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, true)
+	prepared, err := client.PrepareOrder(validKalshiIntent(domain.SideBuy, "YES"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, submitErr := client.SubmitPrepared(context.Background(), prepared)
+	var venueError *port.VenueError
+	if !errors.As(submitErr, &venueError) || venueError.Kind != port.VenueErrorAmbiguous ||
+		venueError.Code != "KALSHI_ORDER_CONFLICT" || venueError.HTTPStatus != http.StatusConflict {
 		t.Fatalf("SubmitPrepared() error = %#v, venue error = %#v", submitErr, venueError)
 	}
 }
@@ -167,8 +190,8 @@ func TestKalshiFOKRejectionReleasesReservationAndAllowsNextSubmission(t *testing
 			t.Errorf("decode submitted order: %v", err)
 		}
 		writer.Header().Set("Content-Type", "application/json")
-		writer.WriteHeader(http.StatusBadRequest)
-		_, _ = writer.Write([]byte(`{"error":{"code":"fill_or_kill_failed","message":"not enough liquidity to fill_or_kill"}}`))
+		writer.WriteHeader(http.StatusConflict)
+		_, _ = writer.Write([]byte(`{"error":{"code":"invalid_order","message":"fill_or_kill order would not be filled immediately due to insufficient resting volume"}}`))
 	}))
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL, "key", privateKey, true)
@@ -372,7 +395,7 @@ func TestOrderLifecycleAndFillEvidenceUseExactVenueIdentity(t *testing.T) {
 			if request.URL.Query().Get("order_id") != "venue-order" {
 				t.Errorf("order_id query=%q", request.URL.Query().Get("order_id"))
 			}
-			_, _ = writer.Write([]byte(`{"fills":[{"fill_id":"fill-1","order_id":"venue-order","market_ticker":"TEST-MARKET","outcome_side":"yes","count_fp":"2.00","yes_price_dollars":"0.6000","no_price_dollars":"0.4000","is_taker":true,"fee_cost":"0.03","action":"buy","created_time":"2026-08-26T00:00:01Z"}],"cursor":""}`))
+			_, _ = writer.Write([]byte(`{"fills":[{"fill_id":"fill-1","order_id":"venue-order","market_ticker":"TEST-MARKET","outcome_side":"yes","book_side":"bid","count_fp":"2.00","yes_price_dollars":"0.6000","no_price_dollars":"0.4000","is_taker":true,"fee_cost":"0.03","action":"buy","created_time":"2026-08-26T00:00:01Z"}],"cursor":""}`))
 		default:
 			http.NotFound(writer, request)
 		}
@@ -401,13 +424,52 @@ func TestFillEvidenceRejectsWrongOutcomeOrAction(t *testing.T) {
 	privateKey := testPrivateKey(t)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"fills":[{"fill_id":"fill-1","order_id":"venue-order","ticker":"TEST-MARKET","outcome_side":"no","count_fp":"1","yes_price_dollars":"0.6","no_price_dollars":"0.4","is_taker":true,"fee_cost":"0","action":"sell","created_time":"2026-08-26T00:00:01Z"}]}`))
+		_, _ = writer.Write([]byte(`{"fills":[{"fill_id":"fill-1","order_id":"venue-order","ticker":"TEST-MARKET","outcome_side":"no","book_side":"ask","count_fp":"1","yes_price_dollars":"0.6","no_price_dollars":"0.4","is_taker":true,"fee_cost":"0","action":"sell","created_time":"2026-08-26T00:00:01Z"}],"cursor":""}`))
 	}))
 	t.Cleanup(server.Close)
 	client := testClient(t, server.URL, "key", privateKey, false)
 	order := domain.Order{VenueOrderID: "venue-order", Intent: validKalshiIntent(domain.SideBuy, "YES")}
 	if _, err := client.ListOrderFills(context.Background(), order); err == nil {
 		t.Fatal("mismatched fill identity must fail closed")
+	}
+}
+
+func TestFillEvidenceUsesCanonicalDirectionAndOutcomePriceForEveryIntent(t *testing.T) {
+	tests := []struct {
+		name        string
+		side        domain.Side
+		outcomeID   string
+		outcomeSide string
+		bookSide    string
+		yesPrice    string
+		wantPrice   domain.Decimal
+	}{
+		{name: "buy yes", side: domain.SideBuy, outcomeID: "YES", outcomeSide: "yes", bookSide: "bid", yesPrice: "0.6000", wantPrice: "0.6000"},
+		{name: "buy no", side: domain.SideBuy, outcomeID: "NO", outcomeSide: "no", bookSide: "ask", yesPrice: "0.4000", wantPrice: "0.6000"},
+		{name: "sell yes", side: domain.SideSell, outcomeID: "YES", outcomeSide: "no", bookSide: "ask", yesPrice: "0.6000", wantPrice: "0.6000"},
+		{name: "sell no", side: domain.SideSell, outcomeID: "NO", outcomeSide: "yes", bookSide: "bid", yesPrice: "0.4000", wantPrice: "0.6000"},
+		{name: "buy no six-decimal price", side: domain.SideBuy, outcomeID: "NO", outcomeSide: "no", bookSide: "ask", yesPrice: "0.123456", wantPrice: "0.876544"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			privateKey := testPrivateKey(t)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(writer,
+					`{"fills":[{"fill_id":"fill-1","order_id":"venue-order","ticker":"TEST-MARKET","outcome_side":%q,"book_side":%q,"count_fp":"1","yes_price_dollars":%q,"no_price_dollars":"0.4000","is_taker":true,"fee_cost":"0","action":%q,"created_time":"2026-08-26T00:00:01Z"}],"cursor":""}`,
+					testCase.outcomeSide, testCase.bookSide, testCase.yesPrice, strings.ToLower(string(testCase.side)))
+			}))
+			t.Cleanup(server.Close)
+			client := testClient(t, server.URL, "key", privateKey, false)
+			order := domain.Order{VenueOrderID: "venue-order", Intent: validKalshiIntent(testCase.side, testCase.outcomeID)}
+			fills, err := client.ListOrderFills(context.Background(), order)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(fills) != 1 || !fills[0].Price.Equal(testCase.wantPrice) {
+				t.Fatalf("fills=%#v, want outcome price %s", fills, testCase.wantPrice)
+			}
+		})
 	}
 }
 
