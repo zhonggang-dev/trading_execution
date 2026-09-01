@@ -83,6 +83,20 @@ func TestValidateStartupReconciliationAllowsAccountLocalAttention(t *testing.T) 
 	if err := validateStartupReconciliation(attention, 1); err != nil {
 		t.Fatalf("validate account-local attention startup reconciliation: %v", err)
 	}
+	attentionWithPersistedError := reconciliation.SweepResult{
+		Runs: []reconciliation.Result{{
+			Run: domain.ReconciliationRun{
+				ExecutionAccountID: "wallet-6",
+				Status:             domain.ReconciliationRunAttentionRequired,
+				Error:              "CLOB fill evidence is inconsistent",
+			},
+			Issues: []domain.ReconciliationIssue{{}},
+		}},
+		Errors: []error{errors.New("reconcile wallet-6: CLOB fill evidence is inconsistent")},
+	}
+	if err := validateStartupReconciliation(attentionWithPersistedError, 1); err != nil {
+		t.Fatalf("validate durably gated account-local startup error: %v", err)
+	}
 
 	tests := []struct {
 		name   string
@@ -101,6 +115,16 @@ func TestValidateStartupReconciliationAllowsAccountLocalAttention(t *testing.T) 
 				Errors: []error{errors.New("position source unavailable")},
 			},
 			want: "position source unavailable",
+		},
+		{
+			name: "attention error does not match durable run",
+			result: reconciliation.SweepResult{
+				Runs: attentionWithPersistedError.Runs,
+				Errors: []error{
+					errors.New("reconcile wallet-6: different failure"),
+				},
+			},
+			want: "different failure",
 		},
 		{
 			name: "failed run",

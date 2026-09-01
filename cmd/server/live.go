@@ -697,19 +697,39 @@ func validateStartupReconciliation(result reconciliation.SweepResult, expectedAc
 	if len(result.Runs) != expectedAccounts {
 		return fmt.Errorf("live startup reconciliation returned %d account run(s), want %d", len(result.Runs), expectedAccounts)
 	}
-	if err := errors.Join(result.Errors...); err != nil {
-		return fmt.Errorf("live startup reconciliation failed: %w", err)
-	}
+	attentionErrors := make(map[string]string, len(result.Runs))
 	for _, run := range result.Runs {
 		switch run.Run.Status {
-		case domain.ReconciliationRunCompleted, domain.ReconciliationRunAttentionRequired:
-			continue
+		case domain.ReconciliationRunCompleted:
+		case domain.ReconciliationRunAttentionRequired:
+			if run.Run.Error != "" {
+				attentionErrors[run.Run.ExecutionAccountID] = run.Run.Error
+			}
 		default:
 			return fmt.Errorf(
 				"execution account %q startup reconciliation failed closed (status %s, issues %d)",
 				run.Run.ExecutionAccountID, run.Run.Status, len(run.Issues),
 			)
 		}
+	}
+	var unpersisted []error
+	for _, sweepErr := range result.Errors {
+		if sweepErr == nil {
+			continue
+		}
+		persisted := false
+		for accountID, runError := range attentionErrors {
+			if sweepErr.Error() == "reconcile "+accountID+": "+runError {
+				persisted = true
+				break
+			}
+		}
+		if !persisted {
+			unpersisted = append(unpersisted, sweepErr)
+		}
+	}
+	if err := errors.Join(unpersisted...); err != nil {
+		return fmt.Errorf("live startup reconciliation failed: %w", err)
 	}
 	return nil
 }
