@@ -292,7 +292,19 @@ func (manager *ReservationManager) Reconcile(ctx context.Context, order domain.O
 			return domain.AssetReservation{}, fmt.Errorf("cumulative filled shares moved backward")
 		}
 		if comparison, err := filled.Compare(reservation.RequestedShares); err != nil || comparison > 0 {
-			return domain.AssetReservation{}, fmt.Errorf("cumulative filled shares exceed requested shares")
+			if err != nil || !order.AllowsBuySharePriceImprovement() {
+				return domain.AssetReservation{}, fmt.Errorf("cumulative filled shares exceed requested shares")
+			}
+			if settledComparison, compareErr := reservation.SettledShares.Compare(reservation.RequestedShares); compareErr != nil || settledComparison != 0 ||
+				reservation.Status != domain.ReservationStatusSettled || !reservation.RemainingReservedBalance.Equal("0") ||
+				!reservation.SettledNotional.Equal(order.FilledNotional) || !reservation.SettledFees.Equal(order.TotalFees) {
+				return domain.AssetReservation{}, fmt.Errorf("Polymarket BUY price improvement must be applied by the authoritative fill ledger")
+			}
+			// The reservation ledger tracks consumption of the requested minimum
+			// shares. Extra price-improvement shares are already present in the
+			// immutable fill, order, lot, and position ledgers. Once those exact
+			// totals are present, generic reservation reconciliation is a no-op.
+			return reservation, nil
 		}
 		averagePrice := order.AverageFillPrice
 		if sign, _ := filled.Sign(); sign == 0 {
@@ -705,7 +717,7 @@ func settlementNumbers(
 			($1::numeric - $2::numeric)::text,
 			($3::numeric * $1::numeric)::text,
 			(($3::numeric * $1::numeric) - $4::numeric)::text,
-			($5::numeric - $1::numeric)::text`,
+			GREATEST(($5::numeric - $1::numeric),0)::text`,
 		filled.String(), settledShares.String(), averagePrice.String(),
 		settledNotional.String(), requestedShares.String(),
 	).Scan(&deltaShares, &cumulativeNotional, &deltaNotional, &remainingShares)

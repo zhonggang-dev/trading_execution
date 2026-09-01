@@ -300,7 +300,7 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 			Message: "successful venue response omitted order id",
 		}, created)
 	}
-	if err := validateVenueOrder(venueOrder, stored.Intent.Size); err != nil {
+	if err := validateVenueOrder(venueOrder, stored); err != nil {
 		return service.finishSubmitError(ctx, stored, attempt, &port.VenueError{
 			Kind:         port.VenueErrorAmbiguous,
 			Code:         "INVALID_VENUE_RESPONSE",
@@ -770,7 +770,7 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_ORDER_READ_FAILED", err.Error())
 		return order, errors.Join(fmt.Errorf("read cancelled venue order before finality: %w", err), uncertainErr, deferErr)
 	}
-	if err := validateVenueOrder(observed, order.Intent.Size); err != nil {
+	if err := validateVenueOrder(observed, order); err != nil {
 		uncertainErr := service.reservations.MarkUncertain(ctx, order, "CANCEL_FINALITY_INVALID_ORDER_EVIDENCE: "+err.Error())
 		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_INVALID_ORDER_EVIDENCE", err.Error())
 		return order, errors.Join(fmt.Errorf("validate cancelled venue order before finality: %w", err), uncertainErr, deferErr)
@@ -1160,7 +1160,7 @@ func (service *Service) statusForVenueObservation(order domain.Order, state port
 		return "", fmt.Errorf("parse authoritative filled size: %w", err)
 	}
 	comparison, err := filled.Compare(order.Intent.Size)
-	if err != nil || comparison > 0 {
+	if err != nil || (comparison > 0 && !order.AllowsBuySharePriceImprovement()) {
 		return "", fmt.Errorf("compare authoritative filled size with requested size")
 	}
 	if target == domain.OrderStatusRejected && sign > 0 {
@@ -1170,7 +1170,7 @@ func (service *Service) statusForVenueObservation(order domain.Order, state port
 	}
 	switch target {
 	case domain.OrderStatusAcknowledged, domain.OrderStatusLive, domain.OrderStatusPartiallyFilled, domain.OrderStatusFilled:
-		if comparison == 0 {
+		if comparison == 0 || (comparison > 0 && order.AllowsBuySharePriceImprovement()) {
 			return domain.OrderStatusFilled, nil
 		}
 		if sign > 0 {
@@ -1272,21 +1272,22 @@ func statusForVenue(state port.VenueOrderState) (domain.OrderStatus, error) {
 }
 
 // validateVenueOrder 校验 Venue Order 的字段和业务约束。
-func validateVenueOrder(order port.VenueOrder, requestedSize domain.Decimal) error {
-	if strings.TrimSpace(order.ID) == "" {
+func validateVenueOrder(observed port.VenueOrder, order domain.Order) error {
+	if strings.TrimSpace(observed.ID) == "" {
 		return fmt.Errorf("venue order id is required")
 	}
-	if _, err := statusForVenue(order.State); err != nil {
+	if _, err := statusForVenue(observed.State); err != nil {
 		return err
 	}
-	filled := order.FilledSize
+	filled := observed.FilledSize
 	if filled.IsEmpty() {
 		filled = "0"
 	}
 	if sign, err := filled.Sign(); err != nil || sign < 0 {
 		return fmt.Errorf("filled size must be non-negative")
 	}
-	if comparison, err := filled.Compare(requestedSize); err != nil || comparison > 0 {
+	if comparison, err := filled.Compare(order.Intent.Size); err != nil ||
+		(comparison > 0 && !order.AllowsBuySharePriceImprovement()) {
 		return fmt.Errorf("filled size exceeds requested size")
 	}
 	return nil

@@ -572,6 +572,39 @@ func TestTradeWireQuantityRequiresDecimalString(t *testing.T) {
 	}
 }
 
+func TestRawOrderAcceptsHumanDecimalMatchedSharesForPriceImprovedBuy(t *testing.T) {
+	var raw rawOrder
+	if err := json.Unmarshal([]byte(`{
+		"id":"0xvenue","status":"MATCHED","original_size":"10200000",
+		"size_matched":"30.147057","price":"0.34"
+	}`), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if !raw.OriginalSize.Equal("10.2") || !raw.SizeMatched.Equal("30.147057") {
+		t.Fatalf("order quantities = %s/%s", raw.OriginalSize, raw.SizeMatched)
+	}
+	order := adapterOrder()
+	order.Intent.Venue = "polymarket"
+	order.Intent.Side = domain.SideBuy
+	order.Intent.Size = "30"
+	observed, err := normalizeRawOrder(raw, order, time.Date(2026, 9, 1, 11, 1, 6, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.State != port.VenueOrderFilled || !observed.FilledSize.Equal("30.147057") {
+		t.Fatalf("price-improved order = %#v", observed)
+	}
+}
+
+func TestNormalizeRawOrderRejectsOverfillOutsidePolymarketBuy(t *testing.T) {
+	order := adapterOrder()
+	order.Intent.Venue = "kalshi"
+	raw := rawOrder{ID: "venue-order", Status: "MATCHED", OriginalSize: "30", SizeMatched: "30.147057"}
+	if _, err := normalizeRawOrder(raw, order, time.Now().UTC()); err == nil {
+		t.Fatal("non-Polymarket BUY overfill was accepted")
+	}
+}
+
 func TestListOrderFillsFailsClosedWithoutFinalizedFeeEvidence(t *testing.T) {
 	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
 	order := adapterOrder()
@@ -601,7 +634,8 @@ func TestListOrderFillsFailsClosedWithoutFinalizedFeeEvidence(t *testing.T) {
 
 	client := newTestTradingClient(t, server.URL, now)
 	if _, err := client.ListOrderFills(context.Background(), order); err == nil ||
-		!strings.Contains(err.Error(), "fee evidence source is not configured") {
+		!strings.Contains(err.Error(), "fee evidence source is not configured") ||
+		!strings.Contains(err.Error(), "CLOB trade trade-1 fee evidence") {
 		t.Fatalf("ListOrderFills() error = %v, want fail-closed evidence error", err)
 	}
 	schedule := client.feeSchedules[order.Intent.ConditionID+"\x00"+order.Intent.TokenID]

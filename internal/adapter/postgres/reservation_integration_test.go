@@ -1077,6 +1077,86 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 	}
 }
 
+func TestPolymarketBuyPriceImprovementCanSettleMoreSharesThanRequested(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	insertAccount(t, db, "account-wallet-6-price-improvement", "0xwallet6", "100", "100", "0")
+	repository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservations, err := NewReservationManager(ReservationManagerParams{DB: db, MaxBuyFeeRateBPS: "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := NewFillLedger(FillLedgerParams{DB: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor, err := fillprocessor.New(fillprocessor.Params{Orders: repository, Source: noFillsSource{}, Ledger: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	order := integrationOrder(
+		"wallet-6-price-improvement", "account-wallet-6-price-improvement",
+		"42", domain.SideBuy, "30", "0.34",
+	)
+	order.Intent.Price = "0.34"
+	orderHash := "0x" + strings.Repeat("22", 32)
+	transactionHash := "0x" + strings.Repeat("cd", 32)
+	order = createAcknowledgedIntegrationOrder(t, ctx, repository, reservations, order, orderHash, now)
+	confirmedAt := now.Add(10 * time.Second)
+	application, err := processor.Process(ctx, order, domain.Fill{
+		VenueFillID: "trade-wallet-6", LiquidityRole: domain.LiquidityRoleTaker,
+		Status: domain.FillStatusConfirmed, Shares: "30.147057", Price: "0.3383414507",
+		GrossNotional: "10.199999", FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
+		FeeSource: domain.FeeSourcePolygonV2OrderFilled, TransactionHash: transactionHash,
+		RawPayloadSHA256: strings.Repeat("a", 64), MatchedAt: confirmedAt, VenueUpdatedAt: confirmedAt,
+		ObservedAt: confirmedAt, ConfirmedAt: &confirmedAt,
+		SettlementEvidence: &domain.SettlementEvidence{
+			SchemaVersion: domain.SettlementEvidenceSchemaV1, Source: domain.FeeSourcePolygonV2OrderFilled,
+			ChainID: domain.SettlementEvidencePolygonChainID, ExchangeAddress: "0x" + strings.Repeat("ab", 20),
+			TransactionHash: transactionHash, BlockNumber: 123, BlockHash: "0x" + strings.Repeat("ef", 32),
+			LogIndex: 7, Confirmations: 64, OrderHash: orderHash, MakerAddress: "0x" + strings.Repeat("11", 20),
+			TokenID: order.Intent.TokenID, Side: domain.SideBuy, MakerAmountBaseUnits: "10199999",
+			TakerAmountBaseUnits: "30147057", TotalFeeBaseUnits: "0", BuilderCode: "0x" + strings.Repeat("00", 32),
+			BuilderFeeKnown: true, BuilderFeeBaseUnits: "0", BuilderFeeSource: domain.SettlementEvidenceZeroBuilder,
+			CollateralDecimals: 6, OutcomeTokenDecimals: 6,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !application.Applied || application.Order.Status != domain.OrderStatusFilled ||
+		!application.Order.FilledSize.Equal("30.147057") || !application.Order.FilledNotional.Equal("10.199999") {
+		t.Fatalf("price-improved fill application = %#v", application)
+	}
+	assertAccount(t, db, "account-wallet-6-price-improvement", "89.800001", "89.800001", "0")
+	assertPosition(t, db, "account-wallet-6-price-improvement", "42", "30.147057", "30.147057", "0")
+	var settledShares, remainingBalance, reservationStatus string
+	if err := db.QueryRow(`
+		SELECT settled_shares::text, remaining_reserved_balance::text, status
+		FROM asset_reservations WHERE order_id=$1`, order.ID,
+	).Scan(&settledShares, &remainingBalance, &reservationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if !sameNumeric(settledShares, "30") || !sameNumeric(remainingBalance, "0") ||
+		reservationStatus != string(domain.ReservationStatusSettled) {
+		t.Fatalf("reservation settlement = %s/%s/%s", settledShares, remainingBalance, reservationStatus)
+	}
+	if _, err := reservations.Reconcile(ctx, application.Order); err != nil {
+		t.Fatalf("reconcile price-improved reservation: %v", err)
+	}
+	assertAccount(t, db, "account-wallet-6-price-improvement", "89.800001", "89.800001", "0")
+}
+
 func TestIOCMultipleFillsCorrectCancelledOrderToFilledPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
 	if databaseURL == "" {

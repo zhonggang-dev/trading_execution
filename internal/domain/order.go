@@ -270,6 +270,15 @@ type Order struct {
 	Revision            int64             `json:"revision"`
 }
 
+// AllowsBuySharePriceImprovement reports the venue-specific case where a BUY
+// fixes the maximum collateral spend and minimum shares in the signed order.
+// Polymarket may settle more outcome shares at a better effective price while
+// spending no more than the protected BUY notional.
+func (order Order) AllowsBuySharePriceImprovement() bool {
+	return strings.EqualFold(strings.TrimSpace(order.Intent.Venue), "polymarket") &&
+		order.Intent.Side == SideBuy
+}
+
 // Terminal 判断当前状态是否为终态。
 func (order Order) Terminal() bool {
 	return slices.Contains([]OrderStatus{

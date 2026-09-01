@@ -168,7 +168,8 @@ func (ledger *FillLedger) recordOnce(ctx context.Context, expected domain.Order,
 	if err != nil {
 		return domain.FillApplication{}, err
 	}
-	if comparison, err := cumulativeShares.Compare(order.Intent.Size); err != nil || comparison > 0 {
+	sharesComparison, err := cumulativeShares.Compare(order.Intent.Size)
+	if err != nil || (sharesComparison > 0 && !order.AllowsBuySharePriceImprovement()) {
 		return domain.FillApplication{}, fmt.Errorf("confirmed fills exceed requested shares")
 	}
 	cumulativeNotional, err := numeric(ctx, tx, `SELECT ($1::numeric + $2::numeric)::text`, decimalOrZero(order.FilledNotional), fill.GrossNotional.String())
@@ -179,12 +180,36 @@ func (ledger *FillLedger) recordOnce(ctx context.Context, expected domain.Order,
 	if err != nil {
 		return domain.FillApplication{}, err
 	}
+	if sharesComparison > 0 {
+		maximumGross, err := numeric(ctx, tx, `SELECT ($1::numeric * $2::numeric)::text`,
+			order.Intent.Size.String(), order.Intent.WorstPrice.String())
+		if err != nil {
+			return domain.FillApplication{}, err
+		}
+		if comparison, compareErr := cumulativeNotional.Compare(maximumGross); compareErr != nil || comparison > 0 {
+			return domain.FillApplication{}, reject(
+				"BUY_PRICE_IMPROVEMENT_EXCEEDS_LIMIT_NOTIONAL",
+				"Polymarket BUY delivered extra shares but exceeded the signed limit-price notional",
+			)
+		}
+		protectedCost, err := numeric(ctx, tx, `SELECT ($1::numeric + $2::numeric)::text`,
+			cumulativeNotional.String(), cumulativeFees.String())
+		if err != nil {
+			return domain.FillApplication{}, err
+		}
+		if comparison, compareErr := protectedCost.Compare(reservation.InitialReservedBalance); compareErr != nil || comparison > 0 {
+			return domain.FillApplication{}, reject(
+				"BUY_PRICE_IMPROVEMENT_EXCEEDS_RESERVATION",
+				"Polymarket BUY delivered extra shares but exceeded the order's protected balance",
+			)
+		}
+	}
 	averagePrice, err := numeric(ctx, tx, `SELECT ($1::numeric / $2::numeric)::text`, cumulativeNotional.String(), cumulativeShares.String())
 	if err != nil {
 		return domain.FillApplication{}, err
 	}
 	target := domain.OrderStatusPartiallyFilled
-	if cumulativeShares.Equal(order.Intent.Size) {
+	if sharesComparison == 0 || (sharesComparison > 0 && order.AllowsBuySharePriceImprovement()) {
 		target = domain.OrderStatusFilled
 	} else if order.Status == domain.OrderStatusManualReview {
 		target = domain.OrderStatusManualReview

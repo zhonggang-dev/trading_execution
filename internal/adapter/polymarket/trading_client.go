@@ -139,9 +139,11 @@ type marketFeeSchedule struct {
 	TakerOnly bool
 }
 
-// UnmarshalJSON converts the V2 order REST response quantities from canonical
-// six-decimal uint256 base units. Trade REST responses use human decimal share
-// strings and are intentionally decoded separately below.
+// UnmarshalJSON converts documented V2 order quantities from canonical
+// six-decimal uint256 base units. Production matched BUY responses can return
+// fractional size_matched shares in human-decimal form after price improvement;
+// a decimal point selects that field's unambiguous alternate representation
+// without reinterpreting documented integer strings.
 func (raw *rawOrder) UnmarshalJSON(data []byte) error {
 	type rawOrderAlias rawOrder
 	var decoded rawOrderAlias
@@ -157,13 +159,13 @@ func (raw *rawOrder) UnmarshalJSON(data []byte) error {
 	}
 	var err error
 	if len(quantities.OriginalSize) > 0 && string(quantities.OriginalSize) != "null" {
-		decoded.OriginalSize, err = decimalFromWireBaseUnits(quantities.OriginalSize, "original_size")
+		decoded.OriginalSize, err = decimalFromWireOrderQuantity(quantities.OriginalSize, "original_size")
 		if err != nil {
 			return err
 		}
 	}
 	if len(quantities.SizeMatched) > 0 && string(quantities.SizeMatched) != "null" {
-		decoded.SizeMatched, err = decimalFromWireBaseUnits(quantities.SizeMatched, "size_matched")
+		decoded.SizeMatched, err = decimalFromWireOrderQuantity(quantities.SizeMatched, "size_matched")
 		if err != nil {
 			return err
 		}
@@ -603,7 +605,7 @@ func (client *TradingClient) Get(ctx context.Context, order domain.Order) (port.
 	if strings.TrimSpace(raw.ID) == "" {
 		raw.ID = orderID
 	}
-	normalized, err := normalizeRawOrder(raw, order.Intent.Size, client.now().UTC())
+	normalized, err := normalizeRawOrder(raw, order, client.now().UTC())
 	if err != nil {
 		return port.VenueOrder{}, err
 	}
@@ -1279,10 +1281,12 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 		return nil, err
 	}
 	for index := range fills {
-		fills[index], err = client.attachFillFeeEvidence(ctx, account, order, fills[index], schedule)
-		if err != nil {
-			return nil, fmt.Errorf("CLOB trade %s fee evidence: %w", fills[index].VenueFillID, err)
+		observed := fills[index]
+		enriched, evidenceErr := client.attachFillFeeEvidence(ctx, account, order, observed, schedule)
+		if evidenceErr != nil {
+			return nil, fmt.Errorf("CLOB trade %s fee evidence: %w", observed.VenueFillID, evidenceErr)
 		}
+		fills[index] = enriched
 	}
 	return fills, nil
 }
@@ -1503,13 +1507,17 @@ func (client *TradingClient) attachFillFeeEvidence(
 	if err != nil {
 		return domain.Fill{}, err
 	}
-	return applyFillFeeEvidence(fill, schedule, evidence, exchange, account.FunderAddress, builderCode)
+	return applyFillFeeEvidence(
+		fill, schedule, evidence, order.MarketValidation.TickSize,
+		exchange, account.FunderAddress, builderCode,
+	)
 }
 
 func applyFillFeeEvidence(
 	fill domain.Fill,
 	schedule marketFeeSchedule,
 	evidence FillFeeEvidence,
+	tickSize domain.Decimal,
 	expectedExchange string,
 	expectedMaker string,
 	expectedBuilder string,
@@ -1558,7 +1566,7 @@ func applyFillFeeEvidence(
 	if !eventShares.Equal(fill.Shares) {
 		return domain.Fill{}, fmt.Errorf("CLOB shares do not match OrderFilled base-unit amounts")
 	}
-	if err := validateEventGross(fill.Shares, fill.Price, eventGross, evidence.CollateralDecimals); err != nil {
+	if err := validateEventGross(fill.Shares, fill.Price, eventGross, tickSize, evidence.CollateralDecimals); err != nil {
 		return domain.Fill{}, err
 	}
 	totalFee, err := decimalFromBaseUnits(evidence.TotalFeeBaseUnits, evidence.CollateralDecimals)
@@ -1686,30 +1694,76 @@ func decimalFromWireBaseUnits(raw json.RawMessage, field string) (domain.Decimal
 	return parsed, nil
 }
 
-func validateEventGross(shares domain.Decimal, price domain.Decimal, eventGross domain.Decimal, decimals uint8) error {
-	sharesRat, err := decimalRat(shares)
+func decimalFromWireOrderQuantity(raw json.RawMessage, field string) (domain.Decimal, error) {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("CLOB V2 %s must be a decimal string", field)
+	}
+	if !strings.Contains(value, ".") {
+		return decimalFromWireBaseUnits(raw, field)
+	}
+	parsed, err := domain.ParseDecimal(value)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("CLOB V2 %s: %w", field, err)
+	}
+	if sign, err := parsed.Sign(); err != nil || sign < 0 {
+		return "", fmt.Errorf("CLOB V2 %s must be non-negative", field)
+	}
+	return parsed, nil
+}
+
+func validateEventGross(
+	shares domain.Decimal,
+	price domain.Decimal,
+	eventGross domain.Decimal,
+	tickSize domain.Decimal,
+	decimals uint8,
+) error {
+	sharesRat, err := decimalRat(shares)
+	if err != nil || sharesRat.Sign() <= 0 {
+		return fmt.Errorf("CLOB fill shares must be positive")
 	}
 	priceRat, err := decimalRat(price)
-	if err != nil {
-		return err
+	if err != nil || priceRat.Sign() <= 0 {
+		return fmt.Errorf("CLOB fill price must be positive")
 	}
 	eventRat, err := decimalRat(eventGross)
-	if err != nil {
-		return err
+	if err != nil || eventRat.Sign() < 0 {
+		return fmt.Errorf("OrderFilled gross amount must be non-negative")
 	}
-	difference := new(big.Rat).Sub(new(big.Rat).Mul(sharesRat, priceRat), eventRat)
+	tickRat, err := decimalRat(tickSize)
+	if err != nil || tickRat.Sign() <= 0 {
+		return fmt.Errorf("persisted CLOB tick size must be positive for OrderFilled amount validation")
+	}
+	computedGross := new(big.Rat).Mul(sharesRat, priceRat)
+	difference := new(big.Rat).Sub(computedGross, eventRat)
 	if difference.Sign() < 0 {
 		difference.Neg(difference)
 	}
 	oneBaseUnit := new(big.Rat).SetFrac(big.NewInt(1), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
-	// V2 CalculatorHelper floors takingAmount integer division, so the only
-	// permitted API-price discrepancy is strictly less than one base unit.
-	if difference.Cmp(oneBaseUnit) >= 0 {
-		return fmt.Errorf("CLOB shares/price do not match OrderFilled base-unit amounts")
+	// A confirmed CLOB trade can report the order's price bucket while the V2
+	// OrderFilled amounts expose the exact price improvement. Treat half of the
+	// persisted market tick as the rounding interval and add one collateral
+	// base unit for the contract's integer amount quantization. The on-chain
+	// amount remains authoritative after this bounded identity check.
+	priceBucketTolerance := new(big.Rat).Quo(tickRat, big.NewRat(2, 1))
+	tolerance := new(big.Rat).Mul(sharesRat, priceBucketTolerance)
+	tolerance.Add(tolerance, oneBaseUnit)
+	if difference.Cmp(tolerance) > 0 {
+		return fmt.Errorf(
+			"CLOB shares/price do not match OrderFilled base-unit amounts: shares=%s price=%s event_gross=%s computed_gross=%s difference=%s tolerance=%s tick_size=%s",
+			shares, price, eventGross, ratDiagnosticDecimal(computedGross), ratDiagnosticDecimal(difference),
+			ratDiagnosticDecimal(tolerance), tickSize,
+		)
 	}
 	return nil
+}
+
+func ratDiagnosticDecimal(value *big.Rat) string {
+	if value == nil {
+		return ""
+	}
+	return canonicalDecimalText(value.FloatString(18))
 }
 
 func subtractDecimal(left domain.Decimal, right domain.Decimal) (domain.Decimal, error) {
@@ -2046,10 +2100,10 @@ func placementState(status string) port.VenueOrderState {
 }
 
 // normalizeRawOrder 规范化 原始数据 Order 的字段和表示。
-func normalizeRawOrder(raw rawOrder, fallbackSize domain.Decimal, observedAt time.Time) (port.VenueOrder, error) {
+func normalizeRawOrder(raw rawOrder, order domain.Order, observedAt time.Time) (port.VenueOrder, error) {
 	original := raw.OriginalSize
 	if original.IsEmpty() {
-		original = fallbackSize
+		original = order.Intent.Size
 	}
 	filled := raw.SizeMatched
 	if filled.IsEmpty() {
@@ -2061,14 +2115,14 @@ func normalizeRawOrder(raw rawOrder, fallbackSize domain.Decimal, observedAt tim
 		return port.VenueOrder{}, fmt.Errorf("CLOB order contains invalid size_matched")
 	}
 	comparison, err := filled.Compare(original)
-	if err != nil || comparison > 0 {
+	if err != nil || (comparison > 0 && !order.AllowsBuySharePriceImprovement()) {
 		return port.VenueOrder{}, fmt.Errorf("CLOB size_matched exceeds original_size")
 	}
 	if state == port.VenueOrderLive && filledSign > 0 {
 		state = port.VenueOrderPartiallyFilled
 	}
 	if state == port.VenueOrderFilled {
-		if comparison == 0 {
+		if comparison == 0 || (comparison > 0 && order.AllowsBuySharePriceImprovement()) {
 			state = port.VenueOrderFilled
 		} else if filledSign > 0 {
 			state = port.VenueOrderPartiallyFilled

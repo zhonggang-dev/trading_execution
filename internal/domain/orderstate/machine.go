@@ -162,7 +162,8 @@ func validateCumulativeFill(order domain.Order, filled domain.Decimal) error {
 	if comparison, err := filled.Compare(current); err != nil || comparison < 0 {
 		return fmt.Errorf("%w: cumulative filled size moved backward", ErrInvalidObservation)
 	}
-	if comparison, err := filled.Compare(order.Intent.Size); err != nil || comparison > 0 {
+	if comparison, err := filled.Compare(order.Intent.Size); err != nil ||
+		(comparison > 0 && !order.AllowsBuySharePriceImprovement()) {
 		return fmt.Errorf("%w: cumulative filled size exceeds requested size", ErrInvalidObservation)
 	}
 	return nil
@@ -188,8 +189,8 @@ func validateFillState(order domain.Order, status domain.OrderStatus) error {
 			return fmt.Errorf("%w: PARTIALLY_FILLED requires 0 < filled_size < order size", ErrInvalidObservation)
 		}
 	case domain.OrderStatusFilled:
-		if comparison != 0 {
-			return fmt.Errorf("%w: FILLED requires filled_size equal to order size", ErrInvalidObservation)
+		if comparison < 0 || (comparison > 0 && !order.AllowsBuySharePriceImprovement()) {
+			return fmt.Errorf("%w: FILLED requires filled_size to satisfy the order size", ErrInvalidObservation)
 		}
 	case domain.OrderStatusRejected:
 		if sign != 0 {

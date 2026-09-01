@@ -261,7 +261,7 @@ func targetReservationAmounts(
 	cumulativeShares domain.Decimal,
 	target domain.OrderStatus,
 ) (domain.Decimal, domain.Decimal, error) {
-	remaining, err := numeric(ctx, tx, `SELECT ($1::numeric-$2::numeric)::text`, reservation.RequestedShares.String(), cumulativeShares.String())
+	remaining, err := numeric(ctx, tx, `SELECT GREATEST(($1::numeric-$2::numeric),0)::text`, reservation.RequestedShares.String(), cumulativeShares.String())
 	if err != nil {
 		return "", "", err
 	}
@@ -287,6 +287,15 @@ func updateReservationForFill(
 	target domain.OrderStatus,
 	fill domain.Fill,
 ) error {
+	settledReservationShares := cumulativeShares
+	if comparison, err := cumulativeShares.Compare(reservation.RequestedShares); err != nil {
+		return err
+	} else if comparison > 0 && reservation.Side == domain.SideBuy {
+		// BUY price improvement can deliver more outcome shares than the signed
+		// minimum. The reservation ledger remains capped at that minimum while
+		// the fill/order/position ledgers retain the complete actual quantity.
+		settledReservationShares = reservation.RequestedShares
+	}
 	terminal := target == domain.OrderStatusFilled || target == domain.OrderStatusRejected
 	status := domain.ReservationStatusActive
 	if target == domain.OrderStatusFilled {
@@ -308,7 +317,7 @@ func updateReservationForFill(
 		    revision=revision+1, updated_at=$9::timestamptz,
 		    released_at=CASE WHEN $10::boolean THEN $9::timestamptz ELSE NULL::timestamptz END
 		WHERE order_id=$1 AND revision=$11`,
-		reservation.OrderID, targetBalance.String(), targetShares.String(), cumulativeShares.String(),
+		reservation.OrderID, targetBalance.String(), targetShares.String(), settledReservationShares.String(),
 		cumulativeNotional.String(), cumulativeFees.String(), string(status), nullTime(fill.VenueUpdatedAt),
 		now, terminal, reservation.Revision)
 	if err != nil {
@@ -319,7 +328,7 @@ func updateReservationForFill(
 	}
 	reservation.RemainingReservedBalance = targetBalance
 	reservation.RemainingReservedShares = targetShares
-	reservation.SettledShares = cumulativeShares
+	reservation.SettledShares = settledReservationShares
 	reservation.SettledNotional = cumulativeNotional
 	reservation.SettledFees = cumulativeFees
 	reservation.Status = status
@@ -328,7 +337,7 @@ func updateReservationForFill(
 	if terminal {
 		reservation.ReleasedAt = &now
 	}
-	eventKey := fmt.Sprintf("fill:%s:%s:%s:%s", fill.Key, cumulativeShares, cumulativeNotional, cumulativeFees)
+	eventKey := fmt.Sprintf("fill:%s:%s:%s:%s", fill.Key, settledReservationShares, cumulativeNotional, cumulativeFees)
 	details := ""
 	if sign, _ := unfilledShares.Sign(); terminal && sign > 0 {
 		details = "terminal order released unfilled remainder"

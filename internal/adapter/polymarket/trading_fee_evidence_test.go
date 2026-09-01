@@ -1,10 +1,33 @@
 package polymarket
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 )
+
+func TestValidateEventGrossAcceptsWallet6PriceBucketDifference(t *testing.T) {
+	err := validateEventGross("30.147057", "0.34", "10.199999", "0.01", 6)
+	if err != nil {
+		t.Fatalf("wallet-6 finalized fill was rejected: %v", err)
+	}
+}
+
+func TestValidateEventGrossRejectsMaterialMismatchWithDiagnostics(t *testing.T) {
+	err := validateEventGross("30.147057", "0.34", "10", "0.01", 6)
+	if err == nil {
+		t.Fatal("material OrderFilled gross mismatch was accepted")
+	}
+	for _, evidence := range []string{
+		"shares=30.147057", "price=0.34", "event_gross=10", "computed_gross=10.24999938",
+		"difference=0.24999938", "tolerance=0.150736285", "tick_size=0.01",
+	} {
+		if !strings.Contains(err.Error(), evidence) {
+			t.Fatalf("error %q omitted %q", err, evidence)
+		}
+	}
+}
 
 func TestApplyFillFeeEvidenceUsesActualEventFeeAndExponent(t *testing.T) {
 	fill := feeEvidenceFill(domain.LiquidityRoleTaker)
@@ -13,6 +36,7 @@ func TestApplyFillFeeEvidenceUsesActualEventFeeAndExponent(t *testing.T) {
 		fill,
 		marketFeeSchedule{Rate: "0.25", Exponent: "2", TakerOnly: true},
 		evidence,
+		"0.01",
 		evidence.ExchangeAddress,
 		evidence.MakerAddress,
 		zeroBytes32,
@@ -41,6 +65,7 @@ func TestApplyFillFeeEvidenceAcceptsProductionV2SellFeeQuantum(t *testing.T) {
 		fill,
 		marketFeeSchedule{Rate: "0.04", Exponent: "1", TakerOnly: true},
 		evidence,
+		"0.001",
 		evidence.ExchangeAddress,
 		evidence.MakerAddress,
 		zeroBytes32,
@@ -58,6 +83,7 @@ func TestApplyFillFeeEvidenceAcceptsProductionV2SellFeeQuantum(t *testing.T) {
 		fill,
 		marketFeeSchedule{Rate: "0.04", Exponent: "1", TakerOnly: true},
 		evidence,
+		"0.001",
 		evidence.ExchangeAddress,
 		evidence.MakerAddress,
 		zeroBytes32,
@@ -70,13 +96,13 @@ func TestApplyFillFeeEvidenceDigestIgnoresGrowingConfirmations(t *testing.T) {
 	fill := feeEvidenceFill(domain.LiquidityRoleTaker)
 	schedule := marketFeeSchedule{Rate: "0.25", Exponent: "2", TakerOnly: true}
 	firstEvidence := feeEvidence()
-	first, err := applyFillFeeEvidence(fill, schedule, firstEvidence, firstEvidence.ExchangeAddress, firstEvidence.MakerAddress, zeroBytes32)
+	first, err := applyFillFeeEvidence(fill, schedule, firstEvidence, "0.01", firstEvidence.ExchangeAddress, firstEvidence.MakerAddress, zeroBytes32)
 	if err != nil {
 		t.Fatal(err)
 	}
 	secondEvidence := firstEvidence
 	secondEvidence.Confirmations++
-	second, err := applyFillFeeEvidence(fill, schedule, secondEvidence, secondEvidence.ExchangeAddress, secondEvidence.MakerAddress, zeroBytes32)
+	second, err := applyFillFeeEvidence(fill, schedule, secondEvidence, "0.01", secondEvidence.ExchangeAddress, secondEvidence.MakerAddress, zeroBytes32)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +120,7 @@ func TestApplyFillFeeEvidenceRequiresAllocationEvenWhenFeeIsZero(t *testing.T) {
 		fill,
 		marketFeeSchedule{Rate: "0.25", Exponent: "2", TakerOnly: true},
 		evidence,
+		"0.01",
 		evidence.ExchangeAddress,
 		evidence.MakerAddress,
 		zeroBytes32,
@@ -107,6 +134,7 @@ func TestApplyFillFeeEvidenceRequiresAllocationEvenWhenFeeIsZero(t *testing.T) {
 		fill,
 		marketFeeSchedule{Rate: "0.25", Exponent: "2", TakerOnly: true},
 		evidence,
+		"0.01",
 		evidence.ExchangeAddress,
 		evidence.MakerAddress,
 		zeroBytes32,
@@ -121,12 +149,12 @@ func TestApplyFillFeeEvidenceFailsClosedOnAmountOrFeeMismatch(t *testing.T) {
 	schedule := marketFeeSchedule{Rate: "0.25", Exponent: "2", TakerOnly: true}
 	evidence := feeEvidence()
 	evidence.TakerAmountBaseUnits = "99999999"
-	if _, err := applyFillFeeEvidence(fill, schedule, evidence, evidence.ExchangeAddress, evidence.MakerAddress, zeroBytes32); err == nil {
+	if _, err := applyFillFeeEvidence(fill, schedule, evidence, "0.01", evidence.ExchangeAddress, evidence.MakerAddress, zeroBytes32); err == nil {
 		t.Fatal("event shares inconsistent with CLOB shares were accepted")
 	}
 	evidence = feeEvidence()
 	evidence.TotalFeeBaseUnits = "1562499"
-	if _, err := applyFillFeeEvidence(fill, schedule, evidence, evidence.ExchangeAddress, evidence.MakerAddress, zeroBytes32); err == nil {
+	if _, err := applyFillFeeEvidence(fill, schedule, evidence, "0.01", evidence.ExchangeAddress, evidence.MakerAddress, zeroBytes32); err == nil {
 		t.Fatal("event fee inconsistent with V2 schedule was accepted")
 	}
 }
@@ -142,6 +170,7 @@ func TestApplyFillFeeEvidenceDoesNotGuessPositiveBuilderFee(t *testing.T) {
 		fill,
 		marketFeeSchedule{Rate: "0.25", Exponent: "2", TakerOnly: true},
 		evidence,
+		"0.01",
 		evidence.ExchangeAddress,
 		evidence.MakerAddress,
 		"0x1234",
