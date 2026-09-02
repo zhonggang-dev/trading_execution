@@ -208,5 +208,60 @@ func feeEvidence() FillFeeEvidence {
 		BlockNumber:          1,
 		BlockHash:            "0xblock",
 		Confirmations:        2,
+		Finalized:            true,
+	}
+}
+
+// TestSettlementEvidenceDigestShapeIsStable pins the digest of a fixed
+// evidence payload. Every persisted execution_fills.raw_payload_sha256 was
+// computed with this shape; a change here would make the ledger reject the
+// re-observation of every already applied fill as an identity conflict.
+func TestSettlementEvidenceDigestShapeIsStable(t *testing.T) {
+	evidence := feeEvidence()
+	evidence.Confirmations = 999
+	evidence.Finalized = false
+	if digest := settlementEvidenceDigest("clob-digest", evidence); digest != settlementEvidenceGoldenDigest {
+		t.Fatalf("settlement evidence digest shape changed: %s", digest)
+	}
+}
+
+const settlementEvidenceGoldenDigest = "62d0d4b8874ecd5231938d0be88792c28da2e8fb93e9b21d72be4b8f318d2b0d"
+
+func TestApplyFillFeeEvidenceMarksShallowReceiptAsFinalityPendingMined(t *testing.T) {
+	fill := feeEvidenceFill(domain.LiquidityRoleTaker)
+	fill.Status = domain.FillStatusConfirmed
+	confirmedAt := fill.MatchedAt
+	fill.ConfirmedAt = &confirmedAt
+	schedule := marketFeeSchedule{Rate: "0.25", Exponent: "2", TakerOnly: true}
+	finalized := feeEvidence()
+	final, err := applyFillFeeEvidence(fill, schedule, finalized, "0.01", finalized.ExchangeAddress, finalized.MakerAddress, zeroBytes32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != domain.FillStatusConfirmed || final.ConfirmedAt == nil {
+		t.Fatalf("finalized evidence status = %s, want CONFIRMED with confirmed_at", final.Status)
+	}
+
+	shallow := finalized
+	shallow.Finalized = false
+	shallow.Confirmations = 1
+	pending, err := applyFillFeeEvidence(fill, schedule, shallow, "0.01", shallow.ExchangeAddress, shallow.MakerAddress, zeroBytes32)
+	if err != nil {
+		t.Fatalf("shallow receipt must produce a finality-pending fill, got %v", err)
+	}
+	if pending.Status != domain.FillStatusMined || pending.ConfirmedAt != nil {
+		t.Fatalf("shallow receipt fill = status %s confirmed_at %v, want MINED without confirmed_at", pending.Status, pending.ConfirmedAt)
+	}
+	if pending.SettlementEvidence == nil || pending.SettlementEvidence.Confirmations != 1 ||
+		!pending.TotalFee.Equal(final.TotalFee) || !pending.GrossNotional.Equal(final.GrossNotional) {
+		t.Fatalf("finality-pending fill lost exact money or evidence: %#v", pending)
+	}
+	if pending.RawPayloadSHA256 != final.RawPayloadSHA256 {
+		t.Fatalf("finality-pending and finalized observations must share one identity digest: %s != %s", pending.RawPayloadSHA256, final.RawPayloadSHA256)
+	}
+
+	shallow.Confirmations = 0
+	if _, err := applyFillFeeEvidence(fill, schedule, shallow, "0.01", shallow.ExchangeAddress, shallow.MakerAddress, zeroBytes32); err == nil {
+		t.Fatal("evidence without any confirmation must fail closed")
 	}
 }

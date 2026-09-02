@@ -128,6 +128,7 @@ type Polymarket struct {
 	MaxReconcileAttempts       int
 	MaxBuyFeeRateBPS           domain.Decimal
 	OrderFilledConfirmations   int
+	FillFinalityMaxAge         time.Duration
 	AutoRedeemInterval         time.Duration
 	AutoRedeemRetryInterval    time.Duration
 	AutoRedeemAmbiguityTimeout time.Duration
@@ -288,6 +289,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	fillFinalityMaxAge, err := duration("POLYGON_FILL_FINALITY_MAX_AGE", 30*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 	autoRedeemInterval, err := duration("POLYMARKET_AUTO_REDEEM_INTERVAL", time.Minute)
 	if err != nil {
 		return Config{}, err
@@ -380,6 +385,7 @@ func Load() (Config, error) {
 			MaxReconcileAttempts:       maxReconcileAttempts,
 			MaxBuyFeeRateBPS:           maxBuyFeeRateBPS,
 			OrderFilledConfirmations:   orderFilledConfirmations,
+			FillFinalityMaxAge:         fillFinalityMaxAge,
 			AutoRedeemInterval:         autoRedeemInterval,
 			AutoRedeemRetryInterval:    autoRedeemRetryInterval,
 			AutoRedeemAmbiguityTimeout: autoRedeemAmbiguityTimeout,

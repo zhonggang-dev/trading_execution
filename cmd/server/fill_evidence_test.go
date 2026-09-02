@@ -44,6 +44,38 @@ func TestPolygonFillFeeEvidenceMapsFinalizedReceipt(t *testing.T) {
 	}
 }
 
+func TestPolygonFillFeeEvidenceReportsShallowReceiptAsFinalityPending(t *testing.T) {
+	shallow := validOrderFilledEvidence()
+	shallow.Confirmations = 17
+	reader := &stubOrderFilledReader{err: &evmrpc.InsufficientConfirmationsError{Evidence: shallow, Required: 64}}
+	source, err := newPolygonFillFeeEvidence(reader)
+	if err != nil {
+		t.Fatalf("newPolygonFillFeeEvidence() error = %v", err)
+	}
+	evidence, err := source.ResolveFillFeeEvidence(context.Background(), validFillFeeEvidenceRequest())
+	if err != nil {
+		t.Fatalf("ResolveFillFeeEvidence() error = %v, want finality-pending evidence", err)
+	}
+	if evidence.Finalized || evidence.Confirmations != 17 || evidence.TotalFeeBaseUnits != "123" ||
+		evidence.BlockNumber != shallow.BlockNumber || evidence.BlockHash != shallow.BlockHash {
+		t.Fatalf("finality-pending evidence = %#v", evidence)
+	}
+
+	finalized := &stubOrderFilledReader{evidence: validOrderFilledEvidence()}
+	source, _ = newPolygonFillFeeEvidence(finalized)
+	evidence, err = source.ResolveFillFeeEvidence(context.Background(), validFillFeeEvidenceRequest())
+	if err != nil || !evidence.Finalized {
+		t.Fatalf("finalized evidence = %#v, %v", evidence, err)
+	}
+
+	zeroDepth := shallow
+	zeroDepth.Confirmations = 0
+	source, _ = newPolygonFillFeeEvidence(&stubOrderFilledReader{err: &evmrpc.InsufficientConfirmationsError{Evidence: zeroDepth, Required: 64}})
+	if _, err := source.ResolveFillFeeEvidence(context.Background(), validFillFeeEvidenceRequest()); err == nil {
+		t.Fatal("finality-pending evidence without receipt depth must fail closed")
+	}
+}
+
 func TestPolygonFillFeeEvidenceFailsClosed(t *testing.T) {
 	if _, err := newPolygonFillFeeEvidence(nil); err == nil {
 		t.Fatal("nil reader must fail")

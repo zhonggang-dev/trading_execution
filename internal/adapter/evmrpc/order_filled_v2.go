@@ -82,6 +82,23 @@ type OrderFilledEvidence struct {
 	Confirmations        uint64
 }
 
+// InsufficientConfirmationsError reports a canonical, successful and exactly
+// matching OrderFilled receipt whose confirmation depth is still below the
+// configured finality threshold. Evidence carries the confirmations observed at
+// read time so a caller may persist a finality-pending observation; it must
+// never be applied to balances or positions until a later read succeeds.
+type InsufficientConfirmationsError struct {
+	Evidence OrderFilledEvidence
+	Required uint64
+}
+
+// Error 返回当前错误模型的可读错误文本。
+func (err *InsufficientConfirmationsError) Error() string {
+	return fmt.Sprintf(
+		"fill has %d confirmations; require at least %d", err.Evidence.Confirmations, err.Required,
+	)
+}
+
 // OrderFilledEvidenceReader reads receipts only. It never signs or sends transactions.
 type OrderFilledEvidenceReader struct {
 	rpcURL                *url.URL
@@ -215,13 +232,15 @@ func (reader *OrderFilledEvidenceReader) Read(
 		return OrderFilledEvidence{}, fmt.Errorf("confirmation count overflows uint64")
 	}
 	confirmations := secondLatest - secondEvidence.BlockNumber + 1
-	if confirmations < reader.requiredConfirmations {
-		return OrderFilledEvidence{}, fmt.Errorf(
-			"fill has %d confirmations; require at least %d", confirmations, reader.requiredConfirmations,
-		)
-	}
-
 	secondEvidence.Confirmations = confirmations
+	if confirmations < reader.requiredConfirmations {
+		// The receipt is canonical and stable, only not deep enough yet. Return
+		// the zero value with a typed error so callers that ignore the type stay
+		// fail-closed while the fill source can record a finality-pending fill.
+		return OrderFilledEvidence{}, &InsufficientConfirmationsError{
+			Evidence: secondEvidence, Required: reader.requiredConfirmations,
+		}
+	}
 	return secondEvidence, nil
 }
 

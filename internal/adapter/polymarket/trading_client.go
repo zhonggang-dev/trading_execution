@@ -1276,10 +1276,12 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 	}
 	fills := make([]domain.Fill, 0, len(observations))
 	for _, fill := range observations {
-		// CLOB's matched/mined/retrying observations do not yet carry finalized
-		// receipt evidence. Returning an empty successful scan here would let
+		// CLOB's matched/mined/retrying observations do not yet carry receipt
+		// evidence. Returning an empty successful scan here would let
 		// cancellation finality release assets while a known fill is still
 		// propagating, so surface an explicit retryable evidence gap instead.
+		// CONFIRMED trades whose receipt is still below the configured depth
+		// are returned as MINED finality-pending fills with full evidence.
 		if !fill.Status.Terminal() {
 			return nil, &port.VenueError{
 				Kind: port.VenueErrorUnavailable, Code: "CLOB_FILL_DETAILS_UNAVAILABLE",
@@ -1566,7 +1568,7 @@ func applyFillFeeEvidence(
 		return domain.Fill{}, fmt.Errorf("OrderFilled evidence must use 6-decimal pUSD and outcome-token units")
 	}
 	if evidence.BlockNumber == 0 || strings.TrimSpace(evidence.BlockHash) == "" || evidence.Confirmations == 0 {
-		return domain.Fill{}, fmt.Errorf("OrderFilled evidence is not finalized")
+		return domain.Fill{}, fmt.Errorf("OrderFilled evidence omitted receipt depth")
 	}
 	makerAmount, err := decimalFromBaseUnits(evidence.MakerAmountBaseUnits, evidence.CollateralDecimals)
 	if err != nil {
@@ -1671,6 +1673,16 @@ func applyFillFeeEvidence(
 		fill.SettlementEvidence.BuilderFeeSource = domain.SettlementEvidenceZeroBuilder
 	}
 	fill.RawPayloadSHA256 = settlementEvidenceDigest(fill.RawPayloadSHA256, evidence)
+	if !evidence.Finalized {
+		// CLOB already reports the trade CONFIRMED, but the Polygon receipt has
+		// not reached the configured confirmation depth. Downgrade the local
+		// status to MINED: the ledger persists the exact money and settlement
+		// evidence as a finality-pending observation, keeps the order's
+		// reservation frozen, and applies balances/positions only once a later
+		// read returns the same evidence with Finalized=true.
+		fill.Status = domain.FillStatusMined
+		fill.ConfirmedAt = nil
+	}
 	return fill, nil
 }
 

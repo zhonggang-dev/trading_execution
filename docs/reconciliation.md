@@ -19,15 +19,27 @@ Python 指定：
   -> CLOB Open Orders / Trades（查询失败 != 空集合）
   -> 对每张本地 venue order 拉真实 /data/trades
   -> CONFIRMED Fill 通过 FillLedger 幂等补账
+     （receipt 确认数不足 POLYGON_ORDER_FILLED_CONFIRMATIONS 时记为 MINED finality-pending 观察）
   -> 通过原订单状态机 Refresh（不直接 UPDATE orders）
+  -> 读取 finality-pending Fill 视图（链上已生效、本地尚未入账的精确增量）
   -> 重新读取本地 positions
-  -> 对比 Data API/未来链上 position source
-  -> 对比 PostgreSQL total_balance/链上 ERC20 balance
+  -> 对比 Data API/未来链上 position source（本地 + finality-pending 增量）
+  -> 对比 PostgreSQL total_balance/链上 ERC20 balance（本地 + finality-pending 净现金）
   -> 记录 reconciliation_run + issues
 ```
 
 必须先补真实 Fill、再比较仓位和余额。否则“本地漏了一笔正常 BUY Fill”会被误报成 Phantom
 Position，并诱发错误的人工补账。
+
+CLOB 已报告 `CONFIRMED`、Polygon receipt 也已稳定但确认数还没到阈值的成交，是预期中的传播
+状态，不是数据源故障。它会带着完整 OrderFilled 证据以 `MINED` 状态写入 `execution_fills`
+（`applied_at IS NULL`），订单进入 `UNKNOWN + VENUE_FILL_EVIDENCE_PENDING`，预占保持冻结；
+链上此时已经减少仓位、增加余额，本地账本仍是成交前的值。对账把每一笔待终局成交的精确
+signed shares 和 `net_cash_delta` 加到本地视图后再与链上比较，逐笔归因而不是解释一个总差额：
+差额恰好等于待终局成交之和才不记异常，其它差额仍按下文人工核查处理。达到阈值后同一证据
+再次读取为 `CONFIRMED`，账本原子入账并释放预占。摘要字段 `finality_pending_fills`、
+`positions_explained_by_finality_pending_fills`、`balance_explained_by_finality_pending_fills`
+记录这一轮吸收了多少。
 
 ## 触发方式
 
@@ -97,6 +109,9 @@ Data API 找候选交易并用 Polygon 回执验证，禁止盲目重发。
 - `EXTERNAL_TRADE`：成交无法映射到本系统订单，无法区分人工或其他程序交易；
 - `BALANCE_DRIFT`：链上余额和本地 total balance 不同，但没有可归因的 Fill/redeem/cash event；
 - `SOURCE_CONFLICT`：Data API、链上或多个 RPC 相互矛盾；本轮关闭所有相关自动修复；
+- `FILL_FINALITY_STALLED`：CLOB 已 `CONFIRMED` 的成交在 `match_time` 之后超过
+  `POLYGON_FILL_FINALITY_MAX_AGE`（默认 30m）仍未达到确认阈值。确认数只会因为交易被丢弃、
+  被 reorg 重新打包或 RPC head 卡住而停止增长，必须人工核对 receipt 是否 canonical；
 - `EXTERNAL_ORDER` 使用 `OBSERVED_ONLY`：只展示，不撤销、不修改、不导入成本系统。
 
 API/RPC 失败记录为 `SOURCE_UNAVAILABLE + RETRY_LATER`。查询接口可以有界重试，但失败结果绝不

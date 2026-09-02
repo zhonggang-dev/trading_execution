@@ -107,6 +107,9 @@ func (state *runState) reconcileBalance(ctx context.Context, executionAccountID 
 		state.balanceExplainedByRedemptions(balance.TotalBalance, external.Amount) {
 		return nil
 	}
+	if state.balanceExplainedByFinalityPendingFills(balance.TotalBalance, external.Amount) {
+		return nil
+	}
 	state.issue(ctx, domain.ReconciliationIssueParams{
 		Type: domain.ReconciliationIssueBalanceDrift, Resolution: domain.ReconciliationResolutionManual,
 		Status: domain.ReconciliationIssueOpen, LocalValue: balance.TotalBalance,
@@ -212,6 +215,11 @@ func (state *runState) comparePositions(
 		baselineByToken[tokenID] = baseline
 	}
 	for tokenID, external := range remote.Positions {
+		if _, hasLocal := localByToken[tokenID]; !hasLocal && state.absentLocalPositionIsFinalityPending(tokenID, external) {
+			// A BUY whose receipt is not deep enough yet already minted the shares
+			// on-chain; the ledger creates the position only at finality.
+			continue
+		}
 		if baseline, exists := baselineByToken[tokenID]; exists {
 			position, hasLocal := localByToken[tokenID]
 			delete(baselineByToken, tokenID)
@@ -247,6 +255,9 @@ func (state *runState) comparePositions(
 			redeeming++
 			continue
 		}
+		if state.positionExplainedByFinalityPendingFills(tokenID, position.TotalShares, "0") {
+			continue
+		}
 		state.recordMissingExternalPosition(ctx, missingExternalPositionParams{tokenID: tokenID, position: position, externalSource: remote.Source})
 	}
 	state.run.Summary["redeeming_positions_pending_ledger"] = redeeming
@@ -270,6 +281,12 @@ func (state *runState) compareBaselinedPosition(ctx context.Context, params comp
 	}
 	// Baseline evidence is exact and immutable. Unlike ordinary live-source
 	// comparison, no epsilon may absorb a change to an unmanaged cutover amount.
+	// A finality-pending managed fill on the same token changes only the
+	// managed part, so its exact signed delta is added before the comparison.
+	if identityMatches && !expected.Equal(params.external.Shares) &&
+		state.baselinedPositionExplainedByFinalityPendingFills(params.tokenID, expected, params.external.Shares) {
+		return
+	}
 	if !identityMatches || !expected.Equal(params.external.Shares) {
 		details := "remote position does not equal the immutable unmanaged baseline plus the managed ledger; do not adjust the baseline or invent a managed position"
 		if !identityMatches {
@@ -313,6 +330,9 @@ func (state *runState) compareExternalPosition(ctx context.Context, params compa
 	sharesMatch := managedPositionSharesMatch(position.TotalShares, params.external, state.service.positionEpsilon)
 	state.settlePositionIfNeeded(ctx, settlePositionParams{tokenID: params.tokenID, position: position, external: params.external, sharesMatch: sharesMatch})
 	if sharesMatch {
+		return
+	}
+	if state.positionExplainedByFinalityPendingFills(params.tokenID, position.TotalShares, params.external.Shares) {
 		return
 	}
 	if state.externalPositionIsRedeemedAwaitingIndex(position, params.external) {

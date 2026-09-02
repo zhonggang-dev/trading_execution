@@ -73,11 +73,19 @@ type FillFeeEvidence struct {
 	BlockHash            string
 	LogIndex             uint64
 	Confirmations        uint64
+	// Finalized reports whether Confirmations reached the configured finality
+	// depth. False means the receipt is canonical, successful and exactly
+	// matching, but still too shallow: the fill is recorded as a MINED
+	// finality-pending observation and never touches balances or positions.
+	// It is excluded from JSON so the persisted raw-payload digest of every
+	// existing and pending fill keeps its exact shape across this rollout.
+	Finalized bool `json:"-"`
 }
 
-// FillFeeEvidenceSource resolves finalized on-chain settlement evidence for a
-// CLOB trade. Implementations must fail when a receipt is missing/reverted,
-// the matching OrderFilled log is absent/ambiguous, or finality is insufficient.
+// FillFeeEvidenceSource resolves on-chain settlement evidence for a CLOB
+// trade. Implementations must fail when a receipt is missing/reverted or the
+// matching OrderFilled log is absent/ambiguous. Insufficient finality is not a
+// failure: it is reported through Finalized=false with the observed depth.
 type FillFeeEvidenceSource interface {
 	ResolveFillFeeEvidence(context.Context, FillFeeEvidenceRequest) (FillFeeEvidence, error)
 }

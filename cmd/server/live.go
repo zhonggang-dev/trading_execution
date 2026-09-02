@@ -407,6 +407,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		BalanceEpsilon:            cfg.Polymarket.BalanceEpsilon,
 		AccountScope:              executionAccountScope,
 		Redemptions:               redemptionProgress,
+		FillFinalityMaxAge:        cfg.Polymarket.FillFinalityMaxAge,
 	})
 	if err != nil {
 		return nil, err
