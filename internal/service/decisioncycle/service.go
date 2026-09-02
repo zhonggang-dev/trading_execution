@@ -1535,9 +1535,7 @@ func validateStrategyOrderForMarket(
 			return fmt.Errorf("order.size is below orderbook min_order_size")
 		}
 	}
-	if err := validateStrategyProtectedPriceForMarket(
-		order.WorstPrice, side, book, constraints.MaxPriceSlippageTicks, marketSource,
-	); err != nil {
+	if err := validateStrategyProtectedPrice(order.WorstPrice, side, book); err != nil {
 		return err
 	}
 	levels := book.Asks
@@ -1575,108 +1573,48 @@ func validateStrategyOrderForMarket(
 	return nil
 }
 
-func validateStrategyProtectedPriceForMarket(
+// validateStrategyProtectedPrice validates only the strategy's explicit limit
+// boundary. Trading intentionally does not cap its distance from top-of-book:
+// the strategy owns worst_price, while execution still requires a valid tick,
+// the executable side of the book, and protected-price liquidity.
+func validateStrategyProtectedPrice(
 	protectedPrice domain.Decimal,
 	side domain.Side,
 	book domain.OrderBookSnapshot,
-	maxSlippageTicks int,
-	marketSource domain.MarketSource,
 ) error {
-	distance, tickValue, err := strategyProtectedPriceDistance(protectedPrice, side, book)
-	if err != nil {
-		return err
-	}
-	if marketSource.Normalize() == domain.MarketSourceKalshi {
-		return nil
-	}
-	return validateStrategyProtectedPriceDistance(distance, tickValue, side, maxSlippageTicks)
-}
-
-// validateStrategyProtectedPrice 校验策略保护价位于盘口可成交方向，且最多偏离最优价指定 tick 数。
-func validateStrategyProtectedPrice(protectedPrice domain.Decimal, side domain.Side, book domain.OrderBookSnapshot, maxSlippageTicks int) error {
-	distance, tickValue, err := strategyProtectedPriceDistance(protectedPrice, side, book)
-	if err != nil {
-		return err
-	}
-	return validateStrategyProtectedPriceDistance(distance, tickValue, side, maxSlippageTicks)
-}
-
-func strategyProtectedPriceDistance(
-	protectedPrice domain.Decimal,
-	side domain.Side,
-	book domain.OrderBookSnapshot,
-) (*big.Rat, *big.Rat, error) {
 	if book.TickSize.IsEmpty() {
-		return nil, nil, fmt.Errorf("DEPTH_AWARE_LIMIT requires orderbook tick_size")
+		return fmt.Errorf("DEPTH_AWARE_LIMIT requires orderbook tick_size")
 	}
 	if sign, err := book.TickSize.Sign(); err != nil || sign <= 0 {
-		return nil, nil, fmt.Errorf("orderbook tick_size must be positive")
+		return fmt.Errorf("orderbook tick_size must be positive")
 	}
 	if sign, err := protectedPrice.Sign(); err != nil || sign <= 0 {
-		return nil, nil, fmt.Errorf("order.worst_price must be positive")
+		return fmt.Errorf("order.worst_price must be positive")
 	}
 	if comparison, err := protectedPrice.Compare("1"); err != nil || comparison > 0 {
-		return nil, nil, fmt.Errorf("order.worst_price must not exceed one")
+		return fmt.Errorf("order.worst_price must not exceed one")
 	}
 	if multiple, err := protectedPrice.IsMultipleOf(book.TickSize); err != nil || !multiple {
-		return nil, nil, fmt.Errorf("order.worst_price must be an exact multiple of orderbook tick_size")
+		return fmt.Errorf("order.worst_price must be an exact multiple of orderbook tick_size")
 	}
 
-	var topPrice domain.Decimal
 	switch side {
 	case domain.SideBuy:
 		if len(book.Asks) == 0 {
-			return nil, nil, fmt.Errorf("BUY price protection requires an ask")
+			return fmt.Errorf("BUY price protection requires an ask")
 		}
-		topPrice = book.Asks[0].Price
-		if comparison, err := protectedPrice.Compare(topPrice); err != nil || comparison < 0 {
-			return nil, nil, fmt.Errorf("BUY order.worst_price must be at or above the strategy snapshot best ask")
+		if comparison, err := protectedPrice.Compare(book.Asks[0].Price); err != nil || comparison < 0 {
+			return fmt.Errorf("BUY order.worst_price must be at or above the strategy snapshot best ask")
 		}
 	case domain.SideSell:
 		if len(book.Bids) == 0 {
-			return nil, nil, fmt.Errorf("SELL price protection requires a bid")
+			return fmt.Errorf("SELL price protection requires a bid")
 		}
-		topPrice = book.Bids[0].Price
-		if comparison, err := protectedPrice.Compare(topPrice); err != nil || comparison > 0 {
-			return nil, nil, fmt.Errorf("SELL order.worst_price must be at or below the strategy snapshot best bid")
+		if comparison, err := protectedPrice.Compare(book.Bids[0].Price); err != nil || comparison > 0 {
+			return fmt.Errorf("SELL order.worst_price must be at or below the strategy snapshot best bid")
 		}
 	default:
-		return nil, nil, fmt.Errorf("unsupported strategy order side %q", side)
-	}
-
-	protectedValue, err := protectedPrice.Multiply("1")
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse order.worst_price: %w", err)
-	}
-	topValue, err := topPrice.Multiply("1")
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse strategy snapshot top-of-book price: %w", err)
-	}
-	distance := new(big.Rat)
-	if side == domain.SideBuy {
-		distance.Sub(protectedValue, topValue)
-	} else {
-		distance.Sub(topValue, protectedValue)
-	}
-	tickValue, err := book.TickSize.Multiply("1")
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse orderbook tick_size: %w", err)
-	}
-	return distance, tickValue, nil
-}
-
-func validateStrategyProtectedPriceDistance(
-	distance *big.Rat,
-	tickValue *big.Rat,
-	side domain.Side,
-	maxSlippageTicks int,
-) error {
-	if maxSlippageTicks < 1 || maxSlippageTicks > domain.DefaultStrategyMaxPriceSlippageTicks {
-		return fmt.Errorf("max_price_slippage_ticks must be between 1 and %d", domain.DefaultStrategyMaxPriceSlippageTicks)
-	}
-	maximumDistance := new(big.Rat).Mul(tickValue, big.NewRat(int64(maxSlippageTicks), 1))
-	if distance.Cmp(maximumDistance) > 0 {
-		return fmt.Errorf("%s order.worst_price may be at most %d ticks worse than the strategy snapshot top-of-book price", side, maxSlippageTicks)
+		return fmt.Errorf("unsupported strategy order side %q", side)
 	}
 	return nil
 }
