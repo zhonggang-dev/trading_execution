@@ -103,7 +103,8 @@ func (state *runState) reconcileBalance(ctx context.Context, executionAccountID 
 		return err
 	}
 	external, conflict := state.readBalanceConsensus(ctx, balance.WalletAddress, balance.CollateralAsset)
-	if conflict || within(balance.TotalBalance, external.Amount, state.service.balanceEpsilon) {
+	if conflict || within(balance.TotalBalance, external.Amount, state.service.balanceEpsilon) ||
+		state.balanceExplainedByRedemptions(balance.TotalBalance, external.Amount) {
 		return nil
 	}
 	state.issue(ctx, domain.ReconciliationIssueParams{
@@ -240,9 +241,15 @@ func (state *runState) comparePositions(
 			details: "the immutable unmanaged baseline token is absent from the external snapshot; the baseline is never reduced or imported into the managed ledger",
 		})
 	}
+	redeeming := 0
 	for tokenID, position := range localByToken {
+		if state.absentPositionIsRedeeming(position) {
+			redeeming++
+			continue
+		}
 		state.recordMissingExternalPosition(ctx, missingExternalPositionParams{tokenID: tokenID, position: position, externalSource: remote.Source})
 	}
+	state.run.Summary["redeeming_positions_pending_ledger"] = redeeming
 }
 
 // compareBaselinedPosition verifies remote_total = immutable unmanaged shares

@@ -230,6 +230,14 @@ type RedemptionStore interface {
 	ReviewRedemption(ctx context.Context, redemption domain.Redemption, reason string, reviewedAt time.Time) error
 }
 
+// RedemptionProgressSource exposes redemptions that may already have burned
+// outcome shares and paid collateral on-chain before the ledger applied them.
+// Reconciliation consults it so the redeem-to-apply window is not recorded as
+// permanent manual drift.
+type RedemptionProgressSource interface {
+	ListInFlightRedemptions(ctx context.Context, executionAccountID string) ([]domain.InFlightRedemption, error)
+}
+
 type RedeemActivitySource interface {
 	ListRedeemActivities(ctx context.Context, walletAddress, conditionID string, start time.Time) ([]domain.RedeemActivity, error)
 }
