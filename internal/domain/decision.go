@@ -697,7 +697,7 @@ const (
 func DefaultStrategyExecutionConstraints() StrategyExecutionConstraints {
 	return StrategyExecutionConstraints{
 		SizeUnit: "SHARES", SizeDecimalPlaces: 2, BuyNotionalDecimals: 4,
-		MinimumBuyNotional: "1", AllowedTimeInForce: []TimeInForce{TimeInForceFOK},
+		MinimumBuyNotional: "1", AllowedTimeInForce: []TimeInForce{TimeInForceIOC, TimeInForceFOK},
 		PriceProtectionPolicy: StrategyPriceProtectionDepthAwareLimit,
 		MaxPriceSlippageTicks: DefaultStrategyMaxPriceSlippageTicks,
 	}

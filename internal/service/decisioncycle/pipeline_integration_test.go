@@ -298,8 +298,11 @@ func TestAlgorithmToExecutionPaperPipelineAndReplay(t *testing.T) {
 		t.Fatalf("submitted order = %#v", intentResult.Result)
 	}
 	order := intentResult.Result.Order
+	// The strategy protocol says FOK; Polymarket BUY executes as IOC so the
+	// share-denominated order never spends a size*worst_price budget.
 	if order.MarketValidation == nil || order.MarketValidation.Mode != "PAPER_BYPASS" ||
-		order.Intent.TimeInForce != domain.TimeInForceFOK || !order.Intent.Price.Equal("0.50") {
+		order.Intent.TimeInForce != domain.TimeInForceIOC || !order.Intent.Price.Equal("0.50") ||
+		order.Intent.Metadata["strategy_time_in_force"] != "FOK" || order.Intent.Metadata["execution_time_in_force"] != "IOC" {
 		t.Fatalf("validated order = %#v", order)
 	}
 	events, err := fixture.repository.Events(context.Background(), order.ID)

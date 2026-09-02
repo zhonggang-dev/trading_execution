@@ -83,3 +83,64 @@ func adapterIntent() domain.OrderIntent {
 		TimeInForce:        domain.TimeInForceGTC,
 	}
 }
+
+// TestPlacementIntentCapsEmulatedIOCToExecutableSize 验证模拟 IOC 的签名数量为校验时保护价内可成交量，
+// 价格保持 worst_price。
+func TestPlacementIntentCapsEmulatedIOCToExecutableSize(t *testing.T) {
+	intent := adapterIntent()
+	intent.TimeInForce = domain.TimeInForceIOC
+	intent.Size = "42"
+	order := domain.Order{Intent: intent, MarketValidation: &domain.MarketValidation{
+		Mode: "LIVE_CHECK", TickSize: "0.01", MinOrderSize: "5", WorstPrice: "0.50", ExecutableSize: "17.5",
+	}}
+	wire, err := placementIntent(order)
+	if err != nil {
+		t.Fatalf("placementIntent() error = %v", err)
+	}
+	if wire.Size != "17.5" || wire.Price != "0.50" || wire.TimeInForce != domain.TimeInForceIOC {
+		t.Fatalf("wire intent = %#v, want 17.5 shares at worst_price", wire)
+	}
+	amounts, err := buildRawAmounts(wire, "0.01", "5", "1")
+	if err != nil {
+		t.Fatalf("buildRawAmounts() error = %v", err)
+	}
+	if amounts.MakerAmount != "8750000" || amounts.TakerAmount != "17500000" {
+		t.Fatalf("amounts = %#v, want 8.75 pUSD for exactly 17.5 shares", amounts)
+	}
+
+	order.MarketValidation.ExecutableSize = ""
+	wire, err = placementIntent(order)
+	if err != nil || wire.Size != "42" {
+		t.Fatalf("placementIntent() without executable size = %#v, err = %v", wire, err)
+	}
+	order.MarketValidation.ExecutableSize = "50"
+	if _, err := placementIntent(order); err == nil {
+		t.Fatal("executable size above the strategy size was accepted")
+	}
+	order.MarketValidation.ExecutableSize = "4"
+	if _, err := placementIntent(order); err == nil {
+		t.Fatal("executable size below min_order_size was accepted")
+	}
+
+	fok := adapterIntent()
+	fok.TimeInForce = domain.TimeInForceFOK
+	order.Intent = fok
+	order.MarketValidation.ExecutableSize = "7"
+	wire, err = placementIntent(order)
+	if err != nil || wire.Size != "10" {
+		t.Fatalf("FOK placementIntent() = %#v, err = %v, want strategy size untouched", wire, err)
+	}
+}
+
+// TestClobOrderTypeEmulatesIOCAsGTC 验证 IOC 以按股数计的 GTC 签名，而不是预算式 FAK。
+func TestClobOrderTypeEmulatesIOCAsGTC(t *testing.T) {
+	orderType, err := clobOrderType(domain.TimeInForceIOC)
+	if err != nil || orderType != "GTC" {
+		t.Fatalf("clobOrderType(IOC) = %q, %v", orderType, err)
+	}
+	client := &TradingClient{}
+	if client.SupportsTimeInForce(domain.TimeInForceIOC) || !client.SupportsTimeInForce(domain.TimeInForceGTC) ||
+		!client.SupportsTimeInForce(domain.TimeInForceFOK) {
+		t.Fatal("SupportsTimeInForce must report IOC as emulated and GTC/FOK as native")
+	}
+}

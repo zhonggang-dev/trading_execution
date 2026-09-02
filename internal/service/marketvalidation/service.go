@@ -3,6 +3,7 @@ package marketvalidation
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -151,7 +152,7 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		return domain.MarketValidation{}, err
 	}
 
-	return (domain.MarketValidationParams{
+	params := domain.MarketValidationParams{
 		Mode:                 "LIVE_CHECK",
 		ValidatedAt:          now,
 		MarketObservedAt:     market.ObservedAt.UTC(),
@@ -167,7 +168,85 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		BestBid:              book.Bids[0].Price,
 		BestAsk:              book.Asks[0].Price,
 		WorstPrice:           intent.WorstPrice,
-	}).Build()
+	}
+	if intent.TimeInForce == domain.TimeInForceIOC {
+		executableSize, err := protectedExecutableSize(intent, book)
+		if err != nil {
+			return domain.MarketValidation{}, err
+		}
+		params.ExecutableSize = executableSize
+	}
+	return params.Build()
+}
+
+// protectedExecutableSize measures what an IOC can take right now: the visible
+// quantity on the executable side of the fresh book at prices inside
+// worst_price, capped at the strategy size. The venue adapter submits that
+// quantity so the emulated IOC leaves the smallest possible remainder to
+// cancel. worst_price is a price ceiling, never a spend budget: size shares is
+// the maximum, whatever they cost inside the limit. The only floor is the
+// venue min_order_size; a thinner protected book fails closed.
+func protectedExecutableSize(intent domain.OrderIntent, book domain.OrderBookSnapshot) (domain.Decimal, error) {
+	levels := book.Asks
+	if intent.Side == domain.SideSell {
+		levels = book.Bids
+	}
+	depth := new(big.Rat)
+	scale := 0
+	for _, level := range levels {
+		comparison, err := level.Price.Compare(intent.WorstPrice)
+		if err != nil {
+			return "", reject("LATEST_BOOK_INVALID", "latest orderbook level price is invalid")
+		}
+		executable := intent.Side == domain.SideBuy && comparison <= 0 || intent.Side == domain.SideSell && comparison >= 0
+		if !executable {
+			continue
+		}
+		size, err := level.Size.Multiply("1")
+		if err != nil {
+			return "", reject("LATEST_BOOK_INVALID", "latest orderbook level size is invalid")
+		}
+		depth.Add(depth, size)
+		scale = max(scale, decimalScale(level.Size))
+	}
+	requested, err := intent.Size.Multiply("1")
+	if err != nil || requested.Sign() <= 0 {
+		return "", reject("INVALID_SIZE", "order size is not a positive decimal")
+	}
+	if depth.Sign() <= 0 {
+		return "", reject("NO_PROTECTED_LIQUIDITY", "latest orderbook has no visible liquidity inside the strategy worst_price")
+	}
+	executable := depth
+	if requested.Cmp(depth) < 0 {
+		executable = requested
+		scale = decimalScale(intent.Size)
+	}
+	if !book.MinOrderSize.IsEmpty() {
+		minimum, err := book.MinOrderSize.Multiply("1")
+		if err != nil || executable.Cmp(minimum) < 0 {
+			return "", reject("PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE",
+				fmt.Sprintf("only %s shares are executable inside worst_price, below the venue min_order_size %s",
+					executable.FloatString(scale), book.MinOrderSize))
+		}
+	}
+	return canonicalDecimal(executable.FloatString(scale)), nil
+}
+
+// decimalScale 计算十进制值所需的小数位数。
+func decimalScale(value domain.Decimal) int {
+	text := strings.TrimRight(strings.TrimSpace(value.String()), "0")
+	if point := strings.IndexByte(text, '.'); point >= 0 {
+		return len(text) - point - 1
+	}
+	return 0
+}
+
+// canonicalDecimal 去掉尾随零，使数量的文本表示与策略输入保持一致。
+func canonicalDecimal(text string) domain.Decimal {
+	if strings.Contains(text, ".") {
+		text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	}
+	return domain.Decimal(text)
 }
 
 // requireMarketContext 检查并要求 Market Context 完整。

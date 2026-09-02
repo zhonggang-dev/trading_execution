@@ -35,7 +35,13 @@ Python Strategy / SUBMIT
 - SELL：`latest_best_bid >= worst_price` 才可下单；
 - 价格必须是当前 `tick_size` 的精确整数倍，全程使用 decimal string，不转成 float；
 - LIMIT 的实际 `price` 使用 `worst_price`，避免订单在校验与发送之间失去价格保护；
-- MARKET 订单也必须带 `worst_price`，供后续真实 Venue adapter 做保护型 FOK/FAK 转换。
+- MARKET 订单也必须带 `worst_price`，供后续真实 Venue adapter 做保护型 FOK/FAK 转换；
+- `size` 是股数上限，`worst_price` 是价格上限，二者都不是资金预算。IOC intent（Kalshi 全部订单、
+  Polymarket 全部 BUY）在校验时用最新盘口测量保护价内可成交的量：`executable_size = min(size, 保护价内可见深度)`，
+  记入 `LIVE_CHECK` 证据并作为 adapter 提交的数量；保护价内深度不足 `size` 不拒单，按能成交的量下单，
+  剩余立即取消。唯一下限是 venue `min_order_size`：可成交量低于它时以
+  `PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE` fail closed。Polymarket 的 IOC 由执行层用 GTC 限价单加
+  立即撤单模拟，因为 CLOB 的 FOK/FAK BUY 是按 pUSD 预算成交的，会在盘口好于保护价时买超 `size` 股。
 
 Kalshi 使用 `DEPTH_AWARE_LIMIT + IOC`：策略快照的最优价作为
 `strategy_reference_price`，`worst_price` 必须处于可成交方向，且冻结盘口在该保护价内至少有正数可见深度。
@@ -136,6 +142,8 @@ Venue。`observed_at` 是这份市场元数据的观察时间，不应拿业务�
 | `LATEST_BOOK_INVALID` | 最新盘口格式、排序或买卖价关系无效 |
 | `LATEST_BOOK_SOURCE_STALE` | 最新盘口源时间过期 |
 | `PRICE_DRIFT` | 最新可成交价越过 Python 的 worst_price |
+| `NO_PROTECTED_LIQUIDITY` | IOC intent 在最新盘口保护价内没有可见深度 |
+| `PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE` | IOC intent 保护价内可成交量低于 venue `min_order_size` |
 
 默认时效阈值为：策略快照 2 分钟、Market Universe 元数据 5 分钟、最新盘口 10 秒、未来
 时钟偏差 2 秒。构造 `marketvalidation.Service` 时都可配置；实盘配置应结合服务 SLA 调整。

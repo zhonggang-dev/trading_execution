@@ -260,3 +260,71 @@ func validFixtures() (time.Time, domain.OrderIntent, domain.MarketSnapshot, doma
 	}
 	return now, intent, market, book
 }
+
+// TestValidateMeasuresIOCExecutableSizeInsideWorstPrice 验证 IOC 的可成交量是保护价内可见深度与 size 的较小值，
+// worst_price 只是价格上限而不是预算。
+func TestValidateMeasuresIOCExecutableSizeInsideWorstPrice(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	intent.TimeInForce = domain.TimeInForceIOC
+	intent.Size = "42"
+	book.Asks = []domain.PriceLevel{
+		{Price: "0.51", Size: "12.5"},
+		{Price: "0.52", Size: "5"},
+		{Price: "0.53", Size: "100"},
+	}
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if validation.ExecutableSize != "17.5" || validation.WorstPrice != "0.52" || validation.BestAsk != "0.51" {
+		t.Fatalf("Validate() = %#v, want 17.5 executable shares inside worst_price 0.52", validation)
+	}
+
+	intent.Size = "10"
+	validation, err = service.Validate(context.Background(), intent)
+	if err != nil || validation.ExecutableSize != "10" {
+		t.Fatalf("Validate() with full depth = %#v, err = %v, want executable_size capped at size", validation, err)
+	}
+}
+
+// TestValidateRejectsIOCBelowLatestMinOrderSize 验证保护价内可成交量低于 min_order_size 时 fail closed。
+func TestValidateRejectsIOCBelowLatestMinOrderSize(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	intent.TimeInForce = domain.TimeInForceIOC
+	intent.Size = "42"
+	book.MinOrderSize = "20"
+	book.Asks = []domain.PriceLevel{{Price: "0.51", Size: "12.5"}, {Price: "0.53", Size: "100"}}
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+
+	_, err := service.Validate(context.Background(), intent)
+	var rejection *port.Rejection
+	if !errors.As(err, &rejection) || rejection.Code != "PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE" {
+		t.Fatalf("Validate() error = %v, want PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE", err)
+	}
+}
+
+// TestValidateIOCSellMeasuresBidDepthAndFOKLeavesExecutableSizeEmpty 验证 SELL IOC 使用买盘深度，
+// 而 FOK/GTC 不记录 executable_size。
+func TestValidateIOCSellMeasuresBidDepthAndFOKLeavesExecutableSizeEmpty(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil || !validation.ExecutableSize.IsEmpty() {
+		t.Fatalf("GTC Validate() = %#v, err = %v, want no executable_size", validation, err)
+	}
+
+	sell := intent
+	sell.Side = domain.SideSell
+	sell.Price = "0.49"
+	sell.WorstPrice = "0.49"
+	sell.TimeInForce = domain.TimeInForceIOC
+	sellBook := book
+	sellBook.Bids = []domain.PriceLevel{{Price: "0.50", Size: "3"}, {Price: "0.49", Size: "4"}, {Price: "0.48", Size: "50"}}
+	service = newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{sellBook}})
+	validation, err = service.Validate(context.Background(), sell)
+	if err != nil || validation.ExecutableSize != "7" {
+		t.Fatalf("SELL IOC Validate() = %#v, err = %v, want 7 executable shares at or above worst_price", validation, err)
+	}
+}

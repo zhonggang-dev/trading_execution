@@ -98,6 +98,16 @@ type Venue interface {
 	Get(ctx context.Context, order domain.Order) (VenueOrder, error)
 }
 
+// TimeInForceSupport is an optional Venue capability. A venue that reports
+// false for IOC has no native immediate-or-cancel order type; execution then
+// emulates IOC by placing a share-denominated resting limit order at the
+// protection price and cancelling any unfilled remainder immediately after the
+// placement response. Venues that do not implement this interface are treated
+// as executing every accepted time_in_force natively.
+type TimeInForceSupport interface {
+	SupportsTimeInForce(timeInForce domain.TimeInForce) bool
+}
+
 // PreparedPlacement is an opaque, in-memory-only signed placement. Only its
 // expected venue order identity is exposed to the execution service; signed
 // bytes and credentials must never be persisted in the order ledger.

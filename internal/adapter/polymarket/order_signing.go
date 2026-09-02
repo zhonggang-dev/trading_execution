@@ -74,8 +74,12 @@ func (builder orderBuilder) build(ctx context.Context, order domain.Order, accou
 	if order.MarketValidation == nil {
 		return postOrderPayload{}, "", newInvalidError("MARKET_VALIDATION_REQUIRED", "persisted market validation is required before signing")
 	}
+	wireIntent, err := placementIntent(order)
+	if err != nil {
+		return postOrderPayload{}, "", err
+	}
 	amounts, err := buildRawAmounts(
-		order.Intent,
+		wireIntent,
 		order.MarketValidation.TickSize,
 		order.MarketValidation.MinOrderSize,
 		builder.minBuyNotional,
@@ -422,7 +426,12 @@ func clobOrderType(timeInForce domain.TimeInForce) (string, error) {
 	case domain.TimeInForceGTC, domain.TimeInForceGTD, domain.TimeInForceFAK, domain.TimeInForceFOK:
 		return string(timeInForce), nil
 	case domain.TimeInForceIOC:
-		return "", newInvalidError("ORDER_TYPE_UNSUPPORTED", "Polymarket CLOB has no IOC order type; use FAK explicitly")
+		// The CLOB has no IOC. FAK is not a substitute: a FAK/FOK BUY is a
+		// collateral budget that buys more than size shares when the book is
+		// better than the limit. IOC is therefore emulated as a share-denominated
+		// GTC limit at worst_price whose unfilled remainder execution cancels
+		// immediately after the placement response.
+		return string(domain.TimeInForceGTC), nil
 	default:
 		return "", newInvalidError("ORDER_TYPE_UNSUPPORTED", "unsupported Polymarket order type")
 	}

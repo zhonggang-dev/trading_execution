@@ -358,6 +358,19 @@ func NewTradingClient(params TradingClientParams) (*TradingClient, error) {
 // Name 返回当前交易场所适配器名称。
 func (client *TradingClient) Name() string { return "polymarket" }
 
+// SupportsTimeInForce reports the CLOB's native order types. IOC is absent, so
+// execution emulates it with a GTC limit plus an immediate cancel of the
+// unfilled remainder; the share-denominated GTC is what keeps a BUY capped at
+// size shares instead of spending a size*worst_price budget.
+func (client *TradingClient) SupportsTimeInForce(timeInForce domain.TimeInForce) bool {
+	switch timeInForce {
+	case domain.TimeInForceGTC, domain.TimeInForceGTD, domain.TimeInForceFAK, domain.TimeInForceFOK:
+		return true
+	default:
+		return false
+	}
+}
+
 // preparedCLOBPlacement is an in-memory-only signed request. Credentials and
 // signed bytes are deliberately opaque; only the expected EIP-712 hash may be
 // copied into the durable execution ledger.

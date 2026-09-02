@@ -179,7 +179,7 @@ type StrategyOrder = {
   type: "LIMIT";
   worst_price: Decimal;
   size: Decimal;
-  time_in_force: "FOK";
+  time_in_force: "IOC" | "FOK";
   expires_at?: UTCDateTime;
 };
 ```
@@ -231,7 +231,7 @@ type StrategyExecutionConstraints = {
   size_decimal_places: 2;
   buy_notional_decimal_places: 4;
   minimum_buy_notional: "1";
-  allowed_time_in_force: ["FOK"];
+  allowed_time_in_force: ["IOC", "FOK"];
   price_protection_policy: "DEPTH_AWARE_LIMIT";
   max_price_slippage_ticks: 2;
 };
@@ -327,9 +327,9 @@ type StrategyDecisionSuccess = {
 - `cycle_id/input_id/context` 必须原样回显；所有 `decision_id` 在整个响应中唯一；
 - `evidence.probability` 必须与输入对应 outcome 的 probability 完全一致；
 - `SKIP` 不能带 `order`；
-- `SUBMIT` 必须是 `BUY + LIMIT + FOK`，`reason_code` 必须为 `ENTRY_SIGNAL`；
+- `SUBMIT` 必须是 `BUY + LIMIT`，`time_in_force` 必须在 `allowed_time_in_force`（`IOC` 或 `FOK`）内，`reason_code` 必须为 `ENTRY_SIGNAL`；
 - 决策接口使用 `DEPTH_AWARE_LIMIT`：Polymarket 的 BUY `worst_price` 可从 `best_ask` 向上最多 2 个 tick，SELL 可从 `best_bid` 向下最多 2 个 tick；Kalshi 稀疏盘口不使用固定 tick 距离上限，但保护价方向必须正确且范围内至少有可成交深度；所有价格必须是 `tick_size` 的整数倍；
-- `size` 单位为 shares，输入最多 2 位小数；Trading 会在 BUY 下单前四舍五入为整数 shares，再校验 BUY 的 `ask.price <= worst_price` 或 SELL 的 `bid.price >= worst_price` 范围内的可见深度。Polymarket 必须覆盖完整 FOK 数量；Kalshi 只要有正数深度，Go 就把新订单转为 IOC，成交可得数量并立即取消剩余。BUY 还要求 `worst_price * size` 最多 4 位小数且不少于 1 美元；
+- `size` 单位为 shares，输入最多 2 位小数；Trading 会在 BUY 下单前四舍五入为整数 shares，再校验 BUY 的 `ask.price <= worst_price` 或 SELL 的 `bid.price >= worst_price` 范围内的可见深度。BUY 只要在保护价内有正数深度即可：Go 把 Kalshi 订单和所有 Polymarket BUY 作为 IOC 执行，成交保护价内可得数量并立即取消剩余，`size` 是股数上限、`worst_price` 只是价格上限，二者都不是资金预算；Polymarket SELL 保持 FOK，必须覆盖完整数量。BUY 还要求 `worst_price * size` 最多 4 位小数且不少于 1 美元；
 - `multfactor_v1` SUBMIT 的 `evidence.metrics` 必须包含
   `best_ask/near_logdiff_usd/rel_spread`，MOM/MACD 可选；`multfactor_v2` 必须完整包含五项；
 - `metrics.best_ask` 必须等于输入 `best_ask`，metrics value 全部为十进制字符串；
@@ -369,7 +369,7 @@ type StrategyDecisionSuccess = {
     "size_decimal_places": 2,
     "buy_notional_decimal_places": 4,
     "minimum_buy_notional": "1",
-    "allowed_time_in_force": ["FOK"],
+    "allowed_time_in_force": ["IOC", "FOK"],
     "price_protection_policy": "DEPTH_AWARE_LIMIT",
     "max_price_slippage_ticks": 2
   }
@@ -725,8 +725,8 @@ type AlgorithmErrorResponse = {
 - 严格回显 `schema_version/cycle_id/input_id/context`；
 - 所有金额、价格、shares、edge和metrics使用字符串小数；
 - 入场接口逐prediction outcome返回评价，退出接口逐 `lot_id` 返回评价；
-- 只允许 `LIMIT + FOK`，不返回GTC、IOC或MARKET；
-- Python负责填写 `worst_price`；Polymarket 决策接口按 `DEPTH_AWARE_LIMIT` 允许向不利方向最多 2 个 tick；Kalshi 允许跨越空价档，冻结及最新官方盘口在保护价范围内都必须有正数可成交深度；Go 仅在构建新的 Kalshi 执行 intent 时把协议 FOK 转成 IOC，Python 协议版本和返回值不变；独立 Position Exit 接口仍要求 SELL 严格等于冻结 best bid；
+- 只允许 `LIMIT`，`time_in_force` 为 `IOC` 或 `FOK`，不返回 GTC、GTD、FAK 或 MARKET；
+- Python负责填写 `worst_price`；Polymarket 决策接口按 `DEPTH_AWARE_LIMIT` 允许向不利方向最多 2 个 tick；Kalshi 允许跨越空价档，冻结及最新官方盘口在保护价范围内都必须有正数可成交深度；Go 在构建新的 Kalshi 执行 intent 和所有 Polymarket BUY 执行 intent 时把协议 FOK 转成 IOC（Polymarket 以 GTC 限价单加立即撤单模拟，避免 FOK/FAK 的预算式成交买超 `size` 股），Python 协议版本和返回值不变；独立 Position Exit 接口仍要求 SELL 严格等于冻结 best bid；
 - 算法做Edge、因子、止盈止损和持有期规则；Go做余额、预占、最大仓位、重复订单、Kill Switch、
   Market状态和最新价格漂移等硬风控；
 - 同一幂等键重试必须返回同一决策，不得产生新的 `decision_id`。

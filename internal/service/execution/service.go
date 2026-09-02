@@ -357,7 +357,41 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 			return SubmitResult{Order: stored, Created: created}, errors.Join(fmt.Errorf("reconcile initial asset reservation: %w", err), uncertainErr)
 		}
 	}
-	return SubmitResult{Order: stored, Created: created}, nil
+	stored, cancelErr := service.cancelEmulatedIOCRemainder(ctx, stored)
+	return SubmitResult{Order: stored, Created: created}, cancelErr
+}
+
+// emulatesImmediateOrCancel reports whether this order's IOC semantics must be
+// completed by execution itself because the venue has no native IOC type.
+func (service *Service) emulatesImmediateOrCancel(order domain.Order) bool {
+	if order.Intent.TimeInForce != domain.TimeInForceIOC {
+		return false
+	}
+	support, ok := service.venue.(port.TimeInForceSupport)
+	return ok && !support.SupportsTimeInForce(domain.TimeInForceIOC)
+}
+
+// cancelEmulatedIOCRemainder completes an emulated IOC. The venue accepted a
+// share-denominated resting limit at worst_price and matched whatever was
+// immediately available inside that price; any remainder that is still resting
+// after the placement response is cancelled at once through the regular cancel
+// path, so partial fills settle as PARTIALLY_FILLED -> CANCELLED exactly like a
+// native IOC and the unfilled reservation is released after fill finality.
+// A fully matched order is terminal and needs nothing.
+func (service *Service) cancelEmulatedIOCRemainder(ctx context.Context, order domain.Order) (domain.Order, error) {
+	if !service.emulatesImmediateOrCancel(order) {
+		return order, nil
+	}
+	switch order.Status {
+	case domain.OrderStatusAcknowledged, domain.OrderStatusLive, domain.OrderStatusPartiallyFilled:
+		cancelled, err := service.Cancel(ctx, order.ID)
+		if err != nil {
+			return cancelled, fmt.Errorf("cancel emulated IOC remainder: %w", err)
+		}
+		return cancelled, nil
+	default:
+		return order, nil
+	}
 }
 
 func entrySubmissionDisabledError() *port.Rejection {
@@ -379,9 +413,11 @@ func executionIntentReplayEquivalent(stored, proposed domain.OrderIntent) bool {
 	}
 	stored = stored.Normalize()
 	proposed = proposed.Normalize()
-	if stored.MarketSource.Normalize() != domain.MarketSourceKalshi ||
-		proposed.MarketSource.Normalize() != domain.MarketSourceKalshi ||
-		stored.Venue != "kalshi" || proposed.Venue != "kalshi" ||
+	// The same directional rollout applies to every venue whose strategy FOK
+	// is executed as IOC: Kalshi natively, Polymarket through the emulated
+	// GTC-plus-cancel path.
+	if stored.MarketSource.Normalize() != proposed.MarketSource.Normalize() ||
+		stored.Venue == "" || stored.Venue != proposed.Venue ||
 		stored.Type != domain.OrderTypeLimit || proposed.Type != domain.OrderTypeLimit ||
 		stored.TimeInForce != domain.TimeInForceFOK || proposed.TimeInForce != domain.TimeInForceIOC ||
 		proposed.Metadata["strategy_time_in_force"] != string(domain.TimeInForceFOK) ||
@@ -643,6 +679,12 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 			return order, err
 		}
 		return order, nil
+	}
+	if service.emulatesImmediateOrCancel(order) && order.Status != domain.OrderStatusUnknown {
+		// A crash between placement and the emulated cancel, or fill evidence
+		// that was still pending at placement, can leave the GTC remainder
+		// resting. Recovery must complete the IOC rather than let it rest.
+		return service.cancelEmulatedIOCRemainder(ctx, order)
 	}
 	if order.Status == domain.OrderStatusUnknown || order.Status == domain.OrderStatusAcknowledged {
 		_ = service.reservations.MarkUncertain(ctx, order, "RECONCILIATION_NOT_FINAL")
