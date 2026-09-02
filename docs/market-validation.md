@@ -34,8 +34,16 @@ Python Strategy / SUBMIT
 - BUY：`latest_best_ask <= worst_price` 才可下单；
 - SELL：`latest_best_bid >= worst_price` 才可下单；
 - 价格必须是当前 `tick_size` 的精确整数倍，全程使用 decimal string，不转成 float；
-- LIMIT 的实际 `price` 使用 `worst_price`，避免订单在校验与发送之间失去价格保护；
-- MARKET 订单也必须带 `worst_price`，供后续真实 Venue adapter 做保护型 FOK/FAK 转换。
+- SELL 与 GTC/GTD 的实际 `price` 使用 `worst_price`，避免订单在校验与发送之间失去价格保护；
+- MARKET 订单也必须带 `worst_price`，供后续真实 Venue adapter 做保护型 FOK/FAK 转换；
+- Polymarket 的 FOK/FAK BUY 是按 **pUSD 预算**（signed maker amount）成交，而不是按股数：
+  CLOB 会把整份预算在限价以内的所有卖单上花完并返回换到的 shares。若按
+  `size × worst_price` 签名，只要盘口好于保护价就会买入超过 `size` 的股数并产生小数零头。
+  因此 Market Validation 为可成交 BUY 记录 `execution_price = 最新 best ask`，并要求
+  **best ask 这一档**的可见数量覆盖 `size`；adapter 以 `size × execution_price` 签名，
+  预算恰好等于 `size` 股。`worst_price` 只作为上限（`best_ask <= worst_price`），不再是签名价格。
+  best ask 档深度不足时以 `BUY_BEST_ASK_DEPTH_INSUFFICIENT` fail closed，而不是走到更深档位超买；
+  Go 不会为此改小 `size`。
 
 Kalshi 使用 `DEPTH_AWARE_LIMIT + IOC`：策略快照的最优价作为
 `strategy_reference_price`，`worst_price` 必须处于可成交方向，且冻结盘口在该保护价内至少有正数可见深度。
@@ -136,6 +144,12 @@ Venue。`observed_at` 是这份市场元数据的观察时间，不应拿业务�
 | `LATEST_BOOK_INVALID` | 最新盘口格式、排序或买卖价关系无效 |
 | `LATEST_BOOK_SOURCE_STALE` | 最新盘口源时间过期 |
 | `PRICE_DRIFT` | 最新可成交价越过 Python 的 worst_price |
+| `MIN_ORDER_SIZE` | 可成交 BUY 的 size 低于最新盘口 `min_order_size` |
+| `BUY_BEST_ASK_DEPTH_INSUFFICIENT` | 最新 best ask 一档的可见数量不足以覆盖 BUY `size`，预算式 FOK 会超买 |
+
+`LIVE_CHECK` 证据里的 `execution_price`（可成交 BUY 时等于最新 `best_ask`）和 `executable_size`
+（该档可见数量）随订单持久化。Polymarket adapter 在签名 FOK/FAK BUY 时必须拿到 `execution_price`，
+且它不得高于 `worst_price`；缺失时返回 `BUY_EXECUTION_PRICE_REQUIRED`，不会退回到 `worst_price` 预算。
 
 默认时效阈值为：策略快照 2 分钟、Market Universe 元数据 5 分钟、最新盘口 10 秒、未来
 时钟偏差 2 秒。构造 `marketvalidation.Service` 时都可配置；实盘配置应结合服务 SLA 调整。

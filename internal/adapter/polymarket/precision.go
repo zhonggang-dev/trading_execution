@@ -32,6 +32,38 @@ type rawAmounts struct {
 	Side        uint8
 }
 
+// placementIntent derives the wire intent that is actually signed. The
+// persisted OrderIntent keeps the strategy's size and worst_price for audit,
+// reservation, and fill accounting. A marketable CLOB BUY (FOK/FAK) is a
+// collateral budget: the exchange spends the full maker amount at any ask
+// inside the limit and returns the resulting shares, so signing
+// size*worst_price buys more than size shares when the book is better. The
+// wire BUY is therefore priced at the market validation execution price (the
+// fresh best ask), which makes the signed budget equal exactly size shares at
+// the price that will match. worst_price only caps that execution price.
+func placementIntent(order domain.Order) (domain.OrderIntent, error) {
+	intent := order.Intent.Normalize()
+	if intent.Side != domain.SideBuy ||
+		(intent.TimeInForce != domain.TimeInForceFOK && intent.TimeInForce != domain.TimeInForceFAK) {
+		return intent, nil
+	}
+	validation := order.MarketValidation
+	if validation == nil || validation.ExecutionPrice.IsEmpty() {
+		return domain.OrderIntent{}, newInvalidError("BUY_EXECUTION_PRICE_REQUIRED",
+			"marketable Polymarket BUY requires the market validation execution_price; a size*worst_price budget can buy more than size shares")
+	}
+	if sign, err := validation.ExecutionPrice.Sign(); err != nil || sign <= 0 {
+		return domain.OrderIntent{}, newInvalidError("BUY_EXECUTION_PRICE_INVALID", "market validation execution_price is not a positive decimal")
+	}
+	if comparison, err := validation.ExecutionPrice.Compare(intent.WorstPrice); err != nil || comparison > 0 {
+		return domain.OrderIntent{}, newInvalidError("BUY_EXECUTION_PRICE_EXCEEDS_WORST_PRICE",
+			"market validation execution_price is above the strategy worst_price protection ceiling")
+	}
+	intent.Type = domain.OrderTypeLimit
+	intent.Price = validation.ExecutionPrice
+	return intent, nil
+}
+
 // buildRawAmounts 根据参数构建 原始数据 Amounts。
 func buildRawAmounts(intent domain.OrderIntent, tickSize, minOrderSize, minBuyNotional domain.Decimal) (rawAmounts, error) {
 	config, exists := roundingByTick[canonicalDecimal(tickSize)]

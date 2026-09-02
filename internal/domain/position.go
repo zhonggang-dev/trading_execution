@@ -62,6 +62,40 @@ type PositionLot struct {
 	Status             PositionLotStatus `json:"status"`
 	OpenedAt           time.Time         `json:"opened_at"`
 	ClosedAt           *time.Time        `json:"closed_at,omitempty"`
+	// IsDust is a derived classification: the remaining shares are positive
+	// but below the smallest quantity a SELL order can express, so the lot can
+	// only leave the book through settlement redemption. It never changes the
+	// real remaining quantity.
+	IsDust bool `json:"is_dust"`
+}
+
+// MinimumSellableShares is the smallest positive share quantity the venue
+// SELL protocol can express: SELL size is limited to two decimal places, so a
+// remainder below 0.01 shares cannot be sold and must wait for redemption.
+const MinimumSellableShares Decimal = "0.01"
+
+// IsDustShares reports whether a positive share remainder is too small to be
+// sold with a two-decimal SELL order. Zero or negative quantities are not dust.
+func IsDustShares(shares Decimal) bool {
+	sign, err := shares.Sign()
+	if err != nil || sign <= 0 {
+		return false
+	}
+	comparison, err := shares.Compare(MinimumSellableShares)
+	return err == nil && comparison < 0
+}
+
+// HasDustRemainder reports whether the lot still holds an unsellable
+// remainder. Such a lot is excluded from strategy SELL inputs and is closed by
+// settlement redemption together with its position.
+func (lot PositionLot) HasDustRemainder() bool {
+	return IsDustShares(lot.RemainingShares)
+}
+
+// WithDerivedDust returns the lot with IsDust derived from RemainingShares.
+func (lot PositionLot) WithDerivedDust() PositionLot {
+	lot.IsDust = lot.HasDustRemainder()
+	return lot
 }
 
 // PositionEventType 表示后端使用的 PositionEventType 类型。

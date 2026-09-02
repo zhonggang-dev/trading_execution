@@ -117,6 +117,14 @@ func (ledger *FillLedger) applyBuy(
 	if err != nil {
 		return domain.Position{}, nil, err
 	}
+	// The lot entry price is the authoritative traded amount divided by the
+	// authoritative traded shares, kept at full numeric precision. The CLOB
+	// display price is a tick bucket and can differ from the settled ratio
+	// after price improvement, so it is not the entry price.
+	entryPrice, err := numeric(ctx, tx, `SELECT ($1::numeric / $2::numeric)::text`, fill.GrossNotional.String(), fill.Shares.String())
+	if err != nil {
+		return domain.Position{}, nil, fmt.Errorf("derive BUY lot entry price: %w", err)
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO position_lots (
 			lot_id, execution_account_id, market_id, condition_id, token_id, outcome_index, outcome_name, neg_risk, model_id, strategy_id,
@@ -125,7 +133,7 @@ func (ledger *FillLedger) applyBuy(
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::numeric,$13::numeric,$14::numeric,$14::numeric,$15::numeric,'OPEN',$16)`,
 		"lot:"+fill.Key, fill.ExecutionAccountID, fill.MarketID, fill.ConditionID, fill.TokenID,
 		order.Intent.OutcomeIndex, order.Intent.OutcomeName, order.Intent.ExpectedNegRisk, order.Intent.ModelID, order.Intent.StrategyID,
-		order.ID, fill.Key, fill.Shares.String(), fillCost.String(), fill.Price.String(), fill.MatchedAt)
+		order.ID, fill.Key, fill.Shares.String(), fillCost.String(), entryPrice.String(), fill.MatchedAt)
 	if err != nil {
 		return domain.Position{}, nil, fmt.Errorf("insert BUY position lot: %w", err)
 	}
@@ -634,7 +642,7 @@ func (ledger *FillLedger) ListLots(ctx context.Context, accountID, tokenID strin
 			value := closed.Time.UTC()
 			lot.ClosedAt = &value
 		}
-		lots = append(lots, lot)
+		lots = append(lots, lot.WithDerivedDust())
 	}
 	return lots, rows.Err()
 }
@@ -769,7 +777,7 @@ func scanPositionLot(row rowScanner) (domain.PositionLot, error) {
 		value := closed.Time.UTC()
 		lot.ClosedAt = &value
 	}
-	return lot, nil
+	return lot.WithDerivedDust(), nil
 }
 
 // ListPositionEvents 查询指定仓位的不可变事件列表。

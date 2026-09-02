@@ -94,7 +94,10 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 `ask.price <= worst_price` 的可见档位累计覆盖 FOK shares；SELL 必须满足
 `best_bid - 2*tick_size <= worst_price <= best_bid`，并由所有
 `bid.price >= worst_price` 的可见档位累计覆盖 FOK shares。保护价必须是
-`tick_size` 的整数倍；执行时仍以 `worst_price` 作为限价，不允许无限追价。
+`tick_size` 的整数倍；执行时不允许无限追价。`size` 严格是股数上限：Polymarket 的 FOK BUY 在 CLOB
+中按 pUSD 预算成交，因此执行侧不会按 `size × worst_price` 签名预算，而是在下单前用最新官方盘口把
+签名价格固定为 best ask（要求该档可见深度覆盖 `size`），`worst_price` 只作为 best ask 不得越过的上限。
+详见 [`market-validation.md`](market-validation.md)。SELL 仍以 `worst_price` 作为限价。
 
 Kalshi 盘口可能跳过中间 tick，因此不套用固定的两 tick 距离上限。策略仍必须基于冻结快照给出明确的
 `worst_price`，价格方向正确、位于 tick 上，且保护价范围内至少有可见的可成交 shares。
@@ -124,7 +127,9 @@ prob 和盘口，但使用不同 `strategy_id`、`execution_account_id`、`cycle
 某个模型当轮没有 Market 时仍调用对应 binding，因为该钱包可能还有需要退出的 OPEN lots；
 严格覆盖模式会关闭整个周期的 entry intent 构建并把该轮标记为失败，不会把这种不完整矩阵视为健康。
 运行日志会逐 binding 记录上游模型和 prediction count，空预测不再与“未调用”混淆。
-`positions` 按开仓批次发送当前 binding 的全部 OPEN lot，不按 token 聚合。`orderbooks` 覆盖
+`positions` 按开仓批次发送当前 binding 的全部 OPEN lot，不按 token 聚合；`entry_price` 是开仓成交
+`gross_notional ÷ shares` 的完整精度。`remaining_shares` 低于 0.01 股的 dust 批次无法被任何 SELL 表达，
+不会出现在 `positions` 中，它留在账本中等待结算赎回。`orderbooks` 覆盖
 prediction 和 position 的 token 并固定请求 top 15，每侧返回实际存在的最多 15 档；价格和数量必须使用 JSON string decimal。
 Trading 不再抓取或发送 `mid_price_histories`。`multfactor_v2` 计算 MOM/MACD 所需的历史由策略服务
 直接读取对应 venue 的官方 prices-history。

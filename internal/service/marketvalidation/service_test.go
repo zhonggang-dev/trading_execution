@@ -260,3 +260,77 @@ func validFixtures() (time.Time, domain.OrderIntent, domain.MarketSnapshot, doma
 	}
 	return now, intent, market, book
 }
+
+// TestValidatePinsMarketableBuyToBestAskDepth 验证 FOK BUY 记录执行价（最新 best ask）与该档可见深度，
+// worst_price 只保留为保护上限。
+func TestValidatePinsMarketableBuyToBestAskDepth(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	intent.TimeInForce = domain.TimeInForceFOK
+	intent.Size = "20"
+	book.Asks = []domain.PriceLevel{
+		{Price: "0.51", Size: "12.5"},
+		{Price: "0.51", Size: "7.5"},
+		{Price: "0.52", Size: "500"},
+	}
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if validation.ExecutionPrice != "0.51" || validation.ExecutableSize != "20" || validation.WorstPrice != "0.52" {
+		t.Fatalf("Validate() = %#v, want execution_price 0.51 covering 20 shares under worst_price 0.52", validation)
+	}
+}
+
+// TestValidateRejectsMarketableBuyBeyondBestAskDepth 验证 best ask 档深度不足时 fail closed：
+// 预算式 FOK 走到更深档位会买入超过 size 的股数。
+func TestValidateRejectsMarketableBuyBeyondBestAskDepth(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	intent.TimeInForce = domain.TimeInForceFOK
+	intent.Size = "20"
+	book.Asks = []domain.PriceLevel{{Price: "0.51", Size: "19.99"}, {Price: "0.52", Size: "500"}}
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+
+	_, err := service.Validate(context.Background(), intent)
+	var rejection *port.Rejection
+	if !errors.As(err, &rejection) || rejection.Code != "BUY_BEST_ASK_DEPTH_INSUFFICIENT" {
+		t.Fatalf("Validate() error = %v, want BUY_BEST_ASK_DEPTH_INSUFFICIENT", err)
+	}
+}
+
+// TestValidateRejectsMarketableBuyBelowLatestMinOrderSize 验证最新盘口 min_order_size 抬高后 BUY 明确被拒。
+func TestValidateRejectsMarketableBuyBelowLatestMinOrderSize(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	intent.TimeInForce = domain.TimeInForceFOK
+	intent.Size = "4"
+	book.MinOrderSize = "5"
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+
+	_, err := service.Validate(context.Background(), intent)
+	var rejection *port.Rejection
+	if !errors.As(err, &rejection) || rejection.Code != "MIN_ORDER_SIZE" {
+		t.Fatalf("Validate() error = %v, want MIN_ORDER_SIZE", err)
+	}
+}
+
+// TestValidateLeavesSellAndRestingBuyWithoutExecutionPrice 验证 SELL 与 GTC BUY 不设置执行价，
+// 它们在交易所按股数成交。
+func TestValidateLeavesSellAndRestingBuyWithoutExecutionPrice(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil || !validation.ExecutionPrice.IsEmpty() || !validation.ExecutableSize.IsEmpty() {
+		t.Fatalf("GTC BUY Validate() = %#v, err = %v, want no execution price", validation, err)
+	}
+
+	sell := intent
+	sell.Side = domain.SideSell
+	sell.Price = "0.50"
+	sell.WorstPrice = "0.50"
+	sell.TimeInForce = domain.TimeInForceFOK
+	validation, err = service.Validate(context.Background(), sell)
+	if err != nil || !validation.ExecutionPrice.IsEmpty() {
+		t.Fatalf("SELL Validate() = %#v, err = %v, want no execution price", validation, err)
+	}
+}

@@ -294,6 +294,7 @@ func (service *Service) prepareBinding(ctx context.Context, binding domain.Strat
 		trades = []domain.PositionExitTrade{}
 	}
 	seen := make(map[string]struct{}, len(trades))
+	sellable := make([]domain.PositionExitTrade, 0, len(trades))
 	for index := range trades {
 		trade := &trades[index]
 		if trade.ExecutionAccountID != binding.ExecutionAccountID || strings.TrimSpace(trade.ModelID) != binding.ModelID ||
@@ -307,7 +308,14 @@ func (service *Service) prepareBinding(ctx context.Context, binding domain.Strat
 		if err := trade.Validate(decisionAt); err != nil {
 			return preparedBinding{binding: binding, err: fmt.Errorf("position lot %q: %w", trade.LotID, err)}
 		}
+		if domain.IsDustShares(trade.RemainingShares) {
+			// Below the two-decimal SELL precision nothing can be sold. The dust
+			// lot remains in the ledger and is closed by settlement redemption.
+			continue
+		}
+		sellable = append(sellable, *trade)
 	}
+	trades = sellable
 	sort.Slice(trades, func(i, j int) bool {
 		if !trades[i].EnteredAt.Equal(trades[j].EnteredAt) {
 			return trades[i].EnteredAt.Before(trades[j].EnteredAt)

@@ -245,6 +245,12 @@ recalculation, interpolation, or gap fill.
 more than `available_shares`. A fully reserved lot remains visible but cannot
 produce another SELL.
 
+A lot whose `remaining_shares` is positive but below `0.01` (the SELL size
+precision) is dust: no SELL order can express it, so Go omits it from `trades`
+entirely. It stays `OPEN` in the ledger and is redeemed together with its
+position when the market settles. `entry_price` is the opening fill's
+`gross_notional / shares` at full precision, not the two-decimal CLOB price.
+
 ### Response
 
 ```json

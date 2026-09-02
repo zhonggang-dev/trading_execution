@@ -47,4 +47,13 @@ type MarketValidation struct {
 	// it to cap the submitted quantity while retaining the strategy-requested
 	// size on OrderIntent for audit and reservation finality.
 	ExecutableSize Decimal `json:"executable_size,omitempty"`
+	// ExecutionPrice is the exact wire price the venue adapter must submit.
+	// Polymarket treats a marketable FOK/FAK BUY as a collateral budget
+	// (maker amount) rather than a share count, so signing size*worst_price
+	// would buy more than Size shares whenever the book is better than the
+	// protection line. Market validation pins the BUY wire price to the fresh
+	// best ask so the signed budget equals Size shares at the price that will
+	// actually match; WorstPrice stays the strategy's protection ceiling only.
+	// Empty means the adapter submits the strategy price unchanged.
+	ExecutionPrice Decimal `json:"execution_price,omitempty"`
 }

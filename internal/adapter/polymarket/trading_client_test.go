@@ -995,3 +995,51 @@ func signedOrderIDForTest(t *testing.T, order signedOrderV2, negRisk bool) strin
 	}
 	return "0x" + hex.EncodeToString(digest)
 }
+
+// TestTradingClientSignsMarketableBuyAtValidatedBestAsk 验证 FOK BUY 的签名 maker 预算等于 size*best_ask，
+// 而不是 size*worst_price：CLOB 按预算成交，预算多了就会买超 size 股。
+func TestTradingClientSignsMarketableBuyAtValidatedBestAsk(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	var posted postOrderPayload
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/version":
+			writeTestJSON(writer, map[string]any{"version": 2})
+		case "/tick-size":
+			writeTestJSON(writer, map[string]any{"minimum_tick_size": 0.01})
+		case "/neg-risk":
+			writeTestJSON(writer, map[string]any{"neg_risk": false})
+		case "/order":
+			if err := json.NewDecoder(request.Body).Decode(&posted); err != nil {
+				t.Fatal(err)
+			}
+			writeTestJSON(writer, map[string]any{
+				"success": true, "orderID": signedOrderIDForTest(t, posted.Order, false), "status": "live",
+			})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	client := newTestTradingClient(t, server.URL, now)
+	order := adapterOrder()
+	order.Intent.TimeInForce = domain.TimeInForceFOK
+	order.Intent.Price = "0.52"
+	order.Intent.WorstPrice = "0.52"
+	order.MarketValidation.BestAsk = "0.50"
+	order.MarketValidation.WorstPrice = "0.52"
+	order.MarketValidation.ExecutionPrice = "0.50"
+	if _, err := client.Place(context.Background(), order); err != nil {
+		t.Fatalf("Place() error = %v", err)
+	}
+	if posted.OrderType != "FOK" || posted.Order.MakerAmount != "5000000" || posted.Order.TakerAmount != "10000000" || posted.Order.Side != "BUY" {
+		t.Fatalf("posted order = %#v, want a 5 pUSD FOK budget for exactly 10 shares at 0.50", posted)
+	}
+
+	order.MarketValidation.ExecutionPrice = ""
+	_, err := client.Place(context.Background(), order)
+	var venueError *port.VenueError
+	if !errors.As(err, &venueError) || venueError.Code != "BUY_EXECUTION_PRICE_REQUIRED" {
+		t.Fatalf("Place() without execution price error = %v, want BUY_EXECUTION_PRICE_REQUIRED", err)
+	}
+}

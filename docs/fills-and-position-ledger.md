@@ -91,7 +91,10 @@ zero builder 时 `builder_fee=0`、`platform_fee=total_fee`；非零 builder 只
 
 当前成本法是加权平均成本法：
 
-- BUY：批次成本包含实际 BUY fee，增加 `shares` 和 `cost_basis`；
+- BUY：批次成本包含实际 BUY fee，增加 `shares` 和 `cost_basis`；批次 `average_entry_price` 是
+  `gross_notional ÷ shares`（权威成交总额除以权威成交股数）的完整 numeric 精度，不是 CLOB 两位小数的
+  展示价，也不四舍五入；它原样进入策略输入 `positions[].entry_price` 和退出输入 `trades[].entry_price`。
+  `migrations/0022_lot_entry_price_from_fill_notional.sql` 按同一公式回填仍未 CLOSED 的托管批次；
 - SELL：按卖出前总仓位的比例，从所有开放批次等比例减少 shares 与成本；
 - 已实现盈亏：`SELL 净收入 - 分摊成本`；
 - 未实现盈亏：有新鲜 mark 时为 `mark_price × remaining_shares - remaining_cost_basis`；
@@ -115,7 +118,14 @@ is_dust          = true/false（取决于配置和 mark）
 ```
 
 不会为了“方便关闭仓位”把 `1.001` 改成 0。只有真实 SELL Fill、赎回或经审计的外部 reconciliation
-事件才有权减少 shares。历史仓位若已有 shares 但没有 cost basis/lots，SELL 会 fail closed 并返回
+事件才有权减少 shares。
+
+批次层面另有一个固定阈值：SELL `size` 只能表达 2 位小数，因此 `remaining_shares` 在 `(0, 0.01)` 之间的
+批次无法通过任何普通 SELL 卖出。这类批次在读取时派生 `is_dust = true`（`PositionLot.IsDust`），
+决策周期的 `positions[]` 和退出任务的 `trades[]` 都不再把它发给 Python；它保持 `OPEN` 留在账本中，
+市场结算时随同一 token 的仓位一起进入 `SETTLED_PENDING_REDEEM`，由 auto redeem 连同其它 shares 一并赎回。
+执行侧同时把 Polymarket FOK BUY 的签名预算固定为 `size × best_ask`（见
+[`market-validation.md`](market-validation.md)），因此新的 BUY 不再产生这类零头；历史零头只需等待结算。历史仓位若已有 shares 但没有 cost basis/lots，SELL 会 fail closed 并返回
 `POSITION_COST_BASIS_MISSING` 或 `POSITION_LOTS_MISSING`；上线前必须先做一次批次和成本回填。
 
 ## 订单状态和 Cancel Race

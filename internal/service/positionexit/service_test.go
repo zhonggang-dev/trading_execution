@@ -582,3 +582,33 @@ func sellResponse(request domain.PositionExitRequest) domain.PositionExitRespons
 		}},
 	}
 }
+
+// TestRunExcludesDustLotsFromPythonExitInput 验证低于 0.01 股的零头批次不会作为可卖批次发给 Python，
+// 它留在账本中等待结算赎回。
+func TestRunExcludesDustLotsFromPythonExitInput(t *testing.T) {
+	fixture := newFixture(t)
+	dust := fixture.tradeSource.trades[0]
+	dust.LotID = "lot-dust"
+	dust.VenueTradeID = "venue-trade-dust"
+	dust.OpeningOrderID = "opening-order-dust"
+	dust.OriginalShares = "30.147057"
+	dust.RemainingShares = "0.007057"
+	dust.AvailableShares = "0.007057"
+	dust.RemainingCost = "0.0024"
+	fixture.tradeSource.trades = append(fixture.tradeSource.trades, dust)
+	service, err := New(fixture.params())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Run(context.Background(), fixture.decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	request := result.Runs[0].Request
+	if len(request.Trades) != 1 || request.Trades[0].LotID != "lot-1" {
+		t.Fatalf("Python trades = %#v, want only the sellable lot", request.Trades)
+	}
+	if len(fixture.executor.intents) != 1 || fixture.executor.intents[0].TargetLotID != "lot-1" {
+		t.Fatalf("intents = %#v, want one SELL for the sellable lot", fixture.executor.intents)
+	}
+}

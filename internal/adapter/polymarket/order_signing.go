@@ -74,8 +74,12 @@ func (builder orderBuilder) build(ctx context.Context, order domain.Order, accou
 	if order.MarketValidation == nil {
 		return postOrderPayload{}, "", newInvalidError("MARKET_VALIDATION_REQUIRED", "persisted market validation is required before signing")
 	}
+	wireIntent, err := placementIntent(order)
+	if err != nil {
+		return postOrderPayload{}, "", err
+	}
 	amounts, err := buildRawAmounts(
-		order.Intent,
+		wireIntent,
 		order.MarketValidation.TickSize,
 		order.MarketValidation.MinOrderSize,
 		builder.minBuyNotional,

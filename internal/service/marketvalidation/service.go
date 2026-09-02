@@ -3,6 +3,7 @@ package marketvalidation
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -151,7 +152,7 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		return domain.MarketValidation{}, err
 	}
 
-	return (domain.MarketValidationParams{
+	params := domain.MarketValidationParams{
 		Mode:                 "LIVE_CHECK",
 		ValidatedAt:          now,
 		MarketObservedAt:     market.ObservedAt.UTC(),
@@ -167,7 +168,80 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		BestBid:              book.Bids[0].Price,
 		BestAsk:              book.Asks[0].Price,
 		WorstPrice:           intent.WorstPrice,
-	}).Build()
+	}
+	if intent.Side == domain.SideBuy && marketableTimeInForce(intent.TimeInForce) {
+		executionPrice, executableSize, err := buyExecutionPlan(intent, book)
+		if err != nil {
+			return domain.MarketValidation{}, err
+		}
+		params.ExecutionPrice = executionPrice
+		params.ExecutableSize = executableSize
+	}
+	return params.Build()
+}
+
+// marketableTimeInForce reports the immediate-or-cancel order types whose BUY
+// side Polymarket denominates in collateral rather than shares.
+func marketableTimeInForce(timeInForce domain.TimeInForce) bool {
+	return timeInForce == domain.TimeInForceFOK || timeInForce == domain.TimeInForceFAK ||
+		timeInForce == domain.TimeInForceIOC
+}
+
+// buyExecutionPlan pins a marketable BUY to the fresh best ask. A CLOB FOK/FAK
+// BUY spends its signed collateral budget at whatever asks are inside the
+// limit, so a budget of size*worst_price buys more than size shares as soon as
+// the book is better than worst_price. Signing size*best_ask instead makes the
+// budget equal exactly Size shares at the price that will match. That only
+// holds when the best-ask level itself covers Size, so a thinner top of book
+// fails closed instead of walking deeper levels with a surplus budget.
+// worst_price remains the protection ceiling that best_ask must not exceed.
+func buyExecutionPlan(intent domain.OrderIntent, book domain.OrderBookSnapshot) (domain.Decimal, domain.Decimal, error) {
+	if !book.MinOrderSize.IsEmpty() {
+		if comparison, err := intent.Size.Compare(book.MinOrderSize); err != nil || comparison < 0 {
+			return "", "", reject("MIN_ORDER_SIZE", "BUY size is below the latest orderbook min_order_size")
+		}
+	}
+	bestAsk := book.Asks[0].Price
+	depth := new(big.Rat)
+	scale := 0
+	for _, level := range book.Asks {
+		if !level.Price.Equal(bestAsk) {
+			continue
+		}
+		size, err := level.Size.Multiply("1")
+		if err != nil {
+			return "", "", reject("LATEST_BOOK_INVALID", "latest best ask level size is invalid")
+		}
+		depth.Add(depth, size)
+		scale = max(scale, decimalScale(level.Size))
+	}
+	requested, err := intent.Size.Multiply("1")
+	if err != nil {
+		return "", "", reject("INVALID_SIZE", "BUY size is not a valid decimal")
+	}
+	if depth.Sign() <= 0 || requested.Cmp(depth) > 0 {
+		return "", "", reject("BUY_BEST_ASK_DEPTH_INSUFFICIENT",
+			fmt.Sprintf("latest best ask %s shows %s shares, below the requested %s; a budget FOK across deeper levels would buy more than size",
+				bestAsk, depth.FloatString(scale), intent.Size))
+	}
+	return bestAsk, canonicalDecimal(depth.FloatString(scale)), nil
+}
+
+// canonicalDecimal 去掉尾随零，使数量的文本表示与策略输入保持一致。
+func canonicalDecimal(text string) domain.Decimal {
+	if strings.Contains(text, ".") {
+		text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	}
+	return domain.Decimal(text)
+}
+
+// decimalScale 计算十进制值所需的小数位数。
+func decimalScale(value domain.Decimal) int {
+	text := strings.TrimRight(strings.TrimSpace(value.String()), "0")
+	if point := strings.IndexByte(text, '.'); point >= 0 {
+		return len(text) - point - 1
+	}
+	return 0
 }
 
 // requireMarketContext 检查并要求 Market Context 完整。

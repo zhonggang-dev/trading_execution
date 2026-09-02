@@ -281,6 +281,17 @@ func (params MarketValidationParams) Build() (MarketValidation, error) {
 			}
 		}
 	}
+	if !validation.ExecutionPrice.IsEmpty() {
+		if sign, err := validation.ExecutionPrice.Sign(); err != nil || sign <= 0 {
+			return MarketValidation{}, fmt.Errorf("market validation execution_price must be positive")
+		}
+		if comparison, err := validation.ExecutionPrice.Compare("1"); err != nil || comparison >= 0 {
+			return MarketValidation{}, fmt.Errorf("market validation execution_price must be below one")
+		}
+		if multiple, err := validation.ExecutionPrice.IsMultipleOf(validation.TickSize); err != nil || !multiple {
+			return MarketValidation{}, fmt.Errorf("market validation execution_price must be an exact multiple of tick_size")
+		}
+	}
 	return validation, nil
 }
 

@@ -351,6 +351,13 @@ func (service *Service) loadPositionLots(ctx context.Context, decisionAt time.Ti
 				return nil, fmt.Errorf("duplicate open position lot %q", lot.LotID)
 			}
 			seen[lot.LotID] = struct{}{}
+			if lot.HasDustRemainder() {
+				// A remainder below the SELL size precision cannot be exited by
+				// any strategy order. It stays in the ledger and leaves through
+				// settlement redemption, so the strategy must not see it as a
+				// sellable lot.
+				continue
+			}
 			strategyLot, err := (domain.StrategyPositionLotParams{
 				LotID: lot.LotID, MarketSource: lot.MarketSource, MarketID: lot.MarketID, ConditionID: lot.ConditionID,
 				OutcomeIndex: *lot.OutcomeIndex, OutcomeName: lot.OutcomeName, TokenID: lot.TokenID,

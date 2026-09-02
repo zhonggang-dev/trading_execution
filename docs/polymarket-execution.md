@@ -53,6 +53,12 @@ verifyingContract = standard V2 exchange 或 neg-risk V2 exchange
 - size 必须不低于 `/book.min_order_size`；
 - BUY notional 默认不得低于 `1 pUSD`，可配置但不能为零；
 - FAK/FOK BUY 的 maker notional 最多 4 位小数；SELL 的 taker notional 保持最多 4 位小数；
+- FAK/FOK BUY 在 CLOB 中按 maker notional（pUSD 预算）成交：预算会在限价内的所有卖单上花完，
+  盘口好于限价时换到的 shares 多于 taker amount。为了严格最多买 `size` 股并避免小数零头，
+  adapter 以 Market Validation 记录的 `execution_price`（最新 best ask）签名，
+  maker notional = `size × execution_price`；`worst_price` 只作为 `execution_price` 的上限。
+  缺少 `execution_price` 或它高于 `worst_price` 时拒绝签名（`BUY_EXECUTION_PRICE_REQUIRED` /
+  `BUY_EXECUTION_PRICE_EXCEEDS_WORST_PRICE`）。SELL 与 GTC/GTD 按股数成交，仍使用策略价格；
 - 除上述明确的 BUY 整数化外，不合法的策略数量直接拒绝；Go 不会为了通过交易所校验而二次改小 shares 或改变方向。
 
 旧 `execute.py` 用 float 先算 USD、再除以价格、再交给 SDK 二次 round-down，可能把 `16.90` 变成 `16.89`。新实现直接生成 6-decimal 整数，例如 `16.90 shares → 16900000`，彻底移除双重舍入。
