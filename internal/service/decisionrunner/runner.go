@@ -258,6 +258,7 @@ type bindingRunSummary struct {
 	Intents                   int    `json:"intents"`
 	OrderSubmissionEnabled    bool   `json:"order_submission_enabled"`
 	AccountSubmissionDisabled bool   `json:"account_submission_disabled"`
+	AccountStrategyDisabled   bool   `json:"account_strategy_disabled"`
 	EntrySubmissionEnabled    bool   `json:"entry_submission_enabled"`
 	EntryBlockReason          string `json:"entry_block_reason,omitempty"`
 	Failed                    bool   `json:"failed"`
@@ -276,6 +277,7 @@ func bindingRunSummaries(result decisioncycle.RunResult) []bindingRunSummary {
 			Intents:                   len(run.Intents),
 			OrderSubmissionEnabled:    run.OrderSubmissionEnabled,
 			AccountSubmissionDisabled: run.AccountSubmissionDisabled,
+			AccountStrategyDisabled:   run.AccountStrategyDisabled,
 			EntrySubmissionEnabled:    run.EntrySubmissionEnabled,
 			EntryBlockReason:          run.EntryBlockReason,
 			Failed:                    run.Error != nil || run.EntryBlockReason != "",

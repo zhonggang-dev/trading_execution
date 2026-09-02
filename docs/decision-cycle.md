@@ -187,6 +187,12 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
   `DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true`，否则配置校验和服务装配都会拒绝启动；
 - `DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=true` 是独立的 sell-only 闸门：即使订单提交已开启，
   Trading 仍会在 Go 侧拒绝所有 BUY，只允许当前 managed lot 的合法 SELL exit；
+- `DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON` 是账户级“暂不下发给策略”的窄开关：列出的
+  execution account 仍保留在拓扑中，继续参与 reconciliation、auto redeem、账户入场闸门和已
+  持久化 intent 的恢复/投递，但决策周期不再为它们加载 position lots，也不再调用策略 API；该轮
+  结果中对应绑定标记 `account_strategy_disabled=true`。默认 `[]`；例如设为
+  `["main","wallet-1"]` 即只把 wallet-6/wallet-7 发给策略。它不能覆盖全部绑定，也不同于
+  `DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON` 的隔离（后者还会移出 reconciliation）；
 - Go 绑定表保证一个 `(model_id, strategy_id)` 只对应一个唯一 `execution_account_id`，同一
   execution account 不能重复绑定；同一逻辑 `model_id` 不能来自多个 `prediction_model_id`，
   同一 `prediction_model_id` 也不能路由到多个逻辑模型。
