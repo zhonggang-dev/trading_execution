@@ -2,6 +2,7 @@ package autoredeem
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,7 +11,10 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 )
 
-type fakeStore struct{ events []string }
+type fakeStore struct {
+	events   []string
+	applyErr error
+}
 
 func (store *fakeStore) SyncPendingRedemptions(context.Context) error { return nil }
 func (store *fakeStore) ListDueRedemptions(context.Context, int, time.Time) ([]domain.Redemption, error) {
@@ -37,6 +41,9 @@ func (store *fakeStore) RecordRedemptionConfirmed(_ context.Context, _ domain.Re
 	return nil
 }
 func (store *fakeStore) ApplyRedemption(context.Context, domain.Redemption, time.Time) error {
+	if store.applyErr != nil {
+		return store.applyErr
+	}
 	store.events = append(store.events, "applied")
 	return nil
 }
@@ -74,9 +81,15 @@ func (venue *fakeVenue) ResolveRedemptionSubmission(context.Context, string, dom
 	return venue.submission, nil
 }
 
-type fakeReceipts struct{ receipt domain.RedemptionReceipt }
+type fakeReceipts struct {
+	receipt domain.RedemptionReceipt
+	err     error
+}
 
 func (source fakeReceipts) ResolveRedemptionReceipt(context.Context, string, string, string, bool) (domain.RedemptionReceipt, error) {
+	if source.err != nil {
+		return domain.RedemptionReceipt{}, source.err
+	}
 	return source.receipt, nil
 }
 
@@ -159,5 +172,103 @@ func TestSubmittedRedeemRequiresReceiptBeforeConfirmation(t *testing.T) {
 	want := []string{"tx:" + hash, "confirmed:" + hash}
 	if fmt.Sprint(store.events) != fmt.Sprint(want) {
 		t.Fatalf("receipt event order = %v, want %v", store.events, want)
+	}
+}
+
+func confirmedRedemption(confirmedAt time.Time) domain.Redemption {
+	redemption := testRedemption(domain.RedemptionConfirmed)
+	redemption.TransactionHash = "0x" + strings.Repeat("11", 32)
+	redemption.PayoutBaseUnits = "3350000"
+	redemption.ConfirmedAt = &confirmedAt
+	return redemption
+}
+
+func firstEventKind(store *fakeStore) string {
+	if len(store.events) == 0 {
+		return ""
+	}
+	return strings.SplitN(store.events[0], ":", 2)[0]
+}
+
+func TestConfirmedApplyEvidenceMismatchMovesToManualReview(t *testing.T) {
+	now := time.Unix(3000, 0).UTC()
+	store := &fakeStore{applyErr: &domain.RedemptionEvidenceError{Reason: "redemption payout 3.35 does not equal managed binary payout 3.4"}}
+	service := newTestService(t, store, &fakeVenue{}, fakeReceipts{}, fakeActivities{})
+	err := service.process(context.Background(), confirmedRedemption(now.Add(-time.Second)), now)
+	if err == nil || len(store.events) != 1 || firstEventKind(store) != "review" ||
+		!strings.Contains(store.events[0], "does not equal managed binary payout") {
+		t.Fatalf("permanent apply failure error/events = %v/%v, want one MANUAL_REVIEW", err, store.events)
+	}
+}
+
+func TestConfirmedApplyTransientFailureRetriesUntilAmbiguityTimeout(t *testing.T) {
+	now := time.Unix(3000, 0).UTC()
+	for name, tc := range map[string]struct {
+		confirmedAt time.Time
+		want        string
+	}{
+		"recent confirmation retries": {confirmedAt: now.Add(-time.Minute), want: "retry"},
+		"stale confirmation reviews":  {confirmedAt: now.Add(-11 * time.Minute), want: "review"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := &fakeStore{applyErr: errors.New("postgres connection reset")}
+			service := newTestService(t, store, &fakeVenue{}, fakeReceipts{}, fakeActivities{})
+			err := service.process(context.Background(), confirmedRedemption(tc.confirmedAt), now)
+			if err == nil || len(store.events) != 1 || firstEventKind(store) != tc.want {
+				t.Fatalf("transient apply failure error/events = %v/%v, want %s", err, store.events, tc.want)
+			}
+		})
+	}
+}
+
+func TestPendingSubmissionEscalatesAfterAmbiguityTimeout(t *testing.T) {
+	now := time.Unix(4000, 0).UTC()
+	hash := "0x" + strings.Repeat("33", 32)
+	cases := map[string]struct {
+		status   domain.RedemptionStatus
+		venue    *fakeVenue
+		receipts fakeReceipts
+		hash     string
+	}{
+		"approval pending": {
+			status: domain.RedemptionApprovalSubmitted,
+			venue:  &fakeVenue{submission: domain.RedemptionSubmission{Provider: "POLYMARKET_RELAYER", Reference: "relayer-1", State: domain.RedemptionSubmissionPending}},
+		},
+		"redeem without transaction hash": {
+			status: domain.RedemptionRedeemSubmitted,
+			venue:  &fakeVenue{submission: domain.RedemptionSubmission{Provider: "POLYMARKET_RELAYER", Reference: "relayer-1", State: domain.RedemptionSubmissionPending}},
+		},
+		"redeem receipt not final": {
+			status:   domain.RedemptionRedeemSubmitted,
+			venue:    &fakeVenue{submission: domain.RedemptionSubmission{Provider: "POLYMARKET_RELAYER", Reference: "relayer-1", TransactionHash: hash, State: domain.RedemptionSubmissionPending}},
+			receipts: fakeReceipts{err: errors.New("redemption receipt is pending or not finalized")},
+			hash:     hash,
+		},
+	}
+	for name, tc := range cases {
+		for age, want := range map[time.Duration]string{time.Minute: "retry", 11 * time.Minute: "review"} {
+			t.Run(fmt.Sprintf("%s after %s", name, age), func(t *testing.T) {
+				store := &fakeStore{}
+				service := newTestService(t, store, tc.venue, tc.receipts, fakeActivities{})
+				redemption := testRedemption(tc.status)
+				redemption.SubmissionProvider, redemption.SubmissionReference = "POLYMARKET_RELAYER", "relayer-1"
+				redemption.TransactionHash = tc.hash
+				submitting := now.Add(-age - time.Second)
+				submitted := now.Add(-age)
+				redemption.SubmittingAt, redemption.SubmittedAt = &submitting, &submitted
+				err := service.process(context.Background(), redemption, now)
+				if want == "review" && err == nil {
+					t.Fatal("escalation returned nil error")
+				}
+				if len(store.events) == 0 || firstEventKind(store) != want {
+					t.Fatalf("pending %s events = %v, want first event %s", name, store.events, want)
+				}
+				for _, event := range store.events {
+					if strings.HasPrefix(event, "confirmed:") || event == "applied" {
+						t.Fatalf("pending %s advanced without evidence: %v", name, store.events)
+					}
+				}
+			})
+		}
 	}
 }

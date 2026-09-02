@@ -236,6 +236,10 @@ type RedemptionStore interface {
 // permanent manual drift.
 type RedemptionProgressSource interface {
 	ListInFlightRedemptions(ctx context.Context, executionAccountID string) ([]domain.InFlightRedemption, error)
+	// ListAppliedRedemptions returns redemptions applied to the ledger at or
+	// after since, with the exact shares burned per token, so a stale external
+	// snapshot that still lists them is not recorded as manual drift.
+	ListAppliedRedemptions(ctx context.Context, executionAccountID string, since time.Time) ([]domain.AppliedRedemption, error)
 }
 
 type RedeemActivitySource interface {

@@ -116,7 +116,7 @@ func (service *Service) process(ctx context.Context, redemption domain.Redemptio
 	case domain.RedemptionRedeemSubmitted:
 		return service.processRedeemSubmitted(ctx, redemption, now)
 	case domain.RedemptionConfirmed:
-		return service.store.ApplyRedemption(ctx, redemption, now)
+		return service.applyConfirmed(ctx, redemption, now)
 	default:
 		return fmt.Errorf("unexpected active redemption status %q", redemption.Status)
 	}
@@ -190,7 +190,8 @@ func (service *Service) processApprovalSubmitted(ctx context.Context, redemption
 		}
 		return service.store.ResetRedemptionReady(ctx, redemption, now)
 	default:
-		return service.store.RetryRedemption(ctx, redemption, "redemption adapter approval is pending", now.Add(service.retryInterval))
+		return service.pendingOrReview(ctx, redemption, redemption.SubmittedAt,
+			"redemption adapter approval is pending", "approval submission stayed pending beyond the ambiguity timeout", now)
 	}
 }
 
@@ -208,7 +209,7 @@ func (service *Service) recoverRedeemSubmitting(ctx context.Context, redemption 
 		return service.review(ctx, redemption, "multiple redemption activities match one ambiguous submit intent", now)
 	}
 	if len(activities) == 1 {
-		return service.confirmReceipt(ctx, redemption, activities[0].TransactionHash, now)
+		return service.confirmReceipt(ctx, redemption, activities[0].TransactionHash, redemption.SubmittingAt, now)
 	}
 	if expired(redemption.SubmittingAt, now, service.ambiguityTimeout) {
 		return service.review(ctx, redemption, "redeem submit outcome remained ambiguous and no matching activity was found", now)
@@ -229,7 +230,8 @@ func (service *Service) processRedeemSubmitted(ctx context.Context, redemption d
 		transactionHash = redemption.TransactionHash
 	}
 	if transactionHash == "" {
-		return service.store.RetryRedemption(ctx, redemption, "redemption transaction hash is pending", now.Add(service.retryInterval))
+		return service.pendingOrReview(ctx, redemption, redemption.SubmittedAt,
+			"redemption transaction hash is pending", "redeem submission stayed pending without a transaction hash beyond the ambiguity timeout", now)
 	}
 	if redemption.TransactionHash == "" {
 		if err := service.store.RecordRedemptionTransaction(ctx, redemption, transactionHash, now.Add(service.retryInterval)); err != nil {
@@ -237,17 +239,64 @@ func (service *Service) processRedeemSubmitted(ctx context.Context, redemption d
 		}
 		redemption.TransactionHash = transactionHash
 	}
-	return service.confirmReceipt(ctx, redemption, transactionHash, now)
+	return service.confirmReceipt(ctx, redemption, transactionHash, redemption.SubmittedAt, now)
 }
 
-func (service *Service) confirmReceipt(ctx context.Context, redemption domain.Redemption, transactionHash string, now time.Time) error {
+// applyConfirmed writes a confirmed redemption into the ledger. The chain has
+// already burned the shares and paid the collateral, so the ledger is behind
+// until this succeeds. A permanent evidence mismatch can never be repaired by
+// retrying; it moves to MANUAL_REVIEW so reconciliation stops treating the
+// condition as in flight and reports the resulting drift. Transient failures
+// retry until the confirmation is older than the ambiguity timeout.
+func (service *Service) applyConfirmed(ctx context.Context, redemption domain.Redemption, now time.Time) error {
+	err := service.store.ApplyRedemption(ctx, redemption, now)
+	if err == nil {
+		return nil
+	}
+	if isPermanent(err) {
+		return service.review(ctx, redemption, "confirmed redemption cannot be applied to the ledger: "+err.Error(), now)
+	}
+	if expired(redemption.ConfirmedAt, now, service.ambiguityTimeout) {
+		return service.review(ctx, redemption, "confirmed redemption kept failing to apply beyond the ambiguity timeout: "+err.Error(), now)
+	}
+	return service.retry(ctx, redemption, err, now)
+}
+
+// pendingOrReview keeps waiting for a venue-reported pending submission until
+// the ambiguity timeout measured from start elapses, then escalates so a
+// dropped relayer job cannot leave the redemption (and its reconciliation
+// exemption) open forever.
+func (service *Service) pendingOrReview(
+	ctx context.Context, redemption domain.Redemption, start *time.Time, waiting, timedOut string, now time.Time,
+) error {
+	if expired(start, now, service.ambiguityTimeout) {
+		return service.review(ctx, redemption, timedOut, now)
+	}
+	return service.store.RetryRedemption(ctx, redemption, waiting, now.Add(service.retryInterval))
+}
+
+func isPermanent(err error) bool {
+	var permanent interface{ Permanent() bool }
+	return errors.As(err, &permanent) && permanent.Permanent()
+}
+
+// confirmReceipt records the finalized receipt. A receipt that is still not
+// final once the ambiguity timeout measured from start has elapsed is not a
+// slow block: the transaction was dropped or replaced, or the RPC view is
+// unreliable. It then escalates instead of retrying forever, so reconciliation
+// can see the real chain state again.
+func (service *Service) confirmReceipt(
+	ctx context.Context, redemption domain.Redemption, transactionHash string, start *time.Time, now time.Time,
+) error {
 	receipt, err := service.receipts.ResolveRedemptionReceipt(
 		ctx, transactionHash, redemption.WalletAddress, redemption.ConditionID, redemption.NegRisk,
 	)
 	if err != nil {
-		var permanent interface{ Permanent() bool }
-		if errors.As(err, &permanent) && permanent.Permanent() {
+		if isPermanent(err) {
 			return service.review(ctx, redemption, err.Error(), now)
+		}
+		if expired(start, now, service.ambiguityTimeout) {
+			return service.review(ctx, redemption, "redeem transaction stayed unconfirmed beyond the ambiguity timeout: "+err.Error(), now)
 		}
 		return service.retry(ctx, redemption, err, now)
 	}

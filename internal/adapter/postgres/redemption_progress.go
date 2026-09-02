@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
@@ -75,4 +76,66 @@ func (reader *RedemptionProgressReader) ListInFlightRedemptions(
 		return nil, fmt.Errorf("iterate in-flight redemptions: %w", err)
 	}
 	return redemptions, nil
+}
+
+// ListAppliedRedemptions returns APPLIED redemptions whose ledger application
+// happened at or after since, with the exact shares each redemption burned per
+// token (from position_lot_redemptions). The Data API may still list those
+// tokens for a short time after the ledger closed them.
+func (reader *RedemptionProgressReader) ListAppliedRedemptions(
+	ctx context.Context, executionAccountID string, since time.Time,
+) ([]domain.AppliedRedemption, error) {
+	executionAccountID = strings.TrimSpace(executionAccountID)
+	if executionAccountID == "" || since.IsZero() {
+		return nil, fmt.Errorf("execution account id and since are required")
+	}
+	rows, err := reader.db.QueryContext(ctx, `
+		SELECT redemption.condition_id, redemption.transaction_hash, redemption.applied_at,
+		       lot.token_id, SUM(lot_redemption.redeemed_shares)::text
+		FROM polymarket_redemptions redemption
+		JOIN position_lot_redemptions lot_redemption
+		  ON lot_redemption.execution_account_id=redemption.execution_account_id
+		 AND lot_redemption.condition_id=redemption.condition_id
+		 AND lot_redemption.transaction_hash=redemption.transaction_hash
+		JOIN position_lots lot ON lot.lot_id=lot_redemption.lot_id
+		WHERE redemption.execution_account_id=$1
+		  AND redemption.status='APPLIED' AND redemption.applied_at>=$2
+		GROUP BY redemption.condition_id, redemption.transaction_hash, redemption.applied_at, lot.token_id
+		ORDER BY redemption.condition_id, lot.token_id`, executionAccountID, since.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("list applied redemptions: %w", err)
+	}
+	defer rows.Close()
+	byCondition := make(map[string]*domain.AppliedRedemption)
+	order := make([]string, 0)
+	for rows.Next() {
+		var conditionID, transactionHash, tokenID, shares string
+		var appliedAt time.Time
+		if err := rows.Scan(&conditionID, &transactionHash, &appliedAt, &tokenID, &shares); err != nil {
+			return nil, fmt.Errorf("scan applied redemption: %w", err)
+		}
+		redeemed, err := domain.ParseDecimal(shares)
+		if err != nil {
+			return nil, fmt.Errorf("applied redemption %s token %s shares: %w", conditionID, tokenID, err)
+		}
+		applied, exists := byCondition[conditionID]
+		if !exists {
+			applied = &domain.AppliedRedemption{
+				ExecutionAccountID: executionAccountID, ConditionID: conditionID,
+				TransactionHash: transactionHash, AppliedAt: appliedAt.UTC(),
+				RedeemedShares: make(map[string]domain.Decimal),
+			}
+			byCondition[conditionID] = applied
+			order = append(order, conditionID)
+		}
+		applied.RedeemedShares[tokenID] = redeemed
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate applied redemptions: %w", err)
+	}
+	result := make([]domain.AppliedRedemption, 0, len(order))
+	for _, conditionID := range order {
+		result = append(result, *byCondition[conditionID])
+	}
+	return result, nil
 }

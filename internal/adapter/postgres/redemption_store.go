@@ -480,7 +480,7 @@ func (store *RedemptionStore) ApplyRedemption(
 	}
 	if current.Status != domain.RedemptionConfirmed || current.TransactionHash != redemption.TransactionHash ||
 		current.PayoutBaseUnits != redemption.PayoutBaseUnits {
-		return fmt.Errorf("confirmed redemption evidence changed before application")
+		return &domain.RedemptionEvidenceError{Reason: fmt.Sprintf("confirmed redemption evidence changed before application")}
 	}
 
 	baseline, err := numeric(ctx, tx, `
@@ -500,7 +500,7 @@ func (store *RedemptionStore) ApplyRedemption(
 		return err
 	}
 	if sign, signErr := baseline.Sign(); signErr != nil || sign != 0 {
-		return fmt.Errorf("unmanaged baseline shares remain for redeemed condition")
+		return &domain.RedemptionEvidenceError{Reason: fmt.Sprintf("unmanaged baseline shares remain for redeemed condition")}
 	}
 
 	rows, err := tx.QueryContext(ctx, positionSelect+`
@@ -524,12 +524,12 @@ func (store *RedemptionStore) ApplyRedemption(
 		return err
 	}
 	if len(positions) == 0 {
-		return fmt.Errorf("confirmed redemption has no settled managed positions")
+		return &domain.RedemptionEvidenceError{Reason: fmt.Sprintf("confirmed redemption has no settled managed positions")}
 	}
 	for _, position := range positions {
 		if position.SettlementPrice.IsEmpty() || (!position.SettlementPrice.Equal("0") && !position.SettlementPrice.Equal("1")) ||
 			!position.ReservedShares.Equal("0") {
-			return fmt.Errorf("settled position %s is not safe to redeem", position.TokenID)
+			return &domain.RedemptionEvidenceError{Reason: fmt.Sprintf("settled position %s is not safe to redeem", position.TokenID)}
 		}
 	}
 
@@ -543,14 +543,14 @@ func (store *RedemptionStore) ApplyRedemption(
 	}
 	payoutBase, ok := new(big.Int).SetString(current.PayoutBaseUnits, 10)
 	if !ok || payoutBase.Sign() < 0 {
-		return fmt.Errorf("confirmed redemption payout base units are invalid")
+		return &domain.RedemptionEvidenceError{Reason: fmt.Sprintf("confirmed redemption payout base units are invalid")}
 	}
 	actualPayout, err := numeric(ctx, tx, `SELECT ($1::numeric/1000000)::text`, payoutBase.String())
 	if err != nil {
 		return err
 	}
 	if !actualPayout.Equal(expectedPayout) {
-		return fmt.Errorf("redemption payout %s does not equal managed binary payout %s", actualPayout, expectedPayout)
+		return &domain.RedemptionEvidenceError{Reason: fmt.Sprintf("redemption payout %s does not equal managed binary payout %s", actualPayout, expectedPayout)}
 	}
 
 	for _, position := range positions {
@@ -650,7 +650,7 @@ func applyRedeemedPosition(
 	}
 	lotRows.Close()
 	if len(lots) == 0 {
-		return fmt.Errorf("settled position %s has no settled lots", position.TokenID)
+		return &domain.RedemptionEvidenceError{Reason: fmt.Sprintf("settled position %s has no settled lots", position.TokenID)}
 	}
 	lotShares, lotCost := domain.Decimal("0"), domain.Decimal("0")
 	for _, item := range lots {
@@ -664,11 +664,11 @@ func applyRedeemedPosition(
 		}
 	}
 	if !lotShares.Equal(position.TotalShares) || !lotCost.Equal(position.CostBasis) {
-		return fmt.Errorf("settled lot balances do not equal position %s", position.TokenID)
+		return &domain.RedemptionEvidenceError{Reason: fmt.Sprintf("settled lot balances do not equal position %s", position.TokenID)}
 	}
 	for _, item := range lots {
 		if !item.negRisk.Valid || item.negRisk.Bool != redemption.NegRisk {
-			return fmt.Errorf("lot %s redemption adapter identity mismatch", item.id)
+			return &domain.RedemptionEvidenceError{Reason: fmt.Sprintf("lot %s redemption adapter identity mismatch", item.id)}
 		}
 		lotPayout, calcErr := numeric(ctx, tx, `SELECT ($1::numeric*$2::numeric)::text`, item.shares.String(), position.SettlementPrice.String())
 		if calcErr != nil {

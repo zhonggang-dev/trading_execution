@@ -16,6 +16,54 @@ func (function redemptionProgressFunc) ListInFlightRedemptions(ctx context.Conte
 	return function(ctx, executionAccountID)
 }
 
+func (redemptionProgressFunc) ListAppliedRedemptions(context.Context, string, time.Time) ([]domain.AppliedRedemption, error) {
+	return nil, nil
+}
+
+// fakeRedemptionProgress serves both views and records the grace boundary the
+// service asked for.
+type fakeRedemptionProgress struct {
+	inFlight   []domain.InFlightRedemption
+	applied    []domain.AppliedRedemption
+	appliedErr error
+	since      time.Time
+}
+
+func (fake *fakeRedemptionProgress) ListInFlightRedemptions(context.Context, string) ([]domain.InFlightRedemption, error) {
+	return fake.inFlight, nil
+}
+
+func (fake *fakeRedemptionProgress) ListAppliedRedemptions(_ context.Context, _ string, since time.Time) ([]domain.AppliedRedemption, error) {
+	fake.since = since
+	return fake.applied, fake.appliedErr
+}
+
+// closedRedeemedPosition is the ledger row after ApplyRedemption: zero shares,
+// CLOSED, cost basis released, settlement evidence retained.
+func closedRedeemedPosition() domain.Position {
+	position := settledPendingRedeemPosition()
+	position.LifecycleStatus = domain.PositionLifecycleClosed
+	position.TotalShares, position.AvailableShares, position.CostBasis, position.AverageCostPrice = "0", "0", "0", "0"
+	return position
+}
+
+func appliedRedemption(appliedAt time.Time, shares domain.Decimal) domain.AppliedRedemption {
+	return domain.AppliedRedemption{
+		ExecutionAccountID: "account-1", ConditionID: "0xcondition-1",
+		TransactionHash: "0xab", AppliedAt: appliedAt,
+		RedeemedShares: map[string]domain.Decimal{"token-1": shares},
+	}
+}
+
+// staleRedeemedExternal is the Data API row for a token whose burn the indexer
+// has not processed yet.
+func staleRedeemedExternal(shares domain.Decimal) []domain.ExternalPosition {
+	return []domain.ExternalPosition{{
+		ConditionID: "0xCondition-1", TokenID: "token-1", OutcomeName: "No", Shares: shares,
+		CurrentPrice: "1", Redeemable: true, Source: "POLYMARKET_DATA_API", ObservedAt: testNow,
+	}}
+}
+
 func settledPendingRedeemPosition() domain.Position {
 	settledAt := testNow.Add(-time.Hour)
 	return domain.Position{
@@ -220,6 +268,122 @@ func TestRedemptionProgressFailureSkipsAssetComparisonWithoutManualDrift(t *test
 			}
 			if result.Run.Status == domain.ReconciliationRunCompleted {
 				t.Fatalf("run completed despite unreadable redemption state: %#v", result.Run)
+			}
+			for _, issue := range result.Issues {
+				if issue.Resolution == domain.ReconciliationResolutionManual {
+					t.Fatalf("manual issue recorded without redemption visibility: %#v", issue)
+				}
+			}
+			assertIssue(t, result.Issues, domain.ReconciliationIssueSourceUnavailable, domain.ReconciliationIssueOpen)
+		})
+	}
+}
+
+func TestAppliedRedemptionIndexerLagIsRetryLaterNotManualDrift(t *testing.T) {
+	ledger := &fakeLedger{balance: testBalance("103.35"), positions: []domain.Position{closedRedeemedPosition()}}
+	progress := &fakeRedemptionProgress{applied: []domain.AppliedRedemption{appliedRedemption(testNow.Add(-5*time.Minute), "3.35")}}
+	service := newRedemptionWindowTestService(t, ledger, staleRedeemedExternal("3.35"), "103.35", progress)
+	result, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+	})
+	if err != nil {
+		t.Fatalf("RunAccount() error = %v", err)
+	}
+	if !progress.since.Equal(testNow.Add(-appliedRedemptionGracePeriod)) {
+		t.Fatalf("applied redemptions were read since %s, want the 30 minute grace boundary", progress.since)
+	}
+	if len(result.Issues) != 1 {
+		t.Fatalf("issues = %#v, want exactly one transient position issue", result.Issues)
+	}
+	issue := result.Issues[0]
+	if issue.Type != domain.ReconciliationIssuePositionDrift || issue.Resolution != domain.ReconciliationResolutionRetry ||
+		issue.Status != domain.ReconciliationIssueOpen || issue.TokenID != "token-1" {
+		t.Fatalf("indexer lag issue = %#v, want OPEN POSITION_DRIFT with RETRY_LATER", issue)
+	}
+	if result.Run.Summary["redeemed_positions_awaiting_index"] != 1 || result.Run.Summary["applied_redemptions_in_grace"] != 1 {
+		t.Fatalf("summary = %#v", result.Run.Summary)
+	}
+}
+
+func TestAppliedRedemptionGraceDoesNotExcuseUnexplainedRemotePosition(t *testing.T) {
+	for name, tc := range map[string]struct {
+		local    domain.Position
+		external []domain.ExternalPosition
+		progress *fakeRedemptionProgress
+	}{
+		"no applied redemption in grace": {
+			local: closedRedeemedPosition(), external: staleRedeemedExternal("3.35"),
+			progress: &fakeRedemptionProgress{},
+		},
+		"remote shares differ from redeemed shares": {
+			local: closedRedeemedPosition(), external: staleRedeemedExternal("5"),
+			progress: &fakeRedemptionProgress{applied: []domain.AppliedRedemption{appliedRedemption(testNow.Add(-5*time.Minute), "3.35")}},
+		},
+		"remote token is no longer redeemable": {
+			local: closedRedeemedPosition(),
+			external: func() []domain.ExternalPosition {
+				external := staleRedeemedExternal("3.35")
+				external[0].Redeemable = false
+				return external
+			}(),
+			progress: &fakeRedemptionProgress{applied: []domain.AppliedRedemption{appliedRedemption(testNow.Add(-5*time.Minute), "3.35")}},
+		},
+		"redemption burned a different token": {
+			local: closedRedeemedPosition(), external: staleRedeemedExternal("3.35"),
+			progress: &fakeRedemptionProgress{applied: []domain.AppliedRedemption{func() domain.AppliedRedemption {
+				applied := appliedRedemption(testNow.Add(-5*time.Minute), "3.35")
+				applied.RedeemedShares = map[string]domain.Decimal{"token-2": "3.35"}
+				return applied
+			}()}},
+		},
+		"local position still open": {
+			local: func() domain.Position {
+				position := closedRedeemedPosition()
+				position.LifecycleStatus = domain.PositionLifecycleOpen
+				return position
+			}(),
+			external: staleRedeemedExternal("3.35"),
+			progress: &fakeRedemptionProgress{applied: []domain.AppliedRedemption{appliedRedemption(testNow.Add(-5*time.Minute), "3.35")}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ledger := &fakeLedger{balance: testBalance("103.35"), positions: []domain.Position{tc.local}}
+			service := newRedemptionWindowTestService(t, ledger, tc.external, "103.35", tc.progress)
+			result, err := service.RunAccount(context.Background(), RunAccountParams{
+				ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+			})
+			if err != nil {
+				t.Fatalf("RunAccount() error = %v", err)
+			}
+			assertIssue(t, result.Issues, domain.ReconciliationIssuePositionDrift, domain.ReconciliationIssueOpen)
+			for _, issue := range result.Issues {
+				if issue.Type == domain.ReconciliationIssuePositionDrift && issue.Resolution != domain.ReconciliationResolutionManual {
+					t.Fatalf("unexplained remote position was not manual drift: %#v", issue)
+				}
+			}
+		})
+	}
+}
+
+func TestAppliedRedemptionReadFailureSkipsAssetComparisonWithoutManualDrift(t *testing.T) {
+	ledger := &fakeLedger{balance: testBalance("103.35"), positions: []domain.Position{closedRedeemedPosition()}}
+	for name, progress := range map[string]*fakeRedemptionProgress{
+		"read error":           {appliedErr: errors.New("postgres unavailable")},
+		"applied before grace": {applied: []domain.AppliedRedemption{appliedRedemption(testNow.Add(-2*time.Hour), "3.35")}},
+		"zero redeemed shares": {applied: []domain.AppliedRedemption{appliedRedemption(testNow.Add(-5*time.Minute), "0")}},
+		"foreign account": {applied: []domain.AppliedRedemption{func() domain.AppliedRedemption {
+			applied := appliedRedemption(testNow.Add(-5*time.Minute), "3.35")
+			applied.ExecutionAccountID = "account-other"
+			return applied
+		}()}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service := newRedemptionWindowTestService(t, ledger, staleRedeemedExternal("3.35"), "103.35", progress)
+			result, err := service.RunAccount(context.Background(), RunAccountParams{
+				ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+			})
+			if err == nil {
+				t.Fatal("RunAccount() error = nil, want applied redemption read failure")
 			}
 			for _, issue := range result.Issues {
 				if issue.Resolution == domain.ReconciliationResolutionManual {

@@ -315,6 +315,20 @@ func (state *runState) compareExternalPosition(ctx context.Context, params compa
 	if sharesMatch {
 		return
 	}
+	if state.externalPositionIsRedeemedAwaitingIndex(position, params.external) {
+		// The ledger already applied the redeem receipt; the snapshot source has
+		// not indexed the burn yet. RETRY_LATER closes itself on the next clean
+		// sweep instead of leaving a manual gate that blocks new orders.
+		state.run.Summary["redeemed_positions_awaiting_index"]++
+		state.issue(ctx, domain.ReconciliationIssueParams{
+			Type: domain.ReconciliationIssuePositionDrift, Resolution: domain.ReconciliationResolutionRetry,
+			Status: domain.ReconciliationIssueOpen, MarketID: position.MarketID,
+			ConditionID: position.ConditionID, TokenID: params.tokenID,
+			LocalValue: position.TotalShares, RemoteValue: params.external.Shares, Source: params.external.Source,
+			Details: "position was redeemed and applied to the ledger within the grace period; the external snapshot has not indexed the burn yet",
+		})
+		return
+	}
 	state.issue(ctx, domain.ReconciliationIssueParams{
 		Type: domain.ReconciliationIssuePositionDrift, Resolution: domain.ReconciliationResolutionManual,
 		Status: domain.ReconciliationIssueOpen, MarketID: position.MarketID,

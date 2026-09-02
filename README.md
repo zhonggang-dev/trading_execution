@@ -111,6 +111,10 @@ transactional outbox 会与账本同事务写入，但生产消息 publisher 仍
 等待 Polygon 回执达到配置确认数后再原子写入 payout/PnL。赎回交易落链到账本入账之间，对账会读取
 `polymarket_redemptions` 中处于 REDEEM_SUBMITTING/REDEEM_SUBMITTED/CONFIRMED 的 condition：已结算仓位从外部快照消失、
 链上余额恰好增加对应 payout 都不会被记为 MANUAL_REVIEW 漂移，因此全自动赎回不会把账户的下单风控卡死。
+入账（APPLIED）后 30 分钟内，若 Data API 仍列出已烧毁的 token 且数量精确等于已赎回份额，只记 `RETRY_LATER`
+并在下一次干净对账自动关闭。CONFIRMED 回执与账本证据不一致（payout 不等于份额×结算价、lot 合计不等于仓位、
+baseline 残留）时不再无限重试，而是转 `MANUAL_REVIEW`，让对账如实报出漂移；relayer 长时间 pending、回执长时间
+不最终化的提交同样在 `POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT` 后升级为 `MANUAL_REVIEW`。
 `POLYMARKET_AUTO_REDEEM_ENABLED` 默认 `false`；
 Deposit Wallet 还必须在受限钱包文件中配置独立 relayer key，缺少时 live 启动 fail closed。
 策略周期已经使用 prediction_infra HTTP snapshot、
