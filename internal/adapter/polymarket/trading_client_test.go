@@ -1069,3 +1069,83 @@ func TestCancelKeepsConfirmedCancelWhilePartialFillDetailsPropagate(t *testing.T
 		t.Fatalf("Cancel() = %#v, want CANCELLED with the observed partial fill", venueOrder)
 	}
 }
+
+type feeEvidenceSourceFunc func(context.Context, FillFeeEvidenceRequest) (FillFeeEvidence, error)
+
+func (source feeEvidenceSourceFunc) ResolveFillFeeEvidence(ctx context.Context, request FillFeeEvidenceRequest) (FillFeeEvidence, error) {
+	return source(ctx, request)
+}
+
+// TestListOrderFillsReturnsShallowReceiptAsFinalityPendingMinedFill verifies a
+// CLOB CONFIRMED trade whose Polygon receipt is below the configured depth is
+// returned as a MINED finality-pending fill carrying the exact settlement
+// evidence, and that the later finalized read is the same fill identity.
+func TestListOrderFillsReturnsShallowReceiptAsFinalityPendingMinedFill(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	order := adapterOrder()
+	order.VenueOrderID = "0x" + strings.Repeat("ab", 32)
+	order.Intent.ConditionID = "condition-1"
+	tokenID := order.Intent.TokenID
+	transactionHash := "0x" + strings.Repeat("cd", 32)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/data/trades":
+			writeTestJSON(writer, map[string]any{"data": []map[string]any{{
+				"id": "trade-shallow", "taker_order_id": order.VenueOrderID, "market": "condition-1",
+				"asset_id": tokenID, "side": "BUY", "size": "10", "price": "0.5",
+				"status": "CONFIRMED", "fee_rate_bps": "0", "transaction_hash": transactionHash,
+				"match_time": "2026-08-18T07:59:58Z", "last_update": "2026-08-18T07:59:59Z",
+				"trader_side": "TAKER", "maker_address": request.URL.Query().Get("maker_address"),
+			}}, "next_cursor": "LTE="})
+		case "/clob-markets/condition-1":
+			writeTestJSON(writer, map[string]any{
+				"c": "condition-1", "t": []map[string]any{{"t": tokenID}},
+				"fd": map[string]any{"r": 0.25, "e": 2, "to": true},
+			})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	confirmations, finalized := uint64(17), false
+	client := newTestTradingClient(t, server.URL, now)
+	client.feeEvidence = feeEvidenceSourceFunc(func(_ context.Context, request FillFeeEvidenceRequest) (FillFeeEvidence, error) {
+		return FillFeeEvidence{
+			Source: v2OrderFilledFeeSource, ExchangeAddress: request.ExpectedExchangeAddress,
+			TransactionHash: request.TransactionHash, OrderHash: request.VenueOrderID,
+			MakerAddress: request.ExpectedMakerAddress, TokenID: request.TokenID,
+			BuilderCode: request.ExpectedBuilderCode, Side: request.Side,
+			MakerAmountBaseUnits: "5000000", TakerAmountBaseUnits: "10000000", TotalFeeBaseUnits: "156250",
+			BuilderFeeBaseUnits: "0", BuilderFeeKnown: true, CollateralDecimals: 6, OutcomeTokenDecimals: 6,
+			BlockNumber: 100, BlockHash: "0x" + strings.Repeat("ef", 32), LogIndex: 3,
+			Confirmations: confirmations, Finalized: finalized,
+		}, nil
+	})
+
+	pending, err := client.ListOrderFills(context.Background(), order)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("ListOrderFills() = %#v, %v; want one finality-pending fill", pending, err)
+	}
+	if pending[0].Status != domain.FillStatusMined || pending[0].ConfirmedAt != nil {
+		t.Fatalf("finality-pending fill = status %s confirmed_at %v", pending[0].Status, pending[0].ConfirmedAt)
+	}
+	if pending[0].SettlementEvidence == nil || pending[0].SettlementEvidence.Confirmations != 17 ||
+		pending[0].FeeSource != domain.FeeSourcePolygonV2OrderFilled ||
+		!pending[0].TotalFee.Equal("0.15625") || !pending[0].GrossNotional.Equal("5") {
+		t.Fatalf("finality-pending fill lost evidence or money: %#v", pending[0])
+	}
+
+	confirmations, finalized = 64, true
+	final, err := client.ListOrderFills(context.Background(), order)
+	if err != nil || len(final) != 1 {
+		t.Fatalf("ListOrderFills() = %#v, %v; want one finalized fill", final, err)
+	}
+	if final[0].Status != domain.FillStatusConfirmed || final[0].ConfirmedAt == nil {
+		t.Fatalf("finalized fill = status %s confirmed_at %v", final[0].Status, final[0].ConfirmedAt)
+	}
+	if final[0].RawPayloadSHA256 != pending[0].RawPayloadSHA256 || final[0].Key != pending[0].Key ||
+		final[0].VenueFillID != pending[0].VenueFillID {
+		t.Fatalf("finalized fill must keep the pending identity: %#v vs %#v", final[0], pending[0])
+	}
+}

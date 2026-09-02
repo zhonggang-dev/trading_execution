@@ -44,8 +44,12 @@ type Params struct {
 	// the redeem transaction and the ledger application is not recorded as
 	// manual drift. Nil means no redemption is ever in flight.
 	Redemptions port.RedemptionProgressSource
-	Now         func() time.Time
-	NewID       func() string
+	// FillFinalityMaxAge bounds how long a CLOB-confirmed fill may wait for the
+	// configured Polygon confirmation depth before the wait is escalated to a
+	// manual FILL_FINALITY_STALLED issue. Zero selects the default.
+	FillFinalityMaxAge time.Duration
+	Now                func() time.Time
+	NewID              func() string
 }
 
 // Service 表示后端使用的 Service 类型。
@@ -65,6 +69,7 @@ type Service struct {
 	balanceEpsilon            domain.Decimal
 	accountScope              port.ExecutionAccountScope
 	redemptions               port.RedemptionProgressSource
+	fillFinalityMaxAge        time.Duration
 	now                       func() time.Time
 	newID                     func() string
 }
@@ -121,6 +126,12 @@ func New(params Params) (*Service, error) {
 			return nil, fmt.Errorf("%s must be a non-negative decimal", name)
 		}
 	}
+	if params.FillFinalityMaxAge == 0 {
+		params.FillFinalityMaxAge = defaultFillFinalityMaxAge
+	}
+	if params.FillFinalityMaxAge < time.Minute {
+		return nil, fmt.Errorf("fill finality max age must be at least one minute")
+	}
 	if params.Now == nil {
 		params.Now = time.Now
 	}
@@ -137,7 +148,8 @@ func New(params Params) (*Service, error) {
 		recorder: params.Recorder, tradeLookback: params.TradeLookback,
 		positionEpsilon: params.PositionEpsilon, balanceEpsilon: params.BalanceEpsilon,
 		accountScope: params.AccountScope, redemptions: params.Redemptions,
-		now: params.Now, newID: params.NewID,
+		fillFinalityMaxAge: params.FillFinalityMaxAge,
+		now:                params.Now, newID: params.NewID,
 	}, nil
 }
 
@@ -185,13 +197,18 @@ func (service *Service) RunAccount(ctx context.Context, params RunAccountParams)
 	// asset comparison is skipped for this run rather than risking a permanent
 	// MANUAL_REVIEW issue.
 	redemptionErr := state.loadInFlightRedemptions(ctx, scope.executionAccountID)
+	// Fills whose receipt is canonical but not yet deep enough already moved the
+	// chain while the ledger still shows the pre-fill state. Without that view
+	// every fast fill would be recorded as balance/position drift, so the asset
+	// comparison is likewise skipped when it cannot be read.
+	finalityErr := state.loadFinalityPendingFills(ctx, scope.executionAccountID)
 	var positionErr, balanceErr error
-	if redemptionErr == nil {
+	if redemptionErr == nil && finalityErr == nil {
 		positionErr = state.reconcilePositions(ctx, scope.executionAccountID, balance.WalletAddress)
 		balanceErr = state.reconcileBalance(ctx, scope.executionAccountID)
 	}
 
-	return service.finish(ctx, state, errors.Join(venueErr, redemptionErr, positionErr, balanceErr, errors.Join(state.errors...)))
+	return service.finish(ctx, state, errors.Join(venueErr, redemptionErr, finalityErr, positionErr, balanceErr, errors.Join(state.errors...)))
 }
 
 // normalize 去除单账户对账参数中允许出现的首尾空白。
@@ -209,6 +226,7 @@ type runState struct {
 	issues      []domain.ReconciliationIssue
 	errors      []error
 	redemptions inFlightRedemptions
+	finality    finalityPendingFills
 }
 
 // issue 补全对账问题身份并通过参数构建器持久化到运行结果。

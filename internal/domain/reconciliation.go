@@ -43,6 +43,12 @@ const (
 	ReconciliationIssueBalanceDrift                  ReconciliationIssueType = "BALANCE_DRIFT"
 	ReconciliationIssueSourceUnavailable             ReconciliationIssueType = "SOURCE_UNAVAILABLE"
 	ReconciliationIssueSourceConflict                ReconciliationIssueType = "SOURCE_CONFLICT"
+	// ReconciliationIssueFillFinalityStalled means a CLOB-confirmed fill has a
+	// canonical receipt that still has not reached the configured confirmation
+	// depth long after it matched. Confirmations only stop growing when the
+	// transaction was dropped or re-included by a reorganization, so this is a
+	// manual gate rather than an expected propagation wait.
+	ReconciliationIssueFillFinalityStalled ReconciliationIssueType = "FILL_FINALITY_STALLED"
 )
 
 // ReconciliationResolution 表示后端使用的 ReconciliationResolution 类型。

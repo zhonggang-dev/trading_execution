@@ -552,14 +552,21 @@ func insertFill(ctx context.Context, tx *sql.Tx, fill domain.Fill) error {
 	return err
 }
 
-// updateFillObservation 在当前事务中更新 Fill Observation。
+// updateFillObservation 在当前事务中更新 Fill Observation。verifyFillIdentity 已经
+// 证明新旧结算证据除 confirmations 外完全一致，因此这里用最新证据覆盖，使
+// finality-pending 成交最终入账时持久化的确认数反映真实终局深度。
 func updateFillObservation(ctx context.Context, tx *sql.Tx, fill domain.Fill) error {
-	_, err := tx.ExecContext(ctx, `
+	evidence, err := canonicalSettlementEvidence(fill.SettlementEvidence)
+	if err != nil {
+		return fmt.Errorf("encode settlement evidence: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
 		UPDATE execution_fills SET status=$2, transaction_hash=CASE WHEN $3='' THEN transaction_hash ELSE $3 END,
 			venue_updated_at=$4, last_observed_at=$5, confirmed_at=COALESCE($6, confirmed_at),
-			raw_payload_sha256=CASE WHEN $7='' THEN raw_payload_sha256 ELSE $7 END
+			raw_payload_sha256=CASE WHEN $7='' THEN raw_payload_sha256 ELSE $7 END,
+			settlement_evidence=CASE WHEN $8::jsonb = '{}'::jsonb THEN settlement_evidence ELSE $8::jsonb END
 		WHERE fill_key=$1`, fill.Key, string(fill.Status), fill.TransactionHash,
-		nullTime(fill.VenueUpdatedAt), fill.ObservedAt, fill.ConfirmedAt, fill.RawPayloadSHA256)
+		nullTime(fill.VenueUpdatedAt), fill.ObservedAt, fill.ConfirmedAt, fill.RawPayloadSHA256, evidence)
 	return err
 }
 

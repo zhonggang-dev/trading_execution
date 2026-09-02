@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -250,6 +251,31 @@ func TestOrderFilledEvidenceReaderRequiresConfirmationsAndStableChainHead(t *tes
 				t.Fatalf("Read() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestOrderFilledEvidenceReaderReturnsTypedInsufficientConfirmations(t *testing.T) {
+	receipt := validReceipt(PolygonCTFExchangeV2Address, OrderSideBuy, testTokenID, "1", "2", "0")
+	reader, _ := readerForSequence(t, 64,
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x66")),
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x66")),
+	)
+	evidence, err := reader.Read(context.Background(), validEvidenceRequest(OrderSideBuy))
+	var shallow *InsufficientConfirmationsError
+	if !errors.As(err, &shallow) {
+		t.Fatalf("Read() error = %v, want InsufficientConfirmationsError", err)
+	}
+	if evidence != (OrderFilledEvidence{}) {
+		t.Fatalf("Read() must return zero evidence with the typed error, got %#v", evidence)
+	}
+	if shallow.Required != 64 || shallow.Evidence.Confirmations != 3 || shallow.Evidence.BlockNumber != 0x64 ||
+		shallow.Evidence.TransactionHash == "" || shallow.Evidence.BlockHash == "" || shallow.Evidence.FeeBaseUnits != "0" {
+		t.Fatalf("typed error evidence = %#v required=%d", shallow.Evidence, shallow.Required)
+	}
+	if !strings.Contains(err.Error(), "has 3 confirmations; require at least 64") {
+		t.Fatalf("error text = %q", err.Error())
 	}
 }
 

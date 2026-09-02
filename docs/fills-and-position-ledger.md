@@ -16,8 +16,15 @@
 | Trade status | 处理 |
 | --- | --- |
 | `MATCHED` / `MINED` / `RETRYING` | 保存观察和审计事件，不改资金与仓位 |
-| `CONFIRMED` | 原子记账 |
+| `CONFIRMED`，receipt 确认数 < `POLYGON_ORDER_FILLED_CONFIRMATIONS` | 本地记为 `MINED` finality-pending：保存完整 OrderFilled 证据与精确金额，不改资金与仓位 |
+| `CONFIRMED`，确认数达到阈值 | 原子记账 |
 | `FAILED` | 保存失败观察，不记账 |
+
+finality-pending 成交与稍后达到阈值的同一成交共享同一 `fill_key` 和 raw-payload 指纹
+（confirmations 不参与指纹），因此后者只是 `MINED -> CONFIRMED` 的状态迁移并原子入账。
+在此期间订单停在 `UNKNOWN + VENUE_FILL_EVIDENCE_PENDING`，卖出份额/买入资金的预占继续冻结，
+待入账的卖出所得不可用于新下单；对账用这些待终局成交逐笔解释链上与本地的差额，不会把它们
+记成 `BALANCE_DRIFT`/`POSITION_DRIFT`，也不会因此阻断该账户的新下单。
 
 旧服务因为 `/trades` 有传播延迟，会在没有 trade 时用下单响应的 `makingAmount/takingAmount`
 补造成交。新实现明确禁止该 fallback：宁可继续保留预占并轮询，也不产生无法去重和核对的仓位。

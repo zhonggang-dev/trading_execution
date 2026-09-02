@@ -591,6 +591,31 @@ func (ledger *FillLedger) ListOrderFills(ctx context.Context, orderID string) ([
 	return fills, rows.Err()
 }
 
+// ListFinalityPendingFills 返回已持有链上结算证据但确认数仍未达到阈值、尚未入账的成交观察。
+func (ledger *FillLedger) ListFinalityPendingFills(ctx context.Context, accountID string) ([]domain.Fill, error) {
+	rows, err := ledger.db.QueryContext(ctx, fillSelect+`
+		WHERE execution_account_id=$1 AND applied_at IS NULL
+		  AND status NOT IN ('CONFIRMED', 'FAILED')
+		  AND fee_source=$2 AND settlement_evidence <> '{}'::jsonb
+		ORDER BY matched_at, venue_fill_id, fill_key`, accountID, domain.FeeSourcePolygonV2OrderFilled)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var fills []domain.Fill
+	for rows.Next() {
+		fill, err := scanFill(rows)
+		if err != nil {
+			return nil, err
+		}
+		if fill.SettlementEvidence == nil {
+			continue
+		}
+		fills = append(fills, fill)
+	}
+	return fills, rows.Err()
+}
+
 // GetPosition 查询指定执行账户和 token 的权威仓位。
 func (ledger *FillLedger) GetPosition(ctx context.Context, accountID, tokenID string) (domain.Position, error) {
 	return selectPosition(ctx, ledger.db, accountID, tokenID, false)

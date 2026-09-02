@@ -1002,9 +1002,16 @@ func (venue *fakeVenue) ListReconciliationTrades(_ context.Context, _ string, af
 
 // fakeLedger 表示后端使用的 fakeLedger 类型。
 type fakeLedger struct {
-	balance   domain.AccountBalance
-	positions []domain.Position
-	settled   []string
+	balance         domain.AccountBalance
+	positions       []domain.Position
+	settled         []string
+	finalityPending []domain.Fill
+	finalityErr     error
+}
+
+// ListFinalityPendingFills 返回模拟账本中尚未达到确认阈值的成交观察。
+func (ledger *fakeLedger) ListFinalityPendingFills(context.Context, string) ([]domain.Fill, error) {
+	return append([]domain.Fill(nil), ledger.finalityPending...), ledger.finalityErr
 }
 
 // GetBalance 返回模拟仓储中的测试记录。

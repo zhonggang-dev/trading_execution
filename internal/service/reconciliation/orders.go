@@ -125,6 +125,9 @@ func (state *runState) syncOrderFills(ctx context.Context, order domain.Order) b
 	state.run.Summary["fill_observations"] += result.Observed
 	state.run.Summary["fills_applied"] += result.Applied
 	for _, application := range result.Applications {
+		if isFinalityPendingFill(application.Fill) && !application.Applied && !application.Duplicate {
+			state.run.Summary["fills_finality_pending"]++
+		}
 		state.recordRecoveredFill(ctx, order, application)
 	}
 	return true

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -55,8 +56,18 @@ func (source *polygonFillFeeEvidence) ResolveFillFeeEvidence(
 		Side:            side,
 		TokenID:         request.TokenID,
 	})
-	if err != nil {
+	finalized := true
+	var shallow *evmrpc.InsufficientConfirmationsError
+	if errors.As(err, &shallow) {
+		// The receipt is canonical and matches exactly; only the confirmation
+		// depth is short. Hand the observed evidence back as finality-pending so
+		// the fill ledger can hold the reservation without recording an outage.
+		evidence, finalized = shallow.Evidence, false
+	} else if err != nil {
 		return polymarket.FillFeeEvidence{}, err
+	}
+	if evidence.Confirmations == 0 || evidence.BlockNumber == 0 {
+		return polymarket.FillFeeEvidence{}, fmt.Errorf("OrderFilled evidence omitted receipt depth")
 	}
 	if !strings.EqualFold(evidence.ExchangeAddress, request.ExpectedExchangeAddress) {
 		return polymarket.FillFeeEvidence{}, fmt.Errorf("OrderFilled exchange address does not match the validated market")
@@ -89,6 +100,7 @@ func (source *polygonFillFeeEvidence) ResolveFillFeeEvidence(
 		BlockHash:            evidence.BlockHash,
 		LogIndex:             evidence.LogIndex,
 		Confirmations:        evidence.Confirmations,
+		Finalized:            finalized,
 	}, nil
 }
 

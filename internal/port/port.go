@@ -222,6 +222,11 @@ type ExternalBalanceSource interface {
 type ReconciliationLedger interface {
 	GetBalance(ctx context.Context, executionAccountID string) (domain.AccountBalance, error)
 	ListPositions(ctx context.Context, executionAccountID string) ([]domain.Position, error)
+	// ListFinalityPendingFills returns fills whose on-chain settlement evidence
+	// is canonical but still below the configured confirmation depth, so they
+	// have not been applied to balances or positions yet. The chain already
+	// reflects them; reconciliation adds their exact deltas to the local view.
+	ListFinalityPendingFills(ctx context.Context, executionAccountID string) ([]domain.Fill, error)
 	MarkPositionSettled(ctx context.Context, executionAccountID, tokenID, sourceReference string, settlementPrice domain.Decimal, observedAt time.Time) (domain.Position, error)
 }
 
