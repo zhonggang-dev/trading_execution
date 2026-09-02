@@ -230,6 +230,18 @@ type RedemptionStore interface {
 	ReviewRedemption(ctx context.Context, redemption domain.Redemption, reason string, reviewedAt time.Time) error
 }
 
+// RedemptionProgressSource exposes redemptions that may already have burned
+// outcome shares and paid collateral on-chain before the ledger applied them.
+// Reconciliation consults it so the redeem-to-apply window is not recorded as
+// permanent manual drift.
+type RedemptionProgressSource interface {
+	ListInFlightRedemptions(ctx context.Context, executionAccountID string) ([]domain.InFlightRedemption, error)
+	// ListAppliedRedemptions returns redemptions applied to the ledger at or
+	// after since, with the exact shares burned per token, so a stale external
+	// snapshot that still lists them is not recorded as manual drift.
+	ListAppliedRedemptions(ctx context.Context, executionAccountID string, since time.Time) ([]domain.AppliedRedemption, error)
+}
+
 type RedeemActivitySource interface {
 	ListRedeemActivities(ctx context.Context, walletAddress, conditionID string, start time.Time) ([]domain.RedeemActivity, error)
 }

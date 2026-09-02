@@ -103,7 +103,8 @@ func (state *runState) reconcileBalance(ctx context.Context, executionAccountID 
 		return err
 	}
 	external, conflict := state.readBalanceConsensus(ctx, balance.WalletAddress, balance.CollateralAsset)
-	if conflict || within(balance.TotalBalance, external.Amount, state.service.balanceEpsilon) {
+	if conflict || within(balance.TotalBalance, external.Amount, state.service.balanceEpsilon) ||
+		state.balanceExplainedByRedemptions(balance.TotalBalance, external.Amount) {
 		return nil
 	}
 	state.issue(ctx, domain.ReconciliationIssueParams{
@@ -240,9 +241,15 @@ func (state *runState) comparePositions(
 			details: "the immutable unmanaged baseline token is absent from the external snapshot; the baseline is never reduced or imported into the managed ledger",
 		})
 	}
+	redeeming := 0
 	for tokenID, position := range localByToken {
+		if state.absentPositionIsRedeeming(position) {
+			redeeming++
+			continue
+		}
 		state.recordMissingExternalPosition(ctx, missingExternalPositionParams{tokenID: tokenID, position: position, externalSource: remote.Source})
 	}
+	state.run.Summary["redeeming_positions_pending_ledger"] = redeeming
 }
 
 // compareBaselinedPosition verifies remote_total = immutable unmanaged shares
@@ -306,6 +313,20 @@ func (state *runState) compareExternalPosition(ctx context.Context, params compa
 	sharesMatch := managedPositionSharesMatch(position.TotalShares, params.external, state.service.positionEpsilon)
 	state.settlePositionIfNeeded(ctx, settlePositionParams{tokenID: params.tokenID, position: position, external: params.external, sharesMatch: sharesMatch})
 	if sharesMatch {
+		return
+	}
+	if state.externalPositionIsRedeemedAwaitingIndex(position, params.external) {
+		// The ledger already applied the redeem receipt; the snapshot source has
+		// not indexed the burn yet. RETRY_LATER closes itself on the next clean
+		// sweep instead of leaving a manual gate that blocks new orders.
+		state.run.Summary["redeemed_positions_awaiting_index"]++
+		state.issue(ctx, domain.ReconciliationIssueParams{
+			Type: domain.ReconciliationIssuePositionDrift, Resolution: domain.ReconciliationResolutionRetry,
+			Status: domain.ReconciliationIssueOpen, MarketID: position.MarketID,
+			ConditionID: position.ConditionID, TokenID: params.tokenID,
+			LocalValue: position.TotalShares, RemoteValue: params.external.Shares, Source: params.external.Source,
+			Details: "position was redeemed and applied to the ledger within the grace period; the external snapshot has not indexed the burn yet",
+		})
 		return
 	}
 	state.issue(ctx, domain.ReconciliationIssueParams{

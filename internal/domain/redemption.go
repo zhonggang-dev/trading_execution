@@ -86,3 +86,53 @@ type RedemptionReceipt struct {
 	BlockHash       string `json:"block_hash"`
 	Confirmations   uint64 `json:"confirmations"`
 }
+
+// InFlightRedemption is a managed redemption whose on-chain effect (outcome
+// shares burned, collateral paid out) may already be observable before
+// ApplyRedemption records it in the ledger. Reconciliation must not classify
+// that transient window as manual position or balance drift.
+type InFlightRedemption struct {
+	ExecutionAccountID string           `json:"execution_account_id"`
+	ConditionID        string           `json:"condition_id"`
+	Status             RedemptionStatus `json:"status"`
+	// ExpectedPayout is the collateral the redemption adds to the wallet:
+	// the confirmed receipt payout when known, otherwise the managed binary
+	// payout (shares × settlement price) that ApplyRedemption will enforce.
+	ExpectedPayout Decimal `json:"expected_payout"`
+}
+
+// InFlight reports whether a redemption status may already have mutated the
+// chain without the ledger having applied the payout yet.
+func (status RedemptionStatus) InFlight() bool {
+	switch status {
+	case RedemptionRedeemSubmitting, RedemptionRedeemSubmitted, RedemptionConfirmed:
+		return true
+	default:
+		return false
+	}
+}
+
+// RedemptionEvidenceError reports that a confirmed redemption's on-chain
+// evidence can never be reconciled with the managed ledger as it stands:
+// the receipt payout differs from the binary payout, settled lots do not sum
+// to the position, or unmanaged baseline shares remain. Retrying cannot fix
+// it, so the redemption must move to MANUAL_REVIEW where reconciliation is
+// again allowed to report the resulting position and balance drift.
+type RedemptionEvidenceError struct{ Reason string }
+
+func (failure *RedemptionEvidenceError) Error() string   { return failure.Reason }
+func (failure *RedemptionEvidenceError) Permanent() bool { return true }
+
+// AppliedRedemption is a redemption whose payout and share burn are already in
+// the ledger. The external position snapshot may still list the burned tokens
+// for a short time after ApplyRedemption; reconciliation uses this view to
+// classify that lag as transient (RETRY_LATER) instead of manual drift.
+type AppliedRedemption struct {
+	ExecutionAccountID string    `json:"execution_account_id"`
+	ConditionID        string    `json:"condition_id"`
+	TransactionHash    string    `json:"transaction_hash"`
+	AppliedAt          time.Time `json:"applied_at"`
+	// RedeemedShares maps each burned token id to the exact managed share
+	// quantity the redemption closed.
+	RedeemedShares map[string]Decimal `json:"redeemed_shares"`
+}

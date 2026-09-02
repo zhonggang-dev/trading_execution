@@ -67,6 +67,8 @@ Content-Type: application/json
 | 本地仍 LIVE、远端已取消 | CLOB 单订单查询明确返回 cancelled，且真实 Fill 已先同步 | 走订单状态机到 `CANCELLED`；保留预占，经过 Fill grace 并再查 Trades 后释放 |
 | Market 已结算 | 外部持仓源明确 `redeemable=true`，且多个已配置来源一致 | 仓位/lot 改为 `SETTLED_PENDING_REDEEM`；不清 shares、不提前记 payout |
 | 待赎回 condition | settlement price 已冻结为精确 `0/1`、所有 managed lot 的 `neg_risk` 一致、该 condition 无剩余 external baseline、adapter 授权已确认 | 先持久化 `*_SUBMITTING`，再提交精确 `redeemPositions`；只有 canonical `PositionsRedeemed` 回执达到确认深度后，才关闭 lot/position 并增加现金、实现 PnL |
+| 赎回已落链、账本未入账 | `polymarket_redemptions` 处于 REDEEM_SUBMITTING/REDEEM_SUBMITTED/CONFIRMED | 已结算仓位从外部快照消失、链上余额恰好多出 payout 不记漂移；OPEN 仓位消失或余额差额不等于 payout 仍记 `MANUAL_REVIEW` |
+| 赎回已入账、Data API 尚未索引 | 本地仓位 `CLOSED` 且 shares 为 0，同 condition 的赎回在 30 分钟内 `APPLIED`，远端仍 `redeemable=true` 且数量精确等于该 token 已赎回份额 | 记 `POSITION_DRIFT + RETRY_LATER`，下一次干净对账自动 `RESOLVED`；超出宽限期或数量不符仍是 `MANUAL_REVIEW` |
 
 所有自动修改都复用现有的 PostgreSQL 事务边界和状态机。对账服务本身不能绕过 FillLedger 直接
 改余额、仓位数量或成交记录。
@@ -75,6 +77,15 @@ Auto redeem 不使用“持有 48 小时”条件，也不使用 CLOB SELL。一
 condition 下的完整 ERC-1155 余额，因此发现任何未消耗 ownership baseline、开放/预占 lot 或不一致的
 adapter identity 时都会进入 `MANUAL_REVIEW`。网络提交前先落 durable intent；若提交响应丢失，只能用
 Data API 找候选交易并用 Polygon 回执验证，禁止盲目重发。
+
+赎回状态机的每个等待都有上界，避免一条记录永远占用对账豁免：
+
+- `CONFIRMED` 入账失败时区分原因。回执 payout 与 `shares × settlement_price` 不精确相等、settled lot 合计不等于
+  仓位、baseline 残留等证据类失败重试也不会改变，立即转 `MANUAL_REVIEW`；数据库等瞬时失败按 retry interval
+  重试，confirmed_at 超过 `POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT` 后同样转 `MANUAL_REVIEW`。
+- `APPROVAL_SUBMITTED` / `REDEEM_SUBMITTED` 在 relayer 持续返回 pending、没有 tx hash、或回执迟迟不最终化时，
+  自 submitted_at 起超过 ambiguity timeout 即转 `MANUAL_REVIEW`。
+- 进入 `MANUAL_REVIEW` 后该 condition 不再被视为 in-flight，对账会如实报出仓位缺失与余额多出，由人工处理。
 
 ## 必须人工核查
 
@@ -149,11 +160,9 @@ position_lots.status                  = SETTLED_PENDING_REDEEM
 shares / cost_basis                   = 原值保留
 ```
 
-Redeem 的链上提交器目前尚未实现，不能声称已经覆盖 RPC timeout/revert。后续模块必须单独持久化
-`chain_id + wallet + nonce + tx_hash + calldata_hash + receipt_status`：广播结果未知时只能按 nonce/hash
-查 receipt；只有 receipt 明确 reverted/dropped 后才能以相同业务幂等键重试。确认成功后再用一个
-PostgreSQL 事务关闭 shares、记录实际 payout 和 realized PnL。没有 receipt 时绝不能靠 Data API
-仓位消失来猜赎回成功。
+链上提交由 `internal/service/autoredeem` 负责，状态持久化在 `polymarket_redemptions`：广播结果未知时只能按
+Data API 活动与 Polygon receipt 恢复，禁止盲目重发；确认成功后再用一个 PostgreSQL 事务关闭 shares、记录
+实际 payout 和 realized PnL。没有 receipt 时绝不能靠 Data API 仓位消失来猜赎回成功。
 
 ## 生产装配
 

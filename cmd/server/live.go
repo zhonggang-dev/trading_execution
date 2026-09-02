@@ -387,6 +387,10 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	redemptionProgress, err := postgresadapter.NewRedemptionProgressReader(database)
+	if err != nil {
+		return nil, err
+	}
 	reconciliationService, err := reconciliation.New(reconciliation.Params{
 		Orders:                    repository,
 		Venue:                     tradingClient,
@@ -402,6 +406,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		PositionEpsilon:           cfg.Polymarket.PositionEpsilon,
 		BalanceEpsilon:            cfg.Polymarket.BalanceEpsilon,
 		AccountScope:              executionAccountScope,
+		Redemptions:               redemptionProgress,
 	})
 	if err != nil {
 		return nil, err

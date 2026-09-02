@@ -40,8 +40,12 @@ type Params struct {
 	// AccountScope is the live process boundary. Nil preserves isolated unit and
 	// paper-mode behavior; live wiring always supplies the wallet-file scope.
 	AccountScope port.ExecutionAccountScope
-	Now          func() time.Time
-	NewID        func() string
+	// Redemptions exposes in-flight Polymarket redemptions so the window between
+	// the redeem transaction and the ledger application is not recorded as
+	// manual drift. Nil means no redemption is ever in flight.
+	Redemptions port.RedemptionProgressSource
+	Now         func() time.Time
+	NewID       func() string
 }
 
 // Service 表示后端使用的 Service 类型。
@@ -60,6 +64,7 @@ type Service struct {
 	positionEpsilon           domain.Decimal
 	balanceEpsilon            domain.Decimal
 	accountScope              port.ExecutionAccountScope
+	redemptions               port.RedemptionProgressSource
 	now                       func() time.Time
 	newID                     func() string
 }
@@ -131,8 +136,8 @@ func New(params Params) (*Service, error) {
 		ledger:                    params.Ledger, fills: params.Fills, orderRefresher: params.OrderRefresher,
 		recorder: params.Recorder, tradeLookback: params.TradeLookback,
 		positionEpsilon: params.PositionEpsilon, balanceEpsilon: params.BalanceEpsilon,
-		accountScope: params.AccountScope,
-		now:          params.Now, newID: params.NewID,
+		accountScope: params.AccountScope, redemptions: params.Redemptions,
+		now: params.Now, newID: params.NewID,
 	}, nil
 }
 
@@ -175,10 +180,18 @@ func (service *Service) RunAccount(ctx context.Context, params RunAccountParams)
 	scope.scanAfter = applyAccountOwnershipBaseline(scope.scanAfter, balance)
 	evidence, venueErr := state.collectVenueEvidence(ctx, scope, orders)
 	state.reconcileOrders(ctx, reconcileOrdersParams{orders: orders, focusOrderID: scope.focusOrderID, evidence: evidence})
-	positionErr := state.reconcilePositions(ctx, scope.executionAccountID, balance.WalletAddress)
-	balanceErr := state.reconcileBalance(ctx, scope.executionAccountID)
+	// Without the in-flight redemption view a missing settled position or a
+	// payout-sized balance gain cannot be told apart from real drift, so the
+	// asset comparison is skipped for this run rather than risking a permanent
+	// MANUAL_REVIEW issue.
+	redemptionErr := state.loadInFlightRedemptions(ctx, scope.executionAccountID)
+	var positionErr, balanceErr error
+	if redemptionErr == nil {
+		positionErr = state.reconcilePositions(ctx, scope.executionAccountID, balance.WalletAddress)
+		balanceErr = state.reconcileBalance(ctx, scope.executionAccountID)
+	}
 
-	return service.finish(ctx, state, errors.Join(venueErr, positionErr, balanceErr, errors.Join(state.errors...)))
+	return service.finish(ctx, state, errors.Join(venueErr, redemptionErr, positionErr, balanceErr, errors.Join(state.errors...)))
 }
 
 // normalize 去除单账户对账参数中允许出现的首尾空白。
@@ -190,11 +203,12 @@ func (params RunAccountParams) normalize() RunAccountParams {
 
 // runState 表示后端使用的 runState 类型。
 type runState struct {
-	service *Service
-	run     *domain.ReconciliationRun
-	now     time.Time
-	issues  []domain.ReconciliationIssue
-	errors  []error
+	service     *Service
+	run         *domain.ReconciliationRun
+	now         time.Time
+	issues      []domain.ReconciliationIssue
+	errors      []error
+	redemptions inFlightRedemptions
 }
 
 // issue 补全对账问题身份并通过参数构建器持久化到运行结果。
