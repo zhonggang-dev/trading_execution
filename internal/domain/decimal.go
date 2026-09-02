@@ -80,6 +80,24 @@ func (d Decimal) IsMultipleOf(step Decimal) (bool, error) {
 	return new(big.Rat).Quo(value, stepValue).IsInt(), nil
 }
 
+// Scale 返回去掉尾随零后表示当前值所需的小数位数；空值或整数返回 0。
+func (d Decimal) Scale() int {
+	text := strings.TrimRight(strings.TrimSpace(string(d)), "0")
+	if point := strings.IndexByte(text, '.'); point >= 0 {
+		return len(text) - point - 1
+	}
+	return 0
+}
+
+// Canonical 去掉尾随零和多余的小数点，使同一数值只有一种文本表示。
+func (d Decimal) Canonical() Decimal {
+	text := strings.TrimSpace(string(d))
+	if strings.Contains(text, ".") {
+		text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	}
+	return Decimal(text)
+}
+
 // Equal 判断两个值在规范化后是否相等。
 func (d Decimal) Equal(other Decimal) bool {
 	if d.IsEmpty() || other.IsEmpty() {

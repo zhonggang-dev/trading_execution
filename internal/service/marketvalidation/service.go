@@ -192,7 +192,6 @@ func protectedExecutableSize(intent domain.OrderIntent, book domain.OrderBookSna
 		levels = book.Bids
 	}
 	depth := new(big.Rat)
-	scale := 0
 	for _, level := range levels {
 		comparison, err := level.Price.Compare(intent.WorstPrice)
 		if err != nil {
@@ -207,46 +206,38 @@ func protectedExecutableSize(intent domain.OrderIntent, book domain.OrderBookSna
 			return "", reject("LATEST_BOOK_INVALID", "latest orderbook level size is invalid")
 		}
 		depth.Add(depth, size)
-		scale = max(scale, decimalScale(level.Size))
 	}
 	requested, err := intent.Size.Multiply("1")
 	if err != nil || requested.Sign() <= 0 {
 		return "", reject("INVALID_SIZE", "order size is not a positive decimal")
 	}
-	if depth.Sign() <= 0 {
+	// The wire quantity must respect the venue share precision; visible depth
+	// is rounded down so the submitted size never exceeds what was seen.
+	sizeScale := domain.DefaultStrategyExecutionConstraints().SizeDecimalPlaces
+	executable := floorRat(depth, sizeScale)
+	if executable.Sign() <= 0 {
 		return "", reject("NO_PROTECTED_LIQUIDITY", "latest orderbook has no visible liquidity inside the strategy worst_price")
 	}
-	executable := depth
-	if requested.Cmp(depth) < 0 {
+	if requested.Cmp(executable) < 0 {
 		executable = requested
-		scale = decimalScale(intent.Size)
 	}
 	if !book.MinOrderSize.IsEmpty() {
 		minimum, err := book.MinOrderSize.Multiply("1")
 		if err != nil || executable.Cmp(minimum) < 0 {
 			return "", reject("PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE",
 				fmt.Sprintf("only %s shares are executable inside worst_price, below the venue min_order_size %s",
-					executable.FloatString(scale), book.MinOrderSize))
+					executable.FloatString(sizeScale), book.MinOrderSize))
 		}
 	}
-	return canonicalDecimal(executable.FloatString(scale)), nil
+	return domain.Decimal(executable.FloatString(sizeScale)).Canonical(), nil
 }
 
-// decimalScale 计算十进制值所需的小数位数。
-func decimalScale(value domain.Decimal) int {
-	text := strings.TrimRight(strings.TrimSpace(value.String()), "0")
-	if point := strings.IndexByte(text, '.'); point >= 0 {
-		return len(text) - point - 1
-	}
-	return 0
-}
-
-// canonicalDecimal 去掉尾随零，使数量的文本表示与策略输入保持一致。
-func canonicalDecimal(text string) domain.Decimal {
-	if strings.Contains(text, ".") {
-		text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
-	}
-	return domain.Decimal(text)
+// floorRat 将有理数向下取整到指定小数位。
+func floorRat(value *big.Rat, scale int) *big.Rat {
+	multiplier := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+	scaled := new(big.Rat).Mul(value, new(big.Rat).SetInt(multiplier))
+	floored := new(big.Int).Quo(scaled.Num(), scaled.Denom())
+	return new(big.Rat).SetFrac(floored, multiplier)
 }
 
 // requireMarketContext 检查并要求 Market Context 完整。

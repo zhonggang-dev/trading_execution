@@ -577,6 +577,15 @@ func (client *TradingClient) Cancel(ctx context.Context, order domain.Order) (po
 		return observed, nil
 	}
 	var venueError *port.VenueError
+	if canceled && errors.As(getErr, &venueError) && venueError.Code == "CLOB_FILL_DETAILS_UNAVAILABLE" &&
+		observed.State == port.VenueOrderCancelled {
+		// The DELETE confirmed the cancel and the order now reads CANCELED with a
+		// partial size_matched whose trade details are still propagating. As in
+		// PlacePrepared, keep the observed state and let fill reconciliation
+		// retry the exact trades instead of degrading a confirmed cancel to an
+		// unknown outcome.
+		return observed, nil
+	}
 	if canceled && errors.As(getErr, &venueError) && venueError.Code == "CLOB_ORDER_NOT_FOUND" {
 		return port.VenueOrder{
 			ID:         order.VenueOrderID,

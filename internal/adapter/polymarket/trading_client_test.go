@@ -1038,3 +1038,34 @@ func TestTradingClientPostsEmulatedIOCAsShareDenominatedGTC(t *testing.T) {
 		t.Fatalf("posted order = %#v, want GTC 7 shares at 0.50", posted)
 	}
 }
+
+// TestCancelKeepsConfirmedCancelWhilePartialFillDetailsPropagate 验证撤单已确认、部分成交明细尚未可见时，
+// 返回 CANCELLED 观察结果而不是把确认的撤单降级为未知结果；模拟 IOC 的残单撤销依赖这一点。
+func TestCancelKeepsConfirmedCancelWhilePartialFillDetailsPropagate(t *testing.T) {
+	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodDelete && request.URL.Path == "/order":
+			writeTestJSON(writer, map[string]any{"canceled": []string{"0xvenue"}, "not_canceled": map[string]string{}})
+		case request.Method == http.MethodGet && request.URL.Path == "/data/order/0xvenue":
+			writeTestJSON(writer, map[string]any{
+				"id": "0xvenue", "status": "CANCELED", "original_size": "10000000", "size_matched": "4000000",
+			})
+		case request.Method == http.MethodGet && request.URL.Path == "/data/trades":
+			writeTestJSON(writer, []map[string]any{})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	client := newTestTradingClient(t, server.URL, now)
+	order := adapterOrder()
+	order.VenueOrderID = "0xvenue"
+	venueOrder, err := client.Cancel(context.Background(), order)
+	if err != nil {
+		t.Fatalf("Cancel() error = %v", err)
+	}
+	if venueOrder.State != port.VenueOrderCancelled || venueOrder.FilledSize != "4" {
+		t.Fatalf("Cancel() = %#v, want CANCELLED with the observed partial fill", venueOrder)
+	}
+}

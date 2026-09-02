@@ -328,3 +328,18 @@ func TestValidateIOCSellMeasuresBidDepthAndFOKLeavesExecutableSizeEmpty(t *testi
 		t.Fatalf("SELL IOC Validate() = %#v, err = %v, want 7 executable shares at or above worst_price", validation, err)
 	}
 }
+
+// TestValidateFloorsIOCExecutableSizeToVenueSharePrecision 验证可成交量向下取整到 2 位小数，
+// 提交数量不会超过所见深度，也不会因精度被交易所拒绝。
+func TestValidateFloorsIOCExecutableSizeToVenueSharePrecision(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	intent.TimeInForce = domain.TimeInForceIOC
+	intent.Size = "42"
+	book.Asks = []domain.PriceLevel{{Price: "0.51", Size: "12.505"}, {Price: "0.52", Size: "0.009"}, {Price: "0.53", Size: "100"}}
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil || validation.ExecutableSize != "12.51" {
+		t.Fatalf("Validate() = %#v, err = %v, want 12.514 floored to 12.51", validation, err)
+	}
+}

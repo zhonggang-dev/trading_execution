@@ -37,7 +37,7 @@ Python Strategy / SUBMIT
 - LIMIT 的实际 `price` 使用 `worst_price`，避免订单在校验与发送之间失去价格保护；
 - MARKET 订单也必须带 `worst_price`，供后续真实 Venue adapter 做保护型 FOK/FAK 转换；
 - `size` 是股数上限，`worst_price` 是价格上限，二者都不是资金预算。IOC intent（Kalshi 全部订单、
-  Polymarket 全部 BUY）在校验时用最新盘口测量保护价内可成交的量：`executable_size = min(size, 保护价内可见深度)`，
+  Polymarket 全部 BUY）在校验时用最新盘口测量保护价内可成交的量：`executable_size = min(size, 保护价内可见深度)`（深度按 venue 的 2 位 shares 精度向下取整），
   记入 `LIVE_CHECK` 证据并作为 adapter 提交的数量；保护价内深度不足 `size` 不拒单，按能成交的量下单，
   剩余立即取消。唯一下限是 venue `min_order_size`：可成交量低于它时以
   `PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE` fail closed。Polymarket 的 IOC 由执行层用 GTC 限价单加

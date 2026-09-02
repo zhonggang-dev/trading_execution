@@ -1378,7 +1378,7 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		"market_source":            string(prediction.MarketSource.Normalize()),
 		"outcome_id":               prediction.Outcomes[outcomeIndex].OutcomeID,
 	}
-	executionTimeInForce := executionTimeInForce(order.TimeInForce, domain.SideBuy, prediction.MarketSource)
+	executionTimeInForce := venueTimeInForce(order.TimeInForce, domain.SideBuy, prediction.MarketSource)
 	if executionTimeInForce != order.TimeInForce {
 		metadata["strategy_time_in_force"] = string(order.TimeInForce)
 		metadata["execution_time_in_force"] = string(executionTimeInForce)
@@ -1464,7 +1464,7 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 		"model_id":                 request.Context.ModelID,
 		"execution_account_id":     request.Context.ExecutionAccountID,
 	}
-	executionTimeInForce := executionTimeInForce(exit.Order.TimeInForce, domain.SideSell, lot.MarketSource)
+	executionTimeInForce := venueTimeInForce(exit.Order.TimeInForce, domain.SideSell, lot.MarketSource)
 	if executionTimeInForce != exit.Order.TimeInForce {
 		metadata["strategy_time_in_force"] = string(exit.Order.TimeInForce)
 		metadata["execution_time_in_force"] = string(executionTimeInForce)
@@ -1564,7 +1564,7 @@ func validateStrategyOrderForMarket(
 	if err != nil {
 		return fmt.Errorf("calculate effective %s shares: %w", side, err)
 	}
-	if executionTimeInForce(order.TimeInForce, side, marketSource) == domain.TimeInForceIOC {
+	if venueTimeInForce(order.TimeInForce, side, marketSource) == domain.TimeInForceIOC {
 		// IOC takes whatever is inside worst_price and cancels the rest, so the
 		// frozen snapshot only has to show some executable depth. The live
 		// validator re-measures that depth on the fresh book before placement.
@@ -1590,7 +1590,7 @@ func validateStrategyOrderForMarket(
 	return nil
 }
 
-// executionTimeInForce maps the strategy protocol time_in_force to what the
+// venueTimeInForce maps the strategy protocol time_in_force to what the
 // venue actually executes. Kalshi orders are native IOC. Polymarket BUY entries
 // are IOC as well: the CLOB's FOK/FAK BUY is a collateral budget that buys more
 // than size shares whenever the book is better than worst_price, whereas the
@@ -1598,7 +1598,7 @@ func validateStrategyOrderForMarket(
 // cancel of the remainder) buys at most size shares and pays what they cost
 // inside the limit. SELL keeps the strategy value unless the strategy itself
 // asks for IOC.
-func executionTimeInForce(strategy domain.TimeInForce, side domain.Side, marketSource domain.MarketSource) domain.TimeInForce {
+func venueTimeInForce(strategy domain.TimeInForce, side domain.Side, marketSource domain.MarketSource) domain.TimeInForce {
 	if marketSource.Normalize() == domain.MarketSourceKalshi || side == domain.SideBuy {
 		return domain.TimeInForceIOC
 	}
