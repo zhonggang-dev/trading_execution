@@ -32,6 +32,35 @@ type rawAmounts struct {
 	Side        uint8
 }
 
+// placementIntent derives the wire intent that is signed. The persisted
+// OrderIntent keeps the strategy-requested size for audit, reservation, and
+// fill accounting. An emulated IOC caps the wire quantity to the depth the
+// market validation saw inside worst_price, mirroring the Kalshi IOC cap, so
+// the resting remainder that must be cancelled afterwards stays minimal. The
+// price stays worst_price: a GTC limit is share-denominated, so the exchange
+// fills at most size shares and returns any price improvement as lower cost.
+func placementIntent(order domain.Order) (domain.OrderIntent, error) {
+	intent := order.Intent.Normalize()
+	if intent.TimeInForce != domain.TimeInForceIOC || order.MarketValidation == nil ||
+		order.MarketValidation.ExecutableSize.IsEmpty() {
+		return intent, nil
+	}
+	validation := *order.MarketValidation
+	if sign, err := validation.ExecutableSize.Sign(); err != nil || sign <= 0 {
+		return domain.OrderIntent{}, newInvalidError("EXECUTABLE_SIZE_INVALID", "market validation executable_size is not a positive decimal")
+	}
+	if comparison, err := validation.ExecutableSize.Compare(intent.Size); err != nil || comparison > 0 {
+		return domain.OrderIntent{}, newInvalidError("EXECUTABLE_SIZE_INVALID", "market validation executable_size exceeds the strategy requested size")
+	}
+	if !validation.MinOrderSize.IsEmpty() {
+		if comparison, err := validation.ExecutableSize.Compare(validation.MinOrderSize); err != nil || comparison < 0 {
+			return domain.OrderIntent{}, newInvalidError("MIN_ORDER_SIZE", "market validation executable_size is below min_order_size")
+		}
+	}
+	intent.Size = validation.ExecutableSize
+	return intent, nil
+}
+
 // buildRawAmounts 根据参数构建 原始数据 Amounts。
 func buildRawAmounts(intent domain.OrderIntent, tickSize, minOrderSize, minBuyNotional domain.Decimal) (rawAmounts, error) {
 	config, exists := roundingByTick[canonicalDecimal(tickSize)]

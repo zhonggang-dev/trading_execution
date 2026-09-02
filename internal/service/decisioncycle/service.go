@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1152,9 +1153,20 @@ func validateExecutionConstraints(constraints domain.StrategyExecutionConstraint
 	if constraints.SizeUnit != "SHARES" || constraints.SizeDecimalPlaces != 2 || constraints.BuyNotionalDecimals != 4 ||
 		constraints.PriceProtectionPolicy != domain.StrategyPriceProtectionDepthAwareLimit ||
 		constraints.MaxPriceSlippageTicks < 1 || constraints.MaxPriceSlippageTicks > domain.DefaultStrategyMaxPriceSlippageTicks ||
-		len(constraints.AllowedTimeInForce) != 1 ||
-		constraints.AllowedTimeInForce[0] != domain.TimeInForceFOK {
+		len(constraints.AllowedTimeInForce) == 0 || len(constraints.AllowedTimeInForce) > 2 {
 		return fmt.Errorf("unsupported strategy execution constraint set")
+	}
+	// Frozen inputs from before the IOC rollout carry ["FOK"]; current inputs
+	// carry ["IOC","FOK"]. Both are valid whitelists of the same two values.
+	seenTimeInForce := make(map[domain.TimeInForce]struct{}, len(constraints.AllowedTimeInForce))
+	for _, timeInForce := range constraints.AllowedTimeInForce {
+		if timeInForce != domain.TimeInForceFOK && timeInForce != domain.TimeInForceIOC {
+			return fmt.Errorf("unsupported strategy execution constraint set")
+		}
+		if _, duplicate := seenTimeInForce[timeInForce]; duplicate {
+			return fmt.Errorf("unsupported strategy execution constraint set")
+		}
+		seenTimeInForce[timeInForce] = struct{}{}
 	}
 	if sign, err := constraints.MinimumBuyNotional.Sign(); err != nil || sign <= 0 {
 		return fmt.Errorf("minimum_buy_notional must be positive")
@@ -1366,9 +1378,8 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		"market_source":            string(prediction.MarketSource.Normalize()),
 		"outcome_id":               prediction.Outcomes[outcomeIndex].OutcomeID,
 	}
-	executionTimeInForce := order.TimeInForce
-	if prediction.MarketSource.Normalize() == domain.MarketSourceKalshi {
-		executionTimeInForce = domain.TimeInForceIOC
+	executionTimeInForce := venueTimeInForce(order.TimeInForce, domain.SideBuy, prediction.MarketSource)
+	if executionTimeInForce != order.TimeInForce {
 		metadata["strategy_time_in_force"] = string(order.TimeInForce)
 		metadata["execution_time_in_force"] = string(executionTimeInForce)
 	}
@@ -1453,9 +1464,8 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 		"model_id":                 request.Context.ModelID,
 		"execution_account_id":     request.Context.ExecutionAccountID,
 	}
-	executionTimeInForce := exit.Order.TimeInForce
-	if lot.MarketSource.Normalize() == domain.MarketSourceKalshi {
-		executionTimeInForce = domain.TimeInForceIOC
+	executionTimeInForce := venueTimeInForce(exit.Order.TimeInForce, domain.SideSell, lot.MarketSource)
+	if executionTimeInForce != exit.Order.TimeInForce {
 		metadata["strategy_time_in_force"] = string(exit.Order.TimeInForce)
 		metadata["execution_time_in_force"] = string(executionTimeInForce)
 	}
@@ -1510,8 +1520,12 @@ func validateStrategyOrderForMarket(
 	constraints domain.StrategyExecutionConstraints,
 	marketSource domain.MarketSource,
 ) error {
-	if order.Side != side || order.Type != domain.OrderTypeLimit || order.TimeInForce != domain.TimeInForceFOK || order.ExpiresAt != nil {
-		return fmt.Errorf("order must be a %s LIMIT FOK without expires_at", side)
+	if order.Side != side || order.Type != domain.OrderTypeLimit || order.ExpiresAt != nil ||
+		(order.TimeInForce != domain.TimeInForceFOK && order.TimeInForce != domain.TimeInForceIOC) {
+		return fmt.Errorf("order must be a %s LIMIT FOK or IOC without expires_at", side)
+	}
+	if !slices.Contains(constraints.AllowedTimeInForce, order.TimeInForce) {
+		return fmt.Errorf("order.time_in_force %s is not in allowed_time_in_force", order.TimeInForce)
 	}
 	if sign, err := order.Size.Sign(); err != nil || sign <= 0 {
 		return fmt.Errorf("order.size must be positive shares")
@@ -1550,7 +1564,10 @@ func validateStrategyOrderForMarket(
 	if err != nil {
 		return fmt.Errorf("calculate effective %s shares: %w", side, err)
 	}
-	if marketSource.Normalize() == domain.MarketSourceKalshi {
+	if venueTimeInForce(order.TimeInForce, side, marketSource) == domain.TimeInForceIOC {
+		// IOC takes whatever is inside worst_price and cancels the rest, so the
+		// frozen snapshot only has to show some executable depth. The live
+		// validator re-measures that depth on the fresh book before placement.
 		if availableShares.Sign() <= 0 {
 			return fmt.Errorf("%s order has no protected-price liquidity", side)
 		}
@@ -1571,6 +1588,21 @@ func validateStrategyOrderForMarket(
 		}
 	}
 	return nil
+}
+
+// venueTimeInForce maps the strategy protocol time_in_force to what the
+// venue actually executes. Kalshi orders are native IOC. Polymarket BUY entries
+// are IOC as well: the CLOB's FOK/FAK BUY is a collateral budget that buys more
+// than size shares whenever the book is better than worst_price, whereas the
+// emulated IOC (share-denominated GTC limit at worst_price plus an immediate
+// cancel of the remainder) buys at most size shares and pays what they cost
+// inside the limit. SELL keeps the strategy value unless the strategy itself
+// asks for IOC.
+func venueTimeInForce(strategy domain.TimeInForce, side domain.Side, marketSource domain.MarketSource) domain.TimeInForce {
+	if marketSource.Normalize() == domain.MarketSourceKalshi || side == domain.SideBuy {
+		return domain.TimeInForceIOC
+	}
+	return strategy
 }
 
 // validateStrategyProtectedPrice validates only the strategy's explicit limit

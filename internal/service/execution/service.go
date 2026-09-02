@@ -329,6 +329,9 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 			return SubmitResult{Order: stored, Created: created}, errors.Join(err, unknownErr, uncertainErr)
 		}
 	}
+	if completed, acted, err := service.completeEmulatedIOC(ctx, stored, venueOrder); acted {
+		return SubmitResult{Order: completed, Created: created}, err
+	}
 	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &stored, venueOrder)
 	if syncErr != nil {
 		if stored.Status == domain.OrderStatusCancelled {
@@ -360,6 +363,48 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 	return SubmitResult{Order: stored, Created: created}, nil
 }
 
+// emulatesImmediateOrCancel reports whether this order's IOC semantics must be
+// completed by execution itself because the venue has no native IOC type.
+func (service *Service) emulatesImmediateOrCancel(order domain.Order) bool {
+	if order.Intent.TimeInForce != domain.TimeInForceIOC {
+		return false
+	}
+	support, ok := service.venue.(port.TimeInForceSupport)
+	return ok && !support.SupportsTimeInForce(domain.TimeInForceIOC)
+}
+
+// restingVenueState reports venue observations in which part of the order is
+// still open on the book and could match later.
+func restingVenueState(state port.VenueOrderState) bool {
+	return state == port.VenueOrderAcknowledged || state == port.VenueOrderLive || state == port.VenueOrderPartiallyFilled
+}
+
+// completeEmulatedIOC finishes an emulated IOC. The venue accepted a
+// share-denominated resting limit at worst_price and matched whatever was
+// immediately available inside that price. If the fresh venue observation still
+// shows a resting remainder, it is cancelled at once through the regular cancel
+// path, which also performs the authoritative fill synchronization; partial
+// fills then settle as PARTIALLY_FILLED -> CANCELLED exactly like a native IOC
+// and the unfilled reservation is released after fill finality. The cancel is
+// issued before any fill-evidence wait so pending CLOB trade details can never
+// leave the remainder on the book. The boolean reports whether the caller's
+// own post-observation handling was replaced by the cancel flow.
+func (service *Service) completeEmulatedIOC(ctx context.Context, order domain.Order, observed port.VenueOrder) (domain.Order, bool, error) {
+	if !service.emulatesImmediateOrCancel(order) || !restingVenueState(observed.State) {
+		return order, false, nil
+	}
+	switch order.Status {
+	case domain.OrderStatusAcknowledged, domain.OrderStatusLive, domain.OrderStatusPartiallyFilled:
+	default:
+		return order, false, nil
+	}
+	cancelled, err := service.Cancel(ctx, order.ID)
+	if err != nil {
+		return cancelled, true, fmt.Errorf("cancel emulated IOC remainder: %w", err)
+	}
+	return cancelled, true, nil
+}
+
 func entrySubmissionDisabledError() *port.Rejection {
 	return &port.Rejection{
 		Code:   domain.StrategyEntryBlockSubmissionDisabled,
@@ -379,9 +424,11 @@ func executionIntentReplayEquivalent(stored, proposed domain.OrderIntent) bool {
 	}
 	stored = stored.Normalize()
 	proposed = proposed.Normalize()
-	if stored.MarketSource.Normalize() != domain.MarketSourceKalshi ||
-		proposed.MarketSource.Normalize() != domain.MarketSourceKalshi ||
-		stored.Venue != "kalshi" || proposed.Venue != "kalshi" ||
+	// The same directional rollout applies to every venue whose strategy FOK
+	// is executed as IOC: Kalshi natively, Polymarket through the emulated
+	// GTC-plus-cancel path.
+	if stored.MarketSource.Normalize() != proposed.MarketSource.Normalize() ||
+		stored.Venue == "" || stored.Venue != proposed.Venue ||
 		stored.Type != domain.OrderTypeLimit || proposed.Type != domain.OrderTypeLimit ||
 		stored.TimeInForce != domain.TimeInForceFOK || proposed.TimeInForce != domain.TimeInForceIOC ||
 		proposed.Metadata["strategy_time_in_force"] != string(domain.TimeInForceFOK) ||
@@ -629,6 +676,11 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 	if err := service.finishAttempt(ctx, &order, &attempt, target, domain.TransitionTriggerReconciliation, venueOrder, "", nil); err != nil {
 		_ = service.reservations.MarkUncertain(ctx, order, "RECONCILE_PERSIST_FAILED: "+err.Error())
 		return order, err
+	}
+	// A crash between placement and the emulated cancel can leave a GTC
+	// remainder resting; recovery completes the IOC instead of letting it rest.
+	if completed, acted, err := service.completeEmulatedIOC(ctx, order, venueOrder); acted {
+		return completed, err
 	}
 	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &order, venueOrder)
 	if syncErr != nil {

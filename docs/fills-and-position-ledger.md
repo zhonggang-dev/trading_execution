@@ -91,7 +91,10 @@ zero builder 时 `builder_fee=0`、`platform_fee=total_fee`；非零 builder 只
 
 当前成本法是加权平均成本法：
 
-- BUY：批次成本包含实际 BUY fee，增加 `shares` 和 `cost_basis`；
+- BUY：批次成本包含实际 BUY fee，增加 `shares` 和 `cost_basis`；批次 `average_entry_price` 是
+  `gross_notional ÷ shares`（权威成交总额除以权威成交股数）的完整 numeric 精度，不是 CLOB 两位小数的
+  展示价，也不四舍五入；它原样进入策略输入 `positions[].entry_price` 和退出输入 `trades[].entry_price`。
+  `migrations/0022_lot_entry_price_from_fill_notional.sql` 按同一公式回填仍未 CLOSED 的托管批次；
 - SELL：按卖出前总仓位的比例，从所有开放批次等比例减少 shares 与成本；
 - 已实现盈亏：`SELL 净收入 - 分摊成本`；
 - 未实现盈亏：有新鲜 mark 时为 `mark_price × remaining_shares - remaining_cost_basis`；

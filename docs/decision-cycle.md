@@ -77,7 +77,7 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
     "size_decimal_places": 2,
     "buy_notional_decimal_places": 4,
     "minimum_buy_notional": "1",
-    "allowed_time_in_force": ["FOK"],
+    "allowed_time_in_force": ["IOC", "FOK"],
     "price_protection_policy": "DEPTH_AWARE_LIMIT",
     "max_price_slippage_ticks": 2
   }
@@ -88,12 +88,16 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 转为整数 shares，然后使用转换后的数量执行最小下单量、保护价卖盘流动性、BUY notional 精度和风控校验。
 如果数量发生变化，原始值会记录在 intent metadata 的 `strategy_requested_size`。
 
+`size` 是股数上限，`worst_price` 是能接受的最差价，两者都不是资金预算。BUY 从 best ask 往上吃，
+吃满 `size` 股停，价格不超过 `worst_price`，花多少算多少；`worst_price` 高于 best ask 的差值是给价格留容错，
+不是给钱留额度。例如 `size=42`、`worst_price=0.29`、`best_ask=0.24` 应买到 42 股、花约 10.5 pUSD，
+而不是拿 `42×0.29=12.18` 当预算扫成 50.75 股。
+
 对于 Polymarket，`DEPTH_AWARE_LIMIT` 允许策略把 `worst_price` 设在同轮盘口最优价到更差最多
-`max_price_slippage_ticks`（当前为 2）个 tick 的范围内。BUY 必须满足
-`best_ask <= worst_price <= best_ask + 2*tick_size`，并由所有
-`ask.price <= worst_price` 的可见档位累计覆盖 FOK shares；SELL 必须满足
-`best_bid - 2*tick_size <= worst_price <= best_bid`，并由所有
-`bid.price >= worst_price` 的可见档位累计覆盖 FOK shares。保护价必须是
+`max_price_slippage_ticks`（当前为 2）个 tick 的范围内。BUY 必须满足 `best_ask <= worst_price`，
+且所有 `ask.price <= worst_price` 的可见档位至少有正数深度；保护价内深度不足 `size` 时不拒单，
+按能买到的量成交，其余立即取消（见下文 IOC）。SELL 必须满足 `best_bid - 2*tick_size <= worst_price <= best_bid`，
+并由所有 `bid.price >= worst_price` 的可见档位累计覆盖 FOK shares。保护价必须是
 `tick_size` 的整数倍；执行时仍以 `worst_price` 作为限价，不允许无限追价。
 
 Kalshi 盘口可能跳过中间 tick，因此不套用固定的两 tick 距离上限。策略仍必须基于冻结快照给出明确的
@@ -124,7 +128,8 @@ prob 和盘口，但使用不同 `strategy_id`、`execution_account_id`、`cycle
 某个模型当轮没有 Market 时仍调用对应 binding，因为该钱包可能还有需要退出的 OPEN lots；
 严格覆盖模式会关闭整个周期的 entry intent 构建并把该轮标记为失败，不会把这种不完整矩阵视为健康。
 运行日志会逐 binding 记录上游模型和 prediction count，空预测不再与“未调用”混淆。
-`positions` 按开仓批次发送当前 binding 的全部 OPEN lot，不按 token 聚合。`orderbooks` 覆盖
+`positions` 按开仓批次发送当前 binding 的全部 OPEN lot，不按 token 聚合；`entry_price` 是开仓成交
+`gross_notional ÷ shares` 的完整精度，不是两位小数的 CLOB 展示价。`orderbooks` 覆盖
 prediction 和 position 的 token 并固定请求 top 15，每侧返回实际存在的最多 15 档；价格和数量必须使用 JSON string decimal。
 Trading 不再抓取或发送 `mid_price_histories`。`multfactor_v2` 计算 MOM/MACD 所需的历史由策略服务
 直接读取对应 venue 的官方 prices-history。
@@ -134,11 +139,16 @@ Trading 不再抓取或发送 `mid_price_histories`。`multfactor_v2` 计算 MOM
 ## 策略输出
 
 策略必须原样回显可信 `context`，并为每个 `(prediction_id, token_id)` 返回一条买入 `SKIP` 或 `SUBMIT`
-evaluation；按手卖出通过 `exits[].lot_id` 返回。entry 和 exit 都只能使用 `LIMIT + FOK`。
-这个 FOK 是 Python 策略协议的稳定值：Trading 为新的 Kalshi 订单构建执行 intent 时会转成
-`LIMIT + IOC`，在 `worst_price` 内立即成交当时可获得的数量，剩余数量由 Kalshi 立即取消。
-Polymarket 仍按策略返回的 FOK 执行。已经冻结持久化的历史 Kalshi FOK delivery 保留原语义恢复，
-不会在重启或重放时被改成 IOC。
+evaluation；按手卖出通过 `exits[].lot_id` 返回。entry 和 exit 只能使用 `LIMIT`，
+`time_in_force` 必须在 `execution_constraints.allowed_time_in_force`（当前 `["IOC","FOK"]`）内。
+Trading 构建执行 intent 时把 Kalshi 订单和所有 Polymarket BUY 转成 `LIMIT + IOC`：在 `worst_price`
+内立即成交当时可获得的数量，剩余数量立即取消；原始值记录在 metadata `strategy_time_in_force` /
+`execution_time_in_force`。Kalshi 原生支持 IOC。Polymarket CLOB 没有 IOC，而它的 FOK/FAK BUY 是
+按 pUSD 预算成交的（预算会在限价内全部花完，盘口好于保护价时买到的 shares 多于 `size`），因此
+Polymarket 的 IOC 由执行层模拟：签一张按股数计的 GTC 限价单（限价 `worst_price`，数量为最新盘口在
+保护价内可成交的量且不超过 `size`），下单响应返回后立刻撤掉未成交部分。这保证最多买 `size` 股、
+价差体现为少花钱；剩余部分在盘口上只停留一次请求往返。Polymarket SELL 保持策略返回的 FOK。
+已经冻结持久化的历史 FOK delivery 保留原语义恢复，不会在重启或重放时被改成 IOC。
 完整 HTTP 请求、响应字段、业务校验和错误码见
 [`python-algorithm-http-api.md`](python-algorithm-http-api.md)。Trading Execution 根据 `SUBMIT` 的订单
 参数生成内部 `OrderIntent`；venue 和 `client_order_id` 不由策略服务指定。

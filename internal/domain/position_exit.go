@@ -103,16 +103,7 @@ func addDecimals(left, right Decimal) (Decimal, error) {
 		return "", err
 	}
 	value := leftRat.Add(leftRat, rightRat)
-	return Decimal(value.FloatString(max(decimalScale(left), decimalScale(right)))), nil
-}
-
-// decimalScale 计算十进制值所需的小数位数。
-func decimalScale(value Decimal) int {
-	text := strings.TrimRight(strings.TrimSpace(value.String()), "0")
-	if point := strings.IndexByte(text, '.'); point >= 0 {
-		return len(text) - point - 1
-	}
-	return 0
+	return Decimal(value.FloatString(max(left.Scale(), right.Scale()))), nil
 }
 
 // PositionExitMarketData 表示后端使用的 PositionExitMarketData 类型。

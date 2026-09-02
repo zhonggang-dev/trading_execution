@@ -188,7 +188,7 @@ func TestValidateStrategyOrderRejectsBuyThatRoundsToZero(t *testing.T) {
 }
 
 // TestValidateStrategyOrderRejectsRoundedBuyBeyondBestAskLiquidity 验证向上取整不会超过保护价的可见卖盘数量。
-func TestValidateStrategyOrderRejectsRoundedBuyBeyondBestAskLiquidity(t *testing.T) {
+func TestValidateStrategyOrderAllowsRoundedBuyBeyondBestAskLiquidityAsIOC(t *testing.T) {
 	order := domain.StrategyOrderParams{
 		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.501", Size: "19.96", TimeInForce: domain.TimeInForceFOK,
 	}
@@ -196,11 +196,21 @@ func TestValidateStrategyOrderRejectsRoundedBuyBeyondBestAskLiquidity(t *testing
 		TickSize: "0.001",
 		Asks:     []domain.PriceLevel{{Price: "0.501", Size: "19.99"}},
 	}
+	// Polymarket BUY executes as IOC: the visible 19.99 shares fill and the
+	// remainder is cancelled, so a snapshot shortfall is not a rejection.
+	if err := validateStrategyOrderForMarket(
+		order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourcePolymarket,
+	); err != nil {
+		t.Fatalf("validateStrategyOrder() error = %v", err)
+	}
+	book.Asks = []domain.PriceLevel{{Price: "0.502", Size: "19.99"}}
+	order.WorstPrice = "0.502"
+	book.Asks[0].Price = "0.503"
 	err := validateStrategyOrderForMarket(
 		order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourcePolymarket,
 	)
-	if err == nil || err.Error() != "BUY order.size exceeds protected-price liquidity" {
-		t.Fatalf("validateStrategyOrder() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "best ask") {
+		t.Fatalf("unmarketable BUY error = %v", err)
 	}
 }
 
@@ -254,7 +264,8 @@ func TestValidateStrategyOrderRejectsBuyNotionalBeyondFourDecimals(t *testing.T)
 func TestDefaultStrategyExecutionConstraintsUseDepthAwareLimit(t *testing.T) {
 	constraints := domain.DefaultStrategyExecutionConstraints()
 	if constraints.PriceProtectionPolicy != domain.StrategyPriceProtectionDepthAwareLimit ||
-		constraints.MaxPriceSlippageTicks != 2 {
+		constraints.MaxPriceSlippageTicks != 2 || len(constraints.AllowedTimeInForce) != 2 ||
+		constraints.AllowedTimeInForce[0] != domain.TimeInForceIOC || constraints.AllowedTimeInForce[1] != domain.TimeInForceFOK {
 		t.Fatalf("default execution constraints = %#v", constraints)
 	}
 	if err := validateExecutionConstraints(constraints); err != nil {
@@ -349,10 +360,25 @@ func TestValidateStrategyOrderAllowsKalshiPartialIOCDepth(t *testing.T) {
 	); err != nil {
 		t.Fatalf("validateStrategyOrderForMarket() error = %v", err)
 	}
+	// Polymarket BUY entries are IOC too, so partial protected depth is enough.
 	if err := validateStrategyOrderForMarket(
 		order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourcePolymarket,
+	); err != nil {
+		t.Fatalf("Polymarket partial-depth BUY validation error = %v", err)
+	}
+	// A Polymarket SELL keeps the strategy FOK and therefore still needs the
+	// frozen bids to cover the whole quantity.
+	sell := domain.StrategyOrderParams{
+		Side: domain.SideSell, Type: domain.OrderTypeLimit, WorstPrice: "0.38", Size: "30", TimeInForce: domain.TimeInForceFOK,
+	}
+	sellBook := domain.OrderBookSnapshot{
+		TickSize: "0.01", MinOrderSize: "1",
+		Bids: []domain.PriceLevel{{Price: "0.39", Size: "7.73"}, {Price: "0.38", Size: "15"}, {Price: "0.37", Size: "50"}},
+	}
+	if err := validateStrategyOrderForMarket(
+		sell, domain.SideSell, sellBook, domain.DefaultStrategyExecutionConstraints(), domain.MarketSourcePolymarket,
 	); err == nil || !strings.Contains(err.Error(), "protected-price liquidity") {
-		t.Fatalf("Polymarket full-depth validation error = %v", err)
+		t.Fatalf("Polymarket SELL FOK full-depth validation error = %v", err)
 	}
 }
 
@@ -402,7 +428,7 @@ func TestValidateStrategyOrderRejectsUnmarketableOrOffTickBuy(t *testing.T) {
 	}
 }
 
-func TestValidateStrategyOrderRejectsBuyBeyondProtectedDepth(t *testing.T) {
+func TestValidateStrategyOrderAllowsBuyBeyondProtectedDepthAsIOCPartial(t *testing.T) {
 	order := domain.StrategyOrderParams{
 		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.52", Size: "11", TimeInForce: domain.TimeInForceFOK,
 	}
@@ -414,9 +440,56 @@ func TestValidateStrategyOrderRejectsBuyBeyondProtectedDepth(t *testing.T) {
 			{Price: "0.53", Size: "100"},
 		},
 	}
-	err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints())
-	if err == nil || err.Error() != "BUY order.size exceeds protected-price liquidity" {
+	// 10 of 11 shares are inside worst_price; IOC takes them and cancels the rest.
+	if err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints()); err != nil {
 		t.Fatalf("validateStrategyOrder() error = %v", err)
+	}
+}
+
+// TestValidateStrategyOrderAcceptsExplicitIOCFromStrategy 验证白名单加入 IOC 后策略可直接返回 IOC。
+func TestValidateStrategyOrderAcceptsExplicitIOCFromStrategy(t *testing.T) {
+	order := domain.StrategyOrderParams{
+		Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.52", Size: "11", TimeInForce: domain.TimeInForceIOC,
+	}
+	book := domain.OrderBookSnapshot{TickSize: "0.01", Asks: []domain.PriceLevel{{Price: "0.50", Size: "4"}}}
+	if err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints()); err != nil {
+		t.Fatalf("IOC validateStrategyOrder() error = %v", err)
+	}
+	legacy := domain.DefaultStrategyExecutionConstraints()
+	legacy.AllowedTimeInForce = []domain.TimeInForce{domain.TimeInForceFOK}
+	if err := validateStrategyOrder(order, domain.SideBuy, book, legacy); err == nil || !strings.Contains(err.Error(), "allowed_time_in_force") {
+		t.Fatalf("IOC against a FOK-only whitelist error = %v", err)
+	}
+	order.TimeInForce = domain.TimeInForceFAK
+	if err := validateStrategyOrder(order, domain.SideBuy, book, domain.DefaultStrategyExecutionConstraints()); err == nil {
+		t.Fatal("FAK strategy order was accepted")
+	}
+}
+
+// TestValidateExecutionConstraintsAcceptsRolloutWhitelists 验证冻结的 ["FOK"] 与当前 ["IOC","FOK"] 都合法。
+func TestValidateExecutionConstraintsAcceptsRolloutWhitelists(t *testing.T) {
+	for _, allowed := range [][]domain.TimeInForce{
+		{domain.TimeInForceFOK},
+		{domain.TimeInForceIOC, domain.TimeInForceFOK},
+		{domain.TimeInForceIOC},
+	} {
+		constraints := domain.DefaultStrategyExecutionConstraints()
+		constraints.AllowedTimeInForce = allowed
+		if err := validateExecutionConstraints(constraints); err != nil {
+			t.Fatalf("validateExecutionConstraints(%v) error = %v", allowed, err)
+		}
+	}
+	for _, allowed := range [][]domain.TimeInForce{
+		{},
+		{domain.TimeInForceFAK},
+		{domain.TimeInForceFOK, domain.TimeInForceFOK},
+		{domain.TimeInForceIOC, domain.TimeInForceFOK, domain.TimeInForceGTC},
+	} {
+		constraints := domain.DefaultStrategyExecutionConstraints()
+		constraints.AllowedTimeInForce = allowed
+		if err := validateExecutionConstraints(constraints); err == nil {
+			t.Fatalf("validateExecutionConstraints(%v) accepted an invalid whitelist", allowed)
+		}
 	}
 }
 
@@ -486,5 +559,54 @@ func TestValidateStrategyOrderRejectsSellBeyondProtectedDepth(t *testing.T) {
 	err := validateStrategyOrder(order, domain.SideSell, book, domain.DefaultStrategyExecutionConstraints())
 	if err == nil || !strings.Contains(err.Error(), "SELL order.size exceeds protected-price liquidity") {
 		t.Fatalf("validateStrategyOrder() error = %v", err)
+	}
+}
+
+// TestBuildEntryIntentExecutesPolymarketBuyAsIOC 验证 Polymarket BUY 的执行 intent 为 IOC，
+// 并记录协议 FOK 与执行 IOC 的映射。
+func TestBuildEntryIntentExecutesPolymarketBuyAsIOC(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	request := domain.StrategyDecisionRequest{
+		CycleID: "cycle-ioc-buy",
+		Context: domain.StrategyExecutionContext{
+			ModelID: "model-1", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-1",
+		},
+		DecisionAt:  decisionAt,
+		Predictions: []domain.Prediction{prediction},
+		OrderBooks: []domain.OrderBookSnapshot{{
+			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID, OutcomeIndex: 0,
+			TokenID: prediction.Outcomes[0].TokenID, Status: domain.OrderBookStatusOK,
+			SourceAt: decisionAt, MinOrderSize: "5", TickSize: "0.01",
+			// Only 30 of the 42 requested shares are inside worst_price: IOC
+			// takes them and cancels the remainder instead of rejecting.
+			Asks: []domain.PriceLevel{{Price: "0.24", Size: "30"}, {Price: "0.30", Size: "500"}},
+		}},
+		ExecutionConstraints: domain.DefaultStrategyExecutionConstraints(),
+	}
+	evaluation := domain.StrategyEvaluation{
+		DecisionID: "decision-ioc-buy", PredictionID: prediction.PredictionID,
+		MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+		OutcomeIndex: 0, TokenID: prediction.Outcomes[0].TokenID,
+		Order: &domain.StrategyOrderParams{
+			Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.29", Size: "42", TimeInForce: domain.TimeInForceFOK,
+		},
+	}
+
+	intent, err := buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket")
+	if err != nil {
+		t.Fatalf("buildEntryIntent() error = %v", err)
+	}
+	if intent.TimeInForce != domain.TimeInForceIOC || intent.Size != "42" || intent.Price != "0.29" || intent.WorstPrice != "0.29" {
+		t.Fatalf("intent = %#v, want IOC for 42 shares limited at 0.29", intent)
+	}
+	if intent.Metadata["strategy_time_in_force"] != "FOK" || intent.Metadata["execution_time_in_force"] != "IOC" {
+		t.Fatalf("intent metadata = %#v", intent.Metadata)
+	}
+
+	evaluation.Order.TimeInForce = domain.TimeInForceIOC
+	intent, err = buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket")
+	if err != nil || intent.TimeInForce != domain.TimeInForceIOC || intent.Metadata["strategy_time_in_force"] != "" {
+		t.Fatalf("explicit IOC intent = %#v, err = %v, want pass-through without mapping metadata", intent, err)
 	}
 }
