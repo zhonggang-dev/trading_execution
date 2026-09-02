@@ -681,12 +681,14 @@ type StrategyExecutionConstraints struct {
 	MinimumBuyNotional    Decimal       `json:"minimum_buy_notional"`
 	AllowedTimeInForce    []TimeInForce `json:"allowed_time_in_force"`
 	PriceProtectionPolicy string        `json:"price_protection_policy"`
-	MaxPriceSlippageTicks int           `json:"max_price_slippage_ticks"`
+	// MaxPriceSlippageTicks is retained for v4 wire compatibility only.
+	// Trading no longer rejects a strategy limit by its top-of-book distance.
+	MaxPriceSlippageTicks int `json:"max_price_slippage_ticks"`
 }
 
 const (
 	// StrategyPriceProtectionDepthAwareLimit permits a strategy limit through
-	// visible snapshot depth while bounding how far it may move from the top.
+	// visible snapshot depth. The strategy owns the explicit worst price.
 	StrategyPriceProtectionDepthAwareLimit = "DEPTH_AWARE_LIMIT"
 	DefaultStrategyMaxPriceSlippageTicks   = 2
 )
