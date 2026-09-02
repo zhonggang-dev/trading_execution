@@ -86,3 +86,28 @@ type RedemptionReceipt struct {
 	BlockHash       string `json:"block_hash"`
 	Confirmations   uint64 `json:"confirmations"`
 }
+
+// InFlightRedemption is a managed redemption whose on-chain effect (outcome
+// shares burned, collateral paid out) may already be observable before
+// ApplyRedemption records it in the ledger. Reconciliation must not classify
+// that transient window as manual position or balance drift.
+type InFlightRedemption struct {
+	ExecutionAccountID string           `json:"execution_account_id"`
+	ConditionID        string           `json:"condition_id"`
+	Status             RedemptionStatus `json:"status"`
+	// ExpectedPayout is the collateral the redemption adds to the wallet:
+	// the confirmed receipt payout when known, otherwise the managed binary
+	// payout (shares × settlement price) that ApplyRedemption will enforce.
+	ExpectedPayout Decimal `json:"expected_payout"`
+}
+
+// InFlight reports whether a redemption status may already have mutated the
+// chain without the ledger having applied the payout yet.
+func (status RedemptionStatus) InFlight() bool {
+	switch status {
+	case RedemptionRedeemSubmitting, RedemptionRedeemSubmitted, RedemptionConfirmed:
+		return true
+	default:
+		return false
+	}
+}
