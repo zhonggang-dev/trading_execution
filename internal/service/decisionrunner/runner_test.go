@@ -326,3 +326,17 @@ func TestRunReadyRecoversDurableIntentsBeforePublishingSchedule(t *testing.T) {
 		t.Fatal("RunReady did not attempt pending intent recovery")
 	}
 }
+
+func TestBindingRunSummariesExposeStrategyDisabledAccounts(t *testing.T) {
+	summaries := bindingRunSummaries(decisioncycle.RunResult{Runs: []decisioncycle.BindingRunResult{{
+		Context: domain.StrategyExecutionContext{
+			ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main",
+		},
+		PredictionModelID:       "echo-source",
+		AccountStrategyDisabled: true,
+	}}})
+	if len(summaries) != 1 || !summaries[0].AccountStrategyDisabled || summaries[0].AccountSubmissionDisabled ||
+		summaries[0].Failed || summaries[0].Intents != 0 {
+		t.Fatalf("summaries = %#v", summaries)
+	}
+}

@@ -284,6 +284,62 @@ func TestLoadRejectsInvalidDecisionSubmissionDisabledAccounts(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsStrategyDisabledMainAndWallet1(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON", `[" main ","wallet-1"]`)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(config.DecisionCycle.StrategyDisabledAccounts) != 2 ||
+		config.DecisionCycle.StrategyDisabledAccounts[0] != "main" ||
+		config.DecisionCycle.StrategyDisabledAccounts[1] != "wallet-1" ||
+		len(config.DecisionCycle.SubmissionDisabledAccounts) != 0 ||
+		len(config.DecisionCycle.EntryDisabledAccounts) != 2 {
+		t.Fatalf("decision cycle config = %#v", config.DecisionCycle)
+	}
+}
+
+func TestLoadDefaultsStrategyDisabledAccountsToNone(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(config.DecisionCycle.StrategyDisabledAccounts) != 0 {
+		t.Fatalf("strategy-disabled accounts = %#v, want none by default", config.DecisionCycle.StrategyDisabledAccounts)
+	}
+}
+
+func TestLoadRejectsInvalidStrategyDisabledAccounts(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "not array", value: `"main"`, want: "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON: "},
+		{name: "trailing value", value: `["main"] []`, want: "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON must contain exactly one JSON array"},
+		{name: "empty", value: `[" "]`, want: "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON account 0 is empty"},
+		{name: "duplicate", value: `["main","main"]`, want: `DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON contains duplicate account "main"`},
+		{name: "unbound", value: `["wallet-3"]`, want: `DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON account "wallet-3" is not a configured binding`},
+		{name: "every binding", value: `["main","wallet-1","wallet-6","wallet-7"]`, want: "cannot disable the strategy for every configured binding"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			t.Setenv("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON", test.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsGlobalSellOnlyGateForWallet67ShadowRelease(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -586,7 +642,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"DECISION_CYCLE_INTERVAL", "DECISION_CYCLE_STARTUP_DELAY", "DECISION_CYCLE_MAX_START_LATENESS", "DECISION_CYCLE_TIMEOUT",
 		"DECISION_CYCLE_PREDICTION_LOOKBACK", "DECISION_CYCLE_MID_PRICE_LOOKBACK",
 		"DECISION_CYCLE_BINDINGS_JSON", "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
-		"DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON",
+		"DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON",
 		"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON",
 	} {
 		t.Setenv(key, "")

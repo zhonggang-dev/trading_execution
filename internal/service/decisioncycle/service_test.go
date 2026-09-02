@@ -2462,3 +2462,197 @@ func newTestService(params Params) (*Service, error) {
 	}
 	return New(params)
 }
+
+func strategySwitchTestBindings(prediction domain.Prediction) []domain.StrategyExecutionBinding {
+	return []domain.StrategyExecutionBinding{
+		{PredictionModelID: prediction.Model.Name, ModelID: "test", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-active"},
+		{PredictionModelID: prediction.Model.Name, ModelID: "test", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "account-strategy-off"},
+	}
+}
+
+// TestRunSkipsStrategyDisabledBindingWhileOtherBindingSubmits verifies the
+// narrow "do not send this wallet to the strategy" switch: the disabled binding
+// is neither queried for position lots nor sent to the strategy, while the other
+// binding runs and submits normally and the disabled binding is not quarantined.
+func TestRunSkipsStrategyDisabledBindingWhileOtherBindingSubmits(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 2, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	books := make([]domain.OrderBookSnapshot, 0, len(prediction.Outcomes))
+	for _, outcome := range prediction.Outcomes {
+		books = append(books, domain.OrderBookSnapshot{
+			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, Status: domain.OrderBookStatusOK,
+			SourceAt: decisionAt, ObservedAt: decisionAt.Add(time.Second),
+			DepthLimit: domain.StrategyOrderBookDepth, TickSize: "0.01", MinOrderSize: "1",
+			Bids: []domain.PriceLevel{{Price: "0.48", Size: "20"}},
+			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
+		})
+	}
+	strategy := &fakeStrategy{response: domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion,
+		DecidedAt:     decisionAt.Add(2 * time.Second),
+		Evaluations: []domain.StrategyEvaluation{
+			{
+				DecisionID: "decision-submit", PredictionID: prediction.PredictionID,
+				MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+				OutcomeIndex: 0, TokenID: prediction.Outcomes[0].TokenID,
+				Action: domain.StrategyActionSubmit, ReasonCode: domain.StrategyReasonEntrySignal,
+				Evidence: domain.StrategyEvidence{Probability: 0.7, Edge: "0.20", Metrics: map[string]string{
+					"best_ask": "0.50", "near_logdiff_usd": "1.2", "rel_spread": "0.04",
+					"MOM": "0.01", "MACD_SIGNAL": "0.02",
+				}},
+				Order: &domain.StrategyOrderParams{
+					Side: domain.SideBuy, Type: domain.OrderTypeLimit, WorstPrice: "0.50",
+					Size: "5", TimeInForce: domain.TimeInForceFOK,
+				},
+			},
+			{
+				DecisionID: "decision-skip", PredictionID: prediction.PredictionID,
+				MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+				OutcomeIndex: 1, TokenID: prediction.Outcomes[1].TokenID,
+				Action: domain.StrategyActionSkip, ReasonCode: domain.StrategyReasonInvalidBook,
+				Evidence: domain.StrategyEvidence{Probability: 0.3},
+			},
+		},
+	}}
+	recorder := &fakeRecorder{}
+	executor := &fakeExecutor{}
+	positionSource := &quarantinePositionSource{rejectedAccount: "account-strategy-off"}
+	service, err := newTestService(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "snapshot-strategy-switch",
+			DecisionAt: decisionAt, GeneratedAt: decisionAt.Add(time.Second),
+			Predictions: []domain.Prediction{prediction},
+			ExpectedPredictions: []domain.PredictionExpectation{
+				completedPredictionExpectation(prediction, 1, 1),
+			},
+		}},
+		PositionSource: positionSource, OrderBookSource: &fakeOrderBookSource{books: books},
+		Strategy: strategy,
+		Recorder: recorder, Executor: executor, SubmitEnabled: true,
+		StrategyDisabledAccounts:     []string{"account-strategy-off"},
+		RequireCompleteModelCoverage: true,
+		Bindings:                     strategySwitchTestBindings(prediction),
+		Venue:                        "polymarket-paper", Now: func() time.Time { return decisionAt.Add(5 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, runErr := service.Run(context.Background(), decisionAt)
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
+	}
+	if len(result.Runs) != 2 || len(recorder.claimedOutputs) != 1 || len(recorder.claimedSubmissionEnabled) != 1 {
+		t.Fatalf("runs/outputs/modes = %d/%d/%#v", len(result.Runs), len(recorder.claimedOutputs), recorder.claimedSubmissionEnabled)
+	}
+	active, disabled := result.Runs[0], result.Runs[1]
+	if active.Context.ExecutionAccountID != "account-active" || disabled.Context.ExecutionAccountID != "account-strategy-off" {
+		t.Fatalf("run order = %#v", result.Runs)
+	}
+	if !active.OrderSubmissionEnabled || active.AccountStrategyDisabled || active.AccountSubmissionDisabled ||
+		disabled.OrderSubmissionEnabled || !disabled.AccountStrategyDisabled || disabled.AccountSubmissionDisabled {
+		t.Fatalf("binding switch flags = %#v", result.Runs)
+	}
+	if len(disabled.Intents) != 0 || disabled.Error != nil || disabled.Request.CycleID != "" || disabled.Response.CycleID != "" {
+		t.Fatalf("strategy-disabled run = %#v, want skipped binding without error or request", disabled)
+	}
+	if len(executor.intents) != 1 || executor.intents[0].ExecutionAccountID != "account-active" ||
+		len(recorder.deliveries) != 1 || recorder.deliveries[0].Intent.ExecutionAccountID != "account-active" {
+		t.Fatalf("executed=%#v deliveries=%#v, want active binding only", executor.intents, recorder.deliveries)
+	}
+	if len(positionSource.calls) != 1 || positionSource.calls[0] != "account-active" ||
+		strategy.request.Context.ExecutionAccountID != "account-active" {
+		t.Fatalf("strategy-disabled dependencies were called: positions=%#v strategy=%#v", positionSource.calls, strategy.request.Context)
+	}
+}
+
+// TestNewKeepsStrategyDisabledAccountsInDeliveryCohorts pins the difference
+// from quarantine: a strategy-disabled account still recovers and delivers
+// intents that were persisted before the switch was turned on.
+func TestNewKeepsStrategyDisabledAccountsInDeliveryCohorts(t *testing.T) {
+	prediction := validPrediction(time.Date(2026, 9, 2, 4, 20, 0, 0, time.UTC))
+	service, err := newTestService(Params{
+		PredictionSource:             fakePredictionSource{},
+		PositionSource:               fakePositionSource{},
+		OrderBookSource:              &fakeOrderBookSource{},
+		Strategy:                     &fakeStrategy{},
+		Recorder:                     &fakeRecorder{},
+		Executor:                     &fakeExecutor{},
+		SubmitEnabled:                true,
+		StrategyDisabledAccounts:     []string{"account-strategy-off"},
+		EntryDisabledAccounts:        []string{"account-strategy-off"},
+		RequireCompleteModelCoverage: true,
+		Bindings:                     strategySwitchTestBindings(prediction),
+		Venue:                        "polymarket-paper",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	cohorts := service.deliveryCohorts()
+	if len(cohorts) != 2 ||
+		len(cohorts[0].executionAccountIDs) != 1 || cohorts[0].executionAccountIDs[0] != "account-active" || cohorts[0].side != "" ||
+		len(cohorts[1].executionAccountIDs) != 1 || cohorts[1].executionAccountIDs[0] != "account-strategy-off" || cohorts[1].side != domain.SideSell {
+		t.Fatalf("delivery cohorts = %#v, want strategy-disabled account kept as sell-only cohort", cohorts)
+	}
+	if len(service.strategyBindings) != 1 || service.strategyBindings[0].ExecutionAccountID != "account-active" ||
+		len(service.activeBindings) != 2 {
+		t.Fatalf("strategy=%#v active=%#v", service.strategyBindings, service.activeBindings)
+	}
+}
+
+func TestNewRejectsInvalidStrategyDisabledAccounts(t *testing.T) {
+	prediction := validPrediction(time.Date(2026, 9, 2, 4, 20, 0, 0, time.UTC))
+	for _, test := range []struct {
+		name     string
+		accounts []string
+		want     string
+	}{
+		{name: "every binding", accounts: []string{"account-active", "account-strategy-off"}, want: "cannot exclude every active decision binding"},
+		{name: "unbound", accounts: []string{"wallet-3"}, want: `strategy-disabled account "wallet-3" is not a configured binding`},
+		{name: "duplicate", accounts: []string{"account-active", "account-active"}, want: `duplicate strategy-disabled account "account-active"`},
+		{name: "empty", accounts: []string{" "}, want: "strategy-disabled account 0 is empty"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := newTestService(Params{
+				PredictionSource:             fakePredictionSource{},
+				PositionSource:               fakePositionSource{},
+				OrderBookSource:              &fakeOrderBookSource{},
+				Strategy:                     &fakeStrategy{},
+				Recorder:                     &fakeRecorder{},
+				Executor:                     &fakeExecutor{},
+				SubmitEnabled:                true,
+				StrategyDisabledAccounts:     test.accounts,
+				RequireCompleteModelCoverage: true,
+				Bindings:                     strategySwitchTestBindings(prediction),
+				Venue:                        "polymarket-paper",
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("New() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+// TestNewRejectsStrategyDisablingEveryBindingLeftByQuarantine covers the
+// combined case: quarantine removes one binding and the strategy switch must
+// not silence the only remaining one.
+func TestNewRejectsStrategyDisablingEveryBindingLeftByQuarantine(t *testing.T) {
+	prediction := validPrediction(time.Date(2026, 9, 2, 4, 20, 0, 0, time.UTC))
+	_, err := newTestService(Params{
+		PredictionSource:             fakePredictionSource{},
+		PositionSource:               fakePositionSource{},
+		OrderBookSource:              &fakeOrderBookSource{},
+		Strategy:                     &fakeStrategy{},
+		Recorder:                     &fakeRecorder{},
+		Executor:                     &fakeExecutor{},
+		SubmitEnabled:                true,
+		SubmissionDisabledAccounts:   []string{"account-strategy-off"},
+		StrategyDisabledAccounts:     []string{"account-active"},
+		RequireCompleteModelCoverage: true,
+		Bindings:                     strategySwitchTestBindings(prediction),
+		Venue:                        "polymarket-paper",
+	})
+	if err == nil || !strings.Contains(err.Error(), "strategy-disabled accounts cannot exclude every active decision binding") {
+		t.Fatalf("New() error = %v", err)
+	}
+}

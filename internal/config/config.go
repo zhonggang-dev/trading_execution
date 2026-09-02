@@ -72,7 +72,13 @@ type DecisionCycle struct {
 	// EntryDisabledAccounts applies the same sell-only rule to an exact account
 	// subset while keeping those accounts active for strategy exits and
 	// reconciliation.
-	EntryDisabledAccounts        []string
+	EntryDisabledAccounts []string
+	// StrategyDisabledAccounts is the narrow operator switch for "do not send
+	// this wallet to the strategy". The listed accounts stay in the topology and
+	// keep reconciliation, auto redeem, the account entry gate, and durable
+	// intent delivery, but the decision cycle neither loads their position lots
+	// nor calls the strategy API for them. Empty means every binding is sent.
+	StrategyDisabledAccounts     []string
 	RequireCompleteModelCoverage bool
 	PredictionInfraBaseURL       string
 	PredictionInfraToken         string
@@ -590,6 +596,12 @@ func (config Config) Validate() error {
 		); err != nil {
 			return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON: %w", err)
 		}
+		if err := validateDecisionStrategyDisabledAccounts(
+			config.DecisionCycle.Bindings,
+			config.DecisionCycle.StrategyDisabledAccounts,
+		); err != nil {
+			return err
+		}
 		if err := validateDecisionPredictionSourceModes(
 			config.DecisionCycle.Bindings,
 			config.DecisionCycle.PredictionSourceModes,
@@ -673,11 +685,19 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	strategyDisabledAccounts, err := decodeDecisionAccountList(
+		"DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON",
+		os.Getenv("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON"),
+	)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	return DecisionCycle{
 		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
 		SubmissionDisabledAccounts:   submissionDisabledAccounts,
 		EntrySubmissionDisabled:      entrySubmissionDisabled,
 		EntryDisabledAccounts:        entryDisabledAccounts,
+		StrategyDisabledAccounts:     strategyDisabledAccounts,
 		RequireCompleteModelCoverage: requireCompleteModelCoverage,
 		PredictionInfraBaseURL:       strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_URL")),
 		PredictionInfraToken:         strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_TOKEN")),
@@ -691,6 +711,12 @@ func loadDecisionCycle() (DecisionCycle, error) {
 }
 
 func decodeDecisionEntryDisabledAccounts(value string) ([]string, error) {
+	return decodeDecisionAccountList("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", value)
+}
+
+// decodeDecisionAccountList parses one DECISION_CYCLE_*_ACCOUNTS_JSON variable:
+// an empty value means no accounts, otherwise exactly one JSON string array.
+func decodeDecisionAccountList(name, value string) ([]string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return nil, nil
@@ -699,10 +725,10 @@ func decodeDecisionEntryDisabledAccounts(value string) ([]string, error) {
 	decoder.DisallowUnknownFields()
 	var accounts []string
 	if err := decoder.Decode(&accounts); err != nil {
-		return nil, fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON: %w", err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return nil, fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly one JSON array")
+		return nil, fmt.Errorf("%s must contain exactly one JSON array", name)
 	}
 	for index := range accounts {
 		accounts[index] = strings.TrimSpace(accounts[index])
@@ -793,23 +819,7 @@ func decodeDecisionPredictionSourceModes(value string) (map[string]domain.Predic
 }
 
 func decodeDecisionSubmissionDisabledAccounts(value string) ([]string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil, nil
-	}
-	decoder := json.NewDecoder(strings.NewReader(value))
-	decoder.DisallowUnknownFields()
-	var accounts []string
-	if err := decoder.Decode(&accounts); err != nil {
-		return nil, fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return nil, fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON must contain exactly one JSON array")
-	}
-	for index := range accounts {
-		accounts[index] = strings.TrimSpace(accounts[index])
-	}
-	return accounts, nil
+	return decodeDecisionAccountList("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", value)
 }
 
 func decodeDecisionBindings(value string) ([]domain.StrategyExecutionBinding, error) {
@@ -930,6 +940,37 @@ func validateDecisionSubmissionDisabledAccounts(
 			return fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON account %q is not a configured binding", accountID)
 		}
 		seen[accountID] = struct{}{}
+	}
+	return nil
+}
+
+// validateDecisionStrategyDisabledAccounts accepts any subset of the bound
+// accounts except the full set: a cycle that sends no binding to the strategy
+// is a misconfiguration, not a switch position.
+func validateDecisionStrategyDisabledAccounts(
+	bindings []domain.StrategyExecutionBinding,
+	accounts []string,
+) error {
+	bound := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		bound[binding.Normalize().ExecutionAccountID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(accounts))
+	for index, accountID := range accounts {
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			return fmt.Errorf("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return fmt.Errorf("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON contains duplicate account %q", accountID)
+		}
+		if _, exists := bound[accountID]; !exists {
+			return fmt.Errorf("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON account %q is not a configured binding", accountID)
+		}
+		seen[accountID] = struct{}{}
+	}
+	if len(bound) > 0 && len(seen) >= len(bound) {
+		return fmt.Errorf("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON cannot disable the strategy for every configured binding")
 	}
 	return nil
 }

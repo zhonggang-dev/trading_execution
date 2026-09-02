@@ -737,6 +737,48 @@ class EnvironmentTests(unittest.TestCase):
                         environment, submission_state="disabled"
                     )
 
+    def test_accepts_strategy_disabled_main_and_wallet1(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
+            )
+            environment = self.environment(wallet_path)
+            environment["DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON"] = (
+                '["main","wallet-1"]'
+            )
+            self.assertEqual(
+                len(
+                    preflight.validate_environment(
+                        environment, submission_state="disabled"
+                    )
+                ),
+                4,
+            )
+
+    def test_rejects_invalid_strategy_disabled_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            wallet_path = self.write_wallet_file(
+                pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
+            )
+            for value, message in (
+                ('"main"', "must be one JSON array"),
+                ('["main","main"]', "duplicates"),
+                ('["wallet-missing"]', "unbound accounts"),
+                ('[" "]', "empty or non-string"),
+                (
+                    '["main","wallet-1","wallet-6","wallet-7"]',
+                    "cannot disable the strategy for every configured binding",
+                ),
+            ):
+                environment = self.environment(wallet_path)
+                environment["DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON"] = value
+                with self.subTest(value=value), self.assertRaisesRegex(
+                    preflight.PreflightError, message
+                ):
+                    preflight.validate_environment(
+                        environment, submission_state="disabled"
+                    )
+
     def test_rejects_global_sell_only_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wallet_path = self.write_wallet_file(

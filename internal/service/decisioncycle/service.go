@@ -57,6 +57,12 @@ type Params struct {
 	// EntryDisabledAccounts keeps selected active bindings sell-only while the
 	// remaining bindings may emit and deliver BUY intents.
 	EntryDisabledAccounts []string
+	// StrategyDisabledAccounts keeps selected active bindings in the topology,
+	// the account entry gate, and durable intent delivery, but skips their
+	// position-lot capture and strategy call. Intents already persisted for
+	// those accounts still recover and deliver normally; only new strategy
+	// requests stop.
+	StrategyDisabledAccounts []string
 	// RequireCompleteModelCoverage keeps live BUY submission fail closed for a
 	// binding that has no fresh probability. Coverage is evaluated independently
 	// per configured source model; a Market is never required to have results
@@ -72,23 +78,30 @@ type Params struct {
 
 // Service 表示后端使用的 Service 类型。
 type Service struct {
-	predictionSource                 port.PredictionSource
-	positionSource                   port.StrategyPositionSource
-	orderBookSource                  port.OrderBookSource
-	strategy                         port.StrategyClient
-	recorder                         port.DecisionRecorder
-	executor                         port.OrderExecutor
-	submissionPolicy                 IntentSubmissionPolicy
-	submitEnabled                    bool
-	submissionDisabledAccounts       []string
-	submissionDisabledAccountSet     map[string]struct{}
-	entrySubmissionDisabled          bool
-	entryDisabledAccounts            []string
-	entryDisabledAccountSet          map[string]struct{}
-	requireCompleteModelCoverage     bool
-	bindings                         []domain.StrategyExecutionBinding
-	predictionSourceModes            map[string]domain.PredictionSourceMode
-	activeBindings                   []domain.StrategyExecutionBinding
+	predictionSource             port.PredictionSource
+	positionSource               port.StrategyPositionSource
+	orderBookSource              port.OrderBookSource
+	strategy                     port.StrategyClient
+	recorder                     port.DecisionRecorder
+	executor                     port.OrderExecutor
+	submissionPolicy             IntentSubmissionPolicy
+	submitEnabled                bool
+	submissionDisabledAccounts   []string
+	submissionDisabledAccountSet map[string]struct{}
+	entrySubmissionDisabled      bool
+	entryDisabledAccounts        []string
+	entryDisabledAccountSet      map[string]struct{}
+	strategyDisabledAccounts     []string
+	strategyDisabledAccountSet   map[string]struct{}
+	requireCompleteModelCoverage bool
+	bindings                     []domain.StrategyExecutionBinding
+	predictionSourceModes        map[string]domain.PredictionSourceMode
+	activeBindings               []domain.StrategyExecutionBinding
+	// strategyBindings are the active bindings that still call the strategy;
+	// strategyEntryEnabledBindings additionally may emit BUY intents and are
+	// the only bindings whose prediction models a cycle has to select.
+	strategyBindings                 []domain.StrategyExecutionBinding
+	strategyEntryEnabledBindings     []domain.StrategyExecutionBinding
 	entryEnabledBindings             []domain.StrategyExecutionBinding
 	activeExecutionAccountIDs        []string
 	entryEnabledExecutionAccountIDs  []string
@@ -117,12 +130,15 @@ type BindingRunResult struct {
 	PositionCount             int
 	OrderSubmissionEnabled    bool
 	AccountSubmissionDisabled bool
-	EntrySubmissionEnabled    bool
-	EntryBlockReason          string
-	Request                   domain.StrategyDecisionRequest
-	Response                  domain.StrategyDecisionResponse
-	Intents                   []IntentResult
-	Error                     error
+	// AccountStrategyDisabled marks a binding that stayed active but was not
+	// sent to the strategy because of StrategyDisabledAccounts.
+	AccountStrategyDisabled bool
+	EntrySubmissionEnabled  bool
+	EntryBlockReason        string
+	Request                 domain.StrategyDecisionRequest
+	Response                domain.StrategyDecisionResponse
+	Intents                 []IntentResult
+	Error                   error
 }
 
 // RunResult 表示后端使用的 RunResult 类型。
@@ -153,16 +169,20 @@ func New(params Params) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	disabledAccounts, disabledAccountSet, err := normalizeSubmissionDisabledAccounts(
-		bindings,
-		params.SubmissionDisabledAccounts,
+	disabledAccounts, disabledAccountSet, err := normalizeBoundAccounts(
+		bindings, params.SubmissionDisabledAccounts, "submission-disabled",
 	)
 	if err != nil {
 		return nil, err
 	}
-	entryDisabledAccounts, entryDisabledAccountSet, err := normalizeEntryDisabledAccounts(
-		bindings,
-		params.EntryDisabledAccounts,
+	entryDisabledAccounts, entryDisabledAccountSet, err := normalizeBoundAccounts(
+		bindings, params.EntryDisabledAccounts, "entry-disabled",
+	)
+	if err != nil {
+		return nil, err
+	}
+	strategyDisabledAccounts, strategyDisabledAccountSet, err := normalizeBoundAccounts(
+		bindings, params.StrategyDisabledAccounts, "strategy-disabled",
 	)
 	if err != nil {
 		return nil, err
@@ -176,6 +196,11 @@ func New(params Params) (*Service, error) {
 	if len(entryEnabledBindings)+len(entryDisabledBindings) != len(activeBindings) {
 		return nil, fmt.Errorf("entry-disabled accounts do not partition every active decision binding")
 	}
+	strategyBindings := filterSubmissionEnabledBindings(activeBindings, strategyDisabledAccountSet)
+	if len(strategyBindings) == 0 {
+		return nil, fmt.Errorf("strategy-disabled accounts cannot exclude every active decision binding")
+	}
+	strategyEntryEnabledBindings := filterSubmissionEnabledBindings(entryEnabledBindings, strategyDisabledAccountSet)
 	if params.Venue == "" {
 		return nil, fmt.Errorf("execution venue is required")
 	}
@@ -208,10 +233,14 @@ func New(params Params) (*Service, error) {
 		entrySubmissionDisabled:          params.EntrySubmissionDisabled,
 		entryDisabledAccounts:            entryDisabledAccounts,
 		entryDisabledAccountSet:          entryDisabledAccountSet,
+		strategyDisabledAccounts:         strategyDisabledAccounts,
+		strategyDisabledAccountSet:       strategyDisabledAccountSet,
 		requireCompleteModelCoverage:     params.RequireCompleteModelCoverage,
 		bindings:                         bindings,
 		predictionSourceModes:            predictionSourceModes,
 		activeBindings:                   activeBindings,
+		strategyBindings:                 strategyBindings,
+		strategyEntryEnabledBindings:     strategyEntryEnabledBindings,
 		entryEnabledBindings:             entryEnabledBindings,
 		activeExecutionAccountIDs:        executionAccountIDs(activeBindings),
 		entryEnabledExecutionAccountIDs:  executionAccountIDs(entryEnabledBindings),
@@ -239,7 +268,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err := snapshot.Validate(decisionAt); err != nil {
 		return RunResult{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}
-	modelIDs := configuredPredictionModels(service.entryEnabledBindings)
+	modelIDs := configuredPredictionModels(service.strategyEntryEnabledBindings)
 	selectedPredictions, err := selectAvailablePredictions(
 		snapshot.Predictions, modelIDs, service.predictionSourceModes,
 		decisionAt.Add(-service.predictionLookback),
@@ -277,6 +306,16 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 				Context: executionContext, PredictionModelID: binding.PredictionModelID,
 				PredictionCount:        len(predictionsForBinding(selectedPredictions, binding)),
 				OrderSubmissionEnabled: false, AccountSubmissionDisabled: true,
+			})
+			continue
+		}
+		if _, bindingStrategyDisabled := service.strategyDisabledAccountSet[binding.ExecutionAccountID]; bindingStrategyDisabled {
+			// The account stays active for reconciliation and durable delivery,
+			// but this cycle sends nothing about it to the strategy.
+			result.Runs = append(result.Runs, BindingRunResult{
+				Context: executionContext, PredictionModelID: binding.PredictionModelID,
+				PredictionCount:        len(predictionsForBinding(selectedPredictions, binding)),
+				OrderSubmissionEnabled: false, AccountStrategyDisabled: true,
 			})
 			continue
 		}
@@ -335,8 +374,8 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 
 // loadPositionLots 加载 Position Lots。
 func (service *Service) loadPositionLots(ctx context.Context, decisionAt time.Time) (map[string][]domain.StrategyPositionLot, error) {
-	result := make(map[string][]domain.StrategyPositionLot, len(service.activeBindings))
-	for _, binding := range service.activeBindings {
+	result := make(map[string][]domain.StrategyPositionLot, len(service.strategyBindings))
+	for _, binding := range service.strategyBindings {
 		lots, err := service.positionSource.ListOpenLots(ctx, binding.ExecutionAccountID)
 		if err != nil {
 			return nil, fmt.Errorf("load position lots for %s: %w", binding.ExecutionAccountID, err)
@@ -735,37 +774,13 @@ func normalizeBindings(bindings []domain.StrategyExecutionBinding) ([]domain.Str
 	return result, nil
 }
 
-func normalizeSubmissionDisabledAccounts(
+// normalizeBoundAccounts validates one account-level switch list against the
+// configured bindings: every entry must be non-empty, unique, and bound. The
+// label names the switch in error messages ("submission-disabled", ...).
+func normalizeBoundAccounts(
 	bindings []domain.StrategyExecutionBinding,
 	accounts []string,
-) ([]string, map[string]struct{}, error) {
-	bound := make(map[string]struct{}, len(bindings))
-	for _, binding := range bindings {
-		bound[binding.ExecutionAccountID] = struct{}{}
-	}
-	result := make([]string, 0, len(accounts))
-	seen := make(map[string]struct{}, len(accounts))
-	for index, accountID := range accounts {
-		accountID = strings.TrimSpace(accountID)
-		if accountID == "" {
-			return nil, nil, fmt.Errorf("submission-disabled account %d is empty", index)
-		}
-		if _, duplicate := seen[accountID]; duplicate {
-			return nil, nil, fmt.Errorf("duplicate submission-disabled account %q", accountID)
-		}
-		if _, exists := bound[accountID]; !exists {
-			return nil, nil, fmt.Errorf("submission-disabled account %q is not a configured binding", accountID)
-		}
-		seen[accountID] = struct{}{}
-		result = append(result, accountID)
-	}
-	sort.Strings(result)
-	return result, seen, nil
-}
-
-func normalizeEntryDisabledAccounts(
-	bindings []domain.StrategyExecutionBinding,
-	accounts []string,
+	label string,
 ) ([]string, map[string]struct{}, error) {
 	bound := make(map[string]struct{}, len(bindings))
 	for _, binding := range bindings {
@@ -776,13 +791,13 @@ func normalizeEntryDisabledAccounts(
 	for index, rawAccountID := range accounts {
 		accountID := strings.TrimSpace(rawAccountID)
 		if accountID == "" {
-			return nil, nil, fmt.Errorf("entry-disabled account %d is empty", index)
+			return nil, nil, fmt.Errorf("%s account %d is empty", label, index)
 		}
 		if _, duplicate := seen[accountID]; duplicate {
-			return nil, nil, fmt.Errorf("duplicate entry-disabled account %q", accountID)
+			return nil, nil, fmt.Errorf("duplicate %s account %q", label, accountID)
 		}
 		if _, exists := bound[accountID]; !exists {
-			return nil, nil, fmt.Errorf("entry-disabled account %q is not a configured binding", accountID)
+			return nil, nil, fmt.Errorf("%s account %q is not a configured binding", label, accountID)
 		}
 		seen[accountID] = struct{}{}
 		result = append(result, accountID)

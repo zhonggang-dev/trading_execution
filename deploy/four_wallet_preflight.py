@@ -100,6 +100,7 @@ TRADING_RUNTIME_KEYS = frozenset(
         "DECISION_CYCLE_BINDINGS_JSON",
         "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON",
         "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
+        "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON",
         "POLYMARKET_ACCOUNTS_FILE",
         "DECISION_CYCLE_PREDICTION_INFRA_URL",
         "DECISION_CYCLE_PREDICTION_LOOKBACK",
@@ -375,40 +376,59 @@ def decode_bindings(payload: str) -> tuple[Binding, ...]:
     return validate_topology(bindings)
 
 
-def decode_submission_disabled_accounts(
-    payload: str, bindings: tuple[Binding, ...]
+def _decode_bound_account_list(
+    name: str, payload: str, bindings: tuple[Binding, ...]
 ) -> tuple[str, ...]:
+    """Decode one DECISION_CYCLE_*_ACCOUNTS_JSON array of bound account ids."""
     try:
         raw = json.loads(payload)
     except json.JSONDecodeError as error:
-        raise PreflightError(
-            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON is invalid JSON: "
-            f"{error.msg}"
-        ) from error
+        raise PreflightError(f"{name} is invalid JSON: {error.msg}") from error
     if not isinstance(raw, list):
-        raise PreflightError(
-            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON must be one JSON array"
-        )
+        raise PreflightError(f"{name} must be one JSON array")
     accounts: list[str] = []
     for index, value in enumerate(raw):
         if not isinstance(value, str) or not value.strip():
             raise PreflightError(
-                "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON "
-                f"account {index} is empty or non-string"
+                f"{name} account {index} is empty or non-string"
             )
         accounts.append(value.strip())
     if len(set(accounts)) != len(accounts):
-        raise PreflightError(
-            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON contains duplicates"
-        )
+        raise PreflightError(f"{name} contains duplicates")
     bound_accounts = {binding.execution_account_id for binding in bindings}
     unknown = set(accounts) - bound_accounts
     if unknown:
         raise PreflightError(
-            "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON contains unbound accounts: "
-            f"{sorted(unknown)}"
+            f"{name} contains unbound accounts: {sorted(unknown)}"
         )
     return tuple(sorted(accounts))
+
+
+def decode_submission_disabled_accounts(
+    payload: str, bindings: tuple[Binding, ...]
+) -> tuple[str, ...]:
+    return _decode_bound_account_list(
+        "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", payload, bindings
+    )
+
+
+def decode_strategy_disabled_accounts(
+    payload: str, bindings: tuple[Binding, ...]
+) -> tuple[str, ...]:
+    """Accounts kept active but not sent to the strategy API.
+
+    Any bound subset is a valid switch position except the full set: a cycle
+    that sends no binding to the strategy is a misconfiguration.
+    """
+    accounts = _decode_bound_account_list(
+        "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON", payload, bindings
+    )
+    if bindings and len(accounts) >= len(bindings):
+        raise PreflightError(
+            "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON cannot disable the "
+            "strategy for every configured binding"
+        )
+    return accounts
 
 
 def decode_prediction_model_source_modes(
@@ -751,6 +771,10 @@ def validate_environment(
     validate_rollout_quarantine(quarantined_accounts)
     decode_entry_disabled_accounts(
         environment.get("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", ""),
+        bindings,
+    )
+    decode_strategy_disabled_accounts(
+        environment.get("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON", "[]"),
         bindings,
     )
     wallet_path = environment.get("POLYMARKET_ACCOUNTS_FILE", "").strip()
