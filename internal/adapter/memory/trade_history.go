@@ -30,6 +30,19 @@ func (*TradeHistoryRepository) ListTradeHistory(_ context.Context, filter domain
 	}, nil
 }
 
+// ListLedgerActivities 返回不伪造任何成交或赎回记录的空账本活动页面。
+func (*TradeHistoryRepository) ListLedgerActivities(_ context.Context, filter domain.LedgerActivityFilter) (domain.LedgerActivityPage, error) {
+	filter = filter.Normalize()
+	return domain.LedgerActivityPage{
+		Items: []domain.LedgerActivity{},
+		Summary: domain.LedgerActivitySummary{
+			BuyNotional: "0", SellNotional: "0", RedeemPayout: "0", NetCashFlow: "0", TotalFee: "0",
+			RealizedPnL: "0", SellRealizedPnL: "0", RedeemRealizedPnL: "0",
+		},
+		Limit: filter.Limit, Offset: filter.Offset,
+	}, nil
+}
+
 // DailyPnL 在模拟执行模式下返回空报告，不把纸交易伪装成真实收益。
 func (*TradeHistoryRepository) DailyPnL(_ context.Context, filter domain.DailyPnLFilter) (domain.DailyPnLReport, error) {
 	filter = filter.Normalize()

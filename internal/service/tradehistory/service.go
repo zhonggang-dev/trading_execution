@@ -30,7 +30,16 @@ func (service *Service) List(ctx context.Context, filter domain.TradeHistoryFilt
 	return service.repository.ListTradeHistory(ctx, filter)
 }
 
-// DailyPnL 返回按 UTC 自然日、执行账户与开仓策略归因的净已实现盈亏。
+// ListLedgerActivities 校验筛选条件并返回成交与赎回结算的统一账本活动快照。
+func (service *Service) ListLedgerActivities(ctx context.Context, filter domain.LedgerActivityFilter) (domain.LedgerActivityPage, error) {
+	filter = filter.Normalize()
+	if err := filter.Validate(); err != nil {
+		return domain.LedgerActivityPage{}, err
+	}
+	return service.repository.ListLedgerActivities(ctx, filter)
+}
+
+// DailyPnL 返回按 UTC 自然日、执行账户与开仓策略归因的净已实现盈亏（SELL 平仓 + REDEEM 赎回）。
 func (service *Service) DailyPnL(ctx context.Context, filter domain.DailyPnLFilter) (domain.DailyPnLReport, error) {
 	filter = filter.Normalize()
 	if err := filter.Validate(); err != nil {

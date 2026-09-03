@@ -52,3 +52,29 @@ func TestDailyPnLFilterNormalizesAndValidates(t *testing.T) {
 		}
 	}
 }
+
+// TestLedgerActivityFilterNormalizesAndValidates 验证账本活动筛选能规范化活动类型并拒绝未知类型。
+func TestLedgerActivityFilterNormalizesAndValidates(t *testing.T) {
+	from := time.Date(2026, 9, 2, 8, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	filter := (LedgerActivityFilter{ActivityType: " redeem ", From: &from, ExecutionAccountID: " wallet-6 "}).Normalize()
+	if filter.Limit != DefaultTradeHistoryLimit || filter.ActivityType != LedgerActivityRedeem || filter.ExecutionAccountID != "wallet-6" {
+		t.Fatalf("normalized filter = %#v", filter)
+	}
+	if filter.From == nil || filter.From.Location() != time.UTC {
+		t.Fatalf("normalized from = %v", filter.From)
+	}
+	if err := filter.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	to := from.Add(-time.Minute)
+	for _, filter := range []LedgerActivityFilter{
+		{Limit: MaxTradeHistoryLimit + 1},
+		{Limit: 10, Offset: -1},
+		{Limit: 10, ActivityType: "HOLD"},
+		{Limit: 10, From: &from, To: &to},
+	} {
+		if err := filter.Validate(); err == nil {
+			t.Fatalf("Validate(%#v) unexpectedly succeeded", filter)
+		}
+	}
+}

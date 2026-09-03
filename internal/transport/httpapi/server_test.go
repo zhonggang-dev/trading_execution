@@ -284,8 +284,10 @@ type fakeReconciliationJob struct {
 // fakeTradeHistoryService 表示后端使用的 fakeTradeHistoryService 类型。
 type fakeTradeHistoryService struct {
 	filter         domain.TradeHistoryFilter
+	ledgerFilter   domain.LedgerActivityFilter
 	dailyPnLFilter domain.DailyPnLFilter
 	calls          int
+	ledgerCalls    int
 	dailyPnLCalls  int
 }
 
@@ -307,6 +309,39 @@ func (service *fakeTradeHistoryService) List(_ context.Context, filter domain.Tr
 			TradeCount: 1, BuyNotional: "0", SellNotional: "6.2", NetCashFlow: "6.19", TotalFee: "0.01", RealizedPnL: "1.19",
 		},
 		Total: 1, Limit: filter.Limit, Offset: filter.Offset,
+	}, nil
+}
+
+// ListLedgerActivities 记录账本活动筛选条件并返回一条 SELL 成交与一条 REDEEM 赎回。
+func (service *fakeTradeHistoryService) ListLedgerActivities(_ context.Context, filter domain.LedgerActivityFilter) (domain.LedgerActivityPage, error) {
+	service.ledgerFilter = filter
+	service.ledgerCalls++
+	return domain.LedgerActivityPage{
+		Items: []domain.LedgerActivity{{
+			ActivityKey: "redemption:lot-redemption:0xabc:lot-1", ActivityType: domain.LedgerActivityRedeem,
+			Venue: "polymarket", ExecutionAccountID: "wallet-6", ModelID: "model-v2", StrategyID: "multfactor_v2",
+			MarketID: "market-1", ConditionID: "0xcond", TokenID: "token-1", LotID: "lot-1",
+			Shares: "40", TotalFee: "0", NetCashDelta: "40", CostBasis: "2.08", SettlementPayout: "40",
+			RealizedPnL: "37.92", TransactionHash: "0xabc",
+			OccurredAt:  time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC),
+			ConfirmedAt: time.Date(2026, 9, 2, 9, 59, 0, 0, time.UTC),
+			AppliedAt:   time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC),
+		}, {
+			ActivityKey: "fill:fill-key-1", ActivityType: domain.LedgerActivitySell, Venue: "polymarket",
+			ExecutionAccountID: "wallet-6", ModelID: "model-v2", StrategyID: "multfactor_v2",
+			MarketID: "market-1", TokenID: "token-1", OrderID: "order-1", VenueTradeID: "venue-trade-1",
+			LiquidityRole: domain.LiquidityRoleTaker, Shares: "10", Price: "0.62", GrossNotional: "6.2",
+			TotalFee: "0.01", NetCashDelta: "6.19", CostBasis: "5", RealizedPnL: "1.19",
+			OccurredAt:  time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC),
+			ConfirmedAt: time.Date(2026, 8, 18, 12, 1, 0, 0, time.UTC),
+			AppliedAt:   time.Date(2026, 8, 18, 12, 1, 0, 0, time.UTC),
+		}},
+		Summary: domain.LedgerActivitySummary{
+			ActivityCount: 2, TradeCount: 1, RedemptionCount: 1, BuyNotional: "0", SellNotional: "6.2",
+			RedeemPayout: "40", NetCashFlow: "46.19", TotalFee: "0.01", RealizedPnL: "39.11",
+			SellRealizedPnL: "1.19", RedeemRealizedPnL: "37.92",
+		},
+		Total: 2, Limit: filter.Limit, Offset: filter.Offset,
 	}, nil
 }
 
@@ -350,6 +385,70 @@ func TestTradeHistoryEndpointAuthenticatesAndValidatesFilters(t *testing.T) {
 	}
 	if history.calls != 1 || history.filter.Side != domain.SideSell || history.filter.Limit != 25 || history.filter.Offset != 5 || history.filter.From == nil {
 		t.Fatalf("captured filter = %#v, calls=%d", history.filter, history.calls)
+	}
+}
+
+// TestLedgerActivitiesEndpointReturnsRedeemRowsWithoutTradeFields 验证统一账本接口鉴权、校验活动类型，
+// 且 REDEEM 行不携带成交价、订单 ID 与流动性角色。
+func TestLedgerActivitiesEndpointReturnsRedeemRowsWithoutTradeFields(t *testing.T) {
+	history := &fakeTradeHistoryService{}
+	server, err := New(Params{
+		Service: baseExecutionService(t), TradeHistory: history,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), APIToken: "console-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized := performRequest(t, server, http.MethodGet, "/api/v1/ledger-activities", "", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d", unauthorized.Code)
+	}
+	for _, path := range []string{"/api/v1/ledger-activities?activity_type=HOLD", "/api/v1/ledger-activities?side=SELL", "/api/v1/ledger-activities?limit=101"} {
+		invalid := performRequest(t, server, http.MethodGet, path, "", "console-secret")
+		if invalid.Code != http.StatusBadRequest || history.ledgerCalls != 0 {
+			t.Fatalf("%s status=%d calls=%d body=%s", path, invalid.Code, history.ledgerCalls, invalid.Body.String())
+		}
+	}
+	response := performRequest(t, server, http.MethodGet,
+		"/api/v1/ledger-activities?limit=25&offset=5&activity_type=redeem&model_id=model-v2&strategy_id=multfactor_v2&execution_account_id=wallet-6&from=2026-09-01T00:00:00Z&q=0xabc",
+		"", "console-secret")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Items   []map[string]any `json:"items"`
+			Summary map[string]any   `json:"summary"`
+			Total   int64            `json:"total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.Total != 2 || len(payload.Data.Items) != 2 {
+		t.Fatalf("payload = %s", response.Body.String())
+	}
+	redeem := payload.Data.Items[0]
+	if redeem["activity_type"] != "REDEEM" || redeem["realized_pnl"] != "37.92" || redeem["settlement_payout"] != "40" || redeem["cost_basis"] != "2.08" || redeem["transaction_hash"] != "0xabc" {
+		t.Fatalf("redeem row = %#v", redeem)
+	}
+	for _, absent := range []string{"price", "order_id", "venue_order_id", "venue_trade_id", "liquidity_role", "order_status", "gross_notional"} {
+		if _, present := redeem[absent]; present {
+			t.Fatalf("redeem row unexpectedly carries %q: %#v", absent, redeem)
+		}
+	}
+	if payload.Data.Items[1]["price"] != "0.62" || payload.Data.Items[1]["liquidity_role"] != "TAKER" {
+		t.Fatalf("sell row = %#v", payload.Data.Items[1])
+	}
+	if payload.Data.Summary["realized_pnl"] != "39.11" || payload.Data.Summary["redeem_payout"] != "40" || payload.Data.Summary["sell_notional"] != "6.2" {
+		t.Fatalf("summary = %#v", payload.Data.Summary)
+	}
+	if history.ledgerCalls != 1 || history.ledgerFilter.ActivityType != domain.LedgerActivityRedeem || history.ledgerFilter.Limit != 25 ||
+		history.ledgerFilter.Offset != 5 || history.ledgerFilter.From == nil || history.ledgerFilter.Search != "0xabc" {
+		t.Fatalf("captured filter = %#v, calls=%d", history.ledgerFilter, history.ledgerCalls)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("cache-control = %q", response.Header().Get("Cache-Control"))
 	}
 }
 
