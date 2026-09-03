@@ -165,8 +165,9 @@ POST /api/v1/orders/{order_id}/refresh
 POST /api/v1/orders/{order_id}/cancel
 GET  /api/v1/orders/{order_id}/events
 GET  /api/v1/orders/{order_id}/attempts
-GET  /api/v1/trades                              # 已确认且已入账的真实 Fill
-GET  /api/v1/daily-pnl                           # UTC 日 × 执行账户 × 策略的净已实现盈亏
+GET  /api/v1/trades                              # 已确认且已入账的真实 Fill（兼容保留）
+GET  /api/v1/ledger-activities                   # 统一账本活动：BUY / SELL 成交 + REDEEM 赎回结算
+GET  /api/v1/daily-pnl                           # UTC 日 × 执行账户 × 策略的净已实现盈亏（SELL 平仓 + REDEEM）
 POST /internal/jobs/position-exit-evaluation/run  # 仅在注入 PositionExitJob 后注册，当前 cmd/server 未装配
 POST /internal/jobs/reconciliation/run             # live 模式注册；paper 模式不注册
 ```
@@ -177,13 +178,29 @@ POST /internal/jobs/reconciliation/run             # live 模式注册；paper �
 curl 'http://127.0.0.1:8090/api/v1/trades?from=2026-08-01T00:00:00Z&side=SELL&model_id=forecast-v2&strategy_id=multfactor_v2&limit=20&offset=0' \
   -H "Authorization: Bearer ${EXECUTION_API_TOKEN}"
 
+curl 'http://127.0.0.1:8090/api/v1/ledger-activities?activity_type=REDEEM&execution_account_id=wallet-6&limit=20&offset=0' \
+  -H "Authorization: Bearer ${EXECUTION_API_TOKEN}"
+
 curl 'http://127.0.0.1:8090/api/v1/daily-pnl?days=14' \
   -H "Authorization: Bearer ${EXECUTION_API_TOKEN}"
 ```
 
-该接口只读取 `execution_fills.status=CONFIRMED AND applied_at IS NOT NULL` 的记录，
+`/trades` 只读取 `execution_fills.status=CONFIRMED AND applied_at IS NOT NULL` 的记录，
 并从 `position_lot_closures` 汇总 SELL 的已实现盈亏。返回价格和金额均为 JSON
-字符串小数；不返回钱包地址、CLOB 凭证、签名或原始响应。配置
+字符串小数；不返回钱包地址、CLOB 凭证、签名或原始响应。
+
+`/ledger-activities` 在同一分页与汇总口径下合并两类事件：`activity_type=BUY|SELL` 来自上述真实
+Fill；`activity_type=REDEEM` 来自 auto redeem 入账后写入的 `position_lot_redemptions`，按原始批次
+归因到钱包、模型与策略，返回赎回份额 `shares`、原始成本 `cost_basis`、结算到账 `settlement_payout`、
+`realized_pnl`、链上 `transaction_hash`，以及 `confirmed_at`（链上确认）和 `applied_at`（入账）。
+REDEEM 不是 CLOB 成交，因此不返回 `price`、`order_id`、`liquidity_role`。汇总中的
+`realized_pnl = sell_realized_pnl + redeem_realized_pnl`，赎回到账单独记入 `redeem_payout`，不计入
+`sell_notional`。支持 `from`/`to`（按发生时间：Fill 撮合时间、REDEEM 入账时间）、`activity_type`、
+`model_id`、`strategy_id`、`execution_account_id`、`q` 筛选。
+
+`/daily-pnl` 同样把已入账的赎回按 `redeemed_at` 的 UTC 日计入：`realized_pnl` 包含 SELL 平仓与
+REDEEM，`closed_shares` 包含赎回份额，`closed_trade_count` 仍只统计 SELL 平仓，赎回事件单独返回
+`redemption_count` 与 `redemption_pnl`。赎回批次与 SELL 平仓批次互斥，不会重复计算。配置
 `TRADING_EXECUTION_DATABASE_URL` 后读取 PostgreSQL；未配置时 paper 模式返回空列表，
 不会把 paper 订单状态伪装成真实成交。生产库需按顺序执行至
 `migrations/0015_position_lot_model_routes.sql`。

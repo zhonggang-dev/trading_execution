@@ -50,6 +50,7 @@ type reconciliationJob interface {
 // tradeHistoryService 表示后端使用的 tradeHistoryService 类型。
 type tradeHistoryService interface {
 	List(context.Context, domain.TradeHistoryFilter) (domain.TradeHistoryPage, error)
+	ListLedgerActivities(context.Context, domain.LedgerActivityFilter) (domain.LedgerActivityPage, error)
 	DailyPnL(context.Context, domain.DailyPnLFilter) (domain.DailyPnLReport, error)
 }
 
@@ -151,6 +152,7 @@ func New(params Params) (*Server, error) {
 	mux.Handle("GET /api/v1/orders/{order_id}/attempts", server.authenticate(http.HandlerFunc(server.attempts)))
 	if server.tradeHistory != nil {
 		mux.Handle("GET /api/v1/trades", server.authenticate(http.HandlerFunc(server.trades)))
+		mux.Handle("GET /api/v1/ledger-activities", server.authenticate(http.HandlerFunc(server.ledgerActivities)))
 		mux.Handle("GET /api/v1/daily-pnl", server.authenticate(http.HandlerFunc(server.dailyPnL)))
 	}
 	if server.liveOperations != nil {
@@ -301,7 +303,24 @@ func (server *Server) trades(writer http.ResponseWriter, request *http.Request) 
 	writeJSON(writer, http.StatusOK, map[string]any{"data": page})
 }
 
-// dailyPnL 返回连续 UTC 日内按执行账户和来源策略归因的净已实现盈亏。
+// ledgerActivities 返回统一的账本活动：已确认并入账的 BUY/SELL 成交与已入账的 REDEEM 赎回结算。
+func (server *Server) ledgerActivities(writer http.ResponseWriter, request *http.Request) {
+	filter, err := parseLedgerActivityFilter(request)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_LEDGER_ACTIVITY_FILTER", err.Error())
+		return
+	}
+	page, err := server.tradeHistory.ListLedgerActivities(request.Context(), filter)
+	if err != nil {
+		server.logger.Error("ledger activity query failed", "error", err)
+		writeError(writer, http.StatusBadGateway, "LEDGER_ACTIVITIES_UNAVAILABLE", "ledger activities are temporarily unavailable")
+		return
+	}
+	writer.Header().Set("Cache-Control", "no-store")
+	writeJSON(writer, http.StatusOK, map[string]any{"data": page})
+}
+
+// dailyPnL 返回连续 UTC 日内按执行账户和来源策略归因的净已实现盈亏（SELL 平仓 + REDEEM 赎回）。
 func (server *Server) dailyPnL(writer http.ResponseWriter, request *http.Request) {
 	filter, err := parseDailyPnLFilter(request)
 	if err != nil {
@@ -418,6 +437,53 @@ func parseTradeHistoryFilter(request *http.Request) (domain.TradeHistoryFilter, 
 	filter = filter.Normalize()
 	if err := filter.Validate(); err != nil {
 		return domain.TradeHistoryFilter{}, err
+	}
+	return filter, nil
+}
+
+// parseLedgerActivityFilter 解析并校验统一账本活动的 HTTP 查询参数。
+func parseLedgerActivityFilter(request *http.Request) (domain.LedgerActivityFilter, error) {
+	query := request.URL.Query()
+	allowed := map[string]bool{
+		"limit": true, "offset": true, "from": true, "to": true, "activity_type": true,
+		"model_id": true, "strategy_id": true, "execution_account_id": true, "q": true,
+	}
+	for key, values := range query {
+		if !allowed[key] {
+			return domain.LedgerActivityFilter{}, fmt.Errorf("unsupported query parameter %q", key)
+		}
+		if len(values) != 1 {
+			return domain.LedgerActivityFilter{}, fmt.Errorf("query parameter %q must be provided once", key)
+		}
+	}
+	filter := domain.LedgerActivityFilter{
+		Limit:        domain.DefaultTradeHistoryLimit,
+		ActivityType: domain.LedgerActivityType(query.Get("activity_type")), ModelID: query.Get("model_id"),
+		StrategyID: query.Get("strategy_id"), ExecutionAccountID: query.Get("execution_account_id"),
+		Search: query.Get("q"),
+	}
+	var err error
+	if raw := query.Get("limit"); raw != "" {
+		filter.Limit, err = strconv.Atoi(raw)
+		if err != nil {
+			return domain.LedgerActivityFilter{}, fmt.Errorf("limit must be an integer")
+		}
+	}
+	if raw := query.Get("offset"); raw != "" {
+		filter.Offset, err = strconv.Atoi(raw)
+		if err != nil {
+			return domain.LedgerActivityFilter{}, fmt.Errorf("offset must be an integer")
+		}
+	}
+	if filter.From, err = parseOptionalRFC3339(query.Get("from")); err != nil {
+		return domain.LedgerActivityFilter{}, fmt.Errorf("from must be RFC3339: %w", err)
+	}
+	if filter.To, err = parseOptionalRFC3339(query.Get("to")); err != nil {
+		return domain.LedgerActivityFilter{}, fmt.Errorf("to must be RFC3339: %w", err)
+	}
+	filter = filter.Normalize()
+	if err := filter.Validate(); err != nil {
+		return domain.LedgerActivityFilter{}, err
 	}
 	return filter, nil
 }

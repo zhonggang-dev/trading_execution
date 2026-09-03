@@ -137,9 +137,10 @@ type FillLedger interface {
 	ListOrderFills(ctx context.Context, orderID string) ([]domain.Fill, error)
 }
 
-// TradeHistoryRepository 提供已确认且已入账成交的只读视图，并保证明细、总数和汇总使用同一筛选条件。
+// TradeHistoryRepository 提供已确认且已入账成交与赎回结算的只读视图，并保证明细、总数和汇总使用同一筛选条件。
 type TradeHistoryRepository interface {
 	ListTradeHistory(ctx context.Context, filter domain.TradeHistoryFilter) (domain.TradeHistoryPage, error)
+	ListLedgerActivities(ctx context.Context, filter domain.LedgerActivityFilter) (domain.LedgerActivityPage, error)
 	DailyPnL(ctx context.Context, filter domain.DailyPnLFilter) (domain.DailyPnLReport, error)
 }
 
