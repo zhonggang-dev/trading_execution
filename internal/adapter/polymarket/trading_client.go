@@ -37,8 +37,12 @@ type TradingClientParams struct {
 	BuilderCode       string
 	Metadata          string
 	MinBuyNotional    domain.Decimal
-	Now               func() time.Time
-	Random            io.Reader
+	// FeeScheduleTTL bounds how long a cached /clob-markets fee schedule is
+	// trusted before it is re-read. Polymarket can enable or change fees on a
+	// market, so a reservation must not rely on a schedule cached forever.
+	FeeScheduleTTL time.Duration
+	Now            func() time.Time
+	Random         io.Reader
 }
 
 // TradingClient 表示后端使用的 TradingClient 类型。
@@ -57,12 +61,21 @@ type TradingClient struct {
 	clockMu        sync.RWMutex
 	clockOffset    time.Duration
 	feeScheduleMu  sync.RWMutex
-	feeSchedules   map[string]marketFeeSchedule
+	feeSchedules   map[string]cachedFeeSchedule
+	feeScheduleTTL time.Duration
 }
+
+type cachedFeeSchedule struct {
+	schedule  marketFeeSchedule
+	fetchedAt time.Time
+}
+
+const defaultFeeScheduleTTL = 15 * time.Minute
 
 var (
 	_ port.FillSource                = (*TradingClient)(nil)
 	_ port.VenueReconciliationSource = (*TradingClient)(nil)
+	_ port.FeeScheduleSource         = (*TradingClient)(nil)
 )
 
 // rawOrder 表示后端使用的 rawOrder 类型。
@@ -334,15 +347,22 @@ func NewTradingClient(params TradingClientParams) (*TradingClient, error) {
 	if params.Now == nil {
 		params.Now = time.Now
 	}
+	if params.FeeScheduleTTL == 0 {
+		params.FeeScheduleTTL = defaultFeeScheduleTTL
+	}
+	if params.FeeScheduleTTL < 0 {
+		return nil, fmt.Errorf("Polymarket fee schedule TTL must not be negative")
+	}
 	client := &TradingClient{
-		baseURL:      baseURL,
-		httpClient:   params.HTTPClient,
-		credentials:  params.Credentials,
-		timeout:      params.RequestTimeout,
-		limiter:      limiter,
-		feeEvidence:  params.FeeEvidence,
-		now:          params.Now,
-		feeSchedules: make(map[string]marketFeeSchedule),
+		baseURL:        baseURL,
+		httpClient:     params.HTTPClient,
+		credentials:    params.Credentials,
+		timeout:        params.RequestTimeout,
+		limiter:        limiter,
+		feeEvidence:    params.FeeEvidence,
+		now:            params.Now,
+		feeSchedules:   make(map[string]cachedFeeSchedule),
+		feeScheduleTTL: params.FeeScheduleTTL,
 		builder: orderBuilder{
 			chainID:        polygonChainID,
 			builderCode:    params.BuilderCode,
@@ -1424,12 +1444,47 @@ func (client *TradingClient) getMarketFeeSchedule(
 		return marketFeeSchedule{}, fmt.Errorf("condition id and token id are required for fee evidence")
 	}
 	cacheKey := conditionID + "\x00" + tokenID
+	now := client.now().UTC()
 	client.feeScheduleMu.RLock()
 	cached, exists := client.feeSchedules[cacheKey]
 	client.feeScheduleMu.RUnlock()
-	if exists {
-		return cached, nil
+	if exists && now.Sub(cached.fetchedAt) <= client.feeScheduleTTL {
+		return cached.schedule, nil
 	}
+	schedule, err := client.fetchMarketFeeSchedule(ctx, conditionID, tokenID)
+	if err != nil {
+		if exists {
+			// An expired schedule is still the last authoritative statement of
+			// the venue; a transient read failure must not turn known fee
+			// evidence into a hard error.
+			return cached.schedule, nil
+		}
+		return marketFeeSchedule{}, err
+	}
+	client.feeScheduleMu.Lock()
+	client.feeSchedules[cacheKey] = cachedFeeSchedule{schedule: schedule, fetchedAt: now}
+	client.feeScheduleMu.Unlock()
+	return schedule, nil
+}
+
+// MarketFeeSchedule exposes the venue fee curve for reservation sizing. Any
+// error means the fee cannot be confirmed and the caller must fall back to the
+// configured fee cap; it must never be interpreted as a zero fee.
+func (client *TradingClient) MarketFeeSchedule(ctx context.Context, conditionID, tokenID string) (domain.MarketFeeSchedule, error) {
+	if strings.TrimSpace(client.builder.builderCode) != "" {
+		return domain.MarketFeeSchedule{}, fmt.Errorf("builder fee rate for builder code is not published by the fee schedule")
+	}
+	schedule, err := client.getMarketFeeSchedule(ctx, conditionID, tokenID)
+	if err != nil {
+		return domain.MarketFeeSchedule{}, err
+	}
+	return domain.MarketFeeSchedule{
+		PlatformFeeRate: schedule.Rate, FeeExponent: schedule.Exponent, TakerOnly: schedule.TakerOnly,
+		FetchedAt: client.now().UTC(),
+	}, nil
+}
+
+func (client *TradingClient) fetchMarketFeeSchedule(ctx context.Context, conditionID, tokenID string) (marketFeeSchedule, error) {
 	body, _, err := client.do(
 		ctx, TradingAccount{}, http.MethodGet, "/clob-markets/"+url.PathEscape(conditionID), nil, nil, false, false,
 	)
@@ -1485,9 +1540,6 @@ func (client *TradingClient) getMarketFeeSchedule(
 		}
 		schedule = marketFeeSchedule{Rate: rate, Exponent: exponent, TakerOnly: takerOnly}
 	}
-	client.feeScheduleMu.Lock()
-	client.feeSchedules[cacheKey] = schedule
-	client.feeScheduleMu.Unlock()
 	return schedule, nil
 }
 

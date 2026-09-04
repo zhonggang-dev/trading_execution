@@ -177,6 +177,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		Credentials:    provider,
 		FeeEvidence:    feeEvidence,
 		RequestTimeout: cfg.Polymarket.RequestTimeout,
+		FeeScheduleTTL: cfg.Polymarket.FeeScheduleTTL,
 	})
 	if err != nil {
 		return nil, err
@@ -302,8 +303,10 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, err
 	}
 	marketValidator, err := marketvalidation.New(marketvalidation.Params{
-		Universe:   marketUniverse,
-		OrderBooks: orderBooks,
+		Universe:         marketUniverse,
+		OrderBooks:       orderBooks,
+		FeeSchedules:     tradingClient,
+		MaxLatestBookAge: cfg.Polymarket.LatestBookMaxAge,
 	})
 	if err != nil {
 		return nil, err

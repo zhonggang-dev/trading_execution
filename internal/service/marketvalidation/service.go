@@ -19,8 +19,12 @@ const (
 
 // Params 表示后端使用的 Params 类型。
 type Params struct {
-	Universe         port.MarketUniverse
-	OrderBooks       port.OrderBookSource
+	Universe   port.MarketUniverse
+	OrderBooks port.OrderBookSource
+	// FeeSchedules is optional. When present, BUY validations record the venue
+	// fee curve so the reservation can size the fee buffer from the real
+	// worst-case fee instead of the configured cap.
+	FeeSchedules     port.FeeScheduleSource
 	MaxUniverseAge   time.Duration
 	MaxLatestBookAge time.Duration
 	MaxFutureSkew    time.Duration
@@ -31,6 +35,7 @@ type Params struct {
 type Service struct {
 	universe         port.MarketUniverse
 	orderBooks       port.OrderBookSource
+	feeSchedules     port.FeeScheduleSource
 	maxUniverseAge   time.Duration
 	maxLatestBookAge time.Duration
 	maxFutureSkew    time.Duration
@@ -60,6 +65,7 @@ func New(params Params) (*Service, error) {
 	return &Service{
 		universe:         params.Universe,
 		orderBooks:       params.OrderBooks,
+		feeSchedules:     params.FeeSchedules,
 		maxUniverseAge:   params.MaxUniverseAge,
 		maxLatestBookAge: params.MaxLatestBookAge,
 		maxFutureSkew:    params.MaxFutureSkew,
@@ -142,9 +148,10 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 	if crossed, err := book.Bids[0].Price.Compare(book.Asks[0].Price); err != nil || crossed > 0 {
 		return domain.MarketValidation{}, reject("LATEST_BOOK_INVALID", "latest best bid exceeds best ask")
 	}
-	if err := validateAge("LATEST_BOOK_SOURCE", book.SourceAt, now, service.maxLatestBookAge, service.maxFutureSkew); err != nil {
-		return domain.MarketValidation{}, err
-	}
+	// book.SourceAt is the venue's last-book-change time. A quiet market keeps
+	// the same timestamp for minutes while the book is still the current one,
+	// so its age is recorded as evidence but never rejects an order. Execution
+	// freshness is the age of our own capture, book.ObservedAt.
 	if err := validateAge("LATEST_BOOK_OBSERVATION", book.ObservedAt, now, service.maxLatestBookAge, service.maxFutureSkew); err != nil {
 		return domain.MarketValidation{}, err
 	}
@@ -176,7 +183,36 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		}
 		params.ExecutableSize = executableSize
 	}
+	if intent.Side == domain.SideBuy && service.feeSchedules != nil {
+		params.BuyFeeReserve = service.buyFeeReserve(ctx, intent)
+	}
 	return params.Build()
+}
+
+// buyFeeReserve resolves the fee basis for a BUY reservation. It never rejects:
+// a confirmed venue schedule yields the worst-case per-share fee inside
+// worst_price, and any failure to confirm the schedule falls back to the
+// configured cap with the reason recorded for audit.
+func (service *Service) buyFeeReserve(ctx context.Context, intent domain.OrderIntent) *domain.BuyFeeReserve {
+	schedule, err := service.feeSchedules.MarketFeeSchedule(ctx, intent.ConditionID, intent.TokenID)
+	if err != nil {
+		return &domain.BuyFeeReserve{Source: domain.BuyFeeReserveSourceConfigCap, Reason: err.Error()}
+	}
+	maxFeePerShare, err := domain.MaxBuyFeePerShare(intent.WorstPrice, schedule)
+	if err != nil {
+		return &domain.BuyFeeReserve{Source: domain.BuyFeeReserveSourceConfigCap, Reason: err.Error()}
+	}
+	fetchedAt := schedule.FetchedAt.UTC()
+	reserve := &domain.BuyFeeReserve{
+		Source:          domain.BuyFeeReserveSourceVenueFeeSchedule,
+		PlatformFeeRate: schedule.PlatformFeeRate,
+		FeeExponent:     schedule.FeeExponent,
+		MaxFeePerShare:  maxFeePerShare,
+	}
+	if !fetchedAt.IsZero() {
+		reserve.ScheduleFetchedAt = &fetchedAt
+	}
+	return reserve
 }
 
 // protectedExecutableSize measures what an IOC can take right now: the visible

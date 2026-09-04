@@ -857,7 +857,7 @@ func liveIntegrationOrder(orderID, accountID, tokenID, size, worstPrice string, 
 	order.Intent.SignalAt = &signalAt
 	order.MarketValidation = &domain.MarketValidation{
 		Mode: liveMarketValidationMode, ValidatedAt: now,
-		StrategySnapshotAt: marketAt, LatestBookSourceAt: latestBookAt,
+		StrategySnapshotAt: marketAt, LatestBookSourceAt: latestBookAt, LatestBookObservedAt: latestBookAt,
 		WorstPrice: order.Intent.WorstPrice,
 	}
 	return order

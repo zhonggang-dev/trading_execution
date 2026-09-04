@@ -133,6 +133,8 @@ type Polymarket struct {
 	CancelFillFinalityGrace    time.Duration
 	MaxReconcileAttempts       int
 	MaxBuyFeeRateBPS           domain.Decimal
+	LatestBookMaxAge           time.Duration
+	FeeScheduleTTL             time.Duration
 	OrderFilledConfirmations   int
 	FillFinalityMaxAge         time.Duration
 	AutoRedeemInterval         time.Duration
@@ -291,6 +293,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	latestBookMaxAge, err := duration("POLYMARKET_LATEST_BOOK_MAX_AGE", 10*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	feeScheduleTTL, err := duration("POLYMARKET_FEE_SCHEDULE_TTL", 15*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 	orderFilledConfirmations, err := integer("POLYGON_ORDER_FILLED_CONFIRMATIONS", 64, 1, 10_000)
 	if err != nil {
 		return Config{}, err
@@ -390,6 +400,8 @@ func Load() (Config, error) {
 			CancelFillFinalityGrace:    cancelFillFinalityGrace,
 			MaxReconcileAttempts:       maxReconcileAttempts,
 			MaxBuyFeeRateBPS:           maxBuyFeeRateBPS,
+			LatestBookMaxAge:           latestBookMaxAge,
+			FeeScheduleTTL:             feeScheduleTTL,
 			OrderFilledConfirmations:   orderFilledConfirmations,
 			FillFinalityMaxAge:         fillFinalityMaxAge,
 			AutoRedeemInterval:         autoRedeemInterval,

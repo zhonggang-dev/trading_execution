@@ -151,9 +151,9 @@ func TestValidateFailsClosed(t *testing.T) {
 			},
 		},
 		{
-			name: "stale latest book", code: "LATEST_BOOK_SOURCE_STALE",
+			name: "stale latest book capture", code: "LATEST_BOOK_OBSERVATION_STALE",
 			mutate: func(_ *domain.OrderIntent, _ *domain.MarketSnapshot, book *domain.OrderBookSnapshot, now time.Time) {
-				book.SourceAt = now.Add(-11 * time.Second)
+				book.ObservedAt = now.Add(-11 * time.Second)
 			},
 		},
 	}
@@ -169,6 +169,121 @@ func TestValidateFailsClosed(t *testing.T) {
 				t.Fatalf("Validate() error = %v, want rejection %s", err, test.code)
 			}
 		})
+	}
+}
+
+// TestValidateAcceptsQuietBookWithOldVenueTimestamp 验证盘口最后变动时间很久以前的慢市场
+// 只要执行层刚抓到盘口就可以下单，venue 时间戳仍被记录为证据。
+func TestValidateAcceptsQuietBookWithOldVenueTimestamp(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	book.SourceAt = now.Add(-7 * time.Minute)
+	book.ObservedAt = now.Add(-time.Second)
+	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v, want quiet market accepted", err)
+	}
+	if !validation.LatestBookSourceAt.Equal(book.SourceAt) || !validation.LatestBookObservedAt.Equal(book.ObservedAt) {
+		t.Fatalf("Validate() timestamps = %s / %s", validation.LatestBookSourceAt, validation.LatestBookObservedAt)
+	}
+	if validation.BuyFeeReserve != nil {
+		t.Fatalf("BuyFeeReserve = %#v, want nil without a fee schedule source", validation.BuyFeeReserve)
+	}
+}
+
+// fakeFeeSchedules 模拟 venue 官方费率读取。
+type fakeFeeSchedules struct {
+	schedule domain.MarketFeeSchedule
+	err      error
+	calls    int
+}
+
+// MarketFeeSchedule 返回模拟费率。
+func (source *fakeFeeSchedules) MarketFeeSchedule(context.Context, string, string) (domain.MarketFeeSchedule, error) {
+	source.calls++
+	return source.schedule, source.err
+}
+
+func newValidatorWithFees(t *testing.T, now time.Time, market domain.MarketSnapshot, books port.OrderBookSource, fees port.FeeScheduleSource) *Service {
+	t.Helper()
+	service, err := New(Params{
+		Universe:     fakeUniverse{market: market, found: true},
+		OrderBooks:   books,
+		FeeSchedules: fees,
+		Now:          func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return service
+}
+
+// TestValidateRecordsVenueFeeReserveForBuy 验证 BUY 校验按官方费率曲线在保护价内的最大值记录
+// 每股最坏手续费。
+func TestValidateRecordsVenueFeeReserveForBuy(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	fetchedAt := now.Add(-time.Minute)
+	fees := &fakeFeeSchedules{schedule: domain.MarketFeeSchedule{
+		PlatformFeeRate: "0.2", FeeExponent: "1", TakerOnly: true, FetchedAt: fetchedAt,
+	}}
+	service := newValidatorWithFees(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}}, fees)
+
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	reserve := validation.BuyFeeReserve
+	if reserve == nil || reserve.Source != domain.BuyFeeReserveSourceVenueFeeSchedule {
+		t.Fatalf("BuyFeeReserve = %#v, want venue fee schedule", reserve)
+	}
+	// worst_price 0.52 允许成交到 0.5，曲线最大值 0.25：0.2 * 0.25 = 0.05
+	if !reserve.MaxFeePerShare.Equal("0.05") || !reserve.PlatformFeeRate.Equal("0.2") || !reserve.FeeExponent.Equal("1") {
+		t.Fatalf("BuyFeeReserve = %#v, want max fee per share 0.05", reserve)
+	}
+	if reserve.ScheduleFetchedAt == nil || !reserve.ScheduleFetchedAt.Equal(fetchedAt) {
+		t.Fatalf("ScheduleFetchedAt = %v, want %s", reserve.ScheduleFetchedAt, fetchedAt)
+	}
+	if fee, ok := reserve.VenueMaxFeePerShare(); !ok || !fee.Equal("0.05") {
+		t.Fatalf("VenueMaxFeePerShare() = %s, %v", fee, ok)
+	}
+}
+
+// TestValidateFallsBackToConfigCapWhenFeeScheduleUnavailable 验证费率无法确认时不拒单，
+// 证据记录退回配置上限的原因。
+func TestValidateFallsBackToConfigCapWhenFeeScheduleUnavailable(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	fees := &fakeFeeSchedules{err: errors.New("clob-markets unavailable")}
+	service := newValidatorWithFees(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}}, fees)
+
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v, want fee schedule failure to fall back instead of rejecting", err)
+	}
+	reserve := validation.BuyFeeReserve
+	if reserve == nil || reserve.Source != domain.BuyFeeReserveSourceConfigCap || reserve.Reason != "clob-markets unavailable" {
+		t.Fatalf("BuyFeeReserve = %#v, want config cap fallback with reason", reserve)
+	}
+	if _, ok := reserve.VenueMaxFeePerShare(); ok {
+		t.Fatal("config cap fallback must not expose a venue fee per share")
+	}
+}
+
+// TestValidateSkipsFeeReserveForSell 验证 SELL 不读取费率，也不记录 BUY 手续费预占依据。
+func TestValidateSkipsFeeReserveForSell(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	intent.Side = domain.SideSell
+	intent.Price = "0.50"
+	intent.WorstPrice = "0.50"
+	fees := &fakeFeeSchedules{schedule: domain.MarketFeeSchedule{PlatformFeeRate: "0.2", FeeExponent: "1"}}
+	service := newValidatorWithFees(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}}, fees)
+
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if validation.BuyFeeReserve != nil || fees.calls != 0 {
+		t.Fatalf("SELL validation = %#v, fee calls = %d, want no fee reserve", validation.BuyFeeReserve, fees.calls)
 	}
 }
 

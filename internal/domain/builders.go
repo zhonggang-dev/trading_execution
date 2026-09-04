@@ -281,6 +281,15 @@ func (params MarketValidationParams) Build() (MarketValidation, error) {
 			}
 		}
 	}
+	if validation.BuyFeeReserve != nil {
+		reserve := *validation.BuyFeeReserve
+		reserve.Source = strings.TrimSpace(reserve.Source)
+		reserve.Reason = strings.TrimSpace(reserve.Reason)
+		if err := reserve.Validate(); err != nil {
+			return MarketValidation{}, fmt.Errorf("market validation buy_fee_reserve: %w", err)
+		}
+		validation.BuyFeeReserve = &reserve
+	}
 	return validation, nil
 }
 

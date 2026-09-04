@@ -47,4 +47,8 @@ type MarketValidation struct {
 	// it to cap the submitted quantity while retaining the strategy-requested
 	// size on OrderIntent for audit and reservation finality.
 	ExecutableSize Decimal `json:"executable_size,omitempty"`
+	// BuyFeeReserve records which fee basis the BUY reservation may use. It is
+	// present only for BUY intents validated by a venue that publishes a fee
+	// schedule; when nil the reservation uses the configured fee-rate cap.
+	BuyFeeReserve *BuyFeeReserve `json:"buy_fee_reserve,omitempty"`
 }

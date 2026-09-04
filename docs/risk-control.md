@@ -40,9 +40,9 @@ strategy 或 wallet 敞口上限；只在执行不可能或不安全时拒绝。
 | `EXECUTION_ACCOUNT_PAUSED` | 当前执行钱包暂停 |
 | `STRATEGY_PAUSED` | 当前策略暂停 |
 | `MARKET_RISK_PAUSED` | 当前 Market 被风控暂停 |
-| `PRICE_TIMESTAMP_REQUIRED` / `PRICE_STALE` | 缺少最新官方盘口时间或执行盘口过期 |
+| `PRICE_TIMESTAMP_REQUIRED` / `PRICE_STALE` | 缺少执行层抓取官方盘口的时间或该抓取过期 |
 | `SIGNAL_TIMESTAMP_REQUIRED` / `SIGNAL_STALE` | 缺少信号时间或 Python 决策过期 |
-| `RISK_STATE_STALE` | 余额、仓位、订单等风险状态过期 |
+| `RISK_STATE_STALE` | 账户从未完成对账，或最近一次已完成对账超出时效窗；正在运行的对账不算过期 |
 | `SAME_DIRECTION_ORDER_EXISTS` | 同钱包、同 token 已有同方向 BUY |
 | `DUPLICATE_SELL_ORDER` | 同钱包、同 token 已有活动 SELL |
 | `INSUFFICIENT_SELL_POSITION` | 卖出数量超过持仓减去活动 SELL 占用 |
@@ -50,8 +50,13 @@ strategy 或 wallet 敞口上限；只在执行不可能或不安全时拒绝。
 
 时间戳还会拒绝超过允许时钟偏差的未来时间。策略响应的 `decided_at` 会写入
 `OrderIntent.signal_at`；`market_snapshot_at` 来自该策略实际引用的冻结盘口并仅作审计。
-价格 freshness 使用执行前官方订单簿校验产生的 `MarketValidation.latest_book_source_at`；
-策略冻结盘口较旧不会再直接阻止订单。
+价格 freshness 使用执行前官方订单簿校验产生的 `MarketValidation.latest_book_observed_at`，
+即执行层抓到官方盘口的时间；CLOB 的盘口变动时间 `latest_book_source_at` 只作证据，慢市场
+长时间不变不会阻止订单。策略冻结盘口较旧同样不会直接阻止订单。
+
+风险状态 freshness 取该账户最近一次 `COMPLETED` 对账的完成时间。定时对账开始时插入的 `RUNNING`
+行不会遮蔽它：对账运行中只读取交易所状态并记录 issue，余额与仓位由 Fill ledger 改写，因此上一次
+完成的对账在其时效窗内仍然有效。Go 的原子预占检查与 migration 0023 的 SUBMITTING trigger 使用同一规则。
 
 可卖数量仍以相同 `token_id` 的 `available_shares` 为准；活动 SELL 已经体现在
 `reserved_shares`，不会再次从 available 中扣减。

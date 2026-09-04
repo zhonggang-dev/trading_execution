@@ -53,7 +53,8 @@ signed shares 和 `net_cash_delta` 加到本地视图后再与链上比较，逐
 Runner 的异常队列不阻塞下单线程。即使进程在入队前崩溃，数据库中的 `UNKNOWN`、
 `CANCEL_PENDING`、预占和 STARTED attempt 仍会被下次启动扫描发现。PostgreSQL 对每个 account 只
 允许一条 `RUNNING` run；崩溃遗留的 run 超过 30 分钟租期后会被标记 `FAILED`，防止多实例同时
-修复同一钱包。
+修复同一钱包。`RUNNING` 或 `FAILED` run 不会让实盘风控判定状态过期：下单时的
+`RISK_STATE_STALE` 只看最近一次 `COMPLETED` run 的完成时间是否在 `max_state_age_ms` 内。
 
 手工触发示例：
 

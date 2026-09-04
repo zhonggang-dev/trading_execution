@@ -70,7 +70,10 @@ func (manager *ReservationManager) authorizeLiveRisk(
 	if err := checkLiveRiskBindingAndControls(ctx, tx, order.Intent); err != nil {
 		return liveRiskAuthorization{}, err
 	}
-	if err := checkRiskTimestamp("PRICE", &order.MarketValidation.LatestBookSourceAt, observedAt, policy.maxPriceAge); err != nil {
+	// Price freshness is the age of our own capture of the official book. The
+	// venue's last-change timestamp (LatestBookSourceAt) is audit evidence only:
+	// a quiet market legitimately keeps it unchanged for minutes.
+	if err := checkRiskTimestamp("PRICE", &order.MarketValidation.LatestBookObservedAt, observedAt, policy.maxPriceAge); err != nil {
 		return liveRiskAuthorization{}, err
 	}
 	if err := checkRiskTimestamp("SIGNAL", order.Intent.SignalAt, observedAt, policy.maxSignalAge); err != nil {
@@ -265,23 +268,29 @@ func checkLiveRiskBindingAndControls(ctx context.Context, tx *sql.Tx, intent dom
 	return nil
 }
 
+// checkLiveRiskState measures risk-state freshness from the latest COMPLETED
+// reconciliation. A RUNNING or FAILED run that started later does not hide it:
+// a periodic run in progress only reads venue state and records issues, so the
+// previously completed run is still the authoritative balance/position check
+// until its own freshness window expires.
 func checkLiveRiskState(ctx context.Context, tx *sql.Tx, accountID string, now time.Time, maxAge time.Duration) error {
-	var status string
 	var completedAt sql.NullTime
 	err := tx.QueryRowContext(ctx, `
-		SELECT status, completed_at
+		SELECT completed_at
 		FROM reconciliation_runs
 		WHERE execution_account_id = $1
-		ORDER BY started_at DESC, run_id DESC
-		LIMIT 1 FOR SHARE`, accountID).Scan(&status, &completedAt)
+		  AND status = $2
+		  AND completed_at IS NOT NULL
+		ORDER BY completed_at DESC, run_id DESC
+		LIMIT 1 FOR SHARE`, accountID, string(domain.ReconciliationRunCompleted)).Scan(&completedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return reject("RISK_STATE_STALE", "the execution account has never completed reconciliation")
 	}
 	if err != nil {
-		return fmt.Errorf("load latest live reconciliation: %w", err)
+		return fmt.Errorf("load latest completed live reconciliation: %w", err)
 	}
-	if status != string(domain.ReconciliationRunCompleted) || !completedAt.Valid {
-		return reject("RISK_STATE_STALE", "the latest execution account reconciliation is not completed")
+	if !completedAt.Valid {
+		return reject("RISK_STATE_STALE", "the latest completed reconciliation has no completion time")
 	}
 	completed := completedAt.Time.UTC()
 	if completed.After(now.Add(maxRiskFutureSkew)) || now.Sub(completed) > maxAge {
@@ -304,8 +313,8 @@ func validateLiveRiskTimestamps(order domain.Order, now time.Time) error {
 	if intent.MarketSnapshotAt == nil || intent.MarketSnapshotAt.IsZero() {
 		return reject("PRICE_TIMESTAMP_REQUIRED", "live order requires market_snapshot_at")
 	}
-	if order.MarketValidation == nil || order.MarketValidation.LatestBookSourceAt.IsZero() {
-		return reject("PRICE_TIMESTAMP_REQUIRED", "live order requires the latest validated orderbook timestamp")
+	if order.MarketValidation == nil || order.MarketValidation.LatestBookObservedAt.IsZero() {
+		return reject("PRICE_TIMESTAMP_REQUIRED", "live order requires the latest validated orderbook capture timestamp")
 	}
 	if intent.SignalAt == nil || intent.SignalAt.IsZero() {
 		return reject("SIGNAL_TIMESTAMP_REQUIRED", "live order requires signal_at")
