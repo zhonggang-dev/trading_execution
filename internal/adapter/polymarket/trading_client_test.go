@@ -638,7 +638,7 @@ func TestListOrderFillsFailsClosedWithoutFinalizedFeeEvidence(t *testing.T) {
 		!strings.Contains(err.Error(), "CLOB trade trade-1 fee evidence") {
 		t.Fatalf("ListOrderFills() error = %v, want fail-closed evidence error", err)
 	}
-	schedule := client.feeSchedules[order.Intent.ConditionID+"\x00"+order.Intent.TokenID]
+	schedule := client.feeSchedules[order.Intent.ConditionID+"\x00"+order.Intent.TokenID].schedule
 	if !schedule.Rate.Equal("0.25") || !schedule.Exponent.Equal("2") {
 		t.Fatalf("official fee schedule = %#v", schedule)
 	}

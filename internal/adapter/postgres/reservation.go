@@ -75,11 +75,9 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 		}
 		reserveUnitPrice := worstPrice
 		if order.Intent.Side == domain.SideBuy {
-			reserveUnitPrice, err = numeric(ctx, tx, `
-				SELECT ($1::numeric * (1 + $2::numeric / 10000))::text`,
-				worstPrice.String(), manager.maxBuyFeeRateBPS.String())
+			reserveUnitPrice, err = manager.buyReserveUnitPrice(ctx, tx, order, worstPrice)
 			if err != nil {
-				return domain.AssetReservation{}, fmt.Errorf("calculate fee-protected BUY reserve: %w", err)
+				return domain.AssetReservation{}, err
 			}
 		}
 
@@ -161,7 +159,7 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 				return domain.AssetReservation{}, fmt.Errorf("reserve buy balance: %w", err)
 			}
 			if !oneRow(result) {
-				return domain.AssetReservation{}, reject("INSUFFICIENT_AVAILABLE_BALANCE", "available balance is below worst-price order notional plus the configured maximum BUY fee buffer")
+				return domain.AssetReservation{}, reject("INSUFFICIENT_AVAILABLE_BALANCE", "available balance is below worst-price order notional plus the worst-case BUY fee buffer")
 			}
 		case domain.SideSell:
 			// Lock explicitly so concurrent SELL reservations cannot both observe
@@ -261,6 +259,36 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 		}
 		return reservation, nil
 	})
+}
+
+// buyReserveUnitPrice 计算 BUY 每股预占现金上限：worst_price 加每股最坏手续费。
+// 手续费优先使用市场校验确认的 venue 官方费率曲线最大值；费率未确认时退回配置的
+// 费率上限。两条路径都保证任何不高于 worst_price 的成交连同手续费都不会超过初始预占，
+// 因此迁移 0008 的结算不变量不变。
+func (manager *ReservationManager) buyReserveUnitPrice(
+	ctx context.Context,
+	tx *sql.Tx,
+	order domain.Order,
+	worstPrice domain.Decimal,
+) (domain.Decimal, error) {
+	if order.MarketValidation != nil {
+		if maxFeePerShare, ok := order.MarketValidation.BuyFeeReserve.VenueMaxFeePerShare(); ok {
+			unitPrice, err := numeric(ctx, tx, `
+				SELECT ($1::numeric + $2::numeric)::text`,
+				worstPrice.String(), maxFeePerShare.String())
+			if err != nil {
+				return "", fmt.Errorf("calculate venue fee-protected BUY reserve: %w", err)
+			}
+			return unitPrice, nil
+		}
+	}
+	unitPrice, err := numeric(ctx, tx, `
+		SELECT ($1::numeric * (1 + $2::numeric / 10000))::text`,
+		worstPrice.String(), manager.maxBuyFeeRateBPS.String())
+	if err != nil {
+		return "", fmt.Errorf("calculate fee-protected BUY reserve: %w", err)
+	}
+	return unitPrice, nil
 }
 
 // Reconcile 按订单累计成交和终态结算或释放资产预占。

@@ -421,6 +421,12 @@ type OrderBookSource interface {
 	Capture(ctx context.Context, decisionAt time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, error)
 }
 
+// FeeScheduleSource 读取 venue 公布的某个 token 官方手续费曲线。返回 error 表示费率无法确认，
+// 调用方必须退回配置上限，不能按零手续费处理。
+type FeeScheduleSource interface {
+	MarketFeeSchedule(ctx context.Context, conditionID, tokenID string) (domain.MarketFeeSchedule, error)
+}
+
 // MidPriceHistorySource 返回每个 Outcome Token 的冻结 Polymarket 中间价序列，单 Token 失败通过响应字段表达。
 type MidPriceHistorySource interface {
 	Capture(ctx context.Context, decisionAt time.Time, lookback time.Duration, targets []domain.BookTarget) ([]domain.MidPriceHistory, error)

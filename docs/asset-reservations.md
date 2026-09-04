@@ -75,14 +75,23 @@ SELL 使用同一个账户锁并额外锁 token position，因此两笔 SELL 也
 
 ## 预占金额
 
-- BUY：`worst_price * (1 + max_buy_fee_rate_bps / 10000) * size`，不是策略快照价，也不是下单时 best ask；
+- BUY：`(worst_price + max_fee_per_share) * size`，不是策略快照价，也不是下单时 best ask；
 - SELL：`size` shares；
 - BUY 缺少正数 `worst_price` 时 fail closed；
 - 全部使用 PostgreSQL `NUMERIC` 和 Go decimal string，不经过 `float64`。
 
-`worst_price` 是 Python 允许的最差成交价，但其合法性仍由 Go Market 校验。`MaxBuyFeeRateBPS`
-由 Go execution 配置所有平台费、builder fee 和逐 Fill 舍入余量的合计上界，不能采用 Python
-策略传入的 fee。该配置必须显式提供；即使已确认零费，也要显式配置 `0`，防止 live 因漏配而
+`max_fee_per_share` 按以下优先级确定，两条路径都由 Go 决定，不能采用 Python 策略传入的 fee：
+
+1. Market 校验已确认 venue 官方费率曲线（`MarketValidation.buy_fee_reserve.source = VENUE_FEE_SCHEDULE`）：
+   Polymarket V2 taker 每股费用为 `rate * (p * (1 - p))^exponent`，成交价只能落在 `(0, worst_price]`，
+   曲线在 0.5 处最大，因此 `max_fee_per_share = rate * (q * (1 - q))^exponent`，其中 `q = min(worst_price, 0.5)`；
+   `exponent = 0` 时费用与价格无关，直接取 `rate`。费率来自 `/clob-markets`，缓存 `POLYMARKET_FEE_SCHEDULE_TTL`
+   （默认 15 分钟）后重新读取；接口返回无 fee details 视为确认零费。
+2. 费率无法确认（接口失败、token 不在返回中、配置了 builder code 等）：
+   `max_fee_per_share = worst_price * max_buy_fee_rate_bps / 10000`，证据记录 `CONFIG_MAX_FEE_RATE_CAP`
+   和原因。费率不确定时绝不按零预占，也不因此拒单。Kalshi 和 paper 始终走这条路径。
+
+`MaxBuyFeeRateBPS` 仍必须显式配置；即使已确认零费，也要显式配置 `0`，防止 live 因漏配而
 静默回到无手续费保护。
 
 `reserve_unit_price` 保存的是最差价格加每 share 手续费 buffer 后的单位现金上限。迁移 0008
@@ -94,8 +103,9 @@ settled_notional + settled_fees + remaining_reserved_balance
   <= initial_reserved_balance
 ```
 
-因此 Fill ledger 即使收到超过配置上限的 reported fee，也会在同一个数据库事务中 fail closed；
-账户扣款、Fill、仓位和 reservation 会整体回滚，不会使用该订单之外的 available balance。
+因此 Fill ledger 即使收到超过预占手续费上限的 reported fee，也会在同一个数据库事务中 fail closed；
+账户扣款、Fill、仓位和 reservation 会整体回滚，不会使用该订单之外的 available balance。按官方费率
+曲线最大值预占正是为了让任何不高于 `worst_price` 的成交连同手续费都满足这条不变量。
 
 ## 部分成交和释放
 

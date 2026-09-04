@@ -81,7 +81,7 @@ Go 不会自行扩大策略给出的限价。
 
 `market_snapshot_at` 标识策略实际引用的冻结盘口，仅作为不可变决策审计证据；它的年龄不再
 充当执行价格门禁。提交前 Trading Execution 会重新抓取官方订单簿，并使用
-`latest_book_source_at` 校验执行价格的新鲜度、盘口深度和策略给出的 `worst_price` 保护边界。
+`latest_book_observed_at` 校验执行价格的新鲜度、盘口深度和策略给出的 `worst_price` 保护边界。
 
 ## Market Universe Service 契约
 
@@ -140,13 +140,22 @@ Venue。`observed_at` 是这份市场元数据的观察时间，不应拿业务�
 | `LATEST_BOOK_UNAVAILABLE` | 最新盘口缺失、为空或状态非 OK |
 | `LATEST_BOOK_IDENTITY_MISMATCH` | 最新盘口不是权威 outcome/token 对应的盘口 |
 | `LATEST_BOOK_INVALID` | 最新盘口格式、排序或买卖价关系无效 |
-| `LATEST_BOOK_SOURCE_STALE` | 最新盘口源时间过期 |
+| `LATEST_BOOK_OBSERVATION_STALE` | 执行层自己抓取最新盘口的时间过期 |
 | `PRICE_DRIFT` | 最新可成交价越过 Python 的 worst_price |
 | `NO_PROTECTED_LIQUIDITY` | IOC intent 在最新盘口保护价内没有可见深度 |
 | `PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE` | IOC intent 保护价内可成交量低于 venue `min_order_size` |
 
-默认时效阈值为：策略快照 2 分钟、Market Universe 元数据 5 分钟、最新盘口 10 秒、未来
-时钟偏差 2 秒。构造 `marketvalidation.Service` 时都可配置；实盘配置应结合服务 SLA 调整。
+默认时效阈值为：Market Universe 元数据 5 分钟、最新盘口抓取 10 秒（`POLYMARKET_LATEST_BOOK_MAX_AGE`）、
+未来时钟偏差 2 秒。构造 `marketvalidation.Service` 时都可配置；实盘配置应结合服务 SLA 调整。
+
+盘口有两个时间：`latest_book_observed_at` 是执行层抓到这份官方盘口的时间，`latest_book_source_at`
+是 CLOB 返回的 `timestamp`，即盘口最后一次变动的时间。慢速事件市场几分钟没有改单或成交时后者
+保持不变，但盘口仍是当前盘口，因此只有前者参与时效拒单，后者只作为证据记录。价格安全由
+`worst_price`、最新最优价和保护价内深度校验保证，不依赖盘口变动频率。
+
+BUY 校验还会读取 Polymarket `/clob-markets` 的官方费率曲线并写入 `buy_fee_reserve` 证据，供资金预占
+按真实最坏手续费计算；费率读取失败时证据记录 `CONFIG_MAX_FEE_RATE_CAP` 和原因，不拒单，预占退回
+配置上限。详见 [`asset-reservations.md`](asset-reservations.md)。
 
 paper 使用显式 `PAPER_BYPASS` validator。live composition 会注入 Gamma Market Universe、
 CLOB OrderBookSource 和 `marketvalidation.Service`，并生成 `LIVE_CHECK` 证据；缺少、过期或冲突的
