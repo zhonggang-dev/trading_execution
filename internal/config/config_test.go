@@ -27,6 +27,38 @@ func TestLoadSafeDefaults(t *testing.T) {
 	if config.Kalshi.MarketDataEnabled {
 		t.Fatalf("Kalshi market data must be disabled without explicit credentials: %#v", config.Kalshi)
 	}
+	if !config.DecisionCycle.KalshiStrategyInputEnabled {
+		t.Fatalf("Kalshi strategy input must stay enabled unless an operator turns it off: %#v", config.DecisionCycle)
+	}
+}
+
+// TestLoadKalshiStrategyInputSwitch covers the venue-level "do not send Kalshi
+// to the strategy" switch: an explicit false turns it off, the default keeps
+// sending Kalshi, and a non-boolean value is rejected.
+func TestLoadKalshiStrategyInputSwitch(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED", "false")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.DecisionCycle.KalshiStrategyInputEnabled {
+		t.Fatalf("Kalshi strategy input = %#v, want disabled", config.DecisionCycle)
+	}
+	t.Setenv("DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED", "")
+	config, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !config.DecisionCycle.KalshiStrategyInputEnabled {
+		t.Fatalf("Kalshi strategy input = %#v, want enabled by default", config.DecisionCycle)
+	}
+	t.Setenv("DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED", "off-please")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED must be a boolean") {
+		t.Fatalf("Load() error = %v, want boolean validation failure", err)
+	}
 }
 
 func TestLoadKalshiMarketDataRequiresCredentialFiles(t *testing.T) {
@@ -636,7 +668,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"POLYMARKET_MAX_BUY_FEE_RATE_BPS", "POLYGON_ORDER_FILLED_CONFIRMATIONS",
 		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",
 		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
-		"DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",
+		"DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED",
 		"DECISION_CYCLE_PREDICTION_INFRA_URL", "DECISION_CYCLE_PREDICTION_INFRA_TOKEN",
 		"DECISION_CYCLE_STRATEGY_URL", "DECISION_CYCLE_STRATEGY_TOKEN",
 		"DECISION_CYCLE_INTERVAL", "DECISION_CYCLE_STARTUP_DELAY", "DECISION_CYCLE_MAX_START_LATENESS", "DECISION_CYCLE_TIMEOUT",

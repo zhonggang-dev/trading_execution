@@ -2656,3 +2656,242 @@ func TestNewRejectsStrategyDisablingEveryBindingLeftByQuarantine(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 }
+
+// kalshiPrediction returns a fresh Kalshi market prediction for the same
+// upstream model as validPrediction so both venues route to one binding.
+func kalshiPrediction(decisionAt time.Time) domain.Prediction {
+	prediction := validPrediction(decisionAt)
+	prediction.PredictionID = "pred-kalshi"
+	prediction.SourceJobID = "job-kalshi"
+	prediction.MarketSource = domain.MarketSourceKalshi
+	prediction.MarketID = "KXTEST"
+	prediction.ConditionID = "kalshi:KXTEST"
+	prediction.Question = "Will the Kalshi market resolve yes?"
+	prediction.Outcomes = []domain.PredictionOutcome{
+		{Index: 0, Name: "Yes", OutcomeID: "YES", TokenID: "kalshi:KXTEST:YES", Probability: 0.6},
+		{Index: 1, Name: "No", OutcomeID: "NO", TokenID: "kalshi:KXTEST:NO", Probability: 0.4},
+	}
+	return prediction
+}
+
+// mixedVenueSkipEvaluations builds one SKIP evaluation per outcome so the
+// strategy response validates against whatever predictions the request holds.
+func mixedVenueSkipEvaluations(predictions ...domain.Prediction) []domain.StrategyEvaluation {
+	evaluations := make([]domain.StrategyEvaluation, 0, 2*len(predictions))
+	for _, prediction := range predictions {
+		for _, outcome := range prediction.Outcomes {
+			evaluations = append(evaluations, domain.StrategyEvaluation{
+				DecisionID: prediction.PredictionID + ":" + outcome.TokenID, PredictionID: prediction.PredictionID,
+				MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+				OutcomeIndex: outcome.Index, TokenID: outcome.TokenID,
+				Action: domain.StrategyActionSkip, ReasonCode: domain.StrategyReasonInvalidBook,
+				Evidence: domain.StrategyEvidence{Probability: outcome.Probability},
+			})
+		}
+	}
+	return evaluations
+}
+
+// mixedVenuePositions returns one open Polymarket lot and one open Kalshi lot
+// owned by the single test binding.
+func mixedVenuePositions(decisionAt time.Time, polymarket domain.Prediction) accountPositionSource {
+	outcomeIndex := 0
+	negRisk := false
+	binding := testBinding()
+	return accountPositionSource{
+		binding.ExecutionAccountID: {
+			{
+				LotID: "lot-poly", ExecutionAccountID: binding.ExecutionAccountID, MarketID: polymarket.MarketID,
+				ConditionID: polymarket.ConditionID, TokenID: polymarket.Outcomes[0].TokenID,
+				OutcomeIndex: &outcomeIndex, OutcomeName: polymarket.Outcomes[0].Name, NegRisk: &negRisk,
+				ModelID: binding.ModelID, StrategyID: domain.StrategyIDMultfactorV2,
+				RemainingShares: "10", AverageEntryPrice: "0.40", Status: domain.PositionLotOpen,
+				OpenedAt: decisionAt.Add(-49 * time.Hour),
+			},
+			{
+				LotID: "lot-kalshi", ExecutionAccountID: binding.ExecutionAccountID, MarketSource: domain.MarketSourceKalshi,
+				MarketID: "KXLOT", ConditionID: "kalshi:KXLOT", TokenID: "kalshi:KXLOT:YES",
+				OutcomeIndex: &outcomeIndex, OutcomeName: "Yes", NegRisk: &negRisk,
+				ModelID: binding.ModelID, StrategyID: domain.StrategyIDMultfactorV2,
+				RemainingShares: "12", AverageEntryPrice: "0.35", Status: domain.PositionLotOpen,
+				OpenedAt: decisionAt.Add(-49 * time.Hour),
+			},
+		},
+	}
+}
+
+func polymarketBooks(decisionAt time.Time, prediction domain.Prediction) []domain.OrderBookSnapshot {
+	books := make([]domain.OrderBookSnapshot, 0, len(prediction.Outcomes))
+	for _, outcome := range prediction.Outcomes {
+		books = append(books, domain.OrderBookSnapshot{
+			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
+			OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, Status: domain.OrderBookStatusOK,
+			SourceAt: decisionAt, ObservedAt: decisionAt.Add(time.Second),
+			DepthLimit: domain.StrategyOrderBookDepth, TickSize: "0.01", MinOrderSize: "1",
+			Bids: []domain.PriceLevel{{Price: "0.48", Size: "20"}},
+			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
+		})
+	}
+	return books
+}
+
+func mixedVenueSnapshot(decisionAt time.Time, predictions ...domain.Prediction) domain.PredictionSnapshot {
+	return domain.PredictionSnapshot{
+		SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-mixed-venue",
+		DecisionAt: decisionAt, CompletedAfter: decisionAt.Add(-3 * time.Hour), GeneratedAt: decisionAt.Add(time.Second),
+		Predictions:         predictions,
+		ExpectedPredictions: completedPredictionExpectations(predictions, 1, 1),
+	}
+}
+
+// TestRunWithholdsKalshiInputFromStrategyWhenSwitchIsOff verifies the venue
+// switch: with Kalshi strategy input disabled, the Kalshi prediction and the
+// Kalshi lot never reach the strategy request, no Kalshi orderbook target is
+// captured, and the Polymarket prediction and lot still flow normally.
+func TestRunWithholdsKalshiInputFromStrategyWhenSwitchIsOff(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	polymarket := validPrediction(decisionAt)
+	kalshi := kalshiPrediction(decisionAt)
+	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
+	strategy := &fakeStrategy{response: domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion, DecidedAt: decisionAt.Add(4 * time.Second),
+		Evaluations: mixedVenueSkipEvaluations(polymarket),
+	}}
+	recorder := &fakeRecorder{}
+	service, err := newTestService(Params{
+		PredictionSource:            fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
+		PositionSource:              mixedVenuePositions(decisionAt, polymarket),
+		OrderBookSource:             bookSource,
+		Strategy:                    strategy,
+		Recorder:                    recorder,
+		KalshiStrategyInputDisabled: true,
+		Bindings:                    []domain.StrategyExecutionBinding{testExecutionBinding()},
+		Venue:                       "polymarket-paper",
+		Now:                         func() time.Time { return decisionAt.Add(5 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !result.KalshiStrategyInputDisabled || result.KalshiPredictionsWithheld != 1 || result.KalshiPositionLotsWithheld != 1 {
+		t.Fatalf("kalshi switch summary = disabled:%v predictions:%d lots:%d, want disabled with one of each withheld",
+			result.KalshiStrategyInputDisabled, result.KalshiPredictionsWithheld, result.KalshiPositionLotsWithheld)
+	}
+	if len(bookSource.targets) != 2 {
+		t.Fatalf("book targets = %#v, want only the two Polymarket outcomes", bookSource.targets)
+	}
+	for _, target := range bookSource.targets {
+		if target.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(target.TokenID, "kalshi:") {
+			t.Fatalf("book target %#v reached the venue router while Kalshi strategy input is disabled", target)
+		}
+	}
+	request := strategy.request
+	if len(request.Predictions) != 1 || request.Predictions[0].PredictionID != polymarket.PredictionID {
+		t.Fatalf("strategy predictions = %#v, want only the Polymarket prediction", request.Predictions)
+	}
+	if len(request.Positions) != 1 || request.Positions[0].LotID != "lot-poly" {
+		t.Fatalf("strategy positions = %#v, want only the Polymarket lot", request.Positions)
+	}
+	for _, book := range request.OrderBooks {
+		if book.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(book.TokenID, "kalshi:") {
+			t.Fatalf("strategy orderbook %#v carries Kalshi data while the switch is off", book)
+		}
+	}
+	if len(result.Runs) != 1 || result.Runs[0].PredictionCount != 1 || result.Runs[0].PositionCount != 1 || result.Runs[0].Error != nil {
+		t.Fatalf("binding run = %#v, want one Polymarket prediction and lot without error", result.Runs)
+	}
+	if !recorder.inputRecorded || !recorder.outputRecorded {
+		t.Fatalf("recorded input/output = %v/%v, want the Polymarket-only cycle audited", recorder.inputRecorded, recorder.outputRecorded)
+	}
+}
+
+// TestRunKeepsSendingKalshiInputToStrategyByDefault is the control for the
+// switch: the zero-value Params keep today's behavior, so the Kalshi
+// prediction reaches the strategy and the venue router next to the Polymarket
+// prediction and lot. The Kalshi lot is left out of this fixture because a
+// Kalshi position lot cannot build an orderbook target today (it carries no
+// outcome id); that pre-existing limitation is independent of the switch.
+func TestRunKeepsSendingKalshiInputToStrategyByDefault(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	polymarket := validPrediction(decisionAt)
+	kalshi := kalshiPrediction(decisionAt)
+	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
+	strategy := &fakeStrategy{response: domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion, DecidedAt: decisionAt.Add(4 * time.Second),
+		Evaluations: mixedVenueSkipEvaluations(polymarket, kalshi),
+	}}
+	positions := mixedVenuePositions(decisionAt, polymarket)
+	positions[testBinding().ExecutionAccountID] = positions[testBinding().ExecutionAccountID][:1]
+	service, err := newTestService(Params{
+		PredictionSource: fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
+		PositionSource:   positions,
+		OrderBookSource:  bookSource,
+		Strategy:         strategy,
+		Recorder:         &fakeRecorder{},
+		Bindings:         []domain.StrategyExecutionBinding{testExecutionBinding()},
+		Venue:            "polymarket-paper",
+		Now:              func() time.Time { return decisionAt.Add(5 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.KalshiStrategyInputDisabled || result.KalshiPredictionsWithheld != 0 || result.KalshiPositionLotsWithheld != 0 {
+		t.Fatalf("kalshi switch summary = %#v, want nothing withheld by default", result)
+	}
+	kalshiTargets := 0
+	for _, target := range bookSource.targets {
+		if target.MarketSource.Normalize() == domain.MarketSourceKalshi {
+			kalshiTargets++
+		}
+	}
+	// Two Polymarket outcomes (the Polymarket lot shares one token) plus the
+	// two Kalshi outcomes.
+	if len(bookSource.targets) != 4 || kalshiTargets != 2 {
+		t.Fatalf("book targets = %#v, want four targets with two Kalshi instruments", bookSource.targets)
+	}
+	request := strategy.request
+	if len(request.Predictions) != 2 || len(request.Positions) != 1 || request.Positions[0].LotID != "lot-poly" {
+		t.Fatalf("strategy request predictions/positions = %#v/%#v, want both venue predictions and the Polymarket lot", request.Predictions, request.Positions)
+	}
+	kalshiBooks := 0
+	for _, book := range request.OrderBooks {
+		if book.MarketSource.Normalize() == domain.MarketSourceKalshi {
+			kalshiBooks++
+		}
+	}
+	if kalshiBooks != 2 {
+		t.Fatalf("strategy orderbooks = %#v, want the two Kalshi outcomes present", request.OrderBooks)
+	}
+	if len(result.Runs) != 1 || result.Runs[0].PredictionCount != 2 || result.Runs[0].PositionCount != 1 || result.Runs[0].Error != nil {
+		t.Fatalf("binding run = %#v, want both venues without error", result.Runs)
+	}
+}
+
+func TestWithholdKalshiPredictionsNormalizesSourceAndKeepsInputIntact(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	legacyPolymarket := validPrediction(decisionAt)
+	explicitPolymarket := validPrediction(decisionAt)
+	explicitPolymarket.PredictionID = "pred-2"
+	explicitPolymarket.MarketSource = domain.MarketSourcePolymarket
+	lowercaseKalshi := kalshiPrediction(decisionAt)
+	lowercaseKalshi.MarketSource = domain.MarketSource("kalshi")
+	input := []domain.Prediction{legacyPolymarket, lowercaseKalshi, explicitPolymarket}
+	kept, withheld := withholdKalshiPredictions(input)
+	if withheld != 1 || len(kept) != 2 || kept[0].PredictionID != "pred-1" || kept[1].PredictionID != "pred-2" {
+		t.Fatalf("withholdKalshiPredictions() = %#v, %d", kept, withheld)
+	}
+	if len(input) != 3 || input[1].PredictionID != "pred-kalshi" {
+		t.Fatalf("input slice was mutated: %#v", input)
+	}
+	kept, withheld = withholdKalshiPredictions(nil)
+	if withheld != 0 || len(kept) != 0 {
+		t.Fatalf("withholdKalshiPredictions(nil) = %#v, %d", kept, withheld)
+	}
+}

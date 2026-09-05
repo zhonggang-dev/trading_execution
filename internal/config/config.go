@@ -78,7 +78,14 @@ type DecisionCycle struct {
 	// keep reconciliation, auto redeem, the account entry gate, and durable
 	// intent delivery, but the decision cycle neither loads their position lots
 	// nor calls the strategy API for them. Empty means every binding is sent.
-	StrategyDisabledAccounts     []string
+	StrategyDisabledAccounts []string
+	// KalshiStrategyInputEnabled is the venue-level "send Kalshi to the
+	// strategy" switch. When false, the decision cycle drops every Kalshi
+	// prediction from the PIT snapshot and every Kalshi position lot before it
+	// builds strategy requests, so no Kalshi orderbook is captured and the
+	// strategy never receives Kalshi markets. Polymarket input, reconciliation,
+	// and delivery of already persisted intents are unaffected. Default true.
+	KalshiStrategyInputEnabled   bool
 	RequireCompleteModelCoverage bool
 	PredictionInfraBaseURL       string
 	PredictionInfraToken         string
@@ -655,6 +662,10 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	kalshiStrategyInputEnabled, err := boolean("DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED", true)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	interval, err := duration("DECISION_CYCLE_INTERVAL", 10*time.Minute)
 	if err != nil {
 		return DecisionCycle{}, err
@@ -710,6 +721,7 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		EntrySubmissionDisabled:      entrySubmissionDisabled,
 		EntryDisabledAccounts:        entryDisabledAccounts,
 		StrategyDisabledAccounts:     strategyDisabledAccounts,
+		KalshiStrategyInputEnabled:   kalshiStrategyInputEnabled,
 		RequireCompleteModelCoverage: requireCompleteModelCoverage,
 		PredictionInfraBaseURL:       strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_URL")),
 		PredictionInfraToken:         strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_TOKEN")),
