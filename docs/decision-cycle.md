@@ -193,6 +193,15 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
   结果中对应绑定标记 `account_strategy_disabled=true`。默认 `[]`；例如设为
   `["main","wallet-1"]` 即只把 wallet-6/wallet-7 发给策略。它不能覆盖全部绑定，也不同于
   `DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON` 的隔离（后者还会移出 reconciliation）；
+- `DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED` 是场所级“是否把 Kalshi 发给策略”的开关，默认
+  `true`。设为 `false` 时，决策周期在拉取 PIT 快照之后、构建策略请求之前丢弃所有
+  `market_source=KALSHI` 的预测和所有 Kalshi position lots，因此不会采集 Kalshi 订单簿，策略
+  请求（predictions/positions/order_books）中不再出现任何 Kalshi 市场，策略也无法据此产出
+  Kalshi intent。Polymarket 输入、账户级闸门、reconciliation 以及已持久化 intent 的恢复/投递
+  不受影响；该轮日志带 `kalshi_strategy_input_disabled=true` 及
+  `kalshi_predictions_withheld` / `kalshi_position_lots_withheld` 计数。若某个绑定的模型在
+  该轮只有 Kalshi 预测，且 `DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true`，该绑定会按
+  既有规则以 `INCOMPLETE_MODEL_COVERAGE` 进入 sell-only；
 - Go 绑定表保证一个 `(model_id, strategy_id)` 只对应一个唯一 `execution_account_id`，同一
   execution account 不能重复绑定；同一逻辑 `model_id` 不能来自多个 `prediction_model_id`，
   同一 `prediction_model_id` 也不能路由到多个逻辑模型。

@@ -97,6 +97,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		EntrySubmissionDisabled:      cycleConfig.EntrySubmissionDisabled,
 		EntryDisabledAccounts:        cycleConfig.EntryDisabledAccounts,
 		StrategyDisabledAccounts:     cycleConfig.StrategyDisabledAccounts,
+		KalshiStrategyInputDisabled:  !cycleConfig.KalshiStrategyInputEnabled,
 		RequireCompleteModelCoverage: cycleConfig.RequireCompleteModelCoverage,
 		Bindings:                     cycleConfig.Bindings,
 		PredictionSourceModes:        cycleConfig.PredictionSourceModes,

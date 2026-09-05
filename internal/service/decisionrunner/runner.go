@@ -241,6 +241,13 @@ func (runner *Runner) logResult(boundary time.Time, result decisioncycle.RunResu
 		"failed_intents", failed,
 		"binding_runs", bindingRunSummaries(result),
 	}
+	if result.KalshiStrategyInputDisabled {
+		attributes = append(attributes,
+			"kalshi_strategy_input_disabled", true,
+			"kalshi_predictions_withheld", result.KalshiPredictionsWithheld,
+			"kalshi_position_lots_withheld", result.KalshiPositionLotsWithheld,
+		)
+	}
 	if runErr != nil {
 		runner.logger.Error("decision cycle completed with errors", append(attributes, "error", runErr)...)
 		return
