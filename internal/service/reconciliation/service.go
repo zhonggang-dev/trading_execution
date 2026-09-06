@@ -22,11 +22,18 @@ type OrderRefresher interface {
 	FinalizeCancellation(context.Context, string) (domain.Order, error)
 }
 
+// KnownPositionBalanceSource only checks an already-owned token; it neither
+// discovers new positions nor infers redemption/settlement metadata.
+type KnownPositionBalanceSource interface {
+	GetKnownPositionBalance(context.Context, string, string) (domain.Decimal, error)
+}
+
 // Params 表示后端使用的 Params 类型。
 type Params struct {
 	Orders                    port.ReconciliationOrderRepository
 	Venue                     port.VenueReconciliationSource
 	PositionSources           []port.ExternalPositionSource
+	KnownPositionBalances     KnownPositionBalanceSource
 	PositionBaselines         port.ExternalPositionBaselineSource
 	PositionDispositionTrades port.ExternalPositionDispositionTradeSource
 	BalanceSources            []port.ExternalBalanceSource
@@ -57,6 +64,7 @@ type Service struct {
 	orders                    port.ReconciliationOrderRepository
 	venue                     port.VenueReconciliationSource
 	positionSources           []port.ExternalPositionSource
+	knownPositionBalances     KnownPositionBalanceSource
 	positionBaselines         port.ExternalPositionBaselineSource
 	positionDispositionTrades port.ExternalPositionDispositionTradeSource
 	balanceSources            []port.ExternalBalanceSource
@@ -141,6 +149,7 @@ func New(params Params) (*Service, error) {
 	return &Service{
 		orders: params.Orders, venue: params.Venue,
 		positionSources:           append([]port.ExternalPositionSource(nil), params.PositionSources...),
+		knownPositionBalances:     params.KnownPositionBalances,
 		positionBaselines:         params.PositionBaselines,
 		positionDispositionTrades: params.PositionDispositionTrades,
 		balanceSources:            append([]port.ExternalBalanceSource(nil), params.BalanceSources...),

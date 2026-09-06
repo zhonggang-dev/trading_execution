@@ -91,6 +91,49 @@ func (state *runState) reconcilePositions(ctx context.Context, executionAccountI
 	if conflict {
 		return nil
 	}
+	// The Data API can omit sub-centish share dust even with sizeThreshold=0.
+	// Verify the actual ERC1155 balance instead of declaring it zero, widening
+	// tolerances, or mutating the managed ledger. No settlement is inferred.
+	if state.service.knownPositionBalances != nil {
+		verified := make(map[string]bool)
+		for _, p := range positions {
+			if _, found := external.Positions[p.TokenID]; found {
+				continue
+			}
+			if _, unmanaged := baselines.Positions[p.TokenID]; unmanaged {
+				continue
+			}
+			positive, _ := p.TotalShares.Sign()
+			small, _ := p.TotalShares.Compare("0.01")
+			if positive <= 0 || small > 0 {
+				continue
+			}
+			actual, readErr := state.service.knownPositionBalances.GetKnownPositionBalance(ctx, walletAddress, p.TokenID)
+			if readErr != nil {
+				state.addInfrastructureIssue(ctx, "EVM_ERC1155_ETH_CALL", "verify omitted managed dust", readErr)
+				return nil
+			}
+			comparison, compareErr := actual.Compare(p.TotalShares)
+			if compareErr != nil || comparison != 0 {
+				state.issue(ctx, domain.ReconciliationIssueParams{Type: domain.ReconciliationIssuePositionDrift,
+					Resolution: domain.ReconciliationResolutionManual, Status: domain.ReconciliationIssueOpen,
+					MarketID: p.MarketID, ConditionID: p.ConditionID, TokenID: p.TokenID, LocalValue: p.TotalShares,
+					RemoteValue: actual, Source: "EVM_ERC1155_ETH_CALL", Details: "omitted managed dust differs from exact on-chain balance"})
+				return nil
+			}
+			state.run.Summary["missing_dust_verified_onchain"]++
+			// Remove only exactly verified positions from this comparison. Keep
+			// the ledger untouched and keep all other tokens subject to comparison.
+			verified[p.TokenID] = true
+		}
+		filtered := make([]domain.Position, 0, len(positions))
+		for _, p := range positions {
+			if !verified[p.TokenID] {
+				filtered = append(filtered, p)
+			}
+		}
+		positions = filtered
+	}
 	state.comparePositions(ctx, positions, baselines, external)
 	return nil
 }
