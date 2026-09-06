@@ -49,6 +49,9 @@ fail closed. The check never infers settlement or changes ledger balances.
 1. Build from reviewed, merged `master`; execute migration `0024` before restarting
    the service. Back up the affected account, lots, positions, issues, environment
    and previous binary. Never commit production manifests or secrets to Git.
+   Use the database migration-owner role, not the restricted application role.
+   Grant the existing application role SELECT on the three new audit tables;
+   leave repair-function EXECUTE revoked from that role and PUBLIC.
 2. Prepare a private JSON manifest: `account`, `wallet`, `trades`. Each trade has
    `venue_trade_id`, `condition_id`, `matched_at` (UTC), and `request` containing
    `TransactionHash`, `OrderHash`, `TokenID`. Independently match trade identity
@@ -68,10 +71,18 @@ fail closed. The check never infers settlement or changes ledger balances.
    function is revoked from PUBLIC; execute with the controlled migration-owner
    operator role, never expose it through HTTP. A repeat of the identical batch
    is a no-op. A changed batch cannot reuse an accounted chain event.
-7. Start the merged binary with the original environment and account pause still
-   in place; run normal reconciliation and verify cash, lots, PnL, exact external
-   identity accounting, and remaining dust. Only restore the account's original
-   risk control after a normal COMPLETED run. Do not force a test trade.
+7. The current wallet-6/7 release refuses startup when an active account's
+   **ACCOUNT** control is paused. After repair, atomically install a temporary
+   **STRATEGY** pause for every enabled strategy of the affected account and
+   restore the original ACCOUNT control (with increasing versions). This keeps
+   both BUY and SELL blocked by Go and the database while allowing startup
+   reconciliation. Preserve any pre-existing strategy pauses separately.
+8. Start the merged binary with the original environment; run normal
+   reconciliation and verify cash, lots, PnL, exact external identity accounting,
+   and remaining dust. Only after a normal COMPLETED run, restore the previous
+   strategy-control semantics with versioned updates. Do not clear unrelated
+   operator pauses or force a test trade. Retain an inactive newly created
+   maintenance-control row for audit rather than deleting its history.
 
 Before commit any failure rolls back the complete batch. After commit, financial
 audit rows are not deleted; any correction requires separately reviewed,
