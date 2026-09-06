@@ -394,10 +394,18 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	knownPositionBalances, err := evmrpc.NewOrderFilledEvidenceReader(evmrpc.OrderFilledEvidenceParams{
+		RPCURL: cfg.Polymarket.PolygonRPCURL, RequiredConfirmations: 128,
+		HTTPClient: noRedirectHTTPClient(cfg.Polymarket.RequestTimeout),
+	})
+	if err != nil {
+		return nil, err
+	}
 	reconciliationService, err := reconciliation.New(reconciliation.Params{
 		Orders:                    repository,
 		Venue:                     tradingClient,
 		PositionSources:           []port.ExternalPositionSource{positionSource},
+		KnownPositionBalances:     knownPositionBalances,
 		PositionBaselines:         positionBaselines,
 		PositionDispositionTrades: positionBaselines,
 		BalanceSources:            []port.ExternalBalanceSource{balanceSource},

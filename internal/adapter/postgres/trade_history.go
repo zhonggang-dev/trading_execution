@@ -226,6 +226,13 @@ const dailyPnLStatement = `
 		WHERE parent.status = 'APPLIED'
 		  AND redemption.redeemed_at >= (bounds.from_day::timestamp AT TIME ZONE 'UTC')
 		  AND redemption.redeemed_at < ((bounds.to_day + 1)::timestamp AT TIME ZONE 'UTC')
+		UNION ALL
+		SELECT (sell.occurred_at AT TIME ZONE 'UTC')::date, sell.execution_account_id,
+		       sell.model_id, sell.strategy_id, 'SELL', sell.sell_id,
+		       sell.net_cash-sell.allocated_cost, sell.shares
+		FROM managed_external_sells sell CROSS JOIN bounds
+		WHERE sell.occurred_at >= (bounds.from_day::timestamp AT TIME ZONE 'UTC')
+		  AND sell.occurred_at < ((bounds.to_day+1)::timestamp AT TIME ZONE 'UTC')
 	), closed AS (
 		SELECT day, execution_account_id, model_id, strategy_id,
 		       SUM(realized_pnl) AS realized_pnl,
@@ -356,6 +363,17 @@ const ledgerActivityFrom = `
 		 AND parent.condition_id = redemption.condition_id
 		JOIN execution_orders AS opening_order ON opening_order.order_id = lot.opening_order_id
 		WHERE parent.status = 'APPLIED' AND parent.confirmed_at IS NOT NULL
+		UNION ALL
+		SELECT sell.sell_id, 'EXTERNAL_SELL', 'polymarket', sell.execution_account_id,
+		       sell.model_id, sell.strategy_id, position.market_id, '' AS market_label,
+		       sell.condition_id, sell.token_id, position.outcome_name, '' AS lot_id,
+		       '' AS order_id, sell.venue_order_id, sell.venue_trade_id, '' AS order_status, '' AS liquidity_role,
+		       sell.shares, sell.gross_notional/sell.shares, sell.gross_notional, sell.total_fee, sell.net_cash,
+		       sell.allocated_cost, NULL::numeric, sell.net_cash-sell.allocated_cost, sell.transaction_hash,
+		       sell.occurred_at, batch.applied_at, batch.applied_at
+		FROM managed_external_sells sell
+		JOIN managed_external_sell_batches batch USING (batch_id)
+		JOIN execution_positions position ON position.execution_account_id=sell.execution_account_id AND position.token_id=sell.token_id
 	) AS activity`
 
 // ListLedgerActivities 在同一可重复读快照中查询成交与赎回结算的统一明细和汇总。
@@ -462,15 +480,15 @@ func queryLedgerActivitySummary(
 ) (domain.LedgerActivitySummary, error) {
 	statement := `
 		SELECT COUNT(*)::bigint,
-		       (COUNT(*) FILTER (WHERE activity.activity_type IN ('BUY','SELL')))::bigint,
+		       (COUNT(*) FILTER (WHERE activity.activity_type IN ('BUY','SELL','EXTERNAL_SELL')))::bigint,
 		       (COUNT(*) FILTER (WHERE activity.activity_type = 'REDEEM'))::bigint,
 		       COALESCE(SUM(activity.gross_notional) FILTER (WHERE activity.activity_type = 'BUY'), 0)::text,
-		       COALESCE(SUM(activity.gross_notional) FILTER (WHERE activity.activity_type = 'SELL'), 0)::text,
+		       COALESCE(SUM(activity.gross_notional) FILTER (WHERE activity.activity_type IN ('SELL','EXTERNAL_SELL')), 0)::text,
 		       COALESCE(SUM(activity.settlement_payout) FILTER (WHERE activity.activity_type = 'REDEEM'), 0)::text,
 		       COALESCE(SUM(activity.net_cash_delta), 0)::text,
 		       COALESCE(SUM(activity.total_fee), 0)::text,
 		       COALESCE(SUM(activity.realized_pnl), 0)::text,
-		       COALESCE(SUM(activity.realized_pnl) FILTER (WHERE activity.activity_type = 'SELL'), 0)::text,
+		       COALESCE(SUM(activity.realized_pnl) FILTER (WHERE activity.activity_type IN ('SELL','EXTERNAL_SELL')), 0)::text,
 		       COALESCE(SUM(activity.realized_pnl) FILTER (WHERE activity.activity_type = 'REDEEM'), 0)::text
 	` + ledgerActivityFrom + where
 	var summary domain.LedgerActivitySummary

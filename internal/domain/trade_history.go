@@ -17,9 +17,10 @@ const (
 type LedgerActivityType string
 
 const (
-	LedgerActivityBuy    LedgerActivityType = "BUY"
-	LedgerActivitySell   LedgerActivityType = "SELL"
-	LedgerActivityRedeem LedgerActivityType = "REDEEM"
+	LedgerActivityBuy          LedgerActivityType = "BUY"
+	LedgerActivitySell         LedgerActivityType = "SELL"
+	LedgerActivityRedeem       LedgerActivityType = "REDEEM"
+	LedgerActivityExternalSell LedgerActivityType = "EXTERNAL_SELL"
 )
 
 // LedgerActivity 是交易与结算记录页的统一行模型。BUY/SELL 来自已确认并入账的真实 Fill，
@@ -286,9 +287,9 @@ func (filter LedgerActivityFilter) Validate() error {
 		return fmt.Errorf("offset must not be negative")
 	}
 	switch filter.ActivityType {
-	case "", LedgerActivityBuy, LedgerActivitySell, LedgerActivityRedeem:
+	case "", LedgerActivityBuy, LedgerActivitySell, LedgerActivityRedeem, LedgerActivityExternalSell:
 	default:
-		return fmt.Errorf("activity_type must be BUY, SELL or REDEEM")
+		return fmt.Errorf("activity_type must be BUY, SELL, EXTERNAL_SELL or REDEEM")
 	}
 	if filter.From != nil && filter.To != nil && filter.From.After(*filter.To) {
 		return fmt.Errorf("from must not be after to")

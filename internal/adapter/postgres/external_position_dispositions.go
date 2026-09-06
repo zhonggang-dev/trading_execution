@@ -31,6 +31,9 @@ func (repository *ExternalPositionBaselineRepository) ListExternalPositionDispos
 		FROM execution_external_position_dispositions
 		WHERE execution_account_id=$1
 		  AND disposition_kind IN ('EXTERNAL_SELL','BASELINE_ACCOUNTED')
+		UNION ALL
+		SELECT execution_account_id,venue_trade_id,venue_order_id,condition_id,token_id
+		FROM managed_external_sells WHERE execution_account_id=$1
 		ORDER BY venue_trade_id, venue_order_id, condition_id, token_id`, executionAccountID)
 	if err != nil {
 		return nil, fmt.Errorf("query external position disposition trades: %w", err)

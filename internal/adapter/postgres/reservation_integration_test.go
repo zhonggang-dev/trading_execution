@@ -2569,6 +2569,15 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 			t.Fatalf("apply migration %s: %v", name, err)
 		}
 	}
+	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql"} {
+		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(string(migration)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
+	}
 	return db
 }
 

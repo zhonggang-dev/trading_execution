@@ -736,6 +736,12 @@ func loadLiveDailyAccounting(ctx context.Context, tx *sql.Tx, clause string, acc
 			WHERE fill.execution_account_id IN %s
 			  AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
 			  AND fill.matched_at >= $%d AND fill.matched_at <= $%d
+			UNION ALL
+			SELECT COALESCE(SUM(sell.net_cash-sell.allocated_cost),0), COALESCE(SUM(sell.total_fee),0)
+			FROM managed_external_sells sell
+			WHERE sell.execution_account_id IN %s AND sell.occurred_at >= $%d AND sell.occurred_at <= $%d
+		), accounting_total AS (
+			SELECT SUM(realized_pnl) AS realized_pnl, SUM(fee) AS fee FROM accounting
 		), risk_confirmed AS (
 			SELECT COALESCE(SUM(fill.gross_notional), 0) AS traded_notional
 			FROM execution_fills fill
@@ -754,8 +760,8 @@ func loadLiveDailyAccounting(ctx context.Context, tx *sql.Tx, clause string, acc
 		)
 		SELECT accounting.realized_pnl::text, accounting.fee::text,
 		       (risk_confirmed.traded_notional + pending.traded_notional)::text
-		FROM accounting CROSS JOIN risk_confirmed CROSS JOIN pending`,
-		clause, startIndex, endIndex, clause, endIndex, endIndex, clause)
+		FROM accounting_total AS accounting CROSS JOIN risk_confirmed CROSS JOIN pending`,
+		clause, startIndex, endIndex, clause, startIndex, endIndex, clause, endIndex, endIndex, clause)
 	var realized, fees, traded domain.Decimal
 	if err := tx.QueryRowContext(ctx, statement, args...).Scan(&realized, &fees, &traded); err != nil {
 		return "", "", "", fmt.Errorf("query live daily accounting: %w", err)
