@@ -35,10 +35,27 @@ func (validator *MarketValidator) Validate(ctx context.Context, intent domain.Or
 		return domain.MarketValidation{}, err
 	}
 	books, err := validator.books.Capture(ctx, validator.now().UTC(), []domain.BookTarget{target})
-	if err != nil || len(books) != 1 || books[0].Status != domain.OrderBookStatusOK || len(books[0].Bids) == 0 || len(books[0].Asks) == 0 {
+	if err != nil || len(books) != 1 {
 		return domain.MarketValidation{}, &port.Rejection{Code: "KALSHI_LATEST_BOOK_UNAVAILABLE", Reason: "latest Kalshi orderbook is unavailable"}
 	}
 	book := books[0]
+	sellExit := intent.Side == domain.SideSell
+	if book.Status != domain.OrderBookStatusOK && (!sellExit || book.Status != domain.OrderBookStatusEmpty) {
+		return domain.MarketValidation{}, kalshiMarketRejection("KALSHI_LATEST_BOOK_UNAVAILABLE", "latest Kalshi orderbook was not fetched successfully")
+	}
+	if book.Status == domain.OrderBookStatusOK && (len(book.Bids) == 0 || len(book.Asks) == 0) {
+		return domain.MarketValidation{}, kalshiMarketRejection("KALSHI_LATEST_BOOK_UNAVAILABLE", "latest Kalshi orderbook does not contain both sides")
+	}
+	if book.Status == domain.OrderBookStatusEmpty {
+		if book.MarketSource.Normalize() != domain.MarketSourceKalshi || book.MarketID != target.MarketID ||
+			book.ConditionID != target.ConditionID || book.TokenID != target.TokenID || book.OutcomeIndex != target.OutcomeIndex ||
+			!strings.EqualFold(book.OutcomeID, target.OutcomeID) {
+			return domain.MarketValidation{}, kalshiMarketRejection("KALSHI_LATEST_BOOK_IDENTITY_MISMATCH", "latest Kalshi orderbook has a different instrument identity")
+		}
+		if err := book.Validate(); err != nil {
+			return domain.MarketValidation{}, kalshiMarketRejection("KALSHI_LATEST_BOOK_INVALID", err.Error())
+		}
+	}
 	now := validator.now().UTC()
 	// SELL exits record the official book as evidence only; a stale venue
 	// timestamp does not block a strategy-ordered sell.
@@ -50,11 +67,18 @@ func (validator *MarketValidator) Validate(ctx context.Context, intent domain.Or
 	if err != nil {
 		return domain.MarketValidation{}, err
 	}
+	var bestBid, bestAsk domain.Decimal
+	if len(book.Bids) > 0 {
+		bestBid = book.Bids[0].Price
+	}
+	if len(book.Asks) > 0 {
+		bestAsk = book.Asks[0].Price
+	}
 	return (domain.MarketValidationParams{Mode: "KALSHI_LIVE_CHECK", ValidatedAt: now,
 		MarketObservedAt: book.SourceAt, StrategySnapshotAt: intent.MarketSnapshotAt.UTC(), LatestBookSourceAt: book.SourceAt,
 		LatestBookObservedAt: book.ObservedAt, OutcomeIndex: *intent.OutcomeIndex, OutcomeName: strings.TrimSpace(intent.OutcomeName),
 		TokenID: intent.TokenID, NegRisk: *intent.ExpectedNegRisk, TickSize: book.TickSize, MinOrderSize: book.MinOrderSize,
-		BestBid: book.Bids[0].Price, BestAsk: book.Asks[0].Price, WorstPrice: intent.WorstPrice,
+		BestBid: bestBid, BestAsk: bestAsk, WorstPrice: intent.WorstPrice, BookStatus: book.Status,
 		ExecutableSize: executableSize}).Build()
 }
 

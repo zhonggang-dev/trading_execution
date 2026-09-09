@@ -181,8 +181,10 @@ SELL 仍然受以下门禁约束：重复卖单（同 lot 或同 token 已有活
 账户门禁（全局 Kill Switch、账户/策略/市场暂停、binding 未启用、risk policy 未启用、最近一次
 COMPLETED 对账超出时效窗或存在 OPEN reconciliation issue）；账本一致性（目标 lot 存在且 model/
 strategy/market/token 归属一致，数量不超过 lot 剩余与 position 可用 shares）；以及 Polymarket 下单前
-的 outcome token 余额/授权检查。市场身份、outcome/token 映射、tick 对齐和两侧可用的最新盘口证据
-仍然必须满足。单个退出订单在市场校验、预占或下单阶段失败只拒绝该订单，不影响同一响应中的其他
+的 outcome token 余额/授权检查。市场身份、outcome/token 映射、tick 对齐和成功读取的最新盘口证据
+仍然必须满足。官方单边或空盘口允许 SELL 提交，记录 `book_status=EMPTY`，不伪造缺失报价；
+官方读取失败（ERROR/MISSING）仍拒绝。Polymarket 签名前也不再用 `min_order_size` 拦截 SELL，
+由交易所确认是否接受小额退出；shares、金额精度与正数要求不变。单个退出订单在市场校验、预占或下单阶段失败只拒绝该订单，不影响同一响应中的其他
 intent；`exits[]` 的身份/格式错误仍会使整个策略响应被拒绝。
 
 ## 审计和失败语义

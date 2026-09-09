@@ -52,7 +52,7 @@ func placementIntent(order domain.Order) (domain.OrderIntent, error) {
 	if comparison, err := validation.ExecutableSize.Compare(intent.Size); err != nil || comparison > 0 {
 		return domain.OrderIntent{}, newInvalidError("EXECUTABLE_SIZE_INVALID", "market validation executable_size exceeds the strategy requested size")
 	}
-	if !validation.MinOrderSize.IsEmpty() {
+	if intent.Side != domain.SideSell && !validation.MinOrderSize.IsEmpty() {
 		if comparison, err := validation.ExecutableSize.Compare(validation.MinOrderSize); err != nil || comparison < 0 {
 			return domain.OrderIntent{}, newInvalidError("MIN_ORDER_SIZE", "market validation executable_size is below min_order_size")
 		}
@@ -95,7 +95,12 @@ func buildRawAmounts(intent domain.OrderIntent, tickSize, minOrderSize, minBuyNo
 	if decimalPlaces(intent.Size) > config.size {
 		return rawAmounts{}, newInvalidError("INVALID_SIZE_PRECISION", fmt.Sprintf("size supports at most %d decimal places", config.size))
 	}
-	if !minOrderSize.IsEmpty() {
+	if sign, err := intent.Size.Sign(); err != nil || sign <= 0 {
+		return rawAmounts{}, newInvalidError("INVALID_SIZE", "size must be a positive decimal")
+	}
+	// Let the venue enforce its minimum for strategy-directed exits, including
+	// a final SELL that clears a position smaller than the displayed minimum.
+	if intent.Side != domain.SideSell && !minOrderSize.IsEmpty() {
 		if comparison, err := intent.Size.Compare(minOrderSize); err != nil || comparison < 0 {
 			return rawAmounts{}, newInvalidError("MIN_ORDER_SIZE", "size is below the market min_order_size")
 		}

@@ -36,7 +36,7 @@ Python Strategy / SUBMIT
 - 价格必须是当前 `tick_size` 的精确整数倍，全程使用 decimal string，不转成 float；
 - LIMIT 的实际 `price` 使用 `worst_price`，避免订单在校验与发送之间失去价格保护；
 - MARKET 订单也必须带 `worst_price`，供后续真实 Venue adapter 做保护型 FOK/FAK 转换；
-- `size` 是股数上限，`worst_price` 是价格上限，二者都不是资金预算。IOC intent（Kalshi 全部订单、
+- `size` 是股数上限，BUY 的 `worst_price` 是价格上限，二者都不是资金预算。BUY IOC intent（Kalshi BUY、
   Polymarket 全部 BUY）在校验时用最新盘口测量保护价内可成交的量：`executable_size = min(size, 保护价内可见深度)`（深度按 venue 的 2 位 shares 精度向下取整），
   记入 `LIVE_CHECK` 证据并作为 adapter 提交的数量；保护价内深度不足 `size` 不拒单，按能成交的量下单，
   剩余立即取消。唯一下限是 venue `min_order_size`：可成交量低于它时以
@@ -46,7 +46,8 @@ Python Strategy / SUBMIT
 SELL 退出是策略的卖出指令，市场校验只确认市场身份、outcome/token 映射、tick 对齐和最新盘口证据可用，
 不因市场交易状态、元数据时效、`neg_risk` 变化、盘口抓取时效、价格漂移或保护价内深度拒绝它。SELL 的
 `neg_risk` 证据取权威市场当前值，adapter 签名前再与 CLOB 核对；SELL IOC 不记录 `executable_size`，
-按策略数量全额提交后由模拟 IOC 撤掉剩余。
+按策略数量全额提交后由模拟 IOC 撤掉剩余。官方请求成功返回的单边或空盘口允许 SELL 提交，
+证据记录 `book_status=EMPTY`，缺少的一侧不填造价；ERROR/MISSING 仍拒绝。BUY 仍要求完整双边盘口。
 
 Kalshi 使用 `DEPTH_AWARE_LIMIT + IOC`：策略快照的最优价作为
 `strategy_reference_price`，`worst_price` 必须处于可成交方向，且冻结盘口在该保护价内至少有正数可见深度。
@@ -55,7 +56,7 @@ Kalshi 盘口可能跳过中间 tick，因此不额外套用固定两 tick 距�
 即可提交；当时能成交多少就成交多少，剩余由 venue 取消。对恢复中的历史 FOK intent，仍要求可见深度覆盖全部 shares。
 最新最优价越过保护线、保护价内零深度、价格不在 tick 上或参考价缺失时均 fail closed，
 Go 不会自行扩大策略给出的限价。这些价格、参考价、盘口时效和深度检查只针对 BUY；Kalshi SELL 退出
-只确认 tick 对齐、数量和官方两侧盘口可用，按全额提交，由 venue 原生 IOC 成交并取消剩余。
+只确认 tick 对齐、数量和官方盘口读取成功（允许单边或空盘口），按全额提交，由 venue 原生 IOC 成交并取消剩余。
 
 ## OrderIntent 的市场上下文
 

@@ -155,9 +155,9 @@ Kalshi 启动时读到的 `balance` 是交易所当前可用现金，不是可�
 | --- | --- |
 | token 缺失、size <= 0 | `OrderIntent.Validate` 直接拒绝，不调用 CLOB、不重试 |
 | 策略价格过期 | Market validator 下单前读最新 top-of-book，BUY 超过 `worst_price` 返回 `PRICE_DRIFT`；SELL 不做该检查 |
-| 无订单簿/无买盘 | 开仓拒绝；lot 退出任务保留仓位并等待后续周期，不伪造成交 |
-| tick、金额、shares 精度错误 | Polymarket adapter 使用十进制定点换算，下单前校验 tick/最小量/舍入 |
-| 不足最小 SELL shares | 标记 dust 并保留真实 shares；等待合并、结算或人工策略处理 |
+| 无订单簿/无买盘 | BUY 拒绝；SELL 在官方成功返回单边/空盘口时可提交；读取失败仍拒绝，不伪造成交 |
+| tick、金额、shares 精度错误 | Polymarket adapter 使用十进制定点换算，下单前校验 tick/精度和 BUY 最小量 |
+| 不足最小 SELL shares | 满足精度的策略 SELL 可提交，由交易所决定是否接受；无真实成交则保留原有 shares |
 | 余额不足或余额滞后 | PostgreSQL 先原子预占；CLOB 拒绝后重新读链上余额并触发对账，不能用 Redis 锁补救 |
 | CLOB 查询不可用 | 只对读请求有界重试；保留原订单和预占，不能解释为“没有订单” |
 | `/trades` 延迟 | 保持 `UNKNOWN/RECONCILING` 并使用重叠窗口重查；不从 `size_matched` 伪造 Fill |
