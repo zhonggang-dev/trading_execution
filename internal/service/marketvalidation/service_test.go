@@ -287,8 +287,9 @@ func TestValidateSkipsFeeReserveForSell(t *testing.T) {
 	}
 }
 
-// TestValidateSellUsesBestBidAsFloor 验证 Validate Sell Uses Best Bid As Floor 场景下的行为。
-func TestValidateSellUsesBestBidAsFloor(t *testing.T) {
+// TestValidateSellIgnoresBestBidDrift 验证 SELL 在最新 best bid 低于策略 worst_price 时仍然通过，
+// 最新盘口只作为证据记录；是否成交由交易所在限价内决定。
+func TestValidateSellIgnoresBestBidDrift(t *testing.T) {
 	now, intent, market, book := validFixtures()
 	index := 1
 	intent.OutcomeIndex = &index
@@ -302,10 +303,122 @@ func TestValidateSellUsesBestBidAsFloor(t *testing.T) {
 	book.Bids[0].Price = "0.47"
 	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
 
-	_, err := service.Validate(context.Background(), intent)
-	var rejection *port.Rejection
-	if !errors.As(err, &rejection) || rejection.Code != "PRICE_DRIFT" {
-		t.Fatalf("Validate() error = %v, want PRICE_DRIFT", err)
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v, want SELL accepted despite bid drift", err)
+	}
+	if validation.BestBid != "0.47" || validation.WorstPrice != "0.48" {
+		t.Fatalf("Validate() = %#v", validation)
+	}
+}
+
+// TestValidateSellSkipsBuyOnlyGates 验证 SELL 不受市场交易状态、元数据时效、neg_risk 变化和
+// 盘口抓取时效门禁影响，只保留身份、tick 和盘口证据校验。
+func TestValidateSellSkipsBuyOnlyGates(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*domain.MarketSnapshot, *domain.OrderBookSnapshot, time.Time)
+		check  func(*testing.T, domain.MarketValidation)
+	}{
+		{name: "resolved", mutate: func(market *domain.MarketSnapshot, _ *domain.OrderBookSnapshot, _ time.Time) { market.Resolved = true }},
+		{name: "closed", mutate: func(market *domain.MarketSnapshot, _ *domain.OrderBookSnapshot, _ time.Time) { market.Closed = true }},
+		{name: "inactive", mutate: func(market *domain.MarketSnapshot, _ *domain.OrderBookSnapshot, _ time.Time) { market.Active = false }},
+		{name: "paused", mutate: func(market *domain.MarketSnapshot, _ *domain.OrderBookSnapshot, _ time.Time) { market.Paused = true }},
+		{name: "not accepting orders", mutate: func(market *domain.MarketSnapshot, _ *domain.OrderBookSnapshot, _ time.Time) {
+			market.AcceptingOrders = false
+		}},
+		{
+			name: "stale market metadata",
+			mutate: func(market *domain.MarketSnapshot, _ *domain.OrderBookSnapshot, now time.Time) {
+				market.ObservedAt = now.Add(-6 * time.Minute)
+			},
+		},
+		{
+			name:   "neg risk changed",
+			mutate: func(market *domain.MarketSnapshot, _ *domain.OrderBookSnapshot, _ time.Time) { market.NegRisk = true },
+			check: func(t *testing.T, validation domain.MarketValidation) {
+				if !validation.NegRisk {
+					t.Fatalf("NegRisk = false, want the market's current flag recorded for signing")
+				}
+			},
+		},
+		{
+			name: "stale latest book capture",
+			mutate: func(_ *domain.MarketSnapshot, book *domain.OrderBookSnapshot, now time.Time) {
+				book.ObservedAt = now.Add(-11 * time.Second)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now, intent, market, book := validFixtures()
+			intent.Side = domain.SideSell
+			intent.Price = "0.50"
+			intent.WorstPrice = "0.50"
+			test.mutate(&market, &book, now)
+			service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+			validation, err := service.Validate(context.Background(), intent)
+			if err != nil {
+				t.Fatalf("Validate() error = %v, want SELL accepted", err)
+			}
+			if test.check != nil {
+				test.check(t, validation)
+			}
+		})
+	}
+}
+
+// TestValidateSellKeepsIdentityAndTickChecks 验证 SELL 仍然拒绝身份、outcome/token 映射、tick 和盘口证据缺失。
+func TestValidateSellKeepsIdentityAndTickChecks(t *testing.T) {
+	tests := []struct {
+		name   string
+		code   string
+		mutate func(*domain.OrderIntent, *domain.MarketSnapshot, *domain.OrderBookSnapshot)
+	}{
+		{
+			name: "wrong token", code: "OUTCOME_TOKEN_MISMATCH",
+			mutate: func(intent *domain.OrderIntent, _ *domain.MarketSnapshot, _ *domain.OrderBookSnapshot) {
+				intent.TokenID = "token-no"
+			},
+		},
+		{
+			name: "market identity", code: "MARKET_IDENTITY_MISMATCH",
+			mutate: func(_ *domain.OrderIntent, market *domain.MarketSnapshot, _ *domain.OrderBookSnapshot) {
+				market.MarketID = "market-2"
+			},
+		},
+		{
+			name: "invalid tick", code: "INVALID_TICK_SIZE",
+			mutate: func(_ *domain.OrderIntent, market *domain.MarketSnapshot, _ *domain.OrderBookSnapshot) {
+				market.TickSize = "0"
+			},
+		},
+		{
+			name: "off tick price", code: "PRICE_TICK_MISMATCH",
+			mutate: func(intent *domain.OrderIntent, _ *domain.MarketSnapshot, _ *domain.OrderBookSnapshot) {
+				intent.Price = "0.505"
+				intent.WorstPrice = "0.505"
+			},
+		},
+		{
+			name: "book without bids", code: "LATEST_BOOK_UNAVAILABLE",
+			mutate: func(_ *domain.OrderIntent, _ *domain.MarketSnapshot, book *domain.OrderBookSnapshot) { book.Bids = nil },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now, intent, market, book := validFixtures()
+			intent.Side = domain.SideSell
+			intent.Price = "0.50"
+			intent.WorstPrice = "0.50"
+			test.mutate(&intent, &market, &book)
+			service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
+			_, err := service.Validate(context.Background(), intent)
+			var rejection *port.Rejection
+			if !errors.As(err, &rejection) || rejection.Code != test.code {
+				t.Fatalf("Validate() error = %v, want rejection %s", err, test.code)
+			}
+		})
 	}
 }
 
@@ -420,9 +533,9 @@ func TestValidateRejectsIOCBelowLatestMinOrderSize(t *testing.T) {
 	}
 }
 
-// TestValidateIOCSellMeasuresBidDepthAndFOKLeavesExecutableSizeEmpty 验证 SELL IOC 使用买盘深度，
-// 而 FOK/GTC 不记录 executable_size。
-func TestValidateIOCSellMeasuresBidDepthAndFOKLeavesExecutableSizeEmpty(t *testing.T) {
+// TestValidateIOCSellSubmitsFullSizeAndFOKLeavesExecutableSizeEmpty 验证 SELL IOC 不再按买盘深度
+// 截断或拒绝，executable_size 留空即提交策略给出的全部数量；FOK/GTC 同样不记录 executable_size。
+func TestValidateIOCSellSubmitsFullSizeAndFOKLeavesExecutableSizeEmpty(t *testing.T) {
 	now, intent, market, book := validFixtures()
 	service := newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{book}})
 	validation, err := service.Validate(context.Background(), intent)
@@ -439,8 +552,15 @@ func TestValidateIOCSellMeasuresBidDepthAndFOKLeavesExecutableSizeEmpty(t *testi
 	sellBook.Bids = []domain.PriceLevel{{Price: "0.50", Size: "3"}, {Price: "0.49", Size: "4"}, {Price: "0.48", Size: "50"}}
 	service = newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{sellBook}})
 	validation, err = service.Validate(context.Background(), sell)
-	if err != nil || validation.ExecutableSize != "7" {
-		t.Fatalf("SELL IOC Validate() = %#v, err = %v, want 7 executable shares at or above worst_price", validation, err)
+	if err != nil || !validation.ExecutableSize.IsEmpty() {
+		t.Fatalf("SELL IOC Validate() = %#v, err = %v, want full strategy size without a depth cap", validation, err)
+	}
+
+	sellBook.Bids = []domain.PriceLevel{{Price: "0.40", Size: "0.5"}}
+	service = newValidator(t, now, market, &fakeBooks{books: []domain.OrderBookSnapshot{sellBook}})
+	validation, err = service.Validate(context.Background(), sell)
+	if err != nil || !validation.ExecutableSize.IsEmpty() {
+		t.Fatalf("SELL IOC Validate() = %#v, err = %v, want acceptance without protected liquidity", validation, err)
 	}
 }
 

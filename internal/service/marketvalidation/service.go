@@ -32,6 +32,11 @@ type Params struct {
 }
 
 // Service 使用权威 Market 元数据和最新订单簿执行失败关闭校验，不包含任何策略规则。
+//
+// BUY 与 SELL 的门禁不同：BUY 入场必须通过市场交易状态、元数据时效、neg_risk 一致、
+// 最新盘口时效、worst_price 保护和 IOC 保护价内深度校验；SELL 退出只确认市场身份、
+// outcome/token 映射、tick 对齐和最新盘口证据，不因市场状态、价格漂移或深度被拒绝。
+// 策略给出的 SELL 就是卖出指令，是否成交由交易所在 worst_price 限价内决定。
 type Service struct {
 	universe         port.MarketUniverse
 	orderBooks       port.OrderBookSource
@@ -94,8 +99,14 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 	if !found {
 		return domain.MarketValidation{}, reject("MARKET_NOT_FOUND", "condition_id is not present in Market Universe Service")
 	}
-	if err := service.validateMarket(intent, market, now); err != nil {
+	sellExit := intent.Side == domain.SideSell
+	if err := validateMarketIdentity(intent, market); err != nil {
 		return domain.MarketValidation{}, err
+	}
+	if !sellExit {
+		if err := service.validateMarketTradable(market, now); err != nil {
+			return domain.MarketValidation{}, err
+		}
 	}
 	if err := validateOutcomeMapping(market.Outcomes); err != nil {
 		return domain.MarketValidation{}, err
@@ -108,7 +119,10 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		!strings.EqualFold(strings.TrimSpace(outcome.Name), intent.OutcomeName) {
 		return domain.MarketValidation{}, reject("OUTCOME_TOKEN_MISMATCH", "outcome name/index does not map to the submitted token_id")
 	}
-	if market.NegRisk != *intent.ExpectedNegRisk {
+	// A SELL signs with the market's current neg_risk (recorded below and
+	// re-checked against the CLOB before placement); only a BUY entry is
+	// rejected when the flag changed after the strategy snapshot.
+	if !sellExit && market.NegRisk != *intent.ExpectedNegRisk {
 		return domain.MarketValidation{}, reject("NEG_RISK_MISMATCH", "market neg_risk changed after the strategy snapshot")
 	}
 	if err := validatePrices(intent, market.TickSize); err != nil {
@@ -152,11 +166,16 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 	// the same timestamp for minutes while the book is still the current one,
 	// so its age is recorded as evidence but never rejects an order. Execution
 	// freshness is the age of our own capture, book.ObservedAt.
-	if err := validateAge("LATEST_BOOK_OBSERVATION", book.ObservedAt, now, service.maxLatestBookAge, service.maxFutureSkew); err != nil {
-		return domain.MarketValidation{}, err
-	}
-	if err := validateWorstPrice(intent.Side, intent.WorstPrice, book.Bids[0].Price, book.Asks[0].Price); err != nil {
-		return domain.MarketValidation{}, err
+	// SELL exits carry the fresh book as evidence only: no capture-age gate and
+	// no worst_price drift gate. The venue fills inside the strategy limit or
+	// leaves the FOK/IOC unfilled.
+	if !sellExit {
+		if err := validateAge("LATEST_BOOK_OBSERVATION", book.ObservedAt, now, service.maxLatestBookAge, service.maxFutureSkew); err != nil {
+			return domain.MarketValidation{}, err
+		}
+		if err := validateWorstPrice(intent.Side, intent.WorstPrice, book.Bids[0].Price, book.Asks[0].Price); err != nil {
+			return domain.MarketValidation{}, err
+		}
 	}
 
 	params := domain.MarketValidationParams{
@@ -176,7 +195,9 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		BestAsk:              book.Asks[0].Price,
 		WorstPrice:           intent.WorstPrice,
 	}
-	if intent.TimeInForce == domain.TimeInForceIOC {
+	// A SELL IOC submits the full strategy size; the emulated IOC cancels
+	// whatever the book did not take, so visible depth never caps or rejects it.
+	if intent.TimeInForce == domain.TimeInForceIOC && !sellExit {
 		executableSize, err := protectedExecutableSize(intent, book)
 		if err != nil {
 			return domain.MarketValidation{}, err
@@ -285,11 +306,19 @@ func requireMarketContext(intent domain.OrderIntent) error {
 	return nil
 }
 
-// validateMarket 校验 Market 的字段和业务约束。
-func (service *Service) validateMarket(intent domain.OrderIntent, market domain.MarketSnapshot, now time.Time) error {
+// validateMarketIdentity 校验权威市场身份和 tick_size；BUY 与 SELL 都必须通过。
+func validateMarketIdentity(intent domain.OrderIntent, market domain.MarketSnapshot) error {
 	if strings.TrimSpace(market.ConditionID) != intent.ConditionID || strings.TrimSpace(market.MarketID) != intent.MarketID {
 		return reject("MARKET_IDENTITY_MISMATCH", "condition_id no longer resolves to the submitted market_id")
 	}
+	if sign, err := market.TickSize.Sign(); err != nil || sign <= 0 {
+		return reject("INVALID_TICK_SIZE", "Market Universe Service returned an invalid tick_size")
+	}
+	return nil
+}
+
+// validateMarketTradable 校验 BUY 入场所需的元数据时效和市场交易状态。
+func (service *Service) validateMarketTradable(market domain.MarketSnapshot, now time.Time) error {
 	if err := validateAge("MARKET_METADATA", market.ObservedAt, now, service.maxUniverseAge, service.maxFutureSkew); err != nil {
 		return err
 	}
@@ -304,9 +333,6 @@ func (service *Service) validateMarket(intent domain.OrderIntent, market domain.
 	}
 	if !market.AcceptingOrders {
 		return reject("MARKET_NOT_ACCEPTING_ORDERS", "market is not accepting orders")
-	}
-	if sign, err := market.TickSize.Sign(); err != nil || sign <= 0 {
-		return reject("INVALID_TICK_SIZE", "Market Universe Service returned an invalid tick_size")
 	}
 	return nil
 }

@@ -40,8 +40,8 @@ strategy 或 wallet 敞口上限；只在执行不可能或不安全时拒绝。
 | `EXECUTION_ACCOUNT_PAUSED` | 当前执行钱包暂停 |
 | `STRATEGY_PAUSED` | 当前策略暂停 |
 | `MARKET_RISK_PAUSED` | 当前 Market 被风控暂停 |
-| `PRICE_TIMESTAMP_REQUIRED` / `PRICE_STALE` | 缺少执行层抓取官方盘口的时间或该抓取过期 |
-| `SIGNAL_TIMESTAMP_REQUIRED` / `SIGNAL_STALE` | 缺少信号时间或 Python 决策过期 |
+| `PRICE_TIMESTAMP_REQUIRED` / `PRICE_STALE` | 缺少执行层抓取官方盘口的时间，或该抓取过期（时效窗仅 BUY） |
+| `SIGNAL_TIMESTAMP_REQUIRED` / `SIGNAL_STALE` | 缺少信号时间，或 Python 决策过期（时效窗仅 BUY） |
 | `RISK_STATE_STALE` | 账户从未完成对账，或最近一次已完成对账超出时效窗；正在运行的对账不算过期 |
 | `SAME_DIRECTION_ORDER_EXISTS` | 同钱包、同 token 已有同方向 BUY |
 | `DUPLICATE_SELL_ORDER` | 同钱包、同 token 已有活动 SELL |
@@ -53,6 +53,10 @@ strategy 或 wallet 敞口上限；只在执行不可能或不安全时拒绝。
 价格 freshness 使用执行前官方订单簿校验产生的 `MarketValidation.latest_book_observed_at`，
 即执行层抓到官方盘口的时间；CLOB 的盘口变动时间 `latest_book_source_at` 只作证据，慢市场
 长时间不变不会阻止订单。策略冻结盘口较旧同样不会直接阻止订单。
+
+价格与信号时效窗只约束 BUY 入场。SELL 退出是策略的卖出指令：只要通过 Kill Switch、暂停、binding、
+policy 和对账状态门禁，无论策略决策或已校验盘口过去了多久都会提交；migration `0025` 让数据库
+SUBMITTING trigger 对 SELL 同样跳过 `PRICE_STALE` / `SIGNAL_STALE`，其余规则两侧一致。
 
 风险状态 freshness 取该账户最近一次 `COMPLETED` 对账的完成时间。定时对账开始时插入的 `RUNNING`
 行不会遮蔽它：对账运行中只读取交易所状态并记录 issue，余额与仓位由 Fill ledger 改写，因此上一次

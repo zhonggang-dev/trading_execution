@@ -96,13 +96,13 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 对于 Polymarket，`DEPTH_AWARE_LIMIT` 允许策略把 `worst_price` 设在同轮盘口最优价到更差最多
 `max_price_slippage_ticks`（当前为 2）个 tick 的范围内。BUY 必须满足 `best_ask <= worst_price`，
 且所有 `ask.price <= worst_price` 的可见档位至少有正数深度；保护价内深度不足 `size` 时不拒单，
-按能买到的量成交，其余立即取消（见下文 IOC）。SELL 必须满足 `best_bid - 2*tick_size <= worst_price <= best_bid`，
-并由所有 `bid.price >= worst_price` 的可见档位累计覆盖 FOK shares。保护价必须是
+按能买到的量成交，其余立即取消（见下文 IOC）。SELL 退出不套用这些门禁：Trading 不比较快照 best bid，
+也不要求保护价内深度覆盖，见下文“SELL 退出只认策略信号”。保护价必须是
 `tick_size` 的整数倍；执行时仍以 `worst_price` 作为限价，不允许无限追价。
 
 Kalshi 盘口可能跳过中间 tick，因此不套用固定的两 tick 距离上限。策略仍必须基于冻结快照给出明确的
 `worst_price`，价格方向正确、位于 tick 上，且保护价范围内至少有可见的可成交 shares。
-下单前 Go 还会用最新官方盘口重复校验最优价没有越过保护线且保护价内仍有正数深度。
+下单前 Go 还会用最新官方盘口重复校验最优价没有越过保护线且保护价内仍有正数深度（仅 BUY）。
 
 `predictions` 每个周期发送当前 binding 所属模型的全部当前有效 Market。一条 Market/Model 预测仍包含两个按原始
 Outcome 顺序对齐且和为 1 的概率和 token，而不是只传一个脱离 Outcome 的 `prob`。
@@ -158,6 +158,32 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
 该字段；正常周期不写该字段，以兼容升级前的幂等输出。被阻断的 SUBMIT evaluation 仍留在审计输出中，但不会
 生成 BUY intent；同一响应里的合法 SELL exit 继续生成、持久化和提交。Runner 的每个 binding 摘要也会记录
 `entry_submission_enabled=false` 和同一 block reason，避免把 4/4 Python 调用误判为 4/4 入场健康。
+
+## SELL 退出只认策略信号
+
+策略通过 `exits[]` 返回的 SELL 就是卖出指令。Trading 对退出只做身份和格式核对：`lot_id`/`token_id`
+必须属于本轮输入的 OPEN lot；`reason_code` 非空即可，不再限定为 `HOLD_48H`；订单必须是
+`SELL + LIMIT + FOK/IOC`、无 `expires_at`、数量为正、精度合法且不超过该 lot 的剩余 shares；
+`worst_price` 在 `(0,1]` 内。以下检查已从 SELL 路径移除：
+
+- 持有 48 小时门槛和 reason_code 枚举；
+- 快照 best bid 与 `worst_price` 的比较、保护价内深度覆盖和 `min_order_size`；
+- 冻结盘口必须为 `OK`：该 token 盘口 MISSING/ERROR 时退出仍然生成，`market_snapshot_at`
+  退回 `decision_at`，metadata 不记录 `strategy_reference_price`；
+- 执行前市场校验里的市场交易状态（resolved/closed/paused/not accepting）、元数据时效、`neg_risk`
+  变化、盘口抓取时效、`PRICE_DRIFT` 和 IOC 保护价内深度（SELL IOC 不记录 `executable_size`，
+  按策略数量全额提交，模拟 IOC 再撤掉剩余）；Kalshi 侧同样不再检查参考价、价格越界、盘口
+  时效和深度；
+- 原子预占里的 `PRICE_STALE` / `SIGNAL_STALE` 时效窗；migration `0025` 同步让数据库 SUBMITTING
+  trigger 对 SELL 跳过这两项。
+
+SELL 仍然受以下门禁约束：重复卖单（同 lot 或同 token 已有活动 SELL 预留，`DUPLICATE_SELL_ORDER`）；
+账户门禁（全局 Kill Switch、账户/策略/市场暂停、binding 未启用、risk policy 未启用、最近一次
+COMPLETED 对账超出时效窗或存在 OPEN reconciliation issue）；账本一致性（目标 lot 存在且 model/
+strategy/market/token 归属一致，数量不超过 lot 剩余与 position 可用 shares）；以及 Polymarket 下单前
+的 outcome token 余额/授权检查。市场身份、outcome/token 映射、tick 对齐和两侧可用的最新盘口证据
+仍然必须满足。单个退出订单在市场校验、预占或下单阶段失败只拒绝该订单，不影响同一响应中的其他
+intent；`exits[]` 的身份/格式错误仍会使整个策略响应被拒绝。
 
 ## 审计和失败语义
 

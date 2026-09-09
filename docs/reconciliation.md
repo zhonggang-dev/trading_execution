@@ -154,7 +154,7 @@ Kalshi 启动时读到的 `balance` 是交易所当前可用现金，不是可�
 | 异常 | 当前处理 |
 | --- | --- |
 | token 缺失、size <= 0 | `OrderIntent.Validate` 直接拒绝，不调用 CLOB、不重试 |
-| 策略价格过期 | Market validator 下单前读最新 top-of-book，超过 `worst_price` 返回 `PRICE_DRIFT` |
+| 策略价格过期 | Market validator 下单前读最新 top-of-book，BUY 超过 `worst_price` 返回 `PRICE_DRIFT`；SELL 不做该检查 |
 | 无订单簿/无买盘 | 开仓拒绝；lot 退出任务保留仓位并等待后续周期，不伪造成交 |
 | tick、金额、shares 精度错误 | Polymarket adapter 使用十进制定点换算，下单前校验 tick/最小量/舍入 |
 | 不足最小 SELL shares | 标记 dust 并保留真实 shares；等待合并、结算或人工策略处理 |
