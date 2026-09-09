@@ -10,21 +10,22 @@ import (
 )
 
 var (
-	ErrOrderNotFound           = errors.New("order not found")
-	ErrOrderRevisionConflict   = errors.New("order revision conflict")
-	ErrReservationNotFound     = errors.New("asset reservation not found")
-	ErrReservationConflict     = errors.New("asset reservation idempotency conflict")
-	ErrFillNotFound            = errors.New("fill not found")
-	ErrFillConflict            = errors.New("fill identity conflict")
-	ErrPositionNotFound        = errors.New("position not found")
-	ErrAccountNotFound         = errors.New("execution account not found")
-	ErrPositionExitRunNotFound = errors.New("position exit run not found")
-	ErrPositionExitConflict    = errors.New("position exit idempotency conflict")
-	ErrDecisionRunNotFound     = errors.New("strategy decision run not found")
-	ErrDecisionConflict        = errors.New("strategy decision idempotency conflict")
-	ErrDecisionIntentNotFound  = errors.New("strategy decision intent not found")
-	ErrDecisionIntentConflict  = errors.New("strategy decision intent claim conflict")
-	ErrCancelFinalityPending   = errors.New("cancel fill finality window has not elapsed")
+	ErrOrderNotFound             = errors.New("order not found")
+	ErrOrderRevisionConflict     = errors.New("order revision conflict")
+	ErrReservationNotFound       = errors.New("asset reservation not found")
+	ErrReservationConflict       = errors.New("asset reservation idempotency conflict")
+	ErrFillNotFound              = errors.New("fill not found")
+	ErrFillConflict              = errors.New("fill identity conflict")
+	ErrPositionNotFound          = errors.New("position not found")
+	ErrAccountNotFound           = errors.New("execution account not found")
+	ErrPositionExitRunNotFound   = errors.New("position exit run not found")
+	ErrPositionExitConflict      = errors.New("position exit idempotency conflict")
+	ErrDecisionRunNotFound       = errors.New("strategy decision run not found")
+	ErrDecisionConflict          = errors.New("strategy decision idempotency conflict")
+	ErrOrderBookSnapshotConflict = errors.New("orderbook snapshot batch idempotency conflict")
+	ErrDecisionIntentNotFound    = errors.New("strategy decision intent not found")
+	ErrDecisionIntentConflict    = errors.New("strategy decision intent claim conflict")
+	ErrCancelFinalityPending     = errors.New("cancel fill finality window has not elapsed")
 )
 
 // ExecutionAccountScope is the process-owned account boundary for live
@@ -425,6 +426,12 @@ type OrderBookSource interface {
 // 调用方必须退回配置上限，不能按零手续费处理。
 type FeeScheduleSource interface {
 	MarketFeeSchedule(ctx context.Context, conditionID, tokenID string) (domain.MarketFeeSchedule, error)
+}
+
+// OrderBookSnapshotRecorder atomically freezes the one shared market-data set
+// used by all strategy bindings at a global decision boundary.
+type OrderBookSnapshotRecorder interface {
+	ClaimBatch(ctx context.Context, batch domain.OrderBookSnapshotBatch) (stored domain.OrderBookSnapshotBatch, created bool, err error)
 }
 
 // MidPriceHistorySource 返回每个 Outcome Token 的冻结 Polymarket 中间价序列，单 Token 失败通过响应字段表达。

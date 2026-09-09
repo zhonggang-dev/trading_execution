@@ -84,10 +84,15 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 	if err != nil {
 		return nil, fmt.Errorf("build strategy decision recorder: %w", err)
 	}
+	snapshotRecorder, err := postgresadapter.NewOrderBookSnapshotRecorder(params.database, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build orderbook snapshot recorder: %w", err)
+	}
 	cycle, err := decisioncycle.New(decisioncycle.Params{
 		PredictionSource:             predictionClient,
 		PositionSource:               params.positionSource,
 		OrderBookSource:              orderBooks,
+		SnapshotRecorder:             snapshotRecorder,
 		Strategy:                     strategyClient,
 		Recorder:                     recorder,
 		Executor:                     params.executor,
@@ -104,6 +109,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		Venue:                        params.cfg.Execution.Venue,
 		PredictionLookback:           cycleConfig.PredictionLookback,
 		DeliveryStaleAge:             cycleConfig.Timeout,
+		Logger:                       params.logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build decision cycle: %w", err)

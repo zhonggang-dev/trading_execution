@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/big"
 	"slices"
@@ -40,6 +41,7 @@ type Params struct {
 	PredictionSource port.PredictionSource
 	PositionSource   port.StrategyPositionSource
 	OrderBookSource  port.OrderBookSource
+	SnapshotRecorder port.OrderBookSnapshotRecorder
 	Strategy         port.StrategyClient
 	Recorder         port.DecisionRecorder
 	Executor         port.OrderExecutor
@@ -82,6 +84,7 @@ type Params struct {
 	PredictionLookback           time.Duration
 	DeliveryStaleAge             time.Duration
 	Now                          func() time.Time
+	Logger                       *slog.Logger
 }
 
 // Service 表示后端使用的 Service 类型。
@@ -89,6 +92,7 @@ type Service struct {
 	predictionSource             port.PredictionSource
 	positionSource               port.StrategyPositionSource
 	orderBookSource              port.OrderBookSource
+	snapshotRecorder             port.OrderBookSnapshotRecorder
 	strategy                     port.StrategyClient
 	recorder                     port.DecisionRecorder
 	executor                     port.OrderExecutor
@@ -119,6 +123,7 @@ type Service struct {
 	predictionLookback               time.Duration
 	deliveryStaleAge                 time.Duration
 	now                              func() time.Time
+	logger                           *slog.Logger
 }
 
 // IntentResult 表示后端使用的 IntentResult 类型。
@@ -165,9 +170,9 @@ type RunResult struct {
 
 // New 校验依赖和配置后创建当前服务实例。
 func New(params Params) (*Service, error) {
-	if params.PredictionSource == nil || params.PositionSource == nil || params.OrderBookSource == nil || params.Strategy == nil ||
-		params.Recorder == nil {
-		return nil, fmt.Errorf("prediction, position, orderbook, strategy, and recorder dependencies are required")
+	if params.PredictionSource == nil || params.PositionSource == nil || params.OrderBookSource == nil ||
+		params.SnapshotRecorder == nil || params.Strategy == nil || params.Recorder == nil {
+		return nil, fmt.Errorf("prediction, position, orderbook, snapshot recorder, strategy, and decision recorder dependencies are required")
 	}
 	if params.SubmitEnabled && params.Executor == nil {
 		return nil, fmt.Errorf("order executor is required when decision-cycle submission is enabled")
@@ -234,10 +239,14 @@ func New(params Params) (*Service, error) {
 	if params.Now == nil {
 		params.Now = time.Now
 	}
+	if params.Logger == nil {
+		params.Logger = slog.Default()
+	}
 	return &Service{
 		predictionSource:                 params.PredictionSource,
 		positionSource:                   params.PositionSource,
 		orderBookSource:                  params.OrderBookSource,
+		snapshotRecorder:                 params.SnapshotRecorder,
 		strategy:                         params.Strategy,
 		recorder:                         params.Recorder,
 		executor:                         params.Executor,
@@ -265,6 +274,7 @@ func New(params Params) (*Service, error) {
 		predictionLookback:               params.PredictionLookback,
 		deliveryStaleAge:                 params.DeliveryStaleAge,
 		now:                              params.Now,
+		logger:                           params.Logger,
 	}, nil
 }
 
@@ -312,6 +322,30 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err != nil {
 		return RunResult{}, err
 	}
+	batch, err := domain.NewOrderBookSnapshotBatch(decisionAt, snapshot.SnapshotID, len(targets), books)
+	if err != nil {
+		return RunResult{}, fmt.Errorf("build shared orderbook snapshot batch: %w", err)
+	}
+	persistStartedAt := time.Now()
+	storedBatch, created, err := service.snapshotRecorder.ClaimBatch(ctx, batch)
+	if err != nil {
+		return RunResult{}, fmt.Errorf("claim shared orderbook snapshot batch for decision_at %s: %w", decisionAt.Format(time.RFC3339), err)
+	}
+	if !sameClaimedOrderBookSnapshotBatch(storedBatch, batch) {
+		return RunResult{}, fmt.Errorf("claimed shared orderbook snapshot batch identity is invalid")
+	}
+	service.logger.Info("Shared orderbook snapshot batch persisted",
+		"decision_at", decisionAt,
+		"prediction_snapshot_id", batch.PredictionSnapshotID,
+		"snapshot_set_id", batch.SnapshotSetID,
+		"snapshot_count", batch.SnapshotCount,
+		"ok_count", batch.OKCount,
+		"empty_count", batch.EmptyCount,
+		"missing_count", batch.MissingCount,
+		"error_count", batch.ErrorCount,
+		"created", created,
+		"elapsed_ms", time.Since(persistStartedAt).Milliseconds(),
+	)
 	result := RunResult{
 		DecisionAt:                  decisionAt,
 		PredictionSnapshotID:        snapshot.SnapshotID,
@@ -393,6 +427,14 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		}
 	}
 	return result, errors.Join(runErrors...)
+}
+
+func sameClaimedOrderBookSnapshotBatch(left, right domain.OrderBookSnapshotBatch) bool {
+	return left.DecisionAt.Equal(right.DecisionAt) &&
+		left.PredictionSnapshotID == right.PredictionSnapshotID && left.SnapshotSetID == right.SnapshotSetID &&
+		left.TargetCount == right.TargetCount && left.SnapshotCount == right.SnapshotCount &&
+		left.OKCount == right.OKCount && left.EmptyCount == right.EmptyCount &&
+		left.MissingCount == right.MissingCount && left.ErrorCount == right.ErrorCount
 }
 
 // loadPositionLots 加载 Position Lots。The second result counts Kalshi lots
@@ -1092,6 +1134,7 @@ func alignBooks(targets []domain.BookTarget, books []domain.OrderBookSnapshot, o
 			return nil, fmt.Errorf("orderbook token %q has mismatched market identity", target.TokenID)
 		}
 		book = failClosedInvalidMinimumOrderSize(book)
+		book = normalizeFailedOrderBook(book)
 		if len(book.Bids) > 0 {
 			book.BestBid = book.Bids[0].Price
 		}
@@ -1108,6 +1151,17 @@ func alignBooks(targets []domain.BookTarget, books []domain.OrderBookSnapshot, o
 		return nil, fmt.Errorf("orderbook source returned an unexpected token")
 	}
 	return result, nil
+}
+
+func normalizeFailedOrderBook(book domain.OrderBookSnapshot) domain.OrderBookSnapshot {
+	if book.Status != domain.OrderBookStatusMissing && book.Status != domain.OrderBookStatusError {
+		return book
+	}
+	book.BestBid = ""
+	book.BestAsk = ""
+	book.Bids = []domain.PriceLevel{}
+	book.Asks = []domain.PriceLevel{}
+	return book
 }
 
 // failClosedInvalidMinimumOrderSize isolates one upstream market whose minimum

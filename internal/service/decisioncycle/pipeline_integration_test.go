@@ -224,7 +224,8 @@ func newPipelineFixture(t *testing.T, submitEnabled ...bool) *pipelineFixture {
 			GeneratedAt: decisionAt.Add(time.Second), Predictions: []domain.Prediction{prediction},
 			ExpectedPredictions: []domain.PredictionExpectation{completedPredictionExpectation(prediction, 1, 1)},
 		}},
-		PositionSource: fakePositionSource{},
+		PositionSource:   fakePositionSource{},
+		SnapshotRecorder: &fakeOrderBookSnapshotRecorder{},
 		OrderBookSource: &fakeOrderBookSource{books: []domain.OrderBookSnapshot{{
 			MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
 			OutcomeIndex: 0, TokenID: prediction.Outcomes[0].TokenID,

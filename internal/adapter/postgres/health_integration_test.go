@@ -33,6 +33,35 @@ func TestHealthCheckerPostgresIntegration(t *testing.T) {
 	}
 }
 
+func TestHealthCheckerRejectsMissingOrderBookSnapshotSchemaPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	for _, test := range []struct {
+		name string
+		sql  string
+	}{
+		{name: "table", sql: `DROP TABLE strategy_orderbook_snapshots CASCADE`},
+		{name: "constraint", sql: `ALTER TABLE strategy_orderbook_snapshots DROP CONSTRAINT strategy_orderbook_snapshots_status`},
+		{name: "index", sql: `DROP INDEX strategy_orderbook_snapshots_token_time_idx`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := newIntegrationDatabase(t, databaseURL)
+			if _, err := db.Exec(test.sql); err != nil {
+				t.Fatal(err)
+			}
+			checker, err := NewHealthChecker(db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := checker.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "schema is incomplete") {
+				t.Fatalf("missing orderbook %s readiness error = %v", test.name, err)
+			}
+		})
+	}
+}
+
 func TestLiveLedgerBootstrapPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
 	if databaseURL == "" {

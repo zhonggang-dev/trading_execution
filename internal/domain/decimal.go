@@ -89,13 +89,44 @@ func (d Decimal) Scale() int {
 	return 0
 }
 
-// Canonical 去掉尾随零和多余的小数点，使同一数值只有一种文本表示。
+// Canonical produces one non-exponent decimal representation for every valid
+// base-10 value. It is used in immutable content identities, so leading zeros,
+// explicit positive signs, and insignificant fractional zeros must not change
+// the represented value.
 func (d Decimal) Canonical() Decimal {
 	text := strings.TrimSpace(string(d))
-	if strings.Contains(text, ".") {
-		text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	if text == "" {
+		return ""
 	}
-	return Decimal(text)
+	negative := false
+	if strings.HasPrefix(text, "+") {
+		text = text[1:]
+	} else if strings.HasPrefix(text, "-") {
+		negative = true
+		text = text[1:]
+	}
+	integer, fraction, hasFraction := strings.Cut(text, ".")
+	integer = strings.TrimLeft(integer, "0")
+	if integer == "" {
+		integer = "0"
+	}
+	if hasFraction {
+		fraction = strings.TrimRight(fraction, "0")
+	}
+	if fraction == "" {
+		if integer == "0" {
+			return "0"
+		}
+		if negative {
+			return Decimal("-" + integer)
+		}
+		return Decimal(integer)
+	}
+	result := integer + "." + fraction
+	if negative {
+		result = "-" + result
+	}
+	return Decimal(result)
 }
 
 // Equal 判断两个值在规范化后是否相等。
