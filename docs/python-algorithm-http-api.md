@@ -295,7 +295,7 @@ type StrategyExit = {
   decision_id: string;
   lot_id: string;
   token_id: string;
-  reason_code: "HOLD_48H";
+  reason_code: string; // 例如 HOLD_48H、STOP_LOSS；非空即可，Trading 不校验枚举
   reason?: string;
   order: StrategyOrder;
 };
@@ -328,8 +328,9 @@ type StrategyDecisionSuccess = {
 - `evidence.probability` 必须与输入对应 outcome 的 probability 完全一致；
 - `SKIP` 不能带 `order`；
 - `SUBMIT` 必须是 `BUY + LIMIT`，`time_in_force` 必须在 `allowed_time_in_force`（`IOC` 或 `FOK`）内，`reason_code` 必须为 `ENTRY_SIGNAL`；
-- 决策接口使用 `DEPTH_AWARE_LIMIT`：Polymarket 的 BUY `worst_price` 可从 `best_ask` 向上最多 2 个 tick，SELL 可从 `best_bid` 向下最多 2 个 tick；Kalshi 稀疏盘口不使用固定 tick 距离上限，但保护价方向必须正确且范围内至少有可成交深度；所有价格必须是 `tick_size` 的整数倍；
-- `size` 单位为 shares，输入最多 2 位小数；Trading 会在 BUY 下单前四舍五入为整数 shares，再校验 BUY 的 `ask.price <= worst_price` 或 SELL 的 `bid.price >= worst_price` 范围内的可见深度。BUY 只要在保护价内有正数深度即可：Go 把 Kalshi 订单和所有 Polymarket BUY 作为 IOC 执行，成交保护价内可得数量并立即取消剩余，`size` 是股数上限、`worst_price` 只是价格上限，二者都不是资金预算；Polymarket SELL 保持 FOK，必须覆盖完整数量。BUY 还要求 `worst_price * size` 最多 4 位小数且不少于 1 美元；
+- 决策接口使用 `DEPTH_AWARE_LIMIT`：Polymarket 的 BUY `worst_price` 可从 `best_ask` 向上最多 2 个 tick；Kalshi 稀疏盘口不使用固定 tick 距离上限，但 BUY 保护价方向必须正确且范围内至少有可成交深度；所有价格必须是 `tick_size` 的整数倍；
+- `exits[]` 的 SELL 是卖出指令：Trading 只核对 `lot_id`/`token_id` 属于输入中的 OPEN lot、`reason_code` 非空、订单为 `SELL + LIMIT + FOK/IOC` 且无 `expires_at`、`size` 为正且不超过该 lot 剩余 shares、`worst_price` 在 `(0,1]` 内；不再要求持有 48 小时，也不比较快照 `best_bid`、不校验保护价内深度或 `min_order_size`。该 token 盘口 MISSING/ERROR 时退出仍然生成；
+- `size` 单位为 shares，输入最多 2 位小数；Trading 会在 BUY 下单前四舍五入为整数 shares，再校验 BUY 的 `ask.price <= worst_price` 范围内的可见深度。BUY 只要在保护价内有正数深度即可：Go 把 Kalshi 订单和所有 Polymarket BUY 作为 IOC 执行，成交保护价内可得数量并立即取消剩余，`size` 是股数上限、`worst_price` 只是价格上限，二者都不是资金预算；Polymarket SELL 按策略给出的 FOK/IOC 和数量原样提交，成交与否由交易所在 `worst_price` 限价内决定。BUY 还要求 `worst_price * size` 最多 4 位小数且不少于 1 美元；
 - `multfactor_v1` SUBMIT 的 `evidence.metrics` 必须包含
   `best_ask/near_logdiff_usd/rel_spread`，MOM/MACD 可选；`multfactor_v2` 必须完整包含五项；
 - `metrics.best_ask` 必须等于输入 `best_ask`，metrics value 全部为十进制字符串；

@@ -72,12 +72,17 @@ func (manager *ReservationManager) authorizeLiveRisk(
 	}
 	// Price freshness is the age of our own capture of the official book. The
 	// venue's last-change timestamp (LatestBookSourceAt) is audit evidence only:
-	// a quiet market legitimately keeps it unchanged for minutes.
-	if err := checkRiskTimestamp("PRICE", &order.MarketValidation.LatestBookObservedAt, observedAt, policy.maxPriceAge); err != nil {
-		return liveRiskAuthorization{}, err
-	}
-	if err := checkRiskTimestamp("SIGNAL", order.Intent.SignalAt, observedAt, policy.maxSignalAge); err != nil {
-		return liveRiskAuthorization{}, err
+	// a quiet market legitimately keeps it unchanged for minutes. Both the
+	// price and the signal freshness windows gate BUY entries only: a SELL exit
+	// is executed whenever the account gates and reconciliation state allow it,
+	// however old the strategy decision or the validated book has become.
+	if order.Intent.Side != domain.SideSell {
+		if err := checkRiskTimestamp("PRICE", &order.MarketValidation.LatestBookObservedAt, observedAt, policy.maxPriceAge); err != nil {
+			return liveRiskAuthorization{}, err
+		}
+		if err := checkRiskTimestamp("SIGNAL", order.Intent.SignalAt, observedAt, policy.maxSignalAge); err != nil {
+			return liveRiskAuthorization{}, err
+		}
 	}
 	if err := checkLiveRiskState(ctx, tx, order.Intent.ExecutionAccountID, observedAt, policy.maxStateAge); err != nil {
 		return liveRiskAuthorization{}, err

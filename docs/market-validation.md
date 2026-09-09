@@ -13,7 +13,7 @@ Python Strategy / SUBMIT
   -> Market Universe：按 condition_id 查询权威市场
   -> 校验 market/outcome/token/状态/neg_risk/tick size/快照时效
   -> Market Data 或 Polymarket CLOB：读取该权威 token 的最新盘口
-  -> 校验最新价格没有越过 worst_price
+  -> 校验最新价格没有越过 worst_price（仅 BUY）
   -> 原子占用 client_order_id 并保存 MarketValidation 证据
   -> Venue.Place
 ```
@@ -32,7 +32,7 @@ Python Strategy / SUBMIT
 执行前读取最新盘口：
 
 - BUY：`latest_best_ask <= worst_price` 才可下单；
-- SELL：`latest_best_bid >= worst_price` 才可下单；
+- SELL：不比较最新 best bid，`worst_price` 只作为限价交给交易所，退出是否成交由 venue 决定；
 - 价格必须是当前 `tick_size` 的精确整数倍，全程使用 decimal string，不转成 float；
 - LIMIT 的实际 `price` 使用 `worst_price`，避免订单在校验与发送之间失去价格保护；
 - MARKET 订单也必须带 `worst_price`，供后续真实 Venue adapter 做保护型 FOK/FAK 转换；
@@ -43,13 +43,19 @@ Python Strategy / SUBMIT
   `PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE` fail closed。Polymarket 的 IOC 由执行层用 GTC 限价单加
   立即撤单模拟，因为 CLOB 的 FOK/FAK BUY 是按 pUSD 预算成交的，会在盘口好于保护价时买超 `size` 股。
 
+SELL 退出是策略的卖出指令，市场校验只确认市场身份、outcome/token 映射、tick 对齐和最新盘口证据可用，
+不因市场交易状态、元数据时效、`neg_risk` 变化、盘口抓取时效、价格漂移或保护价内深度拒绝它。SELL 的
+`neg_risk` 证据取权威市场当前值，adapter 签名前再与 CLOB 核对；SELL IOC 不记录 `executable_size`，
+按策略数量全额提交后由模拟 IOC 撤掉剩余。
+
 Kalshi 使用 `DEPTH_AWARE_LIMIT + IOC`：策略快照的最优价作为
 `strategy_reference_price`，`worst_price` 必须处于可成交方向，且冻结盘口在该保护价内至少有正数可见深度。
 Kalshi 盘口可能跳过中间 tick，因此不额外套用固定两 tick 距离上限。实际提交前 Go 会重新读取不超过
 10 秒的官方盘口，允许价格向有利方向移动，也允许仍在 `worst_price` 内的不利移动。对新的 IOC intent，保护价内有正数深度
 即可提交；当时能成交多少就成交多少，剩余由 venue 取消。对恢复中的历史 FOK intent，仍要求可见深度覆盖全部 shares。
 最新最优价越过保护线、保护价内零深度、价格不在 tick 上或参考价缺失时均 fail closed，
-Go 不会自行扩大策略给出的限价。
+Go 不会自行扩大策略给出的限价。这些价格、参考价、盘口时效和深度检查只针对 BUY；Kalshi SELL 退出
+只确认 tick 对齐、数量和官方两侧盘口可用，按全额提交，由 venue 原生 IOC 成交并取消剩余。
 
 ## OrderIntent 的市场上下文
 
@@ -144,6 +150,10 @@ Venue。`observed_at` 是这份市场元数据的观察时间，不应拿业务�
 | `PRICE_DRIFT` | 最新可成交价越过 Python 的 worst_price |
 | `NO_PROTECTED_LIQUIDITY` | IOC intent 在最新盘口保护价内没有可见深度 |
 | `PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE` | IOC intent 保护价内可成交量低于 venue `min_order_size` |
+
+以下拒绝码只对 BUY 入场生效，SELL 退出跳过：`MARKET_METADATA_STALE`、`MARKET_RESOLVED`、`MARKET_CLOSED`、
+`MARKET_PAUSED`、`MARKET_NOT_ACCEPTING_ORDERS`、`NEG_RISK_MISMATCH`、`LATEST_BOOK_OBSERVATION_STALE`、
+`PRICE_DRIFT`、`NO_PROTECTED_LIQUIDITY`、`PROTECTED_LIQUIDITY_BELOW_MIN_ORDER_SIZE`。
 
 默认时效阈值为：Market Universe 元数据 5 分钟、最新盘口抓取 10 秒（`POLYMARKET_LATEST_BOOK_MAX_AGE`）、
 未来时钟偏差 2 秒。构造 `marketvalidation.Service` 时都可配置；实盘配置应结合服务 SLA 调整。

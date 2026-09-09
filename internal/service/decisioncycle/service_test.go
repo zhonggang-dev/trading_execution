@@ -2895,3 +2895,122 @@ func TestWithholdKalshiPredictionsNormalizesSourceAndKeepsInputIntact(t *testing
 		t.Fatalf("withholdKalshiPredictions(nil) = %#v, %d", kept, withheld)
 	}
 }
+
+// unconditionalExitFixture 构建一条持仓不足 48 小时、盘口很薄的退出输入，用来验证
+// Trading 不再对策略 SELL 施加持有时长、价格保护和深度门禁。
+func unconditionalExitFixture(decisionAt time.Time) (domain.StrategyDecisionRequest, domain.StrategyDecisionResponse) {
+	request := domain.StrategyDecisionRequest{
+		SchemaVersion: domain.StrategyInputSchemaVersion, CycleID: "cycle-exit", InputID: "input-exit",
+		Context: testBinding(), DecisionAt: decisionAt,
+		Positions: []domain.StrategyPositionLot{{
+			LotID: "lot-1", MarketID: "market-1", ConditionID: "condition-1",
+			OutcomeIndex: 0, OutcomeName: "Yes", TokenID: "yes-token", NegRisk: false,
+			EnteredAt: decisionAt.Add(-time.Hour), Shares: "12.50", EntryPrice: "0.40",
+		}},
+		OrderBooks: []domain.OrderBookSnapshot{{
+			MarketID: "market-1", ConditionID: "condition-1", OutcomeIndex: 0, TokenID: "yes-token",
+			Status: domain.OrderBookStatusOK, SourceAt: decisionAt.Add(-time.Minute), ObservedAt: decisionAt,
+			DepthLimit: domain.StrategyOrderBookDepth, TickSize: "0.01", MinOrderSize: "5",
+			Bids: []domain.PriceLevel{{Price: "0.49", Size: "2"}},
+			Asks: []domain.PriceLevel{{Price: "0.50", Size: "20"}},
+		}},
+		ExecutionConstraints: domain.DefaultStrategyExecutionConstraints(),
+	}
+	response := domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion, CycleID: request.CycleID, InputID: request.InputID,
+		Context: request.Context, DecidedAt: decisionAt.Add(time.Second), Evaluations: []domain.StrategyEvaluation{},
+		Exits: []domain.StrategyExit{{
+			DecisionID: "exit-1", LotID: "lot-1", TokenID: "yes-token", ReasonCode: "STOP_LOSS",
+			Order: &domain.StrategyOrderParams{
+				Side: domain.SideSell, Type: domain.OrderTypeLimit, WorstPrice: "0.60", Size: "12.50", TimeInForce: domain.TimeInForceFOK,
+			},
+		}},
+	}
+	return request, response
+}
+
+// TestValidateResponseBuildsSellExitWithoutHoldPriceOrDepthGates 验证策略 SELL 在持仓不足
+// 48 小时、reason_code 不是 HOLD_48H、worst_price 高于快照 best bid、数量超过可见深度且
+// 低于 min_order_size 时仍然生成退出 intent，价格和数量原样保留。
+func TestValidateResponseBuildsSellExitWithoutHoldPriceOrDepthGates(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)
+	request, response := unconditionalExitFixture(decisionAt)
+
+	intents, err := validateResponse(request, response, "polymarket")
+	if err != nil {
+		t.Fatalf("validateResponse() error = %v", err)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("intents = %#v, want exactly one SELL exit", intents)
+	}
+	intent := intents[0]
+	if intent.Side != domain.SideSell || intent.TargetLotID != "lot-1" || intent.WorstPrice != "0.60" ||
+		intent.Price != "0.60" || intent.Size != "12.50" || intent.TimeInForce != domain.TimeInForceFOK {
+		t.Fatalf("exit intent = %#v", intent)
+	}
+	if intent.Metadata["strategy_reason_code"] != "STOP_LOSS" || intent.Metadata["strategy_reference_price"] != "0.49" {
+		t.Fatalf("exit metadata = %#v", intent.Metadata)
+	}
+	if intent.MarketSnapshotAt == nil || !intent.MarketSnapshotAt.Equal(decisionAt.Add(-time.Minute)) {
+		t.Fatalf("market_snapshot_at = %v, want frozen book source time", intent.MarketSnapshotAt)
+	}
+}
+
+// TestValidateResponseBuildsSellExitWithoutUsableOrderbook 验证该 token 的冻结盘口缺失或
+// 出错时退出仍然生成，market_snapshot_at 退回决策时间且不记录参考价。
+func TestValidateResponseBuildsSellExitWithoutUsableOrderbook(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)
+	for _, name := range []string{"error", "missing"} {
+		t.Run(name, func(t *testing.T) {
+			request, response := unconditionalExitFixture(decisionAt)
+			if name == "error" {
+				request.OrderBooks[0].Status = domain.OrderBookStatusError
+				request.OrderBooks[0].Bids = nil
+				request.OrderBooks[0].Asks = nil
+			} else {
+				request.OrderBooks = nil
+			}
+			intents, err := validateResponse(request, response, "polymarket")
+			if err != nil {
+				t.Fatalf("validateResponse() error = %v", err)
+			}
+			if len(intents) != 1 || intents[0].MarketSnapshotAt == nil || !intents[0].MarketSnapshotAt.Equal(decisionAt) {
+				t.Fatalf("intents = %#v, want SELL exit anchored to decision_at", intents)
+			}
+			if _, found := intents[0].Metadata["strategy_reference_price"]; found {
+				t.Fatalf("metadata = %#v, want no reference price without a usable book", intents[0].Metadata)
+			}
+		})
+	}
+}
+
+// TestValidateResponseStillRejectsMalformedExit 验证退出的身份和格式校验仍然存在。
+func TestValidateResponseStillRejectsMalformedExit(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)
+	expiresAt := decisionAt.Add(time.Hour)
+	tests := []struct {
+		name   string
+		mutate func(*domain.StrategyExit)
+	}{
+		{name: "missing reason code", mutate: func(exit *domain.StrategyExit) { exit.ReasonCode = "" }},
+		{name: "unknown lot", mutate: func(exit *domain.StrategyExit) { exit.LotID = "lot-404" }},
+		{name: "token does not match lot", mutate: func(exit *domain.StrategyExit) { exit.TokenID = "no-token" }},
+		{name: "missing order", mutate: func(exit *domain.StrategyExit) { exit.Order = nil }},
+		{name: "size exceeds lot", mutate: func(exit *domain.StrategyExit) { exit.Order.Size = "12.51" }},
+		{name: "buy side", mutate: func(exit *domain.StrategyExit) { exit.Order.Side = domain.SideBuy }},
+		{name: "expires_at set", mutate: func(exit *domain.StrategyExit) { exit.Order.ExpiresAt = &expiresAt }},
+		{name: "gtc", mutate: func(exit *domain.StrategyExit) { exit.Order.TimeInForce = domain.TimeInForceGTC }},
+		{name: "price above one", mutate: func(exit *domain.StrategyExit) { exit.Order.WorstPrice = "1.01" }},
+		{name: "zero price", mutate: func(exit *domain.StrategyExit) { exit.Order.WorstPrice = "0" }},
+		{name: "size precision", mutate: func(exit *domain.StrategyExit) { exit.Order.Size = "1.234" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, response := unconditionalExitFixture(decisionAt)
+			test.mutate(&response.Exits[0])
+			if _, err := validateResponse(request, response, "polymarket"); err == nil {
+				t.Fatal("validateResponse() accepted a malformed exit")
+			}
+		})
+	}
+}

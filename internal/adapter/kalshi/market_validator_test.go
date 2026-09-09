@@ -108,14 +108,6 @@ func TestKalshiMarketValidatorRejectsUnsafeDepthAwarePriceOrDepth(t *testing.T) 
 			},
 		},
 		{
-			name: "sell latest bid beyond protection", code: "KALSHI_PRICE_MOVED",
-			mutate: func(intent *domain.OrderIntent, book *domain.OrderBookSnapshot) {
-				configureKalshiSellIntent(intent)
-				book.Bids = []domain.PriceLevel{{Price: "0.47", Size: "100"}}
-				book.BestBid = "0.47"
-			},
-		},
-		{
 			name: "buy protection is better than strategy reference", code: "KALSHI_PRICE_PROTECTION_INVALID",
 			mutate: func(intent *domain.OrderIntent, _ *domain.OrderBookSnapshot) {
 				intent.Price = "0.49"
@@ -157,8 +149,14 @@ func TestKalshiMarketValidatorAllowsPartialIOCDepth(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Validate() error = %v, want protected partial depth to pass IOC", err)
 			}
-			if validation.ExecutableSize != "9.00" {
-				t.Fatalf("executable_size = %q, want 9.00", validation.ExecutableSize)
+			// BUY caps the wire quantity at the protected depth; a SELL exit is
+			// submitted at full size and the native IOC cancels the remainder.
+			want := domain.Decimal("9.00")
+			if side == domain.SideSell {
+				want = ""
+			}
+			if validation.ExecutableSize != want {
+				t.Fatalf("executable_size = %q, want %q", validation.ExecutableSize, want)
 			}
 		})
 	}
@@ -188,20 +186,114 @@ func TestKalshiMarketValidatorRejectsIOCDepthBelowMinimum(t *testing.T) {
 	assertKalshiRejectionCode(t, validator, intent, "KALSHI_INSUFFICIENT_VISIBLE_DEPTH")
 }
 
-func TestKalshiMarketValidatorStillRequiresFullDepthForNonIOCOrders(t *testing.T) {
-	for _, side := range []domain.Side{domain.SideBuy, domain.SideSell} {
-		t.Run(string(side), func(t *testing.T) {
-			now, intent, book := validKalshiValidationFixtures(side)
-			intent.TimeInForce = domain.TimeInForceFOK
-			if side == domain.SideBuy {
-				book.Asks = []domain.PriceLevel{{Price: "0.51", Size: "4"}, {Price: "0.52", Size: "5"}, {Price: "0.53", Size: "100"}}
-				book.BestAsk = "0.51"
-			} else {
-				book.Bids = []domain.PriceLevel{{Price: "0.49", Size: "4"}, {Price: "0.48", Size: "5"}, {Price: "0.47", Size: "100"}}
+func TestKalshiMarketValidatorStillRequiresFullDepthForNonIOCBuyOrders(t *testing.T) {
+	now, intent, book := validKalshiValidationFixtures(domain.SideBuy)
+	intent.TimeInForce = domain.TimeInForceFOK
+	book.Asks = []domain.PriceLevel{{Price: "0.51", Size: "4"}, {Price: "0.52", Size: "5"}, {Price: "0.53", Size: "100"}}
+	book.BestAsk = "0.51"
+	validator := newKalshiValidatorForTest(t, now, book)
+	assertKalshiRejectionCode(t, validator, intent, "KALSHI_INSUFFICIENT_VISIBLE_DEPTH")
+}
+
+// TestKalshiMarketValidatorSellExitsAreNotPriceOrDepthGated verifies that a
+// strategy SELL passes with an adverse bid move, thin or missing protected
+// depth, a stale venue timestamp, or no strategy reference price, and that the
+// wire quantity is never capped for it.
+func TestKalshiMarketValidatorSellExitsAreNotPriceOrDepthGated(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*domain.OrderIntent, *domain.OrderBookSnapshot, time.Time)
+	}{
+		{
+			name: "latest bid beyond protection",
+			mutate: func(_ *domain.OrderIntent, book *domain.OrderBookSnapshot, _ time.Time) {
+				book.Bids = []domain.PriceLevel{{Price: "0.47", Size: "100"}}
+				book.BestBid = "0.47"
+			},
+		},
+		{
+			name: "fok without cumulative depth",
+			mutate: func(intent *domain.OrderIntent, book *domain.OrderBookSnapshot, _ time.Time) {
+				intent.TimeInForce = domain.TimeInForceFOK
+				book.Bids = []domain.PriceLevel{{Price: "0.49", Size: "1"}, {Price: "0.47", Size: "100"}}
 				book.BestBid = "0.49"
-			}
+			},
+		},
+		{
+			name: "ioc depth below min order size",
+			mutate: func(intent *domain.OrderIntent, book *domain.OrderBookSnapshot, _ time.Time) {
+				intent.TimeInForce = domain.TimeInForceIOC
+				book.Bids = []domain.PriceLevel{{Price: "0.49", Size: "0.50"}}
+				book.BestBid = "0.49"
+			},
+		},
+		{
+			name: "stale venue timestamp",
+			mutate: func(_ *domain.OrderIntent, book *domain.OrderBookSnapshot, now time.Time) {
+				book.SourceAt = now.Add(-11 * time.Second)
+			},
+		},
+		{
+			name: "missing strategy reference price",
+			mutate: func(intent *domain.OrderIntent, _ *domain.OrderBookSnapshot, _ time.Time) {
+				delete(intent.Metadata, "strategy_reference_price")
+			},
+		},
+		{
+			name: "worst price better than reference bid",
+			mutate: func(intent *domain.OrderIntent, _ *domain.OrderBookSnapshot, _ time.Time) {
+				intent.Price = "0.55"
+				intent.WorstPrice = "0.55"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now, intent, book := validKalshiValidationFixtures(domain.SideSell)
+			test.mutate(&intent, &book, now)
 			validator := newKalshiValidatorForTest(t, now, book)
-			assertKalshiRejectionCode(t, validator, intent, "KALSHI_INSUFFICIENT_VISIBLE_DEPTH")
+			validation, err := validator.Validate(context.Background(), intent)
+			if err != nil {
+				t.Fatalf("Validate() error = %v, want SELL exit accepted", err)
+			}
+			if !validation.ExecutableSize.IsEmpty() || validation.WorstPrice != intent.WorstPrice {
+				t.Fatalf("Validate() = %#v, want full-size SELL at the strategy worst price", validation)
+			}
+		})
+	}
+}
+
+// TestKalshiMarketValidatorSellExitsKeepTickAndBookChecks verifies the checks
+// that still apply to a SELL exit: tick alignment, a positive size and an
+// available two-sided official book.
+func TestKalshiMarketValidatorSellExitsKeepTickAndBookChecks(t *testing.T) {
+	tests := []struct {
+		name   string
+		code   string
+		mutate func(*domain.OrderIntent, *domain.OrderBookSnapshot)
+	}{
+		{
+			name: "off tick worst price", code: "KALSHI_PRICE_TICK_MISMATCH",
+			mutate: func(intent *domain.OrderIntent, _ *domain.OrderBookSnapshot) {
+				intent.Price = "0.485"
+				intent.WorstPrice = "0.485"
+			},
+		},
+		{
+			name: "invalid size", code: "KALSHI_ORDER_SIZE_INVALID",
+			mutate: func(intent *domain.OrderIntent, _ *domain.OrderBookSnapshot) { intent.Size = "0" },
+		},
+		{
+			name: "book without bids", code: "KALSHI_LATEST_BOOK_UNAVAILABLE",
+			mutate: func(_ *domain.OrderIntent, book *domain.OrderBookSnapshot) { book.Bids = nil },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now, intent, book := validKalshiValidationFixtures(domain.SideSell)
+			test.mutate(&intent, &book)
+			validator := newKalshiValidatorForTest(t, now, book)
+			assertKalshiRejectionCode(t, validator, intent, test.code)
 		})
 	}
 }

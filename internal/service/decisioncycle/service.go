@@ -1479,28 +1479,22 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 	return intent, err
 }
 
-// buildExitIntent 根据已验证的策略退出结果构建卖出订单意图。
+// buildExitIntent 根据策略退出结果构建卖出订单意图。Trading 只核对退出指向的 lot
+// 归属和订单参数格式，不对 SELL 施加持有时长、reason_code 枚举、快照价格保护或
+// 盘口深度门禁：策略返回的 SELL 就是卖出指令。市场身份、tick 和最新盘口由执行前
+// 的市场校验逐单确认，其失败只拒绝该订单，不影响同一响应中的其他 intent。
 func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time, exit domain.StrategyExit, venue string) (domain.OrderIntent, error) {
-	if exit.ReasonCode != domain.StrategyReasonHold48H {
-		return domain.OrderIntent{}, fmt.Errorf("exit reason_code must be HOLD_48H")
+	if exit.ReasonCode == "" {
+		return domain.OrderIntent{}, fmt.Errorf("exit requires reason_code")
 	}
 	lot, found := strategyPositionLot(request.Positions, exit.LotID)
 	if !found || lot.TokenID != exit.TokenID {
 		return domain.OrderIntent{}, fmt.Errorf("exit lot/token does not belong to the decision input")
 	}
-	if request.DecisionAt.Sub(lot.EnteredAt) < 48*time.Hour {
-		return domain.OrderIntent{}, fmt.Errorf("position lot has not been held for 48 hours")
-	}
-	book, found := strategyBook(request.OrderBooks, lot.TokenID)
-	if !found || book.Status != domain.OrderBookStatusOK {
-		return domain.OrderIntent{}, fmt.Errorf("exit requires an OK orderbook")
-	}
 	if exit.Order == nil {
 		return domain.OrderIntent{}, fmt.Errorf("exit requires order parameters")
 	}
-	if err := validateStrategyOrderForMarket(
-		*exit.Order, domain.SideSell, book, request.ExecutionConstraints, lot.MarketSource,
-	); err != nil {
+	if err := validateStrategyExitOrder(*exit.Order, request.ExecutionConstraints); err != nil {
 		return domain.OrderIntent{}, err
 	}
 	if comparison, err := exit.Order.Size.Compare(lot.Shares); err != nil || comparison > 0 {
@@ -1512,18 +1506,28 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 		return domain.OrderIntent{}, err
 	}
 	expectedNegRisk := lot.NegRisk
-	marketSnapshotAt := book.SourceAt
 	signalAt = signalAt.UTC()
 	metadata := map[string]string{
-		"cycle_id":                 request.CycleID,
-		"input_id":                 request.InputID,
-		"strategy_decision_id":     exit.DecisionID,
-		"strategy_reason_code":     string(exit.ReasonCode),
-		"strategy_reference_price": book.Bids[0].Price.String(),
-		"strategy_worst_price":     exit.Order.WorstPrice.String(),
-		"target_lot_id":            lot.LotID,
-		"model_id":                 request.Context.ModelID,
-		"execution_account_id":     request.Context.ExecutionAccountID,
+		"cycle_id":             request.CycleID,
+		"input_id":             request.InputID,
+		"strategy_decision_id": exit.DecisionID,
+		"strategy_reason_code": string(exit.ReasonCode),
+		"strategy_worst_price": exit.Order.WorstPrice.String(),
+		"target_lot_id":        lot.LotID,
+		"model_id":             request.Context.ModelID,
+		"execution_account_id": request.Context.ExecutionAccountID,
+	}
+	// The frozen book is audit evidence for the exit, not a precondition: a
+	// position whose book was MISSING or ERROR in this cycle can still be sold.
+	// Without a usable book the decision time identifies the strategy snapshot.
+	marketSnapshotAt := request.DecisionAt.UTC()
+	if book, found := strategyBook(request.OrderBooks, lot.TokenID); found && book.Status == domain.OrderBookStatusOK {
+		if !book.SourceAt.IsZero() {
+			marketSnapshotAt = book.SourceAt.UTC()
+		}
+		if len(book.Bids) > 0 {
+			metadata["strategy_reference_price"] = book.Bids[0].Price.String()
+		}
 	}
 	executionTimeInForce := venueTimeInForce(exit.Order.TimeInForce, domain.SideSell, lot.MarketSource)
 	if executionTimeInForce != exit.Order.TimeInForce {
@@ -1549,6 +1553,32 @@ func buildExitIntent(request domain.StrategyDecisionRequest, signalAt time.Time,
 	return intent, err
 }
 
+// validateStrategyExitOrder 只校验 SELL 退出订单的格式：方向、类型、time_in_force、
+// 数量精度和价格区间。它不比较快照盘口、不要求保护价内深度，也不检查 min_order_size；
+// tick 对齐和市场身份由执行前的市场校验按权威元数据逐单确认。
+func validateStrategyExitOrder(order domain.StrategyOrderParams, constraints domain.StrategyExecutionConstraints) error {
+	if order.Side != domain.SideSell || order.Type != domain.OrderTypeLimit || order.ExpiresAt != nil ||
+		(order.TimeInForce != domain.TimeInForceFOK && order.TimeInForce != domain.TimeInForceIOC) {
+		return fmt.Errorf("order must be a SELL LIMIT FOK or IOC without expires_at")
+	}
+	if !slices.Contains(constraints.AllowedTimeInForce, order.TimeInForce) {
+		return fmt.Errorf("order.time_in_force %s is not in allowed_time_in_force", order.TimeInForce)
+	}
+	if sign, err := order.Size.Sign(); err != nil || sign <= 0 {
+		return fmt.Errorf("order.size must be positive shares")
+	}
+	if decimalPlaces(order.Size) > constraints.SizeDecimalPlaces {
+		return fmt.Errorf("order.size exceeds %d decimal places", constraints.SizeDecimalPlaces)
+	}
+	if sign, err := order.WorstPrice.Sign(); err != nil || sign <= 0 {
+		return fmt.Errorf("order.worst_price must be positive")
+	}
+	if comparison, err := order.WorstPrice.Compare("1"); err != nil || comparison > 0 {
+		return fmt.Errorf("order.worst_price must not exceed one")
+	}
+	return nil
+}
+
 func executionOutcomeID(source domain.MarketSource, conditionID, tokenID string) (string, error) {
 	if source.Normalize() != domain.MarketSourceKalshi {
 		return "", nil
@@ -1569,11 +1599,11 @@ func validateStrategyOrder(order domain.StrategyOrderParams, side domain.Side, b
 	return validateStrategyOrderForMarket(order, side, book, constraints, domain.MarketSourcePolymarket)
 }
 
-// validateStrategyOrderForMarket keeps the existing two-tick protection for
-// Polymarket's dense books. Kalshi books can legitimately skip price levels;
-// for them the strategy's explicit worst price plus cumulative visible depth
-// is the protection boundary, and the live validator repeats that check using
-// a fresh official book immediately before placement.
+// validateStrategyOrderForMarket validates BUY entries against the frozen
+// strategy book: the strategy's explicit worst price plus cumulative visible
+// depth is the protection boundary, and the live validator repeats that check
+// using a fresh official book immediately before placement. SELL exits do not
+// pass through here; see validateStrategyExitOrder.
 func validateStrategyOrderForMarket(
 	order domain.StrategyOrderParams,
 	side domain.Side,
