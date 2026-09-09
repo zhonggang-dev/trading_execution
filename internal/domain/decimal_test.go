@@ -20,3 +20,21 @@ func TestDecimalIsMultipleOf(t *testing.T) {
 		}
 	}
 }
+
+func TestDecimalCanonicalNormalizesEquivalentRepresentations(t *testing.T) {
+	tests := []struct {
+		value string
+		want  Decimal
+	}{
+		{value: "", want: ""},
+		{value: " +00.4900 ", want: "0.49"},
+		{value: "0001.00", want: "1"},
+		{value: "-000.500", want: "-0.5"},
+		{value: "-0.000", want: "0"},
+	}
+	for _, test := range tests {
+		if got := Decimal(test.value).Canonical(); got != test.want {
+			t.Fatalf("Decimal(%q).Canonical() = %q, want %q", test.value, got, test.want)
+		}
+	}
+}

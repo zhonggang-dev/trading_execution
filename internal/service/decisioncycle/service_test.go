@@ -59,6 +59,22 @@ type fakeOrderBookSource struct {
 	books   []domain.OrderBookSnapshot
 }
 
+type fakeOrderBookSnapshotRecorder struct {
+	batches []domain.OrderBookSnapshotBatch
+	err     error
+}
+
+func (recorder *fakeOrderBookSnapshotRecorder) ClaimBatch(
+	_ context.Context,
+	batch domain.OrderBookSnapshotBatch,
+) (domain.OrderBookSnapshotBatch, bool, error) {
+	if recorder.err != nil {
+		return domain.OrderBookSnapshotBatch{}, false, recorder.err
+	}
+	recorder.batches = append(recorder.batches, batch)
+	return batch, true, nil
+}
+
 // Capture 返回模拟行情快照。
 func (source *fakeOrderBookSource) Capture(_ context.Context, _ time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, error) {
 	source.targets = targets
@@ -391,6 +407,29 @@ func TestAlignBooksPreservesPositiveMinimumOrderSize(t *testing.T) {
 	}
 }
 
+func TestAlignBooksClearsPartialLevelsFromFailedCapture(t *testing.T) {
+	observedAt := time.Date(2026, 9, 9, 6, 10, 1, 0, time.UTC)
+	target := domain.BookTarget{
+		MarketID: "market-1", ConditionID: "condition-1", OutcomeIndex: 0, TokenID: "token-1",
+	}
+	books, err := alignBooks([]domain.BookTarget{target}, []domain.OrderBookSnapshot{{
+		MarketID: target.MarketID, ConditionID: target.ConditionID,
+		OutcomeIndex: target.OutcomeIndex, TokenID: target.TokenID,
+		Status: domain.OrderBookStatusError, ErrorCode: "CLOB_INVALID_ASK",
+		SourceAt: observedAt.Add(-time.Second), ObservedAt: observedAt,
+		DepthLimit: domain.StrategyOrderBookDepth,
+		Bids:       []domain.PriceLevel{{Price: "0.49", Size: "5"}},
+		Asks:       []domain.PriceLevel{},
+	}}, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(books[0].Bids) != 0 || len(books[0].Asks) != 0 ||
+		!books[0].BestBid.IsEmpty() || !books[0].BestAsk.IsEmpty() {
+		t.Fatalf("failed book retained price levels: %#v", books[0])
+	}
+}
+
 // TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput 验证 Run Builds Frozen Input And Executes Recorded Strategy Output 场景下的行为。
 func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
@@ -448,6 +487,7 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		},
 	}}
 	recorder := &fakeRecorder{}
+	snapshotRecorder := &fakeOrderBookSnapshotRecorder{}
 	executor := &fakeExecutor{}
 	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
@@ -463,6 +503,7 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              bookSource,
+		SnapshotRecorder:             snapshotRecorder,
 		Strategy:                     strategy,
 		Recorder:                     recorder,
 		Executor:                     executor,
@@ -489,6 +530,20 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 	if len(bookSource.targets) != 2 || len(run.Request.OrderBooks) != 2 {
 		t.Fatalf("targets = %#v, books = %#v, want both outcome tokens", bookSource.targets, run.Request.OrderBooks)
 	}
+	if len(snapshotRecorder.batches) != 1 || snapshotRecorder.batches[0].SnapshotCount != len(run.Request.OrderBooks) {
+		t.Fatalf("saved shared batch count = %#v, want %d strategy orderbooks", snapshotRecorder.batches, len(run.Request.OrderBooks))
+	}
+	for index, book := range run.Request.OrderBooks {
+		stored := snapshotRecorder.batches[0].Snapshots[index]
+		if stored.MarketSource.Normalize() != book.MarketSource.Normalize() || stored.MarketID != book.MarketID ||
+			stored.ConditionID != book.ConditionID || stored.TokenID != book.TokenID || stored.OutcomeIndex != book.OutcomeIndex ||
+			!samePriceLevels(stored.Bids, book.Bids) || !samePriceLevels(stored.Asks, book.Asks) {
+			t.Fatalf("stored snapshot %d does not match strategy orderbook: stored=%#v request=%#v", index, stored, book)
+		}
+	}
+	if strings.TrimSpace(string(run.Request.OrderBooks[0].MarketSource)) != "" {
+		t.Fatalf("legacy Polymarket strategy payload gained market_source: %#v", run.Request.OrderBooks[0])
+	}
 	if run.Request.OrderBooks[1].Status != domain.OrderBookStatusMissing {
 		t.Fatalf("missing book = %#v, want explicit MISSING status", run.Request.OrderBooks[1])
 	}
@@ -506,6 +561,18 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		!intent.SignalAt.Equal(strategy.response.DecidedAt) || intent.WorstPrice != "0.50" {
 		t.Fatalf("execution market context = %#v", intent)
 	}
+}
+
+func samePriceLevels(left, right []domain.PriceLevel) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !left[index].Price.Equal(right[index].Price) || !left[index].Size.Equal(right[index].Size) {
+			return false
+		}
+	}
+	return true
 }
 
 func TestRunSkipsQuarantinedBindingWhileOtherBindingSubmits(t *testing.T) {
@@ -627,6 +694,7 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 	bindings := fourWalletBindings()
 	bookSource := &fakeOrderBookSource{}
 	strategy := &matrixStrategy{}
+	snapshotRecorder := &fakeOrderBookSnapshotRecorder{}
 	service, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
@@ -636,6 +704,7 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              bookSource,
+		SnapshotRecorder:             snapshotRecorder,
 		Strategy:                     strategy,
 		Recorder:                     &fakeRecorder{},
 		Executor:                     &fakeExecutor{},
@@ -657,6 +726,9 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 	}
 	if len(bookSource.targets) != 4 {
 		t.Fatalf("independent orderbook targets = %d, want four outcome tokens", len(bookSource.targets))
+	}
+	if len(snapshotRecorder.batches) != 1 || snapshotRecorder.batches[0].SnapshotCount != 4 {
+		t.Fatalf("shared orderbook batches = %#v, want one four-token capture", snapshotRecorder.batches)
 	}
 	seenAccounts := make(map[string]struct{}, 4)
 	for _, request := range strategy.requests {
@@ -681,6 +753,48 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 	}
 	if predictions[0].Model.Name != "echo-producer-v7" || predictions[1].Model.Name != "gemini-3.6-flash" {
 		t.Fatalf("source snapshot was mutated: %#v", predictions)
+	}
+}
+
+func TestRunSnapshotPersistenceFailureBlocksNewStrategyButRecoversOldIntents(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 9, 6, 0, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	strategy := &matrixStrategy{}
+	executor := &fakeExecutor{}
+	recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{{
+		CycleID: "old-cycle", ClientOrderID: "old-intent",
+		Intent: domain.OrderIntent{
+			ClientOrderID: "old-intent", ExecutionAccountID: "account-test-v2", Side: domain.SideBuy,
+		},
+		Status: domain.DecisionIntentPending,
+	}}}
+	snapshotRecorder := &fakeOrderBookSnapshotRecorder{err: errors.New("postgres unavailable")}
+	service, err := newTestService(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "predsnap-persist-failure",
+			DecisionAt: decisionAt, Predictions: []domain.Prediction{prediction},
+		}},
+		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
+		SnapshotRecorder: snapshotRecorder, Strategy: strategy, Recorder: recorder,
+		Executor: executor, SubmitEnabled: true, RequireCompleteModelCoverage: true,
+		Bindings: []domain.StrategyExecutionBinding{testExecutionBinding()}, Venue: "polymarket-paper",
+		Now: func() time.Time { return decisionAt.Add(time.Second) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Run(context.Background(), decisionAt)
+	if err == nil || !strings.Contains(err.Error(), "claim shared orderbook snapshot batch") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(strategy.requests) != 0 || recorder.inputRecorded || recorder.outputRecorded {
+		t.Fatalf("new strategy work after snapshot failure: strategy=%d input=%t output=%t",
+			len(strategy.requests), recorder.inputRecorded, recorder.outputRecorded)
+	}
+	if len(executor.intents) != 1 || executor.intents[0].ClientOrderID != "old-intent" ||
+		recorder.requeueCalls == 0 || len(recorder.claimAccountCalls) == 0 {
+		t.Fatalf("old intent was not recovered before snapshot failure: intents=%#v requeues=%d claims=%d",
+			executor.intents, recorder.requeueCalls, len(recorder.claimAccountCalls))
 	}
 }
 
@@ -818,6 +932,7 @@ func TestSourceModeMismatchSubmitsExitButNeverBuy(t *testing.T) {
 		})
 	}
 	recorder := &fakeRecorder{}
+	snapshotRecorder := &fakeOrderBookSnapshotRecorder{}
 	executor := &fakeExecutor{}
 	strategy := &coverageBuyExitStrategy{}
 	service, err := newTestService(Params{
@@ -829,7 +944,7 @@ func TestSourceModeMismatchSubmitsExitButNeverBuy(t *testing.T) {
 			},
 		}},
 		PositionSource: positions, OrderBookSource: &fakeOrderBookSource{books: books},
-		Strategy: strategy, Recorder: recorder,
+		SnapshotRecorder: snapshotRecorder, Strategy: strategy, Recorder: recorder,
 		Executor: executor, SubmitEnabled: true, RequireCompleteModelCoverage: true,
 		Bindings: bindings, Venue: "polymarket-paper", Now: func() time.Time { return decisionAt.Add(2 * time.Second) },
 	})
@@ -851,6 +966,10 @@ func TestSourceModeMismatchSubmitsExitButNeverBuy(t *testing.T) {
 	}
 	if len(recorder.claimedOutputs) != 1 {
 		t.Fatalf("recorded outputs = %d, want one blocked binding decision", len(recorder.claimedOutputs))
+	}
+	if len(snapshotRecorder.batches) != 1 || snapshotRecorder.batches[0].SnapshotCount != 1 ||
+		snapshotRecorder.batches[0].Snapshots[0].TokenID != prediction.Outcomes[0].TokenID {
+		t.Fatalf("position-only shared batch = %#v", snapshotRecorder.batches)
 	}
 	for index, output := range recorder.claimedOutputs {
 		if output.EntryPolicy == nil || output.EntryPolicy.Enabled ||
@@ -1652,6 +1771,7 @@ func TestNewRejectsInvalidPredictionSourceModes(t *testing.T) {
 				PredictionSource:      fakePredictionSource{},
 				PositionSource:        fakePositionSource{},
 				OrderBookSource:       &fakeOrderBookSource{},
+				SnapshotRecorder:      &fakeOrderBookSnapshotRecorder{},
 				Strategy:              &fakeStrategy{},
 				Recorder:              &fakeRecorder{},
 				Bindings:              []domain.StrategyExecutionBinding{testExecutionBinding()},
@@ -2449,6 +2569,9 @@ func fourWalletBindings() []domain.StrategyExecutionBinding {
 }
 
 func newTestService(params Params) (*Service, error) {
+	if params.SnapshotRecorder == nil {
+		params.SnapshotRecorder = &fakeOrderBookSnapshotRecorder{}
+	}
 	if params.PredictionSourceModes == nil {
 		params.PredictionSourceModes = make(map[string]domain.PredictionSourceMode)
 		for _, rawBinding := range params.Bindings {

@@ -55,6 +55,8 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('managed_external_sell_allocations'),
 			('position_exit_runs'),
 			('strategy_decision_runs'),
+			('strategy_orderbook_snapshot_batches'),
+			('strategy_orderbook_snapshots'),
 			('strategy_order_intent_deliveries'),
 			('reconciliation_runs'),
 			('reconciliation_issues'),
@@ -163,6 +165,22 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_fills_settlement_evidence_object'),
 			('execution_fills_polygon_settlement_evidence_shape'),
 			('strategy_decision_runs_submission_mode_shape'),
+			('strategy_orderbook_snapshot_batches_pkey'),
+			('strategy_orderbook_snapshot_batches_set_unique'),
+			('strategy_orderbook_snapshot_batches_identity_nonempty'),
+			('strategy_orderbook_snapshot_batches_count_shape'),
+			('strategy_orderbook_snapshots_pkey'),
+			('strategy_orderbook_snapshots_batch_fk'),
+			('strategy_orderbook_snapshots_identity_nonempty'),
+			('strategy_orderbook_snapshots_market_source'),
+			('strategy_orderbook_snapshots_outcome_index'),
+			('strategy_orderbook_snapshots_status'),
+			('strategy_orderbook_snapshots_depth'),
+			('strategy_orderbook_snapshots_levels_arrays'),
+			('strategy_orderbook_snapshots_positive_metadata'),
+			('strategy_orderbook_snapshots_best_levels'),
+			('strategy_orderbook_snapshots_book_shape'),
+			('strategy_orderbook_snapshots_failure_shape'),
 			('strategy_order_intent_deliveries_cycle_sequence_unique'),
 			('strategy_order_intent_deliveries_identity_nonempty'),
 			('strategy_order_intent_deliveries_payload_object'),
@@ -227,6 +245,7 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 	err = checker.db.QueryRowContext(ctx, `
 		SELECT count(*)
 		FROM (VALUES
+			('strategy_orderbook_snapshot_batches_set_unique'),
 			('execution_fills_polygon_settlement_event_uidx'),
 			('execution_strategy_bindings_enabled_model_strategy_uidx'),
 			('strategy_decision_runs_account_time_idx'),
@@ -258,6 +277,9 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 	err = checker.db.QueryRowContext(ctx, `
 		SELECT count(*)
 		FROM (VALUES
+			('strategy_orderbook_snapshots_token_time_idx'),
+			('strategy_orderbook_snapshots_condition_time_idx'),
+			('strategy_orderbook_snapshots_time_brin_idx'),
 			('strategy_order_intent_deliveries_pending_idx'),
 			('strategy_order_intent_deliveries_stale_idx'),
 			('execution_external_position_baseline_items_account_idx'),
@@ -286,6 +308,10 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 	err = checker.db.QueryRowContext(ctx, `
 		SELECT count(*)
 		FROM (VALUES
+			('strategy_orderbook_snapshot_batches_complete_trigger'),
+			('strategy_orderbook_snapshots_complete_trigger'),
+			('strategy_orderbook_snapshot_batches_append_only_trigger'),
+			('strategy_orderbook_snapshots_append_only_trigger'),
 			('execution_orders_live_submit_risk_trigger'),
 			('execution_risk_global_control_version_trigger'),
 			('execution_risk_policies_version_trigger'),

@@ -38,6 +38,7 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
   -> load every binding's OPEN position lots
   -> capture CLOB books and [T-48h,T] midpoint histories once for the prediction/position token union
   -> normalize bids DESC / asks ASC / top 15 each side
+  -> atomically freeze the complete shared orderbook batch in PostgreSQL
   -> project source identity to logical model_id
   -> expand configured (model, strategy, execution account) bindings
   -> one isolated trading.strategy_input.v4 per binding
@@ -192,6 +193,8 @@ intent；`exits[]` 的身份/格式错误仍会使整个策略响应被拒绝。
 - 概率快照失败：整个周期失败，不使用上一次内存数据；
 - 单个模型/策略绑定失败：保留该绑定错误，继续执行其他独立账户；
 - 某个盘口失败：在输入中明确标记，由策略拒绝该 token；
+- 共享盘口批次保存失败：整个周期在任何策略调用前失败，不产生新 OrderIntent；
+- 同一 `decision_at` 的等价共享盘口重试只复用首次保存结果；身份、数量或内容不同则幂等冲突；
 - 周期输入通过 `ClaimInput` 原子持久化；重试只能复用原快照；
 - 策略输出通过 `ClaimOutput` 原子持久化；未成功持久化时不执行订单；
 - 进程启动时会在发布下一周期前接管并清空旧进程留下的全部 intent lease；任一恢复失败都会阻止调度器就绪，
@@ -235,8 +238,10 @@ intent；`exits[]` 的身份/格式错误仍会使整个策略响应被拒绝。
   同一 `prediction_model_id` 也不能路由到多个逻辑模型。
 
 生产装配使用 migrations `0012_strategy_decision_cycles.sql`、
-`0013_strategy_intent_deliveries.sql` 和 PostgreSQL `DecisionRecorder` 持久化完整输入、输出与
-订单意图投递状态。配置通过 `DECISION_CYCLE_BINDINGS_JSON` 注入，并要求绑定账户存在于
+`0013_strategy_intent_deliveries.sql`、`0026_strategy_orderbook_snapshots.sql`，并通过 PostgreSQL
+recorders 持久化共享盘口、完整 binding 输入、输出与订单意图投递状态。共享盘口的表结构、查询和
+容量观察见 [`orderbook-snapshot-storage.md`](orderbook-snapshot-storage.md)。配置通过
+`DECISION_CYCLE_BINDINGS_JSON` 注入，并要求绑定账户存在于
 受限钱包文件。只有 live 模式且两个显式开关都打开，OrderIntent 才会进入执行层；之后仍受
 数据库 Kill Switch、账户/策略暂停、binding、余额和 reconciliation freshness 等硬风控阻断。
 
