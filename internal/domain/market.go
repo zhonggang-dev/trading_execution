@@ -42,6 +42,9 @@ type MarketValidation struct {
 	BestBid              Decimal   `json:"best_bid,omitempty"`
 	BestAsk              Decimal   `json:"best_ask,omitempty"`
 	WorstPrice           Decimal   `json:"worst_price,omitempty"`
+	// EMPTY preserves a successfully fetched one-sided or empty book without
+	// inventing a best bid or ask. Older evidence omits this field.
+	BookStatus OrderBookStatus `json:"book_status,omitempty"`
 	// ExecutableSize is the venue-visible quantity inside WorstPrice at
 	// validation time. Venues that support partial immediate execution may use
 	// it to cap the submitted quantity while retaining the strategy-requested

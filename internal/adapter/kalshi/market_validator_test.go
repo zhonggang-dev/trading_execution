@@ -265,7 +265,7 @@ func TestKalshiMarketValidatorSellExitsAreNotPriceOrDepthGated(t *testing.T) {
 
 // TestKalshiMarketValidatorSellExitsKeepTickAndBookChecks verifies the checks
 // that still apply to a SELL exit: tick alignment, a positive size and an
-// available two-sided official book.
+// successfully fetched official book with valid evidence.
 func TestKalshiMarketValidatorSellExitsKeepTickAndBookChecks(t *testing.T) {
 	tests := []struct {
 		name   string

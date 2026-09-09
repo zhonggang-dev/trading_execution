@@ -258,10 +258,19 @@ func (params MarketValidationParams) Build() (MarketValidation, error) {
 	if validation.OutcomeIndex != 0 && validation.OutcomeIndex != 1 {
 		return MarketValidation{}, fmt.Errorf("market validation outcome index must be 0 or 1")
 	}
+	if validation.BookStatus != "" && validation.BookStatus != OrderBookStatusOK && validation.BookStatus != OrderBookStatusEmpty {
+		return MarketValidation{}, fmt.Errorf("market validation requires a successfully fetched orderbook")
+	}
+	if validation.BookStatus == OrderBookStatusEmpty && !validation.BestBid.IsEmpty() && !validation.BestAsk.IsEmpty() {
+		return MarketValidation{}, fmt.Errorf("EMPTY market validation cannot contain both best bid and ask")
+	}
 	for name, value := range map[string]Decimal{
 		"tick_size": validation.TickSize, "best_bid": validation.BestBid,
 		"best_ask": validation.BestAsk, "worst_price": validation.WorstPrice,
 	} {
+		if validation.BookStatus == OrderBookStatusEmpty && (name == "best_bid" || name == "best_ask") && value.IsEmpty() {
+			continue
+		}
 		if sign, err := value.Sign(); err != nil || sign <= 0 {
 			return MarketValidation{}, fmt.Errorf("market validation %s must be positive", name)
 		}

@@ -50,7 +50,7 @@ verifyingContract = standard V2 exchange 或 neg-risk V2 exchange
 - `price × shares` 必须能按对应 tick 的 amount precision 精确表达；
 - raw maker/taker amount 和 CLOB order/trade quantity 使用 6 位 token decimals；例如 wire
   `100000000` 必须显式解码为 `100` shares；
-- size 必须不低于 `/book.min_order_size`；
+- BUY size 必须不低于 `/book.min_order_size`；SELL 不做该本地检查，由交易所决定是否接受，不能因此承诺小额一定成交；
 - BUY notional 默认不得低于 `1 pUSD`，可配置但不能为零；
 - FAK/FOK BUY 的 maker notional 最多 4 位小数；SELL 的 taker notional 保持最多 4 位小数；
 - 除上述明确的 BUY 整数化外，不合法的策略数量直接拒绝；Go 不会为了通过交易所校验而二次改小 shares 或改变方向。
@@ -58,7 +58,7 @@ verifyingContract = standard V2 exchange 或 neg-risk V2 exchange
 旧 `execute.py` 用 float 先算 USD、再除以价格、再交给 SDK 二次 round-down，可能把 `16.90` 变成 `16.89`。新实现直接生成 6-decimal 整数，例如 `16.90 shares → 16900000`，彻底移除双重舍入。
 
 原生支持 `GTC/GTD/FAK/FOK`。Polymarket 没有 IOC 类型，adapter 通过 `SupportsTimeInForce(IOC)=false`
-声明这一点，执行层据此模拟 IOC：订单以 `GTC` 限价签名并提交，数量为 Market Validation 记录的
+声明这一点，执行层据此模拟 IOC：订单以 `GTC` 限价签名并提交，BUY 数量为 Market Validation 记录的
 `executable_size`（最新盘口在 `worst_price` 内可成交的量，不超过策略 `size`，不低于 `min_order_size`），
 下单响应返回后执行层立刻撤掉未成交部分。IOC 绝不会被改成 FAK：FAK/FOK BUY 的 maker notional 是 pUSD 预算，
 盘口好于限价时会买到多于 `size` 的 shares；GTC 按股数成交，最多买 `size` 股，价差体现为少花钱。

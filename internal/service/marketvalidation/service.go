@@ -146,7 +146,10 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		return domain.MarketValidation{}, reject("LATEST_BOOK_UNAVAILABLE", "latest orderbook response is incomplete")
 	}
 	book := books[0]
-	if book.Status != domain.OrderBookStatusOK || len(book.Bids) == 0 || len(book.Asks) == 0 {
+	if book.Status != domain.OrderBookStatusOK && (!sellExit || book.Status != domain.OrderBookStatusEmpty) {
+		return domain.MarketValidation{}, reject("LATEST_BOOK_UNAVAILABLE", "latest orderbook was not fetched successfully")
+	}
+	if book.Status == domain.OrderBookStatusOK && (len(book.Bids) == 0 || len(book.Asks) == 0) {
 		return domain.MarketValidation{}, reject("LATEST_BOOK_UNAVAILABLE", "latest orderbook does not contain both sides")
 	}
 	if book.MarketID != target.MarketID || book.ConditionID != target.ConditionID ||
@@ -159,8 +162,17 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 	if !book.TickSize.IsEmpty() && !book.TickSize.Equal(market.TickSize) {
 		return domain.MarketValidation{}, reject("TICK_SIZE_CHANGED", "latest CLOB orderbook tick_size differs from Market Universe Service")
 	}
-	if crossed, err := book.Bids[0].Price.Compare(book.Asks[0].Price); err != nil || crossed > 0 {
-		return domain.MarketValidation{}, reject("LATEST_BOOK_INVALID", "latest best bid exceeds best ask")
+	var bestBid, bestAsk domain.Decimal
+	if len(book.Bids) > 0 {
+		bestBid = book.Bids[0].Price
+	}
+	if len(book.Asks) > 0 {
+		bestAsk = book.Asks[0].Price
+	}
+	if !bestBid.IsEmpty() && !bestAsk.IsEmpty() {
+		if crossed, err := bestBid.Compare(bestAsk); err != nil || crossed > 0 {
+			return domain.MarketValidation{}, reject("LATEST_BOOK_INVALID", "latest best bid exceeds best ask")
+		}
 	}
 	// book.SourceAt is the venue's last-book-change time. A quiet market keeps
 	// the same timestamp for minutes while the book is still the current one,
@@ -173,7 +185,7 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		if err := validateAge("LATEST_BOOK_OBSERVATION", book.ObservedAt, now, service.maxLatestBookAge, service.maxFutureSkew); err != nil {
 			return domain.MarketValidation{}, err
 		}
-		if err := validateWorstPrice(intent.Side, intent.WorstPrice, book.Bids[0].Price, book.Asks[0].Price); err != nil {
+		if err := validateWorstPrice(intent.Side, intent.WorstPrice, bestBid, bestAsk); err != nil {
 			return domain.MarketValidation{}, err
 		}
 	}
@@ -191,9 +203,10 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		NegRisk:              market.NegRisk,
 		TickSize:             market.TickSize,
 		MinOrderSize:         book.MinOrderSize,
-		BestBid:              book.Bids[0].Price,
-		BestAsk:              book.Asks[0].Price,
+		BestBid:              bestBid,
+		BestAsk:              bestAsk,
 		WorstPrice:           intent.WorstPrice,
+		BookStatus:           book.Status,
 	}
 	// A SELL IOC submits the full strategy size; the emulated IOC cancels
 	// whatever the book did not take, so visible depth never caps or rejects it.
