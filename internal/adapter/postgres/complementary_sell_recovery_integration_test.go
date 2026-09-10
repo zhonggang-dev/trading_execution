@@ -123,6 +123,7 @@ func TestComplementarySellRecoveryPostgresIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	finalized := false
 	evidenceSource := complementaryFeeSource(func(_ context.Context, req polymarket.FillFeeEvidenceRequest) (polymarket.FillFeeEvidence, error) {
 		index := 0
 		if req.ExecutionAccountID == accounts[1].ExecutionAccountID {
@@ -131,8 +132,12 @@ func TestComplementarySellRecoveryPostgresIntegration(t *testing.T) {
 		if req.VenueOrderID != orders[index].VenueOrderID || !strings.EqualFold(req.ExpectedMakerAddress, accounts[index].FunderAddress) || req.TokenID != "42" || req.Side != domain.SideSell || !req.Shares.Equal("48") || !req.Price.Equal("0.042") {
 			return polymarket.FillFeeEvidence{}, fmt.Errorf("incorrect exact component")
 		}
+		confirmations := uint64(17)
+		if finalized {
+			confirmations = 64
+		}
 		return polymarket.FillFeeEvidence{Source: domain.FeeSourcePolygonV2OrderFilled, ExchangeAddress: req.ExpectedExchangeAddress, TransactionHash: req.TransactionHash, OrderHash: req.VenueOrderID, MakerAddress: req.ExpectedMakerAddress, TokenID: req.TokenID, Side: req.Side, BuilderCode: req.ExpectedBuilderCode,
-			MakerAmountBaseUnits: "48000000", TakerAmountBaseUnits: "2016000", TotalFeeBaseUnits: "0", BuilderFeeKnown: true, BuilderFeeBaseUnits: "0", CollateralDecimals: 6, OutcomeTokenDecimals: 6, BlockNumber: 100, BlockHash: "0x" + strings.Repeat("ef", 32), LogIndex: uint64(index + 3), Confirmations: 64, Finalized: true}, nil
+			MakerAmountBaseUnits: "48000000", TakerAmountBaseUnits: "2016000", TotalFeeBaseUnits: "0", BuilderFeeKnown: true, BuilderFeeBaseUnits: "0", CollateralDecimals: 6, OutcomeTokenDecimals: 6, BlockNumber: 100, BlockHash: "0x" + strings.Repeat("ef", 32), LogIndex: uint64(index + 3), Confirmations: confirmations, Finalized: finalized}, nil
 	})
 	client, err := polymarket.NewTradingClient(polymarket.TradingClientParams{BaseURL: server.URL, Credentials: provider, FeeEvidence: evidenceSource, RequestsPerSecond: 1000, Burst: 100, Now: func() time.Time { return base.Add(20 * time.Second) }})
 	if err != nil {
@@ -142,6 +147,29 @@ func TestComplementarySellRecoveryPostgresIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, order := range orders {
+		pending, err := processor.SyncOrder(ctx, order.ID)
+		if err != nil || pending.Observed != 1 || pending.Applied != 0 {
+			t.Fatalf("shallow receipt must be durable without settlement: %#v %v", pending, err)
+		}
+		stored, err := repository.Get(ctx, order.ID)
+		if err != nil || stored.Status != domain.OrderStatusUnknown || !stored.FilledSize.Equal("0") {
+			t.Fatalf("shallow receipt changed order: %#v %v", stored, err)
+		}
+		assertAccount(t, db, order.Intent.ExecutionAccountID, "10", "10", "0")
+		assertPosition(t, db, order.Intent.ExecutionAccountID, "42", "48", "0", "48")
+		var count int
+		if err := db.QueryRow(`SELECT count(*) FROM execution_fills WHERE order_id=$1 AND status='MINED' AND applied_at IS NULL AND confirmed_at IS NULL AND settlement_evidence->>'confirmations'='17'`, order.ID).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("missing durable shallow receipt: count=%d err=%v", count, err)
+		}
+		if err := db.QueryRow(`SELECT count(*) FROM execution_account_events WHERE order_id=$1`, order.ID).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("shallow receipt prematurely booked cash: count=%d err=%v", count, err)
+		}
+		if _, err := db.Exec(`UPDATE execution_fills SET applied_at=clock_timestamp() WHERE order_id=$1`, order.ID); err == nil {
+			t.Fatal("database allowed applying a MINED fill")
+		}
+	}
+	finalized = true
 	for i, order := range orders {
 		result, err := processor.SyncOrder(ctx, order.ID)
 		if err != nil || result.Applied != 1 {
@@ -171,5 +199,18 @@ func TestComplementarySellRecoveryPostgresIntegration(t *testing.T) {
 		if err := db.QueryRow(`SELECT count(*) FROM execution_fills WHERE order_id=$1`, order.ID).Scan(&fills); err != nil || fills != 1 {
 			t.Fatalf("fill count=%d err=%v", fills, err)
 		}
+	}
+	checker, err := NewHealthChecker(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.Check(ctx); err != nil {
+		t.Fatalf("migrated schema must be healthy: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE execution_fills DROP CONSTRAINT execution_fills_pending_polygon_evidence_unapplied`); err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.Check(ctx); err == nil {
+		t.Fatal("readiness accepted a schema without pending-evidence migration")
 	}
 }

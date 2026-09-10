@@ -270,6 +270,18 @@ shares / cost_basis                   = 原值保留
 Data API 活动与 Polygon receipt 恢复，禁止盲目重发；确认成功后再用一个 PostgreSQL 事务关闭 shares、记录
 实际 payout 和 realized PnL。没有 receipt 时绝不能靠 Data API 仓位消失来猜赎回成功。
 
+## 待确认 Polygon 凭证与数据库迁移
+
+迁移 `0028_pending_polygon_settlement_evidence.sql` 必须先于依赖它的服务版本上线。
+经严格校验但尚未达到配置确认数的 receipt 会保存为 `MINED`，保留完整结算凭证；此阶段
+`confirmed_at`、`applied_at` 均为空，不更新现金或仓位，也不释放预占。达到确认深度后，同一
+fill identity 升级为 `CONFIRMED` 并只入账一次。不能把待确认数据强改为 CONFIRMED 来绕过约束。
+
+迁移保留原有链、合约、交易、订单、token、方向、金额字段形状和链上日志唯一性约束；
+新增具名的待确认不得入账约束。数据库就绪检查要求该约束存在，防止遗漏迁移却报告可用。
+PostgreSQL 完整路径测试同时覆盖浅确认不入账、最终确认入账、重复回放、MINED 提前入账拒绝，
+以及遗漏新约束时就绪检查失败。
+
 ## 生产装配
 
 `cmd/server` 的 live composition 已把以下组件连接到同一个 shutdown context：
