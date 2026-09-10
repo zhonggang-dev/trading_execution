@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,6 +122,10 @@ func TestScopedReconciliationIssuesGateOnlyTheAffectedMarketPostgresIntegration(
 			insertAccount(t, db, accountID, "0x"+test.name, "100", "100", "0")
 			provisionLiveRisk(t, db, liveRiskFixture{accountID: accountID, now: now, binding: true,
 				maxOrder: "100", maxMarket: "100", maxStrategy: "100", maxWallet: "100", maxDaily: "100"})
+			// Arm only this isolated fixture so the test reaches the scoped gate.
+			if _, err := db.Exec(`UPDATE execution_risk_global_control SET kill_switch=FALSE, version=version+1 WHERE singleton=TRUE`); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := db.Exec(`UPDATE reconciliation_runs SET status=$2 WHERE execution_account_id=$1`, accountID, test.runStatus); err != nil {
 				t.Fatal(err)
 			}
@@ -177,6 +182,11 @@ func TestScopedReconciliationIssuesGateOnlyTheAffectedMarketPostgresIntegration(
 			if _, err := db.Exec(`UPDATE reconciliation_issues SET impact_scope='TOKEN' WHERE issue_id=$1`, "issue-"+test.name); err != nil {
 				t.Fatal(err)
 			}
+			// Test the submit trigger separately: a new reservation below reaches
+			// the earlier duplicate-direction guard before the scope check.
+			if _, err := db.Exec(`UPDATE execution_orders SET status='SUBMITTING' WHERE order_id=$1`, stored.ID); err == nil || !strings.Contains(err.Error(), "RISK_STATE_HAS_OPEN_ISSUES") {
+				t.Fatalf("submit trigger did not block same-token issue: %v", err)
+			}
 			second := liveIntegrationOrder(test.name+"-2", accountID, tokenID, "10", "0.5", now)
 			second.Status, second.CreatedAt, second.UpdatedAt, second.Revision = domain.OrderStatusReceived, now, now, 1
 			storedSecond, created, err := repository.Create(ctx, second)
@@ -188,7 +198,7 @@ func TestScopedReconciliationIssuesGateOnlyTheAffectedMarketPostgresIntegration(
 				t.Fatal(err)
 			}
 			_, err = manager.Reserve(ctx, storedSecond)
-			assertRejectionCode(t, err, "RISK_STATE_HAS_OPEN_ISSUES")
+			assertRejectionCode(t, err, "SAME_DIRECTION_ORDER_EXISTS")
 		})
 	}
 }

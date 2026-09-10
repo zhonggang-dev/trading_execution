@@ -31,6 +31,21 @@ Python 指定：
 必须先补真实 Fill、再比较仓位和余额。否则“本地漏了一笔正常 BUY Fill”会被误报成 Phantom
 Position，并诱发错误的人工补账。
 
+### 配对成交与已下架订单的回填
+
+单订单 `/data/trades` 查询保留执行钱包 `maker_address` 与市场 `market` 范围，不能用该订单的
+token 作为顶层 `asset_id` 过滤：YES/NO 配对成交的顶层 token 属于 taker，maker 分量可能属于
+另一 outcome。回填必须按精确 order hash 匹配 `maker_orders`，分别检查钱包、condition、token、
+side，再用该分量的数量和价格核验 finalized Polygon OrderFilled 回执；不能将顶层 taker 的
+数量、价格或另一账户的 maker 分量入账。同一 trade ID 在不同订单上的分量分别幂等记账。
+
+订单查询 HTTP 200/null 是缺失证据，返回可重试 `CLOB_ORDER_NOT_FOUND`，不是成功的零成交
+观察，更不是已经撤单。对账仍先通过独立成交回填路径找回真实 Fill，保留未确认部分的预占。
+
+旧余额异常只有在后续完整对账通过、当前余额匹配、并且已入账成交现金事件的净变化完整解释
+原差额时才能自动关闭。仓位减少交给精确 SELL 证据分支；通用 fill-lag 分支不得绕过其来源、
+订单身份和完整数量差额检查。不能通过删除 OPEN issue 或手改 UNKNOWN 恢复交易。
+
 CLOB 已报告 `CONFIRMED`、Polygon receipt 也已稳定但确认数还没到阈值的成交，是预期中的传播
 状态，不是数据源故障。它会带着完整 OrderFilled 证据以 `MINED` 状态写入 `execution_fills`
 （`applied_at IS NULL`），订单进入 `UNKNOWN + VENUE_FILL_EVIDENCE_PENDING`，预占保持冻结；
