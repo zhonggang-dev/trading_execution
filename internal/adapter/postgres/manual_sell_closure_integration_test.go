@@ -10,6 +10,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
 	"github.com/UniPat-AI/trading_execution/internal/service/manualsellclosure"
 )
@@ -19,6 +20,26 @@ type closureSource struct {
 	fill  domain.Fill
 	state port.VenueOrderState
 	extra bool
+}
+
+type archivedClosureVenue struct{ gets int }
+
+func (*archivedClosureVenue) Name() string { return "polymarket" }
+func (*archivedClosureVenue) Place(context.Context, domain.Order) (port.VenueOrder, error) {
+	return port.VenueOrder{}, errors.New("test forbids placement")
+}
+func (*archivedClosureVenue) Cancel(context.Context, domain.Order) (port.VenueOrder, error) {
+	return port.VenueOrder{}, errors.New("test forbids cancellation")
+}
+func (v *archivedClosureVenue) Get(context.Context, domain.Order) (port.VenueOrder, error) {
+	v.gets++
+	return port.VenueOrder{}, &port.VenueError{Kind: port.VenueErrorUnavailable, Code: "CLOB_ORDER_NOT_FOUND", Message: "HTTP 200 null"}
+}
+func (*archivedClosureVenue) Check(context.Context, domain.OrderIntent) error {
+	return errors.New("test forbids new entry")
+}
+func (*archivedClosureVenue) Validate(context.Context, domain.OrderIntent) (domain.MarketValidation, error) {
+	return domain.MarketValidation{}, errors.New("test forbids new entry")
 }
 
 func (s *closureSource) Get(context.Context, domain.Order) (port.VenueOrder, error) {
@@ -181,6 +202,16 @@ func TestAuditedPartialSellClosurePostgresIntegration(t *testing.T) {
 				replay, err := manualsellclosure.Run(ctx, p, true)
 				if err != nil || !replay.AlreadyClosed || replay.Order.Revision != beforeRevision || replay.Reservation.Revision != reserveRevision {
 					t.Fatalf("non-idempotent replay: %#v %v", replay, err)
+				}
+				assertPosition(t, db, target.Account, target.Token, "28.99", "28.99", "0")
+				archived := &archivedClosureVenue{}
+				svc, err := execution.New(execution.Params{Repository: repo, Venue: archived, Guard: archived, MarketValidator: archived, Reservations: reservations, FillSynchronizer: processor, AuthoritativeFills: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				finalized, err := svc.FinalizeCancellation(ctx, o.ID)
+				if err != nil || finalized.Status != domain.OrderStatusCancelled || finalized.Revision != beforeRevision || archived.gets != 0 {
+					t.Fatalf("released PostgreSQL order was re-gated by retired GET: %#v %v calls=%d", finalized, err, archived.gets)
 				}
 				assertPosition(t, db, target.Account, target.Token, "28.99", "28.99", "0")
 				var count int
