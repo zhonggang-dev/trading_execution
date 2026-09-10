@@ -1334,7 +1334,7 @@ func TestExternalPositionBaselineRequiresExactWalletMigrationEvidence(t *testing
 	if _, err := tx.Exec(`
 		INSERT INTO execution_external_position_baselines (
 			baseline_id, execution_account_id, source, observed_at, evidence, actor, reason
-		) VALUES ($1,$2,'POLYMARKET_DATA_API',$3,jsonb_build_object('wallet_address',$4),
+		) VALUES ($1,$2,'POLYMARKET_DATA_API',$3,jsonb_build_object('wallet_address',$4::text),
 		          'integration-test','pre-migration ownership')`, baselineID, accountID, observedAt, oldWallet); err != nil {
 		t.Fatal(err)
 	}

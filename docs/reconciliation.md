@@ -272,6 +272,21 @@ Data API 活动与 Polygon receipt 恢复，禁止盲目重发；确认成功后
 
 ## 待确认 Polygon 凭证与数据库迁移
 
+### 订单数量的实际响应兼容
+
+官方订单文档示例采用6位base units，但实测 `/data/order/{id}` 也会返回
+`original_size="48"`、`size_matched="19.01"` 的人类份额表示。仅凭有无小数点区分单位会
+把原始数量错读成0.000048，导致部分成交查询失败并跳过IOC撤余量。
+
+适配器保留原始值；只有原始数量恰好等于持久化签名订单份额，且订单、市场、token、方向
+全部一致时，才选用人类份额解释。其他情况保持原有base-unit解析，不以数值大小猜单位。
+这同时用于状态与成交均价核验，不改变权威成交入账来源。形状不合法的订单响应为可重试
+外部证据错误，不应因普通重试次数耗尽而自动推入不可继续恢复的人工终态。
+
+参考：https://docs.polymarket.com/api-reference/trade/get-single-order-by-id
+
+### 浅确认凭证
+
 迁移 `0028_pending_polygon_settlement_evidence.sql` 必须先于依赖它的服务版本上线。
 经严格校验但尚未达到配置确认数的 receipt 会保存为 `MINED`，保留完整结算凭证；此阶段
 `confirmed_at`、`applied_at` 均为空，不更新现金或仓位，也不释放预占。达到确认深度后，同一

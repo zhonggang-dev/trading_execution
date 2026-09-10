@@ -94,6 +94,10 @@ type rawOrder struct {
 	Owner           string         `json:"owner"`
 	AssociateTrades []string       `json:"associate_trades"`
 	Expiration      string         `json:"expiration"`
+	// Preserve the exact wire values until a known signed order can disambiguate
+	// human-share integer quantities from the documented base-unit format.
+	originalWireShares domain.Decimal
+	matchedWireShares  domain.Decimal
 }
 
 // OpenOrder 表示后端使用的 OpenOrder 类型。
@@ -163,6 +167,7 @@ func (raw *rawOrder) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
+	decoded.originalWireShares, decoded.matchedWireShares = decoded.OriginalSize, decoded.SizeMatched
 	var quantities struct {
 		OriginalSize json.RawMessage `json:"original_size"`
 		SizeMatched  json.RawMessage `json:"size_matched"`
@@ -655,9 +660,10 @@ func (client *TradingClient) Get(ctx context.Context, order domain.Order) (port.
 	if strings.TrimSpace(raw.ID) == "" {
 		raw.ID = orderID
 	}
+	raw = raw.withKnownOrderQuantityUnits(order)
 	normalized, err := normalizeRawOrder(raw, order, client.now().UTC())
 	if err != nil {
-		return port.VenueOrder{}, err
+		return port.VenueOrder{}, &port.VenueError{Kind: port.VenueErrorUnavailable, Code: "CLOB_INVALID_ORDER_RESPONSE", VenueOrderID: orderID, Cause: err}
 	}
 	if sign, _ := normalized.FilledSize.Sign(); sign > 0 {
 		averagePrice, tradeIDs, err := client.fillAveragePrice(ctx, order.Intent.ExecutionAccountID, raw)
@@ -2158,8 +2164,28 @@ func placementState(status string) port.VenueOrderState {
 	}
 }
 
+// withKnownOrderQuantityUnits handles observed /data/order responses such as
+// original_size="48", size_matched="19.01". Never select units by magnitude or
+// punctuation alone: the unscaled original must equal the persisted signed
+// size, with exact order/market/token/side identity. Unknown external orders
+// keep the documented base-unit interpretation. Exact trades and receipts,
+// not these cumulative observations, remain the authority for booking money.
+func (raw rawOrder) withKnownOrderQuantityUnits(order domain.Order) rawOrder {
+	if !raw.OriginalSize.Equal(order.Intent.Size) && raw.originalWireShares.Equal(order.Intent.Size) &&
+		strings.EqualFold(strings.TrimSpace(raw.ID), strings.TrimSpace(order.VenueOrderID)) &&
+		strings.EqualFold(strings.TrimSpace(raw.Market), strings.TrimSpace(order.Intent.ConditionID)) &&
+		strings.TrimSpace(raw.AssetID) == strings.TrimSpace(order.Intent.TokenID) &&
+		strings.EqualFold(strings.TrimSpace(raw.Side), string(order.Intent.Side)) &&
+		strings.TrimSpace(order.VenueOrderID) != "" && strings.TrimSpace(order.Intent.ConditionID) != "" &&
+		strings.TrimSpace(order.Intent.TokenID) != "" {
+		raw.OriginalSize, raw.SizeMatched = raw.originalWireShares, raw.matchedWireShares
+	}
+	return raw
+}
+
 // normalizeRawOrder 规范化 原始数据 Order 的字段和表示。
 func normalizeRawOrder(raw rawOrder, order domain.Order, observedAt time.Time) (port.VenueOrder, error) {
+	raw = raw.withKnownOrderQuantityUnits(order)
 	original := raw.OriginalSize
 	if original.IsEmpty() {
 		original = order.Intent.Size
