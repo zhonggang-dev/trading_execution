@@ -14,7 +14,10 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
-const defaultLookback = 48 * time.Hour
+const (
+	defaultLookback               = 48 * time.Hour
+	reconciliationFinalizeTimeout = 5 * time.Second
+)
 
 // OrderRefresher 将所有生命周期变更交给已有的可审计状态机，对账模块不会直接写 execution_orders。
 type OrderRefresher interface {
@@ -217,7 +220,11 @@ func (service *Service) RunAccount(ctx context.Context, params RunAccountParams)
 		balanceErr = state.reconcileBalance(ctx, scope.executionAccountID)
 	}
 
-	return service.finish(ctx, state, errors.Join(venueErr, redemptionErr, finalityErr, positionErr, balanceErr, errors.Join(state.errors...)))
+	cause := errors.Join(venueErr, redemptionErr, finalityErr, positionErr, balanceErr, errors.Join(state.errors...))
+	if err := ctx.Err(); err != nil {
+		cause = errors.Join(cause, err)
+	}
+	return service.finish(ctx, state, cause)
 }
 
 // normalize 去除单账户对账参数中允许出现的首尾空白。
@@ -287,14 +294,28 @@ func (service *Service) finish(ctx context.Context, state runState, cause error)
 	}
 	if cause != nil {
 		state.run.Error = cause.Error()
+		if ctx.Err() != nil {
+			// A shutdown can arrive after Start committed but before the evidence
+			// scan returns. Record a terminal failure with an independent bounded
+			// context so the per-account RUNNING lease never blocks the next
+			// process for its full expiry window.
+			state.run.Status = domain.ReconciliationRunFailed
+		}
 		// Infrastructure uncertainty is not a successful reconciliation. It is
 		// still ATTENTION_REQUIRED when useful comparisons completed; FAILED is
 		// reserved for a run that could not even establish local authority.
-		if state.run.Summary["local_orders"] == 0 && state.run.Summary["local_positions"] == 0 {
+		if state.run.Status != domain.ReconciliationRunFailed &&
+			state.run.Summary["local_orders"] == 0 && state.run.Summary["local_positions"] == 0 {
 			state.run.Status = domain.ReconciliationRunFailed
 		}
 	}
-	completeErr := service.recorder.Complete(ctx, *state.run)
+	completeContext := ctx
+	var cancel context.CancelFunc
+	if ctx.Err() != nil {
+		completeContext, cancel = context.WithTimeout(context.Background(), reconciliationFinalizeTimeout)
+		defer cancel()
+	}
+	completeErr := service.recorder.Complete(completeContext, *state.run)
 	return Result{Run: *state.run, Issues: state.issues}, errors.Join(cause, completeErr)
 }
 

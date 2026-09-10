@@ -332,10 +332,11 @@ func TestScheduledReconciliationRetriesFillEvidencePendingAtLowFrequency(t *test
 	}
 }
 
-func TestStartupWithoutAccountBaselineStillScansFullVenueHistory(t *testing.T) {
+func TestStartupUsesBoundedLookbackWithoutAccountBaseline(t *testing.T) {
 	venue := &fakeVenue{}
+	orders := &fakeOrders{}
 	service := newTestService(t, Params{
-		Orders: &fakeOrders{}, Venue: venue, Ledger: &fakeLedger{balance: testBalance("100")},
+		Orders: orders, Venue: venue, Ledger: &fakeLedger{balance: testBalance("100")},
 		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{},
 		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
 			return nil, nil
@@ -351,8 +352,92 @@ func TestStartupWithoutAccountBaselineStillScansFullVenueHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !venue.tradesAfter.IsZero() {
-		t.Fatalf("venue trades after = %s, want full-history zero time", venue.tradesAfter)
+	want := testNow.Add(-defaultLookback)
+	if !venue.tradesAfter.Equal(want) {
+		t.Fatalf("venue trades after = %s, want startup lookback %s", venue.tradesAfter, want)
+	}
+	if !orders.updatedAfter.Equal(want) {
+		t.Fatalf("local order scan after = %s, want startup lookback %s", orders.updatedAfter, want)
+	}
+}
+
+func TestRunAccountFinalizesFailedRunAfterShutdownCancellation(t *testing.T) {
+	started := make(chan struct{})
+	venue := &blockingReconciliationVenue{started: started}
+	recorder := &fakeRecorder{}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{}, Venue: venue, Ledger: &fakeLedger{balance: testBalance("100")},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{}, Recorder: recorder,
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultChannel := make(chan Result, 1)
+	errorChannel := make(chan error, 1)
+	go func() {
+		result, err := service.RunAccount(ctx, RunAccountParams{
+			ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerStartup,
+		})
+		resultChannel <- result
+		errorChannel <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not reach the blocking venue read")
+	}
+	cancel()
+	var result Result
+	select {
+	case result = <-resultChannel:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not return after cancellation")
+	}
+	if err := <-errorChannel; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunAccount() error = %v, want context canceled", err)
+	}
+	if result.Run.Status != domain.ReconciliationRunFailed || result.Run.CompletedAt == nil {
+		t.Fatalf("cancelled reconciliation run = %#v, want completed FAILED", result.Run)
+	}
+	if len(recorder.runs) != 2 || recorder.runs[1].Status != domain.ReconciliationRunFailed ||
+		recorder.runs[1].CompletedAt == nil {
+		t.Fatalf("recorded runs = %#v, want terminal FAILED completion", recorder.runs)
+	}
+	if recorder.completeContextErr != nil {
+		t.Fatalf("completion context error = %v, want independent active context", recorder.completeContextErr)
+	}
+}
+
+func TestRunAccountFinalizesFailedRunWhenDependenciesIgnoreShutdownCancellation(t *testing.T) {
+	recorder := &fakeRecorder{}
+	service := newTestService(t, Params{
+		Orders: &fakeOrders{}, Venue: &fakeVenue{}, Ledger: &fakeLedger{balance: testBalance("100")},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{}, Recorder: recorder,
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := service.RunAccount(ctx, RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerStartup,
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunAccount() error = %v, want context canceled", err)
+	}
+	if result.Run.Status != domain.ReconciliationRunFailed || result.Run.CompletedAt == nil {
+		t.Fatalf("cancelled reconciliation run = %#v, want completed FAILED", result.Run)
+	}
+	if len(recorder.runs) != 2 || recorder.completeContextErr != nil {
+		t.Fatalf("recorded cancellation completion = %#v context=%v", recorder.runs, recorder.completeContextErr)
 	}
 }
 
@@ -968,15 +1053,17 @@ func (function balanceSourceFunc) GetExternalBalance(ctx context.Context, wallet
 
 // fakeOrders 表示后端使用的 fakeOrders 类型。
 type fakeOrders struct {
-	orders []domain.Order
-	err    error
-	calls  int
+	orders       []domain.Order
+	err          error
+	calls        int
+	updatedAfter time.Time
 }
 
 // ListForReconciliation 返回模拟数据源中的测试列表。
 
-func (repository *fakeOrders) ListForReconciliation(context.Context, string, time.Time) ([]domain.Order, error) {
+func (repository *fakeOrders) ListForReconciliation(_ context.Context, _ string, updatedAfter time.Time) ([]domain.Order, error) {
 	repository.calls++
+	repository.updatedAfter = updatedAfter
 	return append([]domain.Order(nil), repository.orders...), repository.err
 }
 
@@ -987,6 +1074,27 @@ type fakeVenue struct {
 	openErr     error
 	tradesErr   error
 	tradesAfter time.Time
+}
+
+type blockingReconciliationVenue struct {
+	started chan<- struct{}
+}
+
+func (venue *blockingReconciliationVenue) ListReconciliationOpenOrders(
+	context.Context,
+	string,
+) ([]domain.VenueOrderSnapshot, error) {
+	return nil, nil
+}
+
+func (venue *blockingReconciliationVenue) ListReconciliationTrades(
+	ctx context.Context,
+	_ string,
+	_ time.Time,
+) ([]domain.VenueTradeSnapshot, error) {
+	close(venue.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 // ListReconciliationOpenOrders 返回模拟数据源中的测试列表。
@@ -1075,8 +1183,9 @@ func (refresher *fakeRefresher) Refresh(_ context.Context, orderID string) (doma
 
 // fakeRecorder 表示后端使用的 fakeRecorder 类型。
 type fakeRecorder struct {
-	runs   []domain.ReconciliationRun
-	issues []domain.ReconciliationIssue
+	runs               []domain.ReconciliationRun
+	issues             []domain.ReconciliationIssue
+	completeContextErr error
 }
 
 // Start 模拟外部尝试开始。
@@ -1092,7 +1201,8 @@ func (recorder *fakeRecorder) RecordIssue(_ context.Context, issue domain.Reconc
 }
 
 // Complete 实现测试替身所需的接口行为。
-func (recorder *fakeRecorder) Complete(_ context.Context, run domain.ReconciliationRun) error {
+func (recorder *fakeRecorder) Complete(ctx context.Context, run domain.ReconciliationRun) error {
+	recorder.completeContextErr = ctx.Err()
 	recorder.runs = append(recorder.runs, run)
 	return nil
 }

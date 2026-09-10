@@ -33,9 +33,12 @@ type accountRunScope struct {
 	scanAfter          time.Time
 }
 
-// reconciliationScanStart 根据触发类型选择全量或有界对账窗口。
+// reconciliationScanStart keeps routine and startup recovery bounded. Durable
+// non-terminal orders and protected terminal orders are selected independently
+// by ListForReconciliation, so a restart still recovers ambiguous work without
+// replaying every historical terminal order and venue trade before HTTP opens.
 func reconciliationScanStart(now time.Time, lookback time.Duration, trigger domain.ReconciliationTrigger) time.Time {
-	if trigger == domain.ReconciliationTriggerStartup || trigger == domain.ReconciliationTriggerAssetDrift {
+	if trigger == domain.ReconciliationTriggerAssetDrift {
 		return time.Time{}
 	}
 	return now.Add(-lookback)
