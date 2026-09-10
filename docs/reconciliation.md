@@ -43,7 +43,9 @@ signed shares 和 `net_cash_delta` 加到本地视图后再与链上比较，逐
 
 ## 触发方式
 
-- Go 服务启动时：`STARTUP` 全钱包扫描；
+- Go 服务启动时：`STARTUP` 对每个钱包使用常规 `RECONCILIATION_TRADE_LOOKBACK`
+  的有界交易窗口，同时无条件选中所有非终态订单、未知订单和仍有活动/不确定预占的终态订单；
+  因此启动恢复不会漏掉风险订单，也不会为重放全部历史终态订单和 trades 而阻塞 HTTP；
 - Runner 默认每 5 分钟：`SCHEDULED`；
 - 下单结果进入 `UNKNOWN`：`ORDER_UNKNOWN`，带 `focus_order_id` 优先处理；
 - 撤单结果不确定：`CANCEL_UNKNOWN`；
@@ -52,7 +54,9 @@ signed shares 和 `net_cash_delta` 加到本地视图后再与链上比较，逐
 
 Runner 的异常队列不阻塞下单线程。即使进程在入队前崩溃，数据库中的 `UNKNOWN`、
 `CANCEL_PENDING`、预占和 STARTED attempt 仍会被下次启动扫描发现。PostgreSQL 对每个 account 只
-允许一条 `RUNNING` run；崩溃遗留的 run 超过 30 分钟租期后会被标记 `FAILED`，防止多实例同时
+允许一条 `RUNNING` run；启动或周期扫描收到 shutdown context 后，服务会在独立的短时数据库
+上下文中把已创建的 run 终结为 `FAILED`，避免留下阻塞下一次启动的账户租约。进程被强制终止等
+无法运行清理代码的情形，遗留 run 超过 30 分钟租期后仍会被标记 `FAILED`，防止多实例同时
 修复同一钱包。`RUNNING` 或 `FAILED` run 不会让实盘风控判定状态过期：下单时的
 `RISK_STATE_STALE` 只看最近一次 `COMPLETED` run 的完成时间是否在 `max_state_age_ms` 内。
 
