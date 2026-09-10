@@ -798,6 +798,9 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 	if order.Status != domain.OrderStatusCancelled {
 		return order, fmt.Errorf("order status %s is not awaiting cancel finality", order.Status)
 	}
+	if finalized, current, err := service.alreadyFinalizedCancellation(ctx, order); err != nil || finalized {
+		return current, err
+	}
 	if !service.authoritativeFills {
 		if order.VenueLastObservedAt == nil || service.now().UTC().Sub(order.VenueLastObservedAt.UTC()) < service.cancelFillFinalityGrace {
 			deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_GRACE_PENDING", "cancellation fill-finality grace period has not elapsed")
