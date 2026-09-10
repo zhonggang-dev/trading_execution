@@ -31,6 +31,21 @@ Python 指定：
 必须先补真实 Fill、再比较仓位和余额。否则“本地漏了一笔正常 BUY Fill”会被误报成 Phantom
 Position，并诱发错误的人工补账。
 
+### 配对成交与已下架订单的回填
+
+单订单 `/data/trades` 查询保留执行钱包 `maker_address` 与市场 `market` 范围，不能用该订单的
+token 作为顶层 `asset_id` 过滤：YES/NO 配对成交的顶层 token 属于 taker，maker 分量可能属于
+另一 outcome。回填必须按精确 order hash 匹配 `maker_orders`，分别检查钱包、condition、token、
+side，再用该分量的数量和价格核验 finalized Polygon OrderFilled 回执；不能将顶层 taker 的
+数量、价格或另一账户的 maker 分量入账。同一 trade ID 在不同订单上的分量分别幂等记账。
+
+订单查询 HTTP 200/null 是缺失证据，返回可重试 `CLOB_ORDER_NOT_FOUND`，不是成功的零成交
+观察，更不是已经撤单。对账仍先通过独立成交回填路径找回真实 Fill，保留未确认部分的预占。
+
+旧余额异常只有在后续完整对账通过、当前余额匹配、并且已入账成交现金事件的净变化完整解释
+原差额时才能自动关闭。仓位减少交给精确 SELL 证据分支；通用 fill-lag 分支不得绕过其来源、
+订单身份和完整数量差额检查。不能通过删除 OPEN issue 或手改 UNKNOWN 恢复交易。
+
 CLOB 已报告 `CONFIRMED`、Polygon receipt 也已稳定但确认数还没到阈值的成交，是预期中的传播
 状态，不是数据源故障。它会带着完整 OrderFilled 证据以 `MINED` 状态写入 `execution_fills`
 （`applied_at IS NULL`），订单进入 `UNKNOWN + VENUE_FILL_EVIDENCE_PENDING`，预占保持冻结；
@@ -254,6 +269,33 @@ shares / cost_basis                   = 原值保留
 链上提交由 `internal/service/autoredeem` 负责，状态持久化在 `polymarket_redemptions`：广播结果未知时只能按
 Data API 活动与 Polygon receipt 恢复，禁止盲目重发；确认成功后再用一个 PostgreSQL 事务关闭 shares、记录
 实际 payout 和 realized PnL。没有 receipt 时绝不能靠 Data API 仓位消失来猜赎回成功。
+
+## 待确认 Polygon 凭证与数据库迁移
+
+### 订单数量的实际响应兼容
+
+官方订单文档示例采用6位base units，但实测 `/data/order/{id}` 也会返回
+`original_size="48"`、`size_matched="19.01"` 的人类份额表示。仅凭有无小数点区分单位会
+把原始数量错读成0.000048，导致部分成交查询失败并跳过IOC撤余量。
+
+适配器保留原始值；只有原始数量恰好等于持久化签名订单份额，且订单、市场、token、方向
+全部一致时，才选用人类份额解释。其他情况保持原有base-unit解析，不以数值大小猜单位。
+这同时用于状态与成交均价核验，不改变权威成交入账来源。形状不合法的订单响应为可重试
+外部证据错误，不应因普通重试次数耗尽而自动推入不可继续恢复的人工终态。
+
+参考：https://docs.polymarket.com/api-reference/trade/get-single-order-by-id
+
+### 浅确认凭证
+
+迁移 `0028_pending_polygon_settlement_evidence.sql` 必须先于依赖它的服务版本上线。
+经严格校验但尚未达到配置确认数的 receipt 会保存为 `MINED`，保留完整结算凭证；此阶段
+`confirmed_at`、`applied_at` 均为空，不更新现金或仓位，也不释放预占。达到确认深度后，同一
+fill identity 升级为 `CONFIRMED` 并只入账一次。不能把待确认数据强改为 CONFIRMED 来绕过约束。
+
+迁移保留原有链、合约、交易、订单、token、方向、金额字段形状和链上日志唯一性约束；
+新增具名的待确认不得入账约束。数据库就绪检查要求该约束存在，防止遗漏迁移却报告可用。
+PostgreSQL 完整路径测试同时覆盖浅确认不入账、最终确认入账、重复回放、MINED 提前入账拒绝，
+以及遗漏新约束时就绪检查失败。
 
 ## 生产装配
 

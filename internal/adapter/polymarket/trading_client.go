@@ -94,6 +94,10 @@ type rawOrder struct {
 	Owner           string         `json:"owner"`
 	AssociateTrades []string       `json:"associate_trades"`
 	Expiration      string         `json:"expiration"`
+	// Preserve the exact wire values until a known signed order can disambiguate
+	// human-share integer quantities from the documented base-unit format.
+	originalWireShares domain.Decimal
+	matchedWireShares  domain.Decimal
 }
 
 // OpenOrder 表示后端使用的 OpenOrder 类型。
@@ -163,6 +167,7 @@ func (raw *rawOrder) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
+	decoded.originalWireShares, decoded.matchedWireShares = decoded.OriginalSize, decoded.SizeMatched
 	var quantities struct {
 		OriginalSize json.RawMessage `json:"original_size"`
 		SizeMatched  json.RawMessage `json:"size_matched"`
@@ -640,6 +645,14 @@ func (client *TradingClient) Get(ctx context.Context, order domain.Order) (port.
 	if err != nil {
 		return port.VenueOrder{}, err
 	}
+	// A retired order can return HTTP 200/null. Missing evidence is neither a
+	// successful zero-fill observation nor proof of cancellation.
+	if bytes.Equal(bytes.TrimSpace(body), []byte("null")) {
+		return port.VenueOrder{}, &port.VenueError{
+			Kind: port.VenueErrorUnavailable, Code: "CLOB_ORDER_NOT_FOUND", VenueOrderID: orderID,
+			Message: "CLOB returned no order; recover exact trades and retain the reservation",
+		}
+	}
 	var raw rawOrder
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return port.VenueOrder{}, &port.VenueError{Kind: port.VenueErrorUnavailable, Code: "CLOB_INVALID_ORDER_RESPONSE", Cause: err}
@@ -647,9 +660,10 @@ func (client *TradingClient) Get(ctx context.Context, order domain.Order) (port.
 	if strings.TrimSpace(raw.ID) == "" {
 		raw.ID = orderID
 	}
+	raw = raw.withKnownOrderQuantityUnits(order)
 	normalized, err := normalizeRawOrder(raw, order, client.now().UTC())
 	if err != nil {
-		return port.VenueOrder{}, err
+		return port.VenueOrder{}, &port.VenueError{Kind: port.VenueErrorUnavailable, Code: "CLOB_INVALID_ORDER_RESPONSE", VenueOrderID: orderID, Cause: err}
 	}
 	if sign, _ := normalized.FilledSize.Sign(); sign > 0 {
 		averagePrice, tradeIDs, err := client.fillAveragePrice(ctx, order.Intent.ExecutionAccountID, raw)
@@ -680,7 +694,9 @@ func (client *TradingClient) fillAveragePrice(ctx context.Context, executionAcco
 			trades = append(trades, page...)
 		}
 	} else {
-		page, err := client.ListTrades(ctx, executionAccountID, TradeFilter{Market: raw.Market, TokenID: raw.AssetID})
+		// asset_id filters the taker token, not every maker component. Paired
+		// YES/NO fills must be found by market and exact order identity.
+		page, err := client.ListTrades(ctx, executionAccountID, TradeFilter{Market: raw.Market})
 		if err != nil {
 			return "", nil, err
 		}
@@ -1265,16 +1281,26 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 	if strings.TrimSpace(order.VenueOrderID) == "" {
 		return nil, newInvalidError("VENUE_ORDER_ID_REQUIRED", "cannot list fills before venue order id is known")
 	}
-	trades, err := client.ListTrades(ctx, order.Intent.ExecutionAccountID, TradeFilter{
-		Market:  order.Intent.ConditionID,
-		TokenID: order.Intent.TokenID,
-	})
+	account, err := client.account(ctx, order.Intent.ExecutionAccountID)
+	if err != nil {
+		return nil, err
+	}
+	// Retain the wallet and market scope, but not the top-level taker asset
+	// filter: complementary-outcome maker fills can have a different token.
+	// Exact component identity and finalized receipt evidence remain mandatory.
+	trades, err := client.ListTrades(ctx, order.Intent.ExecutionAccountID, TradeFilter{Market: order.Intent.ConditionID})
 	if err != nil {
 		return nil, err
 	}
 	observations := make([]domain.Fill, 0)
 	seen := make(map[string]int)
 	for _, trade := range trades {
+		if _, _, matched := tradeFillForOrder(trade, order.VenueOrderID); !matched {
+			continue
+		}
+		if err := validateOrderTradeComponent(trade, order, account.FunderAddress); err != nil {
+			return nil, tradeOwnershipVenueError(err)
+		}
 		fill, matched, err := mapTradeToOrderFill(trade, order, client.now().UTC())
 		if err != nil {
 			return nil, err
@@ -1315,10 +1341,6 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 	}
 	if len(fills) == 0 {
 		return fills, nil
-	}
-	account, err := client.account(ctx, order.Intent.ExecutionAccountID)
-	if err != nil {
-		return nil, err
 	}
 	schedule, err := client.getMarketFeeSchedule(ctx, order.Intent.ConditionID, order.Intent.TokenID)
 	if err != nil {
@@ -2142,8 +2164,28 @@ func placementState(status string) port.VenueOrderState {
 	}
 }
 
+// withKnownOrderQuantityUnits handles observed /data/order responses such as
+// original_size="48", size_matched="19.01". Never select units by magnitude or
+// punctuation alone: the unscaled original must equal the persisted signed
+// size, with exact order/market/token/side identity. Unknown external orders
+// keep the documented base-unit interpretation. Exact trades and receipts,
+// not these cumulative observations, remain the authority for booking money.
+func (raw rawOrder) withKnownOrderQuantityUnits(order domain.Order) rawOrder {
+	if !raw.OriginalSize.Equal(order.Intent.Size) && raw.originalWireShares.Equal(order.Intent.Size) &&
+		strings.EqualFold(strings.TrimSpace(raw.ID), strings.TrimSpace(order.VenueOrderID)) &&
+		strings.EqualFold(strings.TrimSpace(raw.Market), strings.TrimSpace(order.Intent.ConditionID)) &&
+		strings.TrimSpace(raw.AssetID) == strings.TrimSpace(order.Intent.TokenID) &&
+		strings.EqualFold(strings.TrimSpace(raw.Side), string(order.Intent.Side)) &&
+		strings.TrimSpace(order.VenueOrderID) != "" && strings.TrimSpace(order.Intent.ConditionID) != "" &&
+		strings.TrimSpace(order.Intent.TokenID) != "" {
+		raw.OriginalSize, raw.SizeMatched = raw.originalWireShares, raw.matchedWireShares
+	}
+	return raw
+}
+
 // normalizeRawOrder 规范化 原始数据 Order 的字段和表示。
 func normalizeRawOrder(raw rawOrder, order domain.Order, observedAt time.Time) (port.VenueOrder, error) {
+	raw = raw.withKnownOrderQuantityUnits(order)
 	original := raw.OriginalSize
 	if original.IsEmpty() {
 		original = order.Intent.Size

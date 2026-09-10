@@ -166,6 +166,7 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_fills_fee_exponent_shape'),
 			('execution_fills_settlement_evidence_object'),
 			('execution_fills_polygon_settlement_evidence_shape'),
+			('execution_fills_pending_polygon_evidence_unapplied'),
 			('strategy_decision_runs_submission_mode_shape'),
 			('strategy_orderbook_snapshot_batches_pkey'),
 			('strategy_orderbook_snapshot_batches_set_unique'),

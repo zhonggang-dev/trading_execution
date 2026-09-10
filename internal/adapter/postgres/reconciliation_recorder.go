@@ -418,7 +418,8 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		  AND issue.resolution='MANUAL_REVIEW' AND issue.issue_type='BALANCE_DRIFT'
 		  AND issue.run_id<>$2
 		  AND account.execution_account_id=issue.execution_account_id
-		  AND issue.remote_value IS NOT NULL
+		  AND issue.source='EVM_ERC20_ETH_CALL'
+		  AND issue.local_value IS NOT NULL AND issue.remote_value IS NOT NULL
 		  AND account.total_balance=issue.remote_value
 		  AND EXISTS (
 		    SELECT 1
@@ -430,6 +431,17 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		      AND fill.applied_at>issue.observed_at
 		      AND fill.applied_at<=$3
 		  )
+		  AND (
+		    SELECT COALESCE(SUM(event.total_balance_delta),0)
+		    FROM execution_account_events event
+		    JOIN execution_fills fill ON fill.fill_key=event.fill_key
+		    WHERE event.execution_account_id=issue.execution_account_id
+		      AND fill.execution_account_id=issue.execution_account_id
+		      AND event.order_id=fill.order_id
+		      AND event.event_type IN ('FILL_SETTLED','BUY_FILL','SELL_FILL')
+		      AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
+		      AND fill.applied_at>issue.observed_at AND fill.applied_at<=$3
+		  )=issue.remote_value-issue.local_value
 		  AND NOT EXISTS (
 		    SELECT 1 FROM reconciliation_issues reproduced
 		    WHERE reproduced.execution_account_id=issue.execution_account_id
@@ -453,6 +465,9 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		WHERE issue.execution_account_id=$1 AND issue.status='OPEN'
 		  AND issue.resolution='MANUAL_REVIEW'
 		  AND issue.issue_type IN ('PHANTOM_POSITION','POSITION_DRIFT')
+		  -- A share deficit needs the stricter exact SELL attribution below.
+		  -- Do not let this legacy fill-lag branch bypass its identity/delta checks.
+		  AND (issue.local_value IS NULL OR issue.remote_value>=issue.local_value)
 		  AND issue.run_id<>$2
 		  AND position.execution_account_id=issue.execution_account_id
 		  AND position.token_id=issue.token_id

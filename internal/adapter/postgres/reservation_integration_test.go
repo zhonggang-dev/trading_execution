@@ -1334,7 +1334,7 @@ func TestExternalPositionBaselineRequiresExactWalletMigrationEvidence(t *testing
 	if _, err := tx.Exec(`
 		INSERT INTO execution_external_position_baselines (
 			baseline_id, execution_account_id, source, observed_at, evidence, actor, reason
-		) VALUES ($1,$2,'POLYMARKET_DATA_API',$3,jsonb_build_object('wallet_address',$4),
+		) VALUES ($1,$2,'POLYMARKET_DATA_API',$3,jsonb_build_object('wallet_address',$4::text),
 		          'integration-test','pre-migration ownership')`, baselineID, accountID, observedAt, oldWallet); err != nil {
 		t.Fatal(err)
 	}
@@ -2569,7 +2569,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 			t.Fatalf("apply migration %s: %v", name, err)
 		}
 	}
-	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql"} {
+	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatal(err)
