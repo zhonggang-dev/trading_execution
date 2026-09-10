@@ -27,6 +27,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/marketvalidation"
+	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 	"github.com/UniPat-AI/trading_execution/internal/service/readiness"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliationtrigger"
@@ -46,6 +47,8 @@ type liveRuntime struct {
 	decisionRunner *decisionrunner.Runner
 	autoRedeem     *autoredeem.Service
 	activeAccounts []string
+	// recovery is the order-level lease guard shared with the order coordinator.
+	recovery *orderrecovery.Guard
 }
 
 // buildLiveRuntimeParams 收拢实盘依赖装配参数，避免长参数列表破坏函数声明可读性。
@@ -401,6 +404,16 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	recoveryLeases, err := postgresadapter.NewOrderRecoveryLeaseStore(database)
+	if err != nil {
+		return nil, err
+	}
+	recoveryGuard, err := orderrecovery.NewGuard(orderrecovery.GuardParams{
+		Store: recoveryLeases, Policy: cfg.Execution.OrderRecoveryPolicy(), Logger: logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure order recovery guard: %w", err)
+	}
 	reconciliationService, err := reconciliation.New(reconciliation.Params{
 		Orders:                    repository,
 		Venue:                     tradingClient,
@@ -419,6 +432,10 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		AccountScope:              executionAccountScope,
 		Redemptions:               redemptionProgress,
 		FillFinalityMaxAge:        cfg.Polymarket.FillFinalityMaxAge,
+		Recovery:                  recoveryGuard,
+		Reservations:              reservations,
+		RecoveryPendingGrace:      cfg.Execution.OrderRecoveryPendingGrace,
+		Logger:                    logger,
 	})
 	if err != nil {
 		return nil, err
@@ -554,6 +571,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
 		autoRedeem:     autoRedeemService,
 		activeAccounts: append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
+		recovery:       recoveryGuard,
 	}, nil
 }
 

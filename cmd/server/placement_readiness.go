@@ -20,8 +20,11 @@ type placementReadinessVenue struct {
 	checker placementAccountReadinessChecker
 }
 
+// placementAccountReadinessChecker decides per intent: account freshness and
+// account-wide issues block everything, scoped issues block only the intent's
+// market/condition/token.
 type placementAccountReadinessChecker interface {
-	CheckAccount(context.Context, string) error
+	CheckPlacement(context.Context, domain.Order) error
 }
 
 type placementAccountReadiness struct {
@@ -39,8 +42,8 @@ func newPlacementAccountReadiness(
 	return &placementAccountReadiness{reconciliation: reconciliation, global: global}, nil
 }
 
-func (checker *placementAccountReadiness) CheckAccount(ctx context.Context, accountID string) error {
-	if err := checker.reconciliation.CheckAccount(ctx, accountID); err != nil {
+func (checker *placementAccountReadiness) CheckPlacement(ctx context.Context, order domain.Order) error {
+	if err := checker.reconciliation.CheckPlacement(ctx, order); err != nil {
 		return fmt.Errorf("reconciliation: %w", err)
 	}
 	if checker.global != nil {
@@ -74,20 +77,21 @@ func (venue *placementReadinessVenue) Bind(checker placementAccountReadinessChec
 func (venue *placementReadinessVenue) Name() string { return venue.venue.Name() }
 
 func (venue *placementReadinessVenue) Place(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
-	if err := venue.checkPlace(ctx, order.Intent.ExecutionAccountID); err != nil {
+	if err := venue.checkPlace(ctx, order); err != nil {
 		return port.VenueOrder{}, err
 	}
 	return venue.venue.Place(ctx, order)
 }
 
-func (venue *placementReadinessVenue) checkPlace(ctx context.Context, accountID string) error {
+func (venue *placementReadinessVenue) checkPlace(ctx context.Context, order domain.Order) error {
 	venue.mu.RLock()
 	checker := venue.checker
 	venue.mu.RUnlock()
 	if checker == nil {
 		return reconciliationNotReadyError(fmt.Errorf("reconciliation readiness is not bound"))
 	}
-	if err := checker.CheckAccount(ctx, strings.TrimSpace(accountID)); err != nil {
+	order.Intent.ExecutionAccountID = strings.TrimSpace(order.Intent.ExecutionAccountID)
+	if err := checker.CheckPlacement(ctx, order); err != nil {
 		return reconciliationNotReadyError(err)
 	}
 	return nil
@@ -103,7 +107,7 @@ func (prepared placementReadinessPrepared) ExpectedVenueOrderID() string {
 }
 
 func (venue *placementReadinessVenue) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {
-	if err := venue.checkPlace(ctx, order.Intent.ExecutionAccountID); err != nil {
+	if err := venue.checkPlace(ctx, order); err != nil {
 		return nil, err
 	}
 	underlying, ok := venue.venue.(port.PreparedVenue)
@@ -123,7 +127,7 @@ func (venue *placementReadinessVenue) PlacePrepared(ctx context.Context, order d
 	if !ok || !supported || prepared.inner == nil {
 		return port.VenueOrder{}, reconciliationNotReadyError(fmt.Errorf("placement readiness prepared placement is invalid"))
 	}
-	if err := venue.checkPlace(ctx, order.Intent.ExecutionAccountID); err != nil {
+	if err := venue.checkPlace(ctx, order); err != nil {
 		return port.VenueOrder{}, err
 	}
 	return underlying.PlacePrepared(ctx, order, prepared.inner)
@@ -135,6 +139,15 @@ func (venue *placementReadinessVenue) Cancel(ctx context.Context, order domain.O
 
 func (venue *placementReadinessVenue) Get(ctx context.Context, order domain.Order) (port.VenueOrder, error) {
 	return venue.venue.Get(ctx, order)
+}
+
+// SupportsTimeInForce forwards the optional venue capability. The execution
+// service only sees this outermost decorator; without the pass-through it
+// would treat the CLOB as natively IOC-capable and never cancel the emulated
+// IOC remainder that the venue left resting.
+func (venue *placementReadinessVenue) SupportsTimeInForce(timeInForce domain.TimeInForce) bool {
+	support, ok := venue.venue.(port.TimeInForceSupport)
+	return !ok || support.SupportsTimeInForce(timeInForce)
 }
 
 func reconciliationNotReadyError(cause error) error {
@@ -155,3 +168,4 @@ func reconciliationNotReadyError(cause error) error {
 
 var _ port.Venue = (*placementReadinessVenue)(nil)
 var _ port.PreparedVenue = (*placementReadinessVenue)(nil)
+var _ port.TimeInForceSupport = (*placementReadinessVenue)(nil)

@@ -12,8 +12,8 @@ import (
 
 type placementCheckerFunc func(context.Context, string) error
 
-func (checker placementCheckerFunc) CheckAccount(ctx context.Context, accountID string) error {
-	return checker(ctx, accountID)
+func (checker placementCheckerFunc) CheckPlacement(ctx context.Context, order domain.Order) error {
+	return checker(ctx, order.Intent.ExecutionAccountID)
 }
 
 type placementTestVenue struct {

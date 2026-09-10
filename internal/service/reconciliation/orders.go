@@ -8,6 +8,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
 
 // reconcileOrdersParams 收拢订单对账阶段使用的本地订单、关注订单和外部证据。
@@ -32,6 +33,17 @@ type orderSourceIssueParams struct {
 	err       error
 }
 
+// orderStepResult 汇总一张订单在本轮的证据步骤结果。
+type orderStepResult struct {
+	// refreshed is the latest state returned by the order state machine, or
+	// the input order when no refresh ran.
+	refreshed domain.Order
+	// evidencePending means CLOB fill details are still missing; this is a
+	// durable wait state, not a source failure.
+	evidencePending bool
+	err             error
+}
+
 // reconcileOrders 按关注订单优先的顺序逐张恢复成交和订单状态。
 func (state *runState) reconcileOrders(ctx context.Context, params reconcileOrdersParams) {
 	for _, order := range prioritizeOrder(params.orders, params.focusOrderID) {
@@ -43,13 +55,49 @@ func (state *runState) reconcileOrders(ctx context.Context, params reconcileOrde
 	}
 }
 
-// reconcileOrder 对单张订单同步成交、处理撤单终局并按需刷新状态。
+// reconcileOrder 对单张订单同步成交、处理撤单终局并按需刷新状态。订单结果不确定
+// 的恢复状态经过订单级租约串行化并受单笔超时保护；其余订单只受单笔超时保护。
 func (state *runState) reconcileOrder(ctx context.Context, params reconcileOrderParams) {
 	if strings.TrimSpace(params.order.VenueOrderID) == "" {
 		state.recordUnconfirmedSubmission(ctx, params.order)
 		return
 	}
+	if !domain.IsOrderRecoveryStatus(params.order.Status) {
+		stepCtx, cancel := context.WithTimeout(ctx, state.service.recovery.Policy().Timeout)
+		defer cancel()
+		state.reconcileOrderSteps(stepCtx, params)
+		return
+	}
+	var (
+		result   orderStepResult
+		executed bool
+	)
+	outcome := state.service.recovery.Run(ctx, orderrecovery.RunParams{
+		Order: params.order, Holder: state.recoveryHolder(), BypassBackoff: params.order.ID == params.focusOrderID,
+		Work: func(workCtx context.Context) (domain.OrderRecoveryOutcomeKind, error) {
+			executed = true
+			result = state.reconcileOrderSteps(workCtx, params)
+			return result.kind(), result.err
+		},
+	})
+	state.recordRecoveryOutcome(params.order, outcome, executed && result.evidencePending, true)
+}
 
+// kind maps the evidence steps to the recovery outcome the lease persists.
+func (result orderStepResult) kind() domain.OrderRecoveryOutcomeKind {
+	switch {
+	case result.err != nil:
+		return domain.OrderRecoveryOutcomeFailed
+	case result.evidencePending || domain.IsOrderRecoveryStatus(result.refreshed.Status):
+		return domain.OrderRecoveryOutcomeWaiting
+	default:
+		return domain.OrderRecoveryOutcomeResolved
+	}
+}
+
+// reconcileOrderSteps 执行成交同步、撤单终局与状态刷新，并汇总结果。
+func (state *runState) reconcileOrderSteps(ctx context.Context, params reconcileOrderParams) orderStepResult {
+	result := orderStepResult{refreshed: params.order}
 	_, tradeReferenced := params.evidence.ordersWithTrades[normalizedID(params.order.VenueOrderID)]
 	_, pendingTrade := params.evidence.ordersWithPendingTrades[normalizedID(params.order.VenueOrderID)]
 	fillEvidenceComplete := params.evidence.tradesAvailable && !tradeReferenced
@@ -58,22 +106,27 @@ func (state *runState) reconcileOrder(ctx context.Context, params reconcileOrder
 		// not turn an unavailable account-level trade scan into proof that a
 		// cancelled order had no fills. Cancellation finality requires both
 		// sources to have completed successfully in this run.
-		orderFillEvidenceComplete := state.syncOrderFills(ctx, params.order)
+		orderFillEvidenceComplete, evidencePending, syncErr := state.syncOrderFills(ctx, params.order)
+		result.evidencePending = evidencePending
+		result.err = errors.Join(result.err, syncErr)
 		fillEvidenceComplete = params.evidence.tradesAvailable && !pendingTrade && orderFillEvidenceComplete
 	}
 	if params.order.Status == domain.OrderStatusCancelled {
-		state.finalizeCancellationWhenSafe(ctx, params.order, fillEvidenceComplete)
-		return
+		result.err = errors.Join(result.err, state.finalizeCancellationWhenSafe(ctx, params.order, fillEvidenceComplete))
+		return result
 	}
-	state.refreshOrder(ctx, params.order, fillEvidenceComplete)
+	refreshed, refreshErr := state.refreshOrder(ctx, params.order, fillEvidenceComplete)
+	result.refreshed = refreshed
+	result.err = errors.Join(result.err, refreshErr)
+	return result
 }
 
 // finalizeCancellationWhenSafe 仅在成交证据完整时释放已撤订单的剩余预占。
-func (state *runState) finalizeCancellationWhenSafe(ctx context.Context, order domain.Order, fillEvidenceComplete bool) {
+func (state *runState) finalizeCancellationWhenSafe(ctx context.Context, order domain.Order, fillEvidenceComplete bool) error {
 	if !fillEvidenceComplete {
-		return
+		return nil
 	}
-	state.finalizeCancellation(ctx, order)
+	return state.finalizeCancellation(ctx, order)
 }
 
 // recordUnconfirmedSubmission 记录没有外部订单标识且结果不确定的提交。
@@ -108,8 +161,9 @@ func shouldSyncOrderFills(order domain.Order, focusOrderID string, tradeReferenc
 		order.Status == domain.OrderStatusCancelled || order.Status == domain.OrderStatusManualReview
 }
 
-// syncOrderFills 同步一张订单的真实成交并记录自动补录结果。
-func (state *runState) syncOrderFills(ctx context.Context, order domain.Order) bool {
+// syncOrderFills 同步一张订单的真实成交并记录自动补录结果。返回值依次为：
+// 订单级成交证据是否完整、是否处于成交明细待传播状态、数据源错误。
+func (state *runState) syncOrderFills(ctx context.Context, order domain.Order) (complete, evidencePending bool, err error) {
 	result, err := state.service.fills.SyncOrder(ctx, order.ID)
 	if err != nil {
 		if isFillEvidencePendingError(err) {
@@ -117,10 +171,10 @@ func (state *runState) syncOrderFills(ctx context.Context, order domain.Order) b
 			// failure. It still makes cancellation evidence incomplete, while the
 			// next scheduled sweep can retry without poisoning runner readiness.
 			state.run.Summary["fill_evidence_pending"]++
-			return false
+			return false, true, nil
 		}
 		state.addOrderSourceIssue(ctx, orderSourceIssueParams{order: order, source: "CLOB_ORDER_TRADES", operation: "read/apply order fills", err: err})
-		return false
+		return false, false, err
 	}
 	state.run.Summary["fill_observations"] += result.Observed
 	state.run.Summary["fills_applied"] += result.Applied
@@ -130,7 +184,7 @@ func (state *runState) syncOrderFills(ctx context.Context, order domain.Order) b
 		}
 		state.recordRecoveredFill(ctx, order, application)
 	}
-	return true
+	return true, false, nil
 }
 
 func isFillEvidencePendingError(err error) bool {
@@ -162,22 +216,27 @@ func recoveredFillIssueType(side domain.Side) domain.ReconciliationIssueType {
 	return domain.ReconciliationIssueMissedBuyFill
 }
 
-// refreshOrder 刷新一张需要对账的订单，并处理新确认的撤单。
-func (state *runState) refreshOrder(ctx context.Context, order domain.Order, fillEvidenceComplete bool) {
+// refreshOrder 刷新一张需要对账的订单，并处理新确认的撤单。返回刷新后的订单。
+func (state *runState) refreshOrder(ctx context.Context, order domain.Order, fillEvidenceComplete bool) (domain.Order, error) {
 	if !orderNeedsRefresh(order) {
-		return
+		return order, nil
 	}
 	refreshed, err := state.service.orderRefresher.Refresh(ctx, order.ID)
 	if err != nil {
+		if errors.Is(err, port.ErrOrderRevisionConflict) {
+			// Another worker progressed the order first; the next read sees it.
+			state.run.Summary["orders_refresh_conflicts"]++
+			return order, nil
+		}
 		state.addOrderSourceIssue(ctx, orderSourceIssueParams{order: order, source: "CLOB_ORDER", operation: "refresh order state", err: err})
-		return
+		return order, err
 	}
 	state.run.Summary["orders_refreshed"]++
 	if order.Status == domain.OrderStatusCancelled || refreshed.Status != domain.OrderStatusCancelled {
-		return
+		return refreshed, nil
 	}
 	state.recordConfirmedCancellation(ctx, order, refreshed)
-	state.finalizeCancellationWhenSafe(ctx, refreshed, fillEvidenceComplete)
+	return refreshed, state.finalizeCancellationWhenSafe(ctx, refreshed, fillEvidenceComplete)
 }
 
 // recordConfirmedCancellation 记录交易所已经证明撤销的本地订单。
@@ -204,17 +263,18 @@ func (state *runState) addOrderSourceIssue(ctx context.Context, params orderSour
 }
 
 // finalizeCancellation 在宽限期满足时完成已撤订单的最终预占释放。
-func (state *runState) finalizeCancellation(ctx context.Context, order domain.Order) {
+func (state *runState) finalizeCancellation(ctx context.Context, order domain.Order) error {
 	_, err := state.service.orderRefresher.FinalizeCancellation(ctx, order.ID)
 	if errors.Is(err, port.ErrCancelFinalityPending) {
 		state.run.Summary["cancel_finality_pending"]++
-		return
+		return nil
 	}
 	if err != nil {
 		state.addOrderSourceIssue(ctx, orderSourceIssueParams{order: order, source: "CANCEL_FINALITY", operation: "release cancelled order reservation", err: err})
-		return
+		return err
 	}
 	state.run.Summary["cancellations_finalized"]++
+	return nil
 }
 
 // orderNeedsRefresh 判断订单当前状态是否需要从交易所刷新。

@@ -339,3 +339,14 @@ func (venue *Venue) Get(ctx context.Context, order domain.Order) (port.VenueOrde
 
 var _ port.Venue = (*Venue)(nil)
 var _ port.PreparedVenue = (*Venue)(nil)
+
+// SupportsTimeInForce forwards the optional venue capability. Without this
+// pass-through the execution service sees only the outermost decorator, never
+// learns that the CLOB has no native IOC, and leaves the emulated IOC remainder
+// resting on the book instead of cancelling it.
+func (venue *Venue) SupportsTimeInForce(timeInForce domain.TimeInForce) bool {
+	support, ok := venue.venue.(port.TimeInForceSupport)
+	return !ok || support.SupportsTimeInForce(timeInForce)
+}
+
+var _ port.TimeInForceSupport = (*Venue)(nil)

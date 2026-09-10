@@ -5,14 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/accountscope"
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
+	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
 
 var testNow = time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
@@ -1208,6 +1212,19 @@ func (recorder *fakeRecorder) Complete(ctx context.Context, run domain.Reconcili
 }
 
 // newTestService 创建测试所需的模拟对象。
+// newTestRecoveryGuard builds an in-memory order recovery guard pinned to testNow.
+func newTestRecoveryGuard(t *testing.T, store port.OrderRecoveryLeaseStore, policy orderrecovery.Policy) *orderrecovery.Guard {
+	t.Helper()
+	guard, err := orderrecovery.NewGuard(orderrecovery.GuardParams{
+		Store: store, Policy: policy, Now: func() time.Time { return testNow },
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewGuard() error = %v", err)
+	}
+	return guard
+}
+
 func newTestService(t *testing.T, params Params) *Service {
 	t.Helper()
 	if params.Recorder == nil {
@@ -1224,6 +1241,12 @@ func newTestService(t *testing.T, params Params) *Service {
 		})
 	}
 	params.Now = func() time.Time { return testNow }
+	if params.Logger == nil {
+		params.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if params.Recovery == nil {
+		params.Recovery = newTestRecoveryGuard(t, memory.NewOrderRecoveryLeaseStore(), orderrecovery.Policy{})
+	}
 	sequence := 0
 	params.NewID = func() string {
 		sequence++

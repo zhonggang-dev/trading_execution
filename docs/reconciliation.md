@@ -58,7 +58,8 @@ Runner 的异常队列不阻塞下单线程。即使进程在入队前崩溃，�
 上下文中把已创建的 run 终结为 `FAILED`，避免留下阻塞下一次启动的账户租约。进程被强制终止等
 无法运行清理代码的情形，遗留 run 超过 30 分钟租期后仍会被标记 `FAILED`，防止多实例同时
 修复同一钱包。`RUNNING` 或 `FAILED` run 不会让实盘风控判定状态过期：下单时的
-`RISK_STATE_STALE` 只看最近一次 `COMPLETED` run 的完成时间是否在 `max_state_age_ms` 内。
+`RISK_STATE_STALE` 只看最近一次完成的扫描（`COMPLETED` 或 `ATTENTION_REQUIRED`）的完成时间是否在
+`max_state_age_ms` 内；有问题的扫描由 OPEN issue 的 `impact_scope` 决定拦截范围，见下文。
 
 手工触发示例：
 
@@ -73,6 +74,75 @@ Content-Type: application/json
   "focus_order_id": "ord-123"
 }
 ```
+
+## 单笔异常订单的隔离
+
+一张 `UNKNOWN/RECONCILING/CANCEL_PENDING/SUBMITTING` 订单的恢复失败，不应让同一账户的其它市场
+停止交易，也不应把正常的账本比较误判成人工漂移。实现位置：
+
+- `internal/service/orderrecovery`：订单级恢复守卫（租约、单笔超时、退避、升级）；
+- `internal/adapter/postgres/order_recovery_lease.go` + `migrations/0027_order_recovery_isolation.sql`：
+  `order_recovery_leases` 持久化租约与重试计划；
+- `internal/service/reconciliation/recovery.go`：未解决订单视图，隔离资产比较；
+- `reconciliation_issues.impact_scope`：每条 OPEN issue 持久化其交易影响范围。
+
+### 订单级租约与版本校验
+
+快速订单扫描（`ordercoordinator`，秒级）与定时对账（分钟级）都会恢复同一张不确定订单。除了已有的
+revision compare-and-swap，两者现在先按 `order_id` 获取同一条 `order_recovery_leases` 租约：
+
+- 另一持有者的租约未过期 → 本轮跳过该订单（`orders_recovery_deferred`），不重复调用交易所；
+- 租约里记录的 `order_revision` 比调用方看到的更新 → 视为过期快照，跳过；
+- `next_retry_at` 未到 → 跳过；只有 `ORDER_UNKNOWN` 即时触发的 focus 订单可以越过退避；
+- 工作完成后释放：脱离恢复状态 → 删除租约；仍在等待（成交明细传播中、revision 冲突）→ 不消耗重试
+  预算；数据源失败或单笔超时 → `attempts+1`，`next_retry_at = now + min(30s × 2^(attempts-1), 10m)`。
+
+### 单笔超时、退避与人工队列
+
+每张订单的恢复调用受 `ORDER_RECOVERY_TIMEOUT`（默认 30s）约束；超时按失败记录并以 ERROR 日志告警，
+其余订单和其它账户继续扫描。自 `first_pending_at` 起超过 `ORDER_RECOVERY_ESCALATE_AFTER`（默认 30m）
+仍未解决的订单记 `ORDER_RECOVERY_STALLED`（`MANUAL_REVIEW`），进入人工队列；自动重试仍以上限退避继续，
+但任何路径都不会自动释放该订单可能已成交的预占。
+
+| 环境变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `ORDER_RECOVERY_TIMEOUT` | 30s | 单笔恢复调用超时 |
+| `ORDER_RECOVERY_LEASE_TTL` | 2m | 租约有效期（必须大于超时） |
+| `ORDER_RECOVERY_RETRY_BACKOFF` | 30s | 失败后首个退避 |
+| `ORDER_RECOVERY_MAX_BACKOFF` | 10m | 退避上限 |
+| `ORDER_RECOVERY_ESCALATE_AFTER` | 30m | 进入人工队列的挂起时长 |
+| `ORDER_RECOVERY_PENDING_GRACE` | 2m | 成交明细传播期内不记 `ORDER_RECOVERY_PENDING` 的宽限 |
+
+### 未解决订单不污染资产比较
+
+本轮恢复没有完成的订单（被跳过、失败、超时、仍在等待且账本里没有对应 MINED 成交）构成“未解决订单”
+视图。它们的预占仍然冻结，因此链上任何由它们造成的变动都有界：
+
+- 持仓：这些订单的 token 本轮不参与持仓比较（`positions_deferred_for_unresolved_orders`），不会记
+  `POSITION_DRIFT`；其它 token 照常比较。
+- 余额：`外部余额 − (本地余额 + 待终局成交净现金)` 若落在
+  `[−Σ BUY 剩余预占金额, +Σ SELL 剩余预占份额 × 1]` 之内，记 `BALANCE_DRIFT + RETRY_LATER`（并把差额归因
+  到这些订单），而不是账户级 `MANUAL_REVIEW`；超出区间仍按原逻辑记人工漂移。
+- 已经有 `MINED` 成交、只在等待确认深度的订单，由既有的 finality-pending 视图解释，不算未解决。
+- 未解决订单记 `ORDER_RECOVERY_PENDING`（`RETRY_LATER`），使后续干净对账不会在订单尚未收敛时自动
+  关闭它的 issue；成交明细传播的前 `ORDER_RECOVERY_PENDING_GRACE` 内保持静默但仍排除其 token。
+
+### “对账完成”与“允许交易”分离
+
+run 状态不变：无 OPEN issue 为 `COMPLETED`，有 OPEN issue 为 `ATTENTION_REQUIRED`，无法建立本地权威为
+`FAILED`。新增的 `impact_scope` 说明每条 OPEN issue 阻止什么：
+
+| impact_scope | 何时 | 效果 |
+| --- | --- | --- |
+| `ACCOUNT` | `BALANCE_DRIFT`(MANUAL)、`SOURCE_CONFLICT`、账户级 `SOURCE_UNAVAILABLE`、缺少市场身份的 issue、未知类型 | 该账户所有新下单被拒 |
+| `ORDER` / `TOKEN` | 订单级 `SOURCE_UNAVAILABLE`、`SUBMIT_UNCONFIRMED`、`FILL_FINALITY_STALLED`、`ORDER_RECOVERY_*`、`POSITION_DRIFT`、`PHANTOM_POSITION`、baseline drift、`EXTERNAL_TRADE` | 只拒绝同 token / 同 condition / 同 market 的新下单 |
+| `NONE` | `OBSERVED_ONLY`、由未解决订单解释的 `BALANCE_DRIFT`(RETRY_LATER) | 不阻止交易 |
+
+三处门控使用同一份范围：Go 侧 `Runner.CheckPlacement(order)`（`placementReadinessVenue`）、
+`ReservationManager` 的 live risk 授权、以及 `enforce_live_order_submit_risk` 提交触发器。
+`RISK_STATE_STALE` 的新鲜度现在取最近一次 **完成的扫描**（`COMPLETED` 或 `ATTENTION_REQUIRED`），
+`RUNNING/FAILED` 仍不计。`Result.Impact` 和 run summary 中的 `impact_account_wide / impact_scoped_orders /
+impact_scoped_tokens` 给出影响范围；`/health/ready` 只在账户级问题或扫描过期时报不就绪。
 
 ## 自动修复白名单
 
@@ -165,6 +235,7 @@ Kalshi 启动时读到的 `balance` 是交易所当前可用现金，不是可�
 | 余额不足或余额滞后 | PostgreSQL 先原子预占；CLOB 拒绝后重新读链上余额并触发对账，不能用 Redis 锁补救 |
 | CLOB 查询不可用 | 只对读请求有界重试；保留原订单和预占，不能解释为“没有订单” |
 | `/trades` 延迟 | 保持 `UNKNOWN/RECONCILING` 并使用重叠窗口重查；不从 `size_matched` 伪造 Fill |
+| 单笔订单恢复持续失败 | 订单级租约 + 退避重试，超时告警；其它订单继续扫描；超过升级窗口记 `ORDER_RECOVERY_STALLED` 进入人工队列，预占不自动释放 |
 | placement status=`delayed` | 只映射为 `ACKNOWLEDGED`，不入仓位 |
 | Cancel Race | `CANCEL_PENDING` 后先同步 Fill，再查订单；成交优先按真实 Fill 入账 |
 | 部分成交 | 累计 shares/notional/fees，保存未成交预占和剩余 lot，不清零 |

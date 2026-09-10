@@ -58,7 +58,9 @@ verifyingContract = standard V2 exchange 或 neg-risk V2 exchange
 旧 `execute.py` 用 float 先算 USD、再除以价格、再交给 SDK 二次 round-down，可能把 `16.90` 变成 `16.89`。新实现直接生成 6-decimal 整数，例如 `16.90 shares → 16900000`，彻底移除双重舍入。
 
 原生支持 `GTC/GTD/FAK/FOK`。Polymarket 没有 IOC 类型，adapter 通过 `SupportsTimeInForce(IOC)=false`
-声明这一点，执行层据此模拟 IOC：订单以 `GTC` 限价签名并提交，BUY 数量为 Market Validation 记录的
+声明这一点（生产装配里的每层 venue 封装——conditional funding、geoblock eligibility、CLOB heartbeat、
+placement readiness——都必须透传这个能力接口，否则执行层只看到最外层封装、误以为 IOC 是原生的，
+模拟 IOC 的未成交余量就会一直挂在簿上），执行层据此模拟 IOC：订单以 `GTC` 限价签名并提交，BUY 数量为 Market Validation 记录的
 `executable_size`（最新盘口在 `worst_price` 内可成交的量，不超过策略 `size`，不低于 `min_order_size`），
 下单响应返回后执行层立刻撤掉未成交部分。IOC 绝不会被改成 FAK：FAK/FOK BUY 的 maker notional 是 pUSD 预算，
 盘口好于限价时会买到多于 `size` 的 shares；GTC 按股数成交，最多买 `size` 股，价差体现为少花钱。

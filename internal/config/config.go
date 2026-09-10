@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
 
 // Config 表示后端使用的 Config 类型。
@@ -113,6 +114,27 @@ type Execution struct {
 	AllowMarketOrders    bool
 	CoordinatorInterval  time.Duration
 	CoordinatorBatchSize int
+	// Order recovery isolation: one order whose venue outcome is uncertain is
+	// serialized through a durable lease, bounded by a per-order timeout,
+	// retried with backoff, and escalated to the manual queue after the
+	// escalation window. Its reservation is never released automatically.
+	OrderRecoveryTimeout       time.Duration
+	OrderRecoveryLeaseTTL      time.Duration
+	OrderRecoveryRetryBackoff  time.Duration
+	OrderRecoveryMaxBackoff    time.Duration
+	OrderRecoveryEscalateAfter time.Duration
+	OrderRecoveryPendingGrace  time.Duration
+}
+
+// OrderRecoveryPolicy 返回订单恢复守卫使用的租约、超时、退避和升级策略。
+func (execution Execution) OrderRecoveryPolicy() orderrecovery.Policy {
+	return orderrecovery.Policy{
+		LeaseTTL:      execution.OrderRecoveryLeaseTTL,
+		Timeout:       execution.OrderRecoveryTimeout,
+		BaseBackoff:   execution.OrderRecoveryRetryBackoff,
+		MaxBackoff:    execution.OrderRecoveryMaxBackoff,
+		EscalateAfter: execution.OrderRecoveryEscalateAfter,
+	}
 }
 
 // Polymarket 保存 fail-closed 实盘装配配置，钱包秘密只留在受限文件中。
@@ -215,6 +237,30 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	coordinatorBatchSize, err := integer("ORDER_COORDINATOR_BATCH_SIZE", 100, 1, 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	orderRecoveryTimeout, err := duration("ORDER_RECOVERY_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	orderRecoveryLeaseTTL, err := duration("ORDER_RECOVERY_LEASE_TTL", 2*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	orderRecoveryRetryBackoff, err := duration("ORDER_RECOVERY_RETRY_BACKOFF", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	orderRecoveryMaxBackoff, err := duration("ORDER_RECOVERY_MAX_BACKOFF", 10*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	orderRecoveryEscalateAfter, err := duration("ORDER_RECOVERY_ESCALATE_AFTER", 30*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	orderRecoveryPendingGrace, err := duration("ORDER_RECOVERY_PENDING_GRACE", 2*time.Minute)
 	if err != nil {
 		return Config{}, err
 	}
@@ -379,6 +425,13 @@ func Load() (Config, error) {
 			AllowMarketOrders:    allowMarketOrders,
 			CoordinatorInterval:  coordinatorInterval,
 			CoordinatorBatchSize: coordinatorBatchSize,
+
+			OrderRecoveryTimeout:       orderRecoveryTimeout,
+			OrderRecoveryLeaseTTL:      orderRecoveryLeaseTTL,
+			OrderRecoveryRetryBackoff:  orderRecoveryRetryBackoff,
+			OrderRecoveryMaxBackoff:    orderRecoveryMaxBackoff,
+			OrderRecoveryEscalateAfter: orderRecoveryEscalateAfter,
+			OrderRecoveryPendingGrace:  orderRecoveryPendingGrace,
 		},
 		Polymarket: Polymarket{
 			LiveTradingEnabled: liveTradingEnabled,
@@ -455,6 +508,12 @@ func (config Config) Validate() error {
 	}
 	if config.Execution.CoordinatorInterval < 100*time.Millisecond || config.Execution.CoordinatorInterval > time.Minute {
 		return fmt.Errorf("ORDER_COORDINATOR_INTERVAL must be between 100ms and 1m")
+	}
+	if _, err := config.Execution.OrderRecoveryPolicy().Normalize(); err != nil {
+		return fmt.Errorf("ORDER_RECOVERY_* settings are invalid: %w", err)
+	}
+	if config.Execution.OrderRecoveryPendingGrace < 0 {
+		return fmt.Errorf("ORDER_RECOVERY_PENDING_GRACE must not be negative")
 	}
 	if config.Execution.Mode == "live" {
 		if !config.Polymarket.LiveTradingEnabled {

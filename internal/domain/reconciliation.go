@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -103,6 +104,9 @@ type ReconciliationIssue struct {
 	Details            string                    `json:"details"`
 	ObservedAt         time.Time                 `json:"observed_at"`
 	ResolvedAt         *time.Time                `json:"resolved_at,omitempty"`
+	// ImpactScope is the persisted trading boundary of an OPEN issue. Empty
+	// means "not yet classified"; readers fall back to the type-based rule.
+	ImpactScope ReconciliationImpactScope `json:"impact_scope,omitempty"`
 }
 
 // VenueOrderSnapshot 表示后端使用的 VenueOrderSnapshot 类型。
@@ -191,3 +195,165 @@ const (
 	PositionLifecycleClosed               PositionLifecycleStatus = "CLOSED"
 	PositionLifecycleManualReview         PositionLifecycleStatus = "MANUAL_REVIEW"
 )
+
+const (
+	// ReconciliationIssueOrderRecoveryPending means one order is still being
+	// recovered (held by another worker, waiting for its retry slot, or waiting
+	// for fill evidence) and its exact token cannot be declared reconciled yet.
+	// Its reservation stays frozen; other tokens and accounts are unaffected.
+	ReconciliationIssueOrderRecoveryPending ReconciliationIssueType = "ORDER_RECOVERY_PENDING"
+	// ReconciliationIssueOrderRecoveryStalled means the order exceeded the
+	// recovery escalation window and now sits in the manual queue. Automatic
+	// retries continue at the capped backoff; nothing is released automatically.
+	ReconciliationIssueOrderRecoveryStalled ReconciliationIssueType = "ORDER_RECOVERY_STALLED"
+)
+
+// ReconciliationImpactScope states which trading an OPEN issue must block.
+// It is persisted with the issue so the Go placement gate, the PostgreSQL live
+// risk authorization, and the submit trigger apply the same boundary.
+type ReconciliationImpactScope string
+
+const (
+	// ReconciliationImpactNone is observation only: nothing is blocked.
+	ReconciliationImpactNone ReconciliationImpactScope = "NONE"
+	// ReconciliationImpactOrder blocks the market/condition/token of one order.
+	ReconciliationImpactOrder ReconciliationImpactScope = "ORDER"
+	// ReconciliationImpactToken blocks one market/condition/token.
+	ReconciliationImpactToken ReconciliationImpactScope = "TOKEN"
+	// ReconciliationImpactAccount blocks every new placement for the account.
+	ReconciliationImpactAccount ReconciliationImpactScope = "ACCOUNT"
+)
+
+// ClassifyReconciliationImpact derives the trading boundary of an issue from
+// its type, resolution, and identity. Anything unknown fails closed to the
+// whole account; a scoped classification requires a concrete market identity.
+func ClassifyReconciliationImpact(issue ReconciliationIssue) ReconciliationImpactScope {
+	if issue.Status != ReconciliationIssueOpen || issue.Resolution == ReconciliationResolutionObserved {
+		return ReconciliationImpactNone
+	}
+	switch issue.Type {
+	case ReconciliationIssueBalanceDrift:
+		if issue.Resolution == ReconciliationResolutionRetry {
+			// The drift is bounded by frozen reservations of unresolved orders;
+			// those orders carry their own token-scoped issues.
+			return ReconciliationImpactNone
+		}
+		return ReconciliationImpactAccount
+	case ReconciliationIssueSourceConflict:
+		return ReconciliationImpactAccount
+	case ReconciliationIssueSourceUnavailable,
+		ReconciliationIssueSubmitUnconfirmed, ReconciliationIssueFillFinalityStalled,
+		ReconciliationIssueLocalOrderCancelled, ReconciliationIssueMissedBuyFill,
+		ReconciliationIssueMissedSellFill, ReconciliationIssueExternalTrade,
+		ReconciliationIssueOrderRecoveryPending, ReconciliationIssueOrderRecoveryStalled:
+		return orderScopedImpact(issue)
+	case ReconciliationIssuePositionDrift, ReconciliationIssuePhantomPosition,
+		ReconciliationIssueExternalPositionBaselineDrift, ReconciliationIssuePositionSettled:
+		return tokenScopedImpact(issue)
+	default:
+		return ReconciliationImpactAccount
+	}
+}
+
+func orderScopedImpact(issue ReconciliationIssue) ReconciliationImpactScope {
+	if !issueHasMarketIdentity(issue) {
+		return ReconciliationImpactAccount
+	}
+	if strings.TrimSpace(issue.OrderID) != "" {
+		return ReconciliationImpactOrder
+	}
+	return ReconciliationImpactToken
+}
+
+func tokenScopedImpact(issue ReconciliationIssue) ReconciliationImpactScope {
+	if !issueHasMarketIdentity(issue) {
+		return ReconciliationImpactAccount
+	}
+	return ReconciliationImpactToken
+}
+
+func issueHasMarketIdentity(issue ReconciliationIssue) bool {
+	return strings.TrimSpace(issue.TokenID) != "" || strings.TrimSpace(issue.ConditionID) != "" ||
+		strings.TrimSpace(issue.MarketID) != ""
+}
+
+// BlocksIntent reports whether this OPEN issue forbids placing the intent.
+// ACCOUNT blocks everything; ORDER/TOKEN block the same token, the same
+// condition, or the same market, so both outcomes of a condition are covered.
+func (issue ReconciliationIssue) BlocksIntent(intent OrderIntent) bool {
+	scope := issue.ImpactScope
+	if scope == "" {
+		scope = ClassifyReconciliationImpact(issue)
+	}
+	switch scope {
+	case ReconciliationImpactAccount:
+		return true
+	case ReconciliationImpactOrder, ReconciliationImpactToken:
+		return identityMatches(issue.TokenID, intent.TokenID) ||
+			identityMatches(issue.ConditionID, intent.ConditionID) ||
+			identityMatches(issue.MarketID, intent.MarketID)
+	default:
+		return false
+	}
+}
+
+func identityMatches(issueValue, intentValue string) bool {
+	issueValue = strings.TrimSpace(issueValue)
+	return issueValue != "" && strings.EqualFold(issueValue, strings.TrimSpace(intentValue))
+}
+
+// ReconciliationImpact summarizes the trading boundary of a completed run so
+// "the scan finished" and "trading is allowed" are reported separately.
+type ReconciliationImpact struct {
+	AccountWide bool `json:"account_wide"`
+	// Reasons lists the account-wide issue types; ScopedReasons the scoped ones.
+	Reasons       []string `json:"reasons,omitempty"`
+	ScopedReasons []string `json:"scoped_reasons,omitempty"`
+	OrderIDs      []string `json:"order_ids,omitempty"`
+	TokenIDs      []string `json:"token_ids,omitempty"`
+	ConditionIDs  []string `json:"condition_ids,omitempty"`
+	MarketIDs     []string `json:"market_ids,omitempty"`
+}
+
+// SummarizeReconciliationImpact aggregates OPEN issues into one impact view.
+func SummarizeReconciliationImpact(issues []ReconciliationIssue) ReconciliationImpact {
+	impact := ReconciliationImpact{}
+	seen := make(map[string]struct{})
+	add := func(target *[]string, prefix, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		key := prefix + "\x00" + value
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		*target = append(*target, value)
+	}
+	for _, issue := range issues {
+		scope := issue.ImpactScope
+		if scope == "" {
+			scope = ClassifyReconciliationImpact(issue)
+		}
+		switch scope {
+		case ReconciliationImpactAccount:
+			impact.AccountWide = true
+			add(&impact.Reasons, "reason", string(issue.Type)+":"+issue.Source)
+		case ReconciliationImpactOrder, ReconciliationImpactToken:
+			add(&impact.ScopedReasons, "scoped", string(issue.Type)+":"+issue.Source)
+			add(&impact.OrderIDs, "order", issue.OrderID)
+			add(&impact.TokenIDs, "token", issue.TokenID)
+			add(&impact.ConditionIDs, "condition", issue.ConditionID)
+			add(&impact.MarketIDs, "market", issue.MarketID)
+		}
+	}
+	return impact
+}
+
+// Partial reports a completed scan whose problems are confined to specific
+// orders or tokens: reconciliation finished, trading elsewhere may continue.
+func (impact ReconciliationImpact) Partial() bool {
+	return !impact.AccountWide && (len(impact.OrderIDs) > 0 || len(impact.TokenIDs) > 0 ||
+		len(impact.ConditionIDs) > 0 || len(impact.MarketIDs) > 0)
+}

@@ -300,3 +300,12 @@ var _ GeographicEligibilityChecker = (*CLOBEligibilityChecker)(nil)
 var _ ClosedOnlyChecker = (*TradingClient)(nil)
 var _ port.Venue = (*EligibilityVenue)(nil)
 var _ port.PreparedVenue = (*EligibilityVenue)(nil)
+
+// SupportsTimeInForce forwards the optional venue capability so the emulated
+// IOC decision made by execution still sees the CLOB's real order types.
+func (venue *EligibilityVenue) SupportsTimeInForce(timeInForce domain.TimeInForce) bool {
+	support, ok := venue.venue.(port.TimeInForceSupport)
+	return !ok || support.SupportsTimeInForce(timeInForce)
+}
+
+var _ port.TimeInForceSupport = (*EligibilityVenue)(nil)

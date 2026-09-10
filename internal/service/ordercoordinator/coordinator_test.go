@@ -2,12 +2,16 @@ package ordercoordinator_test
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/ordercoordinator"
+	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
 
 // TestSweepCancelsExpiredLiveAndRefreshesUnknown 验证 Sweep Cancels Expired Live And Refreshes Unknown 场景下的行为。
@@ -87,12 +91,21 @@ type fakeExecution struct {
 	refreshed []string
 	cancelled []string
 	finalized []string
+	failures  map[string]error
+	resolved  map[string]domain.OrderStatus
 }
 
 // Refresh 记录模拟订单刷新。
 func (execution *fakeExecution) Refresh(_ context.Context, orderID string) (domain.Order, error) {
 	execution.refreshed = append(execution.refreshed, orderID)
-	return domain.Order{ID: orderID}, nil
+	if err := execution.failures[orderID]; err != nil {
+		return domain.Order{ID: orderID}, err
+	}
+	status := domain.OrderStatusUnknown
+	if resolved, ok := execution.resolved[orderID]; ok {
+		status = resolved
+	}
+	return domain.Order{ID: orderID, Status: status}, nil
 }
 
 // Resume 实现当前测试场景所需的辅助行为。
@@ -117,5 +130,73 @@ func createOrder(t *testing.T, repository *memory.OrderRepository, order domain.
 	t.Helper()
 	if _, created, err := repository.Create(context.Background(), order); err != nil || !created {
 		t.Fatalf("Create(%s) = %v, %v", order.ID, created, err)
+	}
+}
+
+// TestSweepSerializesRecoveryOrdersThroughTheLease 验证恢复状态的订单经过订单级租约：
+// 被其他恢复者持有的订单被跳过而不是重复刷新，失败后按退避推迟，成功脱离恢复状态后释放租约。
+func TestSweepSerializesRecoveryOrdersThroughTheLease(t *testing.T) {
+	now := time.Date(2026, 9, 10, 8, 0, 10, 0, time.UTC)
+	clock := now
+	repository := memory.NewOrderRepository()
+	createOrder(t, repository, domain.Order{ID: "held", Intent: domain.OrderIntent{ClientOrderID: "held", ExecutionAccountID: "acct"}, Status: domain.OrderStatusUnknown, FilledSize: "0", CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute), Revision: 1})
+	createOrder(t, repository, domain.Order{ID: "failing", Intent: domain.OrderIntent{ClientOrderID: "failing", ExecutionAccountID: "acct"}, Status: domain.OrderStatusUnknown, FilledSize: "0", CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute), Revision: 1})
+	createOrder(t, repository, domain.Order{ID: "live", Intent: domain.OrderIntent{ClientOrderID: "live", ExecutionAccountID: "acct"}, Status: domain.OrderStatusLive, FilledSize: "0", CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute), Revision: 1})
+	leases := memory.NewOrderRecoveryLeaseStore()
+	if _, err := leases.AcquireOrderRecoveryLease(context.Background(), domain.OrderRecoveryLeaseRequest{
+		OrderID: "held", ExecutionAccountID: "acct", Holder: "reconciliation:run-1", OrderRevision: 1, Now: now, TTL: 5 * time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := orderrecovery.NewGuard(orderrecovery.GuardParams{
+		Store: leases, Policy: orderrecovery.Policy{BaseBackoff: 30 * time.Second}, Now: func() time.Time { return clock },
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := &fakeExecution{failures: map[string]error{"failing": errors.New("clob 503")}}
+	coordinator, err := ordercoordinator.New(ordercoordinator.Params{
+		Repository: repository, Execution: execution, PollInterval: time.Second,
+		Now: func() time.Time { return clock }, Recovery: guard, RecoveryHolder: "ordercoordinator:test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := coordinator.Sweep(context.Background())
+	if result.Selected != 3 || result.Deferred != 1 || result.Refreshed != 1 || len(result.Errors) != 1 {
+		t.Fatalf("Sweep() = %#v", result)
+	}
+	for _, refreshed := range execution.refreshed {
+		if refreshed == "held" {
+			t.Fatalf("held order was refreshed by the coordinator: %#v", execution.refreshed)
+		}
+	}
+	lease, exists := leases.Lease("failing")
+	if !exists || lease.Attempts != 1 || lease.Holder != "" || lease.NextRetryAt == nil || !lease.NextRetryAt.Equal(now.Add(30*time.Second)) {
+		t.Fatalf("failing lease = %#v exists=%v, want one failed attempt with 30s backoff", lease, exists)
+	}
+	if _, exists := leases.Lease("live"); exists {
+		t.Fatal("LIVE order must not use the recovery lease")
+	}
+
+	// Inside the backoff window the failing order is deferred, not retried.
+	clock = now.Add(10 * time.Second)
+	refreshedBefore := len(execution.refreshed)
+	result = coordinator.Sweep(context.Background())
+	if result.Deferred != 2 || len(result.Errors) != 0 || len(execution.refreshed) != refreshedBefore+1 {
+		t.Fatalf("Sweep() inside backoff = %#v refreshed=%#v", result, execution.refreshed)
+	}
+
+	// After the backoff the order recovers and leaves the lease behind.
+	clock = now.Add(time.Minute)
+	delete(execution.failures, "failing")
+	execution.resolved = map[string]domain.OrderStatus{"failing": domain.OrderStatusFilled}
+	result = coordinator.Sweep(context.Background())
+	if result.Refreshed != 2 || len(result.Errors) != 0 {
+		t.Fatalf("Sweep() after backoff = %#v", result)
+	}
+	if _, exists := leases.Lease("failing"); exists {
+		t.Fatal("resolved order still holds a recovery lease")
 	}
 }
