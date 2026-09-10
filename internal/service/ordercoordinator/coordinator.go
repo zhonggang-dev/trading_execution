@@ -10,7 +10,10 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
+
+const defaultRecoveryHolder = "ordercoordinator"
 
 // Execution 表示后端使用的 Execution 类型。
 type Execution interface {
@@ -28,16 +31,24 @@ type Params struct {
 	BatchSize    int
 	Accounts     []string
 	Now          func() time.Time
+	// Recovery serializes SUBMITTING/UNKNOWN/RECONCILING/CANCEL_PENDING refreshes
+	// with the scheduled reconciliation and paces their retries. Nil keeps the
+	// legacy unguarded refresh for isolated/paper use.
+	Recovery *orderrecovery.Guard
+	// RecoveryHolder identifies this coordinator in the order lease.
+	RecoveryHolder string
 }
 
 // Coordinator 表示后端使用的 Coordinator 类型。
 type Coordinator struct {
-	repository   port.OrderRepository
-	execution    Execution
-	pollInterval time.Duration
-	batchSize    int
-	accounts     []string
-	now          func() time.Time
+	repository     port.OrderRepository
+	execution      Execution
+	pollInterval   time.Duration
+	batchSize      int
+	accounts       []string
+	now            func() time.Time
+	recovery       *orderrecovery.Guard
+	recoveryHolder string
 }
 
 // SweepResult 表示后端使用的 SweepResult 类型。
@@ -47,7 +58,10 @@ type SweepResult struct {
 	Refreshed int
 	Cancelled int
 	Finalized int
-	Errors    []error
+	// Deferred counts recovery orders skipped because another worker holds the
+	// lease or the persisted backoff is not due; they are not errors.
+	Deferred int
+	Errors   []error
 }
 
 // sweepAction 表示订单协调器成功完成的单次动作。
@@ -59,6 +73,7 @@ const (
 	sweepActionRefresh
 	sweepActionCancel
 	sweepActionFinalizeCancellation
+	sweepActionDeferred
 )
 
 // New 校验依赖和配置后创建当前服务实例。
@@ -85,10 +100,15 @@ func New(params Params) (*Coordinator, error) {
 	if err != nil {
 		return nil, err
 	}
+	holder := strings.TrimSpace(params.RecoveryHolder)
+	if holder == "" {
+		holder = defaultRecoveryHolder
+	}
 	return &Coordinator{
 		repository: params.Repository, execution: params.Execution,
 		pollInterval: params.PollInterval, batchSize: params.BatchSize,
 		accounts: accounts, now: params.Now,
+		recovery: params.Recovery, recoveryHolder: holder,
 	}, nil
 }
 
@@ -189,12 +209,44 @@ func (coordinator *Coordinator) resumeOrder(ctx context.Context, order domain.Or
 	return sweepActionResume, nil
 }
 
-// refreshOrder 刷新一张已经进入交易所生命周期的订单。
+// refreshOrder 刷新一张已经进入交易所生命周期的订单。结果不确定的恢复状态经过
+// 订单级租约：同一订单同时只有一个恢复者，失败后按持久化退避重试。
 func (coordinator *Coordinator) refreshOrder(ctx context.Context, order domain.Order) (sweepAction, error) {
-	if _, err := coordinator.execution.Refresh(ctx, order.ID); err != nil {
-		return sweepActionNone, ignoreRevisionConflict("refresh", order.ID, err)
+	if coordinator.recovery == nil || !domain.IsOrderRecoveryStatus(order.Status) {
+		if _, err := coordinator.execution.Refresh(ctx, order.ID); err != nil {
+			return sweepActionNone, ignoreRevisionConflict("refresh", order.ID, err)
+		}
+		return sweepActionRefresh, nil
 	}
-	return sweepActionRefresh, nil
+	outcome := coordinator.recovery.Run(ctx, orderrecovery.RunParams{
+		Order: order, Holder: coordinator.recoveryHolder,
+		Work: func(workCtx context.Context) (domain.OrderRecoveryOutcomeKind, error) {
+			refreshed, err := coordinator.execution.Refresh(workCtx, order.ID)
+			if errors.Is(err, port.ErrOrderRevisionConflict) {
+				// Someone else progressed the order; no venue call was wasted twice.
+				return domain.OrderRecoveryOutcomeWaiting, nil
+			}
+			if err != nil {
+				return domain.OrderRecoveryOutcomeFailed, err
+			}
+			if domain.IsOrderRecoveryStatus(refreshed.Status) {
+				return domain.OrderRecoveryOutcomeWaiting, nil
+			}
+			return domain.OrderRecoveryOutcomeResolved, nil
+		},
+	})
+	switch {
+	case outcome.Skipped && outcome.StoreErr != nil:
+		return sweepActionNone, fmt.Errorf("refresh order %s: order recovery lease unavailable: %w", order.ID, outcome.StoreErr)
+	case outcome.Skipped:
+		return sweepActionDeferred, nil
+	case outcome.Err != nil:
+		return sweepActionNone, fmt.Errorf("refresh order %s: %w", order.ID, outcome.Err)
+	case outcome.StoreErr != nil:
+		return sweepActionRefresh, fmt.Errorf("refresh order %s: release order recovery lease: %w", order.ID, outcome.StoreErr)
+	default:
+		return sweepActionRefresh, nil
+	}
 }
 
 // ignoreRevisionConflict 忽略其他并发工作者已经完成的乐观锁竞争。
@@ -216,6 +268,8 @@ func (result *SweepResult) record(action sweepAction) {
 		result.Cancelled++
 	case sweepActionFinalizeCancellation:
 		result.Finalized++
+	case sweepActionDeferred:
+		result.Deferred++
 	}
 }
 

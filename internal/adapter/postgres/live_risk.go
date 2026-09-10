@@ -84,7 +84,7 @@ func (manager *ReservationManager) authorizeLiveRisk(
 			return liveRiskAuthorization{}, err
 		}
 	}
-	if err := checkLiveRiskState(ctx, tx, order.Intent.ExecutionAccountID, observedAt, policy.maxStateAge); err != nil {
+	if err := checkLiveRiskState(ctx, tx, order.Intent, observedAt, policy.maxStateAge); err != nil {
 		return liveRiskAuthorization{}, err
 	}
 
@@ -273,21 +273,26 @@ func checkLiveRiskBindingAndControls(ctx context.Context, tx *sql.Tx, intent dom
 	return nil
 }
 
-// checkLiveRiskState measures risk-state freshness from the latest COMPLETED
-// reconciliation. A RUNNING or FAILED run that started later does not hide it:
-// a periodic run in progress only reads venue state and records issues, so the
-// previously completed run is still the authoritative balance/position check
-// until its own freshness window expires.
-func checkLiveRiskState(ctx context.Context, tx *sql.Tx, accountID string, now time.Time, maxAge time.Duration) error {
+// checkLiveRiskState measures risk-state freshness from the latest finished
+// reconciliation scan (COMPLETED or ATTENTION_REQUIRED). A RUNNING or FAILED
+// run that started later does not hide it: a periodic run in progress only
+// reads venue state and records issues, so the previously finished scan is
+// still the authoritative balance/position check until its own freshness
+// window expires. ATTENTION_REQUIRED is a finished scan whose problems are
+// represented by OPEN issues; the scoped issue gate below decides which of
+// those problems actually forbid this intent. Mirrors migration 0027.
+func checkLiveRiskState(ctx context.Context, tx *sql.Tx, intent domain.OrderIntent, now time.Time, maxAge time.Duration) error {
+	accountID := intent.ExecutionAccountID
 	var completedAt sql.NullTime
 	err := tx.QueryRowContext(ctx, `
 		SELECT completed_at
 		FROM reconciliation_runs
 		WHERE execution_account_id = $1
-		  AND status = $2
+		  AND status IN ($2, $3)
 		  AND completed_at IS NOT NULL
 		ORDER BY completed_at DESC, run_id DESC
-		LIMIT 1 FOR SHARE`, accountID, string(domain.ReconciliationRunCompleted)).Scan(&completedAt)
+		LIMIT 1 FOR SHARE`, accountID,
+		string(domain.ReconciliationRunCompleted), string(domain.ReconciliationRunAttentionRequired)).Scan(&completedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return reject("RISK_STATE_STALE", "the execution account has never completed reconciliation")
 	}
@@ -301,14 +306,32 @@ func checkLiveRiskState(ctx context.Context, tx *sql.Tx, accountID string, now t
 	if completed.After(now.Add(maxRiskFutureSkew)) || now.Sub(completed) > maxAge {
 		return reject("RISK_STATE_STALE", "the latest execution account reconciliation is outside the policy freshness window")
 	}
-	count, err := queryRiskCount(ctx, tx, `
+	accountWide, err := queryRiskCount(ctx, tx, `
 		SELECT count(*) FROM reconciliation_issues
-		WHERE execution_account_id = $1 AND status = 'OPEN'`, accountID)
+		WHERE execution_account_id = $1 AND status = 'OPEN' AND impact_scope = $2`,
+		accountID, string(domain.ReconciliationImpactAccount))
 	if err != nil {
-		return fmt.Errorf("check open reconciliation issues: %w", err)
+		return fmt.Errorf("check account-wide open reconciliation issues: %w", err)
 	}
-	if count != 0 {
-		return reject("RISK_STATE_HAS_OPEN_ISSUES", "the execution account has unresolved reconciliation issues")
+	if accountWide != 0 {
+		return reject("RISK_STATE_HAS_OPEN_ISSUES", "the execution account has unresolved account-wide reconciliation issues")
+	}
+	scoped, err := queryRiskCount(ctx, tx, `
+		SELECT count(*) FROM reconciliation_issues
+		WHERE execution_account_id = $1 AND status = 'OPEN'
+		  AND impact_scope IN ($2, $3)
+		  AND (
+		       (token_id <> '' AND token_id = $4)
+		    OR (condition_id <> '' AND $5 <> '' AND lower(condition_id) = lower($5))
+		    OR (market_id <> '' AND market_id = $6)
+		  )`,
+		accountID, string(domain.ReconciliationImpactOrder), string(domain.ReconciliationImpactToken),
+		strings.TrimSpace(intent.TokenID), strings.TrimSpace(intent.ConditionID), strings.TrimSpace(intent.MarketID))
+	if err != nil {
+		return fmt.Errorf("check scoped open reconciliation issues: %w", err)
+	}
+	if scoped != 0 {
+		return reject("RISK_STATE_HAS_OPEN_ISSUES", "the order's market has unresolved reconciliation issues; unrelated markets are not blocked")
 	}
 	return nil
 }

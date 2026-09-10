@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
 
 const (
@@ -58,8 +60,20 @@ type Params struct {
 	// configured Polygon confirmation depth before the wait is escalated to a
 	// manual FILL_FINALITY_STALLED issue. Zero selects the default.
 	FillFinalityMaxAge time.Duration
-	Now                func() time.Time
-	NewID              func() string
+	// Recovery serializes and paces recovery work on orders whose venue outcome
+	// is uncertain. It is shared with the order coordinator so the fast scan
+	// and the scheduled reconciliation never work the same order at once.
+	Recovery *orderrecovery.Guard
+	// Reservations bounds how much cash or how many shares an unresolved order
+	// could have moved on-chain. Nil falls back to the order intent.
+	Reservations port.OrderReservationReader
+	// RecoveryPendingGrace is how long an order may wait for propagating fill
+	// evidence before the run reports ORDER_RECOVERY_PENDING. Zero selects the
+	// default.
+	RecoveryPendingGrace time.Duration
+	Logger               *slog.Logger
+	Now                  func() time.Time
+	NewID                func() string
 }
 
 // Service 表示后端使用的 Service 类型。
@@ -81,14 +95,21 @@ type Service struct {
 	accountScope              port.ExecutionAccountScope
 	redemptions               port.RedemptionProgressSource
 	fillFinalityMaxAge        time.Duration
+	recovery                  *orderrecovery.Guard
+	reservations              port.OrderReservationReader
+	recoveryPendingGrace      time.Duration
+	logger                    *slog.Logger
 	now                       func() time.Time
 	newID                     func() string
 }
 
-// Result 表示后端使用的 Result 类型。
+// Result 表示后端使用的 Result 类型。Impact separates "the scan finished" from
+// "trading is allowed": ATTENTION_REQUIRED with a non-account-wide impact is a
+// partial degradation confined to the listed orders/tokens.
 type Result struct {
 	Run    domain.ReconciliationRun     `json:"run"`
 	Issues []domain.ReconciliationIssue `json:"issues"`
+	Impact domain.ReconciliationImpact  `json:"impact"`
 }
 
 // RunAccountParams 收拢单账户对账所需的业务参数，避免公共函数参数持续膨胀。
@@ -143,6 +164,18 @@ func New(params Params) (*Service, error) {
 	if params.FillFinalityMaxAge < time.Minute {
 		return nil, fmt.Errorf("fill finality max age must be at least one minute")
 	}
+	if params.Recovery == nil {
+		return nil, fmt.Errorf("order recovery guard is required")
+	}
+	if params.RecoveryPendingGrace == 0 {
+		params.RecoveryPendingGrace = defaultRecoveryPendingGrace
+	}
+	if params.RecoveryPendingGrace < 0 {
+		return nil, fmt.Errorf("recovery pending grace must not be negative")
+	}
+	if params.Logger == nil {
+		params.Logger = slog.Default()
+	}
 	if params.Now == nil {
 		params.Now = time.Now
 	}
@@ -161,7 +194,9 @@ func New(params Params) (*Service, error) {
 		positionEpsilon: params.PositionEpsilon, balanceEpsilon: params.BalanceEpsilon,
 		accountScope: params.AccountScope, redemptions: params.Redemptions,
 		fillFinalityMaxAge: params.FillFinalityMaxAge,
-		now:                params.Now, newID: params.NewID,
+		recovery:           params.Recovery, reservations: params.Reservations,
+		recoveryPendingGrace: params.RecoveryPendingGrace, logger: params.Logger,
+		now: params.Now, newID: params.NewID,
 	}, nil
 }
 
@@ -214,6 +249,11 @@ func (service *Service) RunAccount(ctx context.Context, params RunAccountParams)
 	// every fast fill would be recorded as balance/position drift, so the asset
 	// comparison is likewise skipped when it cannot be read.
 	finalityErr := state.loadFinalityPendingFills(ctx, scope.executionAccountID)
+	// Orders whose recovery did not finish in this run keep their reservations
+	// frozen. Their tokens are excluded from the position comparison and their
+	// reservations bound the balance comparison, so one UNKNOWN order cannot
+	// turn into account-wide manual drift.
+	state.classifyUnresolvedOrders(ctx)
 	var positionErr, balanceErr error
 	if redemptionErr == nil && finalityErr == nil {
 		positionErr = state.reconcilePositions(ctx, scope.executionAccountID, balance.WalletAddress)
@@ -243,6 +283,13 @@ type runState struct {
 	errors      []error
 	redemptions inFlightRedemptions
 	finality    finalityPendingFills
+	recovery    recoveryState
+}
+
+// recoveryState collects the per-order recovery results of one run.
+type recoveryState struct {
+	outcomes   []orderRecoveryOutcome
+	unresolved unresolvedOrders
 }
 
 // issue 补全对账问题身份并通过参数构建器持久化到运行结果。
@@ -257,6 +304,7 @@ func (state *runState) issue(ctx context.Context, params domain.ReconciliationIs
 		issue.ResolvedAt = &resolvedAt
 	}
 	issue.Fingerprint = issueFingerprint(issue)
+	issue.ImpactScope = domain.ClassifyReconciliationImpact(issue)
 	issue, err := domain.ReconciliationIssueParams(issue).Build()
 	if err != nil {
 		state.errors = append(state.errors, err)
@@ -309,6 +357,24 @@ func (service *Service) finish(ctx context.Context, state runState, cause error)
 			state.run.Status = domain.ReconciliationRunFailed
 		}
 	}
+	impact := domain.SummarizeReconciliationImpact(state.issues)
+	if impact.AccountWide {
+		state.run.Summary["impact_account_wide"] = 1
+	} else {
+		state.run.Summary["impact_account_wide"] = 0
+	}
+	state.run.Summary["impact_scoped_orders"] = len(impact.OrderIDs)
+	state.run.Summary["impact_scoped_tokens"] = len(impact.TokenIDs)
+	if state.run.Status == domain.ReconciliationRunAttentionRequired {
+		if impact.AccountWide {
+			service.logger.Warn("reconciliation finished with account-wide issues; new placements for the account are blocked",
+				"execution_account_id", state.run.ExecutionAccountID, "run_id", state.run.RunID, "reasons", impact.Reasons)
+		} else {
+			service.logger.Warn("reconciliation finished with scoped issues; only the listed orders/tokens are gated",
+				"execution_account_id", state.run.ExecutionAccountID, "run_id", state.run.RunID,
+				"order_ids", impact.OrderIDs, "token_ids", impact.TokenIDs, "reasons", impact.ScopedReasons)
+		}
+	}
 	completeContext := ctx
 	var cancel context.CancelFunc
 	if ctx.Err() != nil {
@@ -316,7 +382,7 @@ func (service *Service) finish(ctx context.Context, state runState, cause error)
 		defer cancel()
 	}
 	completeErr := service.recorder.Complete(completeContext, *state.run)
-	return Result{Run: *state.run, Issues: state.issues}, errors.Join(cause, completeErr)
+	return Result{Run: *state.run, Issues: state.issues, Impact: impact}, errors.Join(cause, completeErr)
 }
 
 // validTrigger 判断当前业务条件是否成立。

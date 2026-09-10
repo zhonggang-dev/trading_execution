@@ -26,6 +26,9 @@ var (
 	ErrDecisionIntentNotFound    = errors.New("strategy decision intent not found")
 	ErrDecisionIntentConflict    = errors.New("strategy decision intent claim conflict")
 	ErrCancelFinalityPending     = errors.New("cancel fill finality window has not elapsed")
+	ErrOrderRecoveryLeaseHeld    = errors.New("order recovery lease is held by another worker")
+	ErrOrderRecoveryBackoff      = errors.New("order recovery retry is not due yet")
+	ErrOrderRecoveryStaleView    = errors.New("order recovery snapshot revision is stale")
 )
 
 // ExecutionAccountScope is the process-owned account boundary for live
@@ -385,6 +388,31 @@ type FillSyncResult struct {
 // FillSynchronizer 定义对账服务同步单个订单真实成交时依赖的端口。
 type FillSynchronizer interface {
 	SyncOrder(ctx context.Context, orderID string) (FillSyncResult, error)
+}
+
+// OrderRecoveryLeaseStore serializes recovery work on one order across the
+// fast order coordinator and the scheduled reconciliation, and persists the
+// per-order retry schedule so backoff and escalation survive restarts.
+//
+// Acquire returns ErrOrderRecoveryLeaseHeld when another holder owns an
+// unexpired lease, ErrOrderRecoveryBackoff when the persisted next_retry_at is
+// still in the future (unless BypassBackoff), and ErrOrderRecoveryStaleView
+// when the caller's order revision is older than the one already recorded. In
+// all three cases the current lease row is returned alongside the error so the
+// caller can report the pending state without acting on the order.
+//
+// Release only succeeds for the current holder. RESOLVED deletes the row;
+// WAITING/FAILED free the lease and persist the retry schedule.
+type OrderRecoveryLeaseStore interface {
+	AcquireOrderRecoveryLease(ctx context.Context, request domain.OrderRecoveryLeaseRequest) (domain.OrderRecoveryLease, error)
+	ReleaseOrderRecoveryLease(ctx context.Context, release domain.OrderRecoveryRelease) (domain.OrderRecoveryLease, error)
+}
+
+// OrderReservationReader exposes the frozen reservation of one order so
+// reconciliation can bound how much cash or how many shares an unresolved
+// order could have moved on-chain without any local ledger entry yet.
+type OrderReservationReader interface {
+	GetOrderReservation(ctx context.Context, orderID string) (domain.AssetReservation, error)
 }
 
 // AssetReservationManager 定义资金与仓位并发预占的权威边界，实盘实现必须在 PostgreSQL 事务中锁定执行账户行。

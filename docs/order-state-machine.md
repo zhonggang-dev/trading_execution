@@ -64,6 +64,14 @@ Kalshi 的 HTTP `409` 默认也属于不确定结果，不能释放预留。唯�
 finality grace 释放未成交的剩余预留。GET/fills 的短暂 `404`、限流、超时或 5xx 不记入人工处理重试上限，
 也不释放预留。
 
+## 恢复状态的订单级租约
+
+`SUBMITTING/UNKNOWN/RECONCILING/CANCEL_PENDING` 订单的恢复动作（Refresh、成交同步）同时被
+`ordercoordinator` 和定时对账发起。两者在 revision CAS 之外还共享 `order_recovery_leases`：同一
+订单同时只有一个恢复者，失败后按持久化退避重试，超过升级窗口进入人工队列（`ORDER_RECOVERY_STALLED`），
+详见 `docs/reconciliation.md` 的“单笔异常订单的隔离”。`ACKNOWLEDGED/LIVE/PARTIALLY_FILLED` 的常规轮询
+和 `CANCELLED` 的终局释放不经过租约，只受单笔超时约束。
+
 ## Cancel Race
 
 撤单前先持久化 `CANCEL_PENDING + STARTED attempt`：

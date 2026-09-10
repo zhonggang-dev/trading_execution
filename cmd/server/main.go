@@ -22,6 +22,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/executionrouter"
 	"github.com/UniPat-AI/trading_execution/internal/service/ordercoordinator"
+	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 	"github.com/UniPat-AI/trading_execution/internal/service/tradehistory"
 	"github.com/UniPat-AI/trading_execution/internal/transport/httpapi"
@@ -151,14 +152,28 @@ func run() error {
 
 	if database != nil {
 		var coordinatorAccounts []string
+		var recoveryGuard *orderrecovery.Guard
 		if live != nil {
 			coordinatorAccounts = live.activeAccounts
+			recoveryGuard = live.recovery
+		} else {
+			recoveryLeases, leaseErr := postgresadapter.NewOrderRecoveryLeaseStore(database)
+			if leaseErr != nil {
+				return leaseErr
+			}
+			recoveryGuard, err = orderrecovery.NewGuard(orderrecovery.GuardParams{
+				Store: recoveryLeases, Policy: cfg.Execution.OrderRecoveryPolicy(), Logger: logger,
+			})
+			if err != nil {
+				return fmt.Errorf("configure order recovery guard: %w", err)
+			}
 		}
 		coordinator, err := ordercoordinator.New(ordercoordinator.Params{
 			Repository: repository, Execution: executionService,
 			PollInterval: cfg.Execution.CoordinatorInterval,
 			BatchSize:    cfg.Execution.CoordinatorBatchSize,
 			Accounts:     coordinatorAccounts,
+			Recovery:     recoveryGuard,
 		})
 		if err != nil {
 			return err

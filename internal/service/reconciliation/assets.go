@@ -153,6 +153,9 @@ func (state *runState) reconcileBalance(ctx context.Context, executionAccountID 
 	if state.balanceExplainedByFinalityPendingFills(balance.TotalBalance, external.Amount) {
 		return nil
 	}
+	if state.balanceExplainedByUnresolvedOrders(ctx, balance.TotalBalance, external.Amount) {
+		return nil
+	}
 	state.issue(ctx, domain.ReconciliationIssueParams{
 		Type: domain.ReconciliationIssueBalanceDrift, Resolution: domain.ReconciliationResolutionManual,
 		Status: domain.ReconciliationIssueOpen, LocalValue: balance.TotalBalance,
@@ -258,6 +261,14 @@ func (state *runState) comparePositions(
 		baselineByToken[tokenID] = baseline
 	}
 	for tokenID, external := range remote.Positions {
+		if state.tokenUnresolved(tokenID) {
+			// An order on this token is still being recovered; its fills may
+			// already have moved the chain. Compare the token on the next run.
+			delete(localByToken, tokenID)
+			delete(baselineByToken, tokenID)
+			state.run.Summary["positions_deferred_for_unresolved_orders"]++
+			continue
+		}
 		if _, hasLocal := localByToken[tokenID]; !hasLocal && state.absentLocalPositionIsFinalityPending(tokenID, external) {
 			// A BUY whose receipt is not deep enough yet already minted the shares
 			// on-chain; the ledger creates the position only at finality.
@@ -294,6 +305,10 @@ func (state *runState) comparePositions(
 	}
 	redeeming := 0
 	for tokenID, position := range localByToken {
+		if state.tokenUnresolved(tokenID) {
+			state.run.Summary["positions_deferred_for_unresolved_orders"]++
+			continue
+		}
 		if state.absentPositionIsRedeeming(position) {
 			redeeming++
 			continue

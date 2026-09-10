@@ -242,16 +242,25 @@ func TestRunnerCheckAccountDoesNotLetUnrelatedWalletBlockPlacement(t *testing.T)
 	defer stopReadinessTestLoop(t, cancel, done)
 
 	completedAt := clock.Now()
-	runner.remember("main", Result{Run: domain.ReconciliationRun{
-		ExecutionAccountID: "main", Status: domain.ReconciliationRunAttentionRequired, CompletedAt: &completedAt,
-	}})
+	accountWide := domain.ReconciliationIssue{
+		Type: domain.ReconciliationIssueBalanceDrift, Resolution: domain.ReconciliationResolutionManual,
+		Status: domain.ReconciliationIssueOpen, Source: "CHAIN",
+	}
+	accountWide.ImpactScope = domain.ClassifyReconciliationImpact(accountWide)
+	runner.remember("main", Result{
+		Run: domain.ReconciliationRun{
+			ExecutionAccountID: "main", Status: domain.ReconciliationRunAttentionRequired, CompletedAt: &completedAt,
+		},
+		Issues: []domain.ReconciliationIssue{accountWide},
+		Impact: domain.SummarizeReconciliationImpact([]domain.ReconciliationIssue{accountWide}),
+	})
 	if err := runner.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "main") {
 		t.Fatalf("global Check() error = %v, want main reconciliation failure", err)
 	}
 	if err := runner.CheckAccount(context.Background(), "wallet-7"); err != nil {
 		t.Fatalf("wallet-7 CheckAccount() error = %v, want healthy account placement", err)
 	}
-	if err := runner.CheckAccount(context.Background(), "main"); err == nil || !strings.Contains(err.Error(), "ATTENTION_REQUIRED") {
+	if err := runner.CheckAccount(context.Background(), "main"); err == nil || !strings.Contains(err.Error(), "account-wide") {
 		t.Fatalf("main CheckAccount() error = %v, want account-local failure", err)
 	}
 	if err := runner.CheckAccount(context.Background(), "wallet-8"); err == nil || !strings.Contains(err.Error(), "not active") {
@@ -344,5 +353,63 @@ func stopReadinessTestLoop(t *testing.T, cancel context.CancelFunc, done <-chan 
 		}
 	case <-time.After(time.Second):
 		t.Fatal("reconciliation loop did not stop")
+	}
+}
+
+// TestRunnerScopedIssueGatesOnlyTheAffectedMarket 验证单张订单的问题只拦截同一
+// market/token 的新下单，其余市场和全局就绪状态不受影响。
+func TestRunnerScopedIssueGatesOnlyTheAffectedMarket(t *testing.T) {
+	clock := &runnerTestClock{now: time.Date(2026, time.September, 10, 3, 20, 0, 0, time.UTC)}
+	service := &fakeAccountReconciler{now: clock.Now}
+	runner, err := NewRunner(RunnerParams{
+		Service: service, Accounts: []string{"main"}, Interval: time.Hour,
+		Now: clock.Now, MaxResultAge: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Sweep(context.Background(), domain.ReconciliationTriggerStartup)
+	cancel, done := startReadinessTestLoop(t, runner)
+	defer stopReadinessTestLoop(t, cancel, done)
+
+	completedAt := clock.Now()
+	scoped := domain.ReconciliationIssue{
+		Type: domain.ReconciliationIssueSourceUnavailable, Resolution: domain.ReconciliationResolutionRetry,
+		Status: domain.ReconciliationIssueOpen, OrderID: "order-unknown", MarketID: "market-1",
+		ConditionID: "condition-1", TokenID: "token-1", Source: "CLOB_ORDER",
+	}
+	scoped.ImpactScope = domain.ClassifyReconciliationImpact(scoped)
+	if scoped.ImpactScope != domain.ReconciliationImpactOrder {
+		t.Fatalf("impact scope = %s, want ORDER", scoped.ImpactScope)
+	}
+	runner.remember("main", Result{
+		Run: domain.ReconciliationRun{
+			ExecutionAccountID: "main", Status: domain.ReconciliationRunAttentionRequired, CompletedAt: &completedAt,
+		},
+		Issues: []domain.ReconciliationIssue{scoped},
+		Impact: domain.SummarizeReconciliationImpact([]domain.ReconciliationIssue{scoped}),
+	})
+	if err := runner.Check(context.Background()); err != nil {
+		t.Fatalf("global Check() error = %v, want scoped issue not to degrade global readiness", err)
+	}
+	if err := runner.CheckAccount(context.Background(), "main"); err != nil {
+		t.Fatalf("CheckAccount() error = %v, want scoped issue to keep the account tradable", err)
+	}
+	blocked := domain.Order{Intent: domain.OrderIntent{ExecutionAccountID: "main", MarketID: "market-9", TokenID: "token-1"}}
+	if err := runner.CheckPlacement(context.Background(), blocked); err == nil || !strings.Contains(err.Error(), "order-unknown") {
+		t.Fatalf("CheckPlacement(same token) error = %v, want scoped block", err)
+	}
+	sameCondition := domain.Order{Intent: domain.OrderIntent{ExecutionAccountID: "main", MarketID: "market-9", ConditionID: "CONDITION-1", TokenID: "token-2"}}
+	if err := runner.CheckPlacement(context.Background(), sameCondition); err == nil {
+		t.Fatal("CheckPlacement(same condition, other outcome) error = nil, want scoped block")
+	}
+	unrelated := domain.Order{Intent: domain.OrderIntent{ExecutionAccountID: "main", MarketID: "market-2", ConditionID: "condition-2", TokenID: "token-2"}}
+	if err := runner.CheckPlacement(context.Background(), unrelated); err != nil {
+		t.Fatalf("CheckPlacement(unrelated market) error = %v, want allowed", err)
+	}
+	failed := Result{Run: domain.ReconciliationRun{ExecutionAccountID: "main", Status: domain.ReconciliationRunFailed, CompletedAt: &completedAt}}
+	runner.remember("main", failed)
+	if err := runner.CheckPlacement(context.Background(), unrelated); err == nil || !strings.Contains(err.Error(), "FAILED") {
+		t.Fatalf("CheckPlacement(after FAILED run) error = %v, want blocked", err)
 	}
 }

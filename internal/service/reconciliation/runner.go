@@ -242,8 +242,10 @@ func (runner *Runner) runLoop(ctx context.Context, initialErrors []error, ready 
 	}
 }
 
-// Check implements live readiness. Every configured account must have a fresh,
-// completed reconciliation and the background loop must be running and active.
+// Check implements live readiness. Every configured account must have a fresh
+// finished scan without account-wide issues, and the background loop must be
+// running and active. Scoped issues (one order, one token) degrade only the
+// affected placements through CheckPlacement, never the whole process.
 func (runner *Runner) Check(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -282,12 +284,53 @@ func (runner *Runner) CheckAccount(ctx context.Context, accountID string) error 
 	return runner.checkLoopLocked(now)
 }
 
+// CheckPlacement gates one concrete placement. Beyond the account freshness
+// and account-wide checks it refuses only intents whose token, condition, or
+// market is named by an OPEN scoped issue of the latest finished scan.
+func (runner *Runner) CheckPlacement(ctx context.Context, order domain.Order) error {
+	if err := runner.CheckAccount(ctx, order.Intent.ExecutionAccountID); err != nil {
+		return err
+	}
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	result := runner.lastResults[strings.TrimSpace(order.Intent.ExecutionAccountID)]
+	for _, issue := range result.Issues {
+		if issue.Status != domain.ReconciliationIssueOpen || !issue.BlocksIntent(order.Intent) {
+			continue
+		}
+		return fmt.Errorf(
+			"execution account %q has an open %s issue (%s) on market %s / token %s (order %s); only that market is gated",
+			order.Intent.ExecutionAccountID, issue.Type, issue.Resolution, firstNonEmpty(issue.MarketID, issue.ConditionID),
+			issue.TokenID, issue.OrderID,
+		)
+	}
+	return nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func (runner *Runner) checkAccountResultLocked(accountID string, now time.Time) error {
 	result, exists := runner.lastResults[accountID]
 	if !exists {
 		return fmt.Errorf("execution account %q has not completed reconciliation", accountID)
 	}
-	if result.Run.Status != domain.ReconciliationRunCompleted {
+	switch result.Run.Status {
+	case domain.ReconciliationRunCompleted:
+	case domain.ReconciliationRunAttentionRequired:
+		// The scan finished. Only account-wide issues block every placement;
+		// scoped issues are enforced per intent by CheckPlacement.
+		if result.Impact.AccountWide {
+			return fmt.Errorf("execution account %q reconciliation has account-wide open issues: %s",
+				accountID, strings.Join(result.Impact.Reasons, ", "))
+		}
+	default:
 		return fmt.Errorf("execution account %q reconciliation status is %s", accountID, result.Run.Status)
 	}
 	if result.Run.CompletedAt == nil || result.Run.CompletedAt.IsZero() {

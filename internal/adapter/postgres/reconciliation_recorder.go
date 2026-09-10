@@ -84,6 +84,12 @@ func (recorder *ReconciliationRecorder) RecordIssue(ctx context.Context, issue d
 			return nil
 		}
 	}
+	// The persisted scope is what the live risk authorization and the submit
+	// trigger read; an unclassified issue fails closed to the whole account.
+	impactScope := issue.ImpactScope
+	if impactScope == "" {
+		impactScope = domain.ClassifyReconciliationImpact(issue)
+	}
 	conflictClause := "ON CONFLICT DO NOTHING"
 	if issue.Status == domain.ReconciliationIssueOpen {
 		// Re-observing the same open fingerprint moves its evidence to this
@@ -97,24 +103,25 @@ func (recorder *ReconciliationRecorder) RecordIssue(ctx context.Context, issue d
 				source = EXCLUDED.source,
 				local_value = EXCLUDED.local_value,
 				remote_value = EXCLUDED.remote_value,
-				observed_at = EXCLUDED.observed_at`
+				observed_at = EXCLUDED.observed_at,
+				impact_scope = EXCLUDED.impact_scope`
 	}
 	_, err := recorder.db.ExecContext(ctx, `
 		INSERT INTO reconciliation_issues (
 			issue_id, run_id, fingerprint, execution_account_id, issue_type,
 			resolution, status, order_id, venue_order_id, venue_trade_id,
 			market_id, condition_id, token_id, local_value, remote_value, source,
-			details, observed_at, resolved_at
+			details, observed_at, resolved_at, impact_scope
 		) VALUES (
 			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
-			NULLIF($14,'')::numeric,NULLIF($15,'')::numeric,$16,$17,$18,$19
+			NULLIF($14,'')::numeric,NULLIF($15,'')::numeric,$16,$17,$18,$19,$20
 		)
 		`+conflictClause,
 		issue.IssueID, issue.RunID, issue.Fingerprint, issue.ExecutionAccountID,
 		string(issue.Type), string(issue.Resolution), string(issue.Status),
 		issue.OrderID, issue.VenueOrderID, issue.VenueTradeID, issue.MarketID,
 		issue.ConditionID, issue.TokenID, issue.LocalValue.String(), issue.RemoteValue.String(),
-		issue.Source, issue.Details, issue.ObservedAt.UTC(), issue.ResolvedAt)
+		issue.Source, issue.Details, issue.ObservedAt.UTC(), issue.ResolvedAt, string(impactScope))
 	if err != nil {
 		return fmt.Errorf("record reconciliation issue: %w", err)
 	}

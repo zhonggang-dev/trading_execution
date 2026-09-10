@@ -146,3 +146,12 @@ func preSubmitFundingRejection(code, message string, cause error) error {
 
 var _ port.Venue = (*ConditionalFundingVenue)(nil)
 var _ port.PreparedVenue = (*ConditionalFundingVenue)(nil)
+
+// SupportsTimeInForce forwards the optional venue capability so the emulated
+// IOC decision made by execution still sees the CLOB's real order types.
+func (venue *ConditionalFundingVenue) SupportsTimeInForce(timeInForce domain.TimeInForce) bool {
+	support, ok := venue.venue.(port.TimeInForceSupport)
+	return !ok || support.SupportsTimeInForce(timeInForce)
+}
+
+var _ port.TimeInForceSupport = (*ConditionalFundingVenue)(nil)
