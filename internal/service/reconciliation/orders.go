@@ -20,9 +20,10 @@ type reconcileOrdersParams struct {
 
 // reconcileOrderParams 收拢单张订单对账所需的上下文证据。
 type reconcileOrderParams struct {
-	order        domain.Order
-	focusOrderID string
-	evidence     venueEvidence
+	order         domain.Order
+	focusOrderID  string
+	forceFillSync bool
+	evidence      venueEvidence
 }
 
 // orderSourceIssueParams 收拢单张订单外部数据源异常的记录信息。
@@ -51,7 +52,8 @@ func (state *runState) reconcileOrders(ctx context.Context, params reconcileOrde
 			state.errors = append(state.errors, err)
 			return
 		}
-		state.reconcileOrder(ctx, reconcileOrderParams{order: order, focusOrderID: params.focusOrderID, evidence: params.evidence})
+		_, forceFillSync := state.recovery.forceFillSync[order.ID]
+		state.reconcileOrder(ctx, reconcileOrderParams{order: order, focusOrderID: params.focusOrderID, evidence: params.evidence, forceFillSync: forceFillSync})
 	}
 }
 
@@ -63,7 +65,7 @@ func (state *runState) reconcileOrder(ctx context.Context, params reconcileOrder
 		return
 	}
 	_, tradeReferenced := params.evidence.ordersWithTrades[normalizedID(params.order.VenueOrderID)]
-	if !shouldSyncOrderFills(params.order, params.focusOrderID, tradeReferenced) && !orderNeedsRefresh(params.order) {
+	if !params.forceFillSync && !shouldSyncOrderFills(params.order, params.focusOrderID, tradeReferenced) && !orderNeedsRefresh(params.order) {
 		stepCtx, cancel := context.WithTimeout(ctx, state.service.recovery.Policy().Timeout)
 		defer cancel()
 		result := state.reconcileOrderSteps(stepCtx, params)
@@ -108,7 +110,7 @@ func (state *runState) reconcileOrderSteps(ctx context.Context, params reconcile
 	_, tradeReferenced := params.evidence.ordersWithTrades[normalizedID(params.order.VenueOrderID)]
 	_, pendingTrade := params.evidence.ordersWithPendingTrades[normalizedID(params.order.VenueOrderID)]
 	fillEvidenceComplete := params.evidence.tradesAvailable && !tradeReferenced
-	if shouldSyncOrderFills(params.order, params.focusOrderID, tradeReferenced) {
+	if params.forceFillSync || shouldSyncOrderFills(params.order, params.focusOrderID, tradeReferenced) {
 		// A successful order-level read can recover delayed fills, but it must
 		// not turn an unavailable account-level trade scan into proof that a
 		// cancelled order had no fills. Cancellation finality requires both
