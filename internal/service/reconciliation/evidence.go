@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
 // venueEvidence 保存本次账户级交易扫描对单订单处理有用的最小证据。
@@ -72,6 +73,29 @@ func (state *runState) loadLocalAuthority(ctx context.Context, scope accountRunS
 	if err != nil {
 		state.addInfrastructureIssue(ctx, "POSTGRES_ORDERS", "read local orders", err)
 		return domain.AccountBalance{}, nil, err
+	}
+	if source, ok := state.service.orders.(port.ReconciliationIssueOrderRepository); ok {
+		recoveryOrders, err := source.ListWithOpenReconciliationIssues(ctx, scope.executionAccountID)
+		if err != nil {
+			state.addInfrastructureIssue(ctx, "POSTGRES_RECOVERY_ORDERS", "read orders with unresolved issues", err)
+			return domain.AccountBalance{}, nil, err
+		}
+		state.run.VerifyReconciliation("source", "POSTGRES_RECOVERY_ORDERS")
+		state.run.Summary["orders_with_open_issues"] = len(recoveryOrders)
+		indexes := make(map[string]int, len(orders))
+		for i, order := range orders {
+			indexes[order.ID] = i
+		}
+		state.recovery.forceFillSync = make(map[string]struct{}, len(recoveryOrders))
+		for _, order := range recoveryOrders {
+			state.recovery.forceFillSync[order.ID] = struct{}{}
+			if i, exists := indexes[order.ID]; exists {
+				orders[i] = order
+			} else {
+				indexes[order.ID] = len(orders)
+				orders = append(orders, order)
+			}
+		}
 	}
 	state.run.Summary["local_orders"] = len(orders)
 	state.run.VerifyReconciliation("source", "POSTGRES_ORDERS")

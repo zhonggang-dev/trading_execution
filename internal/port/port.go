@@ -194,6 +194,13 @@ type ReconciliationOrderRepository interface {
 	ListForReconciliation(ctx context.Context, executionAccountID string, updatedAfter time.Time) ([]domain.Order, error)
 }
 
+// ReconciliationIssueOrderRepository keeps unresolved, retryable order issues
+// in the recovery set after their orders leave the ordinary lookback window.
+// The returned orders require an explicit fill read even when already terminal.
+type ReconciliationIssueOrderRepository interface {
+	ListWithOpenReconciliationIssues(ctx context.Context, executionAccountID string) ([]domain.Order, error)
+}
+
 // VenueReconciliationSource 表示后端使用的 VenueReconciliationSource 类型。
 type VenueReconciliationSource interface {
 	ListReconciliationOpenOrders(ctx context.Context, executionAccountID string) ([]domain.VenueOrderSnapshot, error)

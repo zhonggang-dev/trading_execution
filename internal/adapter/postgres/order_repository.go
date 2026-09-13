@@ -449,6 +449,38 @@ func (repository *OrderRepository) ListForReconciliation(
 	return orders, nil
 }
 
+var _ port.ReconciliationIssueOrderRepository = (*OrderRepository)(nil)
+
+// ListWithOpenReconciliationIssues selects retryable owned-order problems
+// independently of order age and status. EXISTS deduplicates multiple issues;
+// the recovery guard still enforces each order's lease and durable backoff.
+func (repository *OrderRepository) ListWithOpenReconciliationIssues(ctx context.Context, executionAccountID string) ([]domain.Order, error) {
+	rows, err := repository.db.QueryContext(ctx, selectOrderColumns+`
+        WHERE execution_account_id=$1 AND EXISTS (
+            SELECT 1 FROM reconciliation_issues issue
+            WHERE issue.execution_account_id=execution_orders.execution_account_id
+              AND issue.order_id=execution_orders.order_id
+              AND issue.status='OPEN' AND issue.impact_scope='ORDER'
+              AND (issue.resolution='RETRY_LATER' OR issue.issue_type='ORDER_RECOVERY_STALLED')
+        ) ORDER BY created_at, order_id`, strings.TrimSpace(executionAccountID))
+	if err != nil {
+		return nil, fmt.Errorf("query orders with open reconciliation issues: %w", err)
+	}
+	defer rows.Close()
+	var orders []domain.Order
+	for rows.Next() {
+		order, err := scanOrder(rows)
+		if err != nil {
+			return nil, err
+		}
+		orders = append(orders, order)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate orders with open reconciliation issues: %w", err)
+	}
+	return orders, nil
+}
+
 // insertOrderEvent 在当前事务中插入 Order Event。
 func insertOrderEvent(ctx context.Context, tx *sql.Tx, event domain.OrderEvent) error {
 	_, err := tx.ExecContext(ctx, `

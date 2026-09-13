@@ -289,8 +289,9 @@ type runState struct {
 
 // recoveryState collects the per-order recovery results of one run.
 type recoveryState struct {
-	outcomes   []orderRecoveryOutcome
-	unresolved unresolvedOrders
+	outcomes      []orderRecoveryOutcome
+	unresolved    unresolvedOrders
+	forceFillSync map[string]struct{}
 }
 
 // issue 补全对账问题身份并通过参数构建器持久化到运行结果。
