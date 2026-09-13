@@ -52,6 +52,10 @@ side，再用该分量的数量和价格核验 finalized Polygon OrderFilled 回
 前后数量连续、经过旧远端 30，且最终净变化精确解释当前仓位。缺失流水、非成交调整、
 证据不完整、本轮仍有同 token 问题或扫描开始后仍在入账时保留限制；此过程不改写成交或账本。
 
+主动取消或整轮超时会将任务记为FAILED，并保留已有问题；取消后的未执行读取不能被记成
+新的账户级数据源故障。父任务仍正常时的依赖超时、独立数据库错误继续按原规则记录。
+日常验收使用SCHEDULED范围；ASSET_DRIFT明确扫描全部历史，不应作为普通健康检查调用。
+
 CLOB 已报告 `CONFIRMED`、Polygon receipt 也已稳定但确认数还没到阈值的成交，是预期中的传播
 状态，不是数据源故障。它会带着完整 OrderFilled 证据以 `MINED` 状态写入 `execution_fills`
 （`applied_at IS NULL`），订单进入 `UNKNOWN + VENUE_FILL_EVIDENCE_PENDING`，预占保持冻结；

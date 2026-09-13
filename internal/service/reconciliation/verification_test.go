@@ -3,11 +3,77 @@ package reconciliation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
+
+func TestCancelledScanDoesNotInventInfrastructureGates(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		cancelled          bool
+		deadline           bool
+		independentFailure bool
+		wantIssue          bool
+	}{
+		{name: "cancelled parent", cancelled: true},
+		{name: "expired parent", deadline: true},
+		{name: "active parent dependency timeout", wantIssue: true},
+		{name: "real failure despite cancellation", cancelled: true, independentFailure: true, wantIssue: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.cancelled {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			} else if tc.deadline {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer cancel()
+			}
+			cause := error(context.DeadlineExceeded)
+			if ctx.Err() != nil {
+				cause = ctx.Err()
+			}
+			if tc.independentFailure {
+				cause = errors.New("database connection refused")
+			}
+			fixture := newRecoveryFixture()
+			service := fixture.service(t, orderrecovery.Policy{})
+			history := domain.ReconciliationIssue{IssueID: "existing", Type: domain.ReconciliationIssuePositionDrift,
+				Status: domain.ReconciliationIssueOpen, Resolution: domain.ReconciliationResolutionManual,
+				TokenID: "existing-token", ImpactScope: domain.ReconciliationImpactToken}
+			recorder := &completionStateRecorder{open: []domain.ReconciliationIssue{history}}
+			service.recorder = recorder
+			run, err := (domain.ReconciliationRunParams{RunID: "cancel-test", ExecutionAccountID: "account-1",
+				Trigger: domain.ReconciliationTriggerScheduled, StartedAt: testNow}).Build()
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := runState{service: service, run: &run, now: testNow}
+			state.addInfrastructureIssue(ctx, "POSTGRES_FILLS", "read pending fills", fmt.Errorf("wrapped: %w", cause))
+			if (len(recorder.issues) > 0) != tc.wantIssue {
+				t.Fatalf("recorded issues=%#v, wantIssue=%v", recorder.issues, tc.wantIssue)
+			}
+			if run.Summary["verified_source:POSTGRES_FILLS"] != 0 {
+				t.Fatal("aborted source marked verified")
+			}
+			if ctx.Err() != nil {
+				result, err := service.finish(ctx, state, errors.Join(ctx.Err(), errors.Join(state.errors...)))
+				if !errors.Is(err, ctx.Err()) || result.Run.Status != domain.ReconciliationRunFailed {
+					t.Fatalf("cancelled run not finalized: %#v %v", result, err)
+				}
+				if len(result.Issues) != 1 || result.Issues[0].IssueID != "existing" {
+					t.Fatalf("existing gate was lost: %#v", result.Issues)
+				}
+			}
+		})
+	}
+}
 
 func TestPartialRunVerifiesOnlyComparedAssets(t *testing.T) {
 	fixture := newRecoveryFixture()
