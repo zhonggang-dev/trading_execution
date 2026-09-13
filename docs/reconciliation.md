@@ -46,6 +46,12 @@ side，再用该分量的数量和价格核验 finalized Polygon OrderFilled 回
 原差额时才能自动关闭。仓位减少交给精确 SELL 证据分支；通用 fill-lag 分支不得绕过其来源、
 订单身份和完整数量差额检查。不能通过删除 OPEN issue 或手改 UNKNOWN 恢复交易。
 
+连续成交可能使旧远端快照变成中间值，例如本地 60、远端 30，三笔已确认 SELL 回填后
+流水为 60→45→30→15。后续对账独立核实当前 15 后，允许按完整流水关闭旧差异：每个
+非零份额事件必须关联同账户、market、condition、token、方向和订单的 finalized Fill，
+前后数量连续、经过旧远端 30，且最终净变化精确解释当前仓位。缺失流水、非成交调整、
+证据不完整、本轮仍有同 token 问题或扫描开始后仍在入账时保留限制；此过程不改写成交或账本。
+
 CLOB 已报告 `CONFIRMED`、Polygon receipt 也已稳定但确认数还没到阈值的成交，是预期中的传播
 状态，不是数据源故障。它会带着完整 OrderFilled 证据以 `MINED` 状态写入 `execution_fills`
 （`applied_at IS NULL`），订单进入 `UNKNOWN + VENUE_FILL_EVIDENCE_PENDING`，预占保持冻结；

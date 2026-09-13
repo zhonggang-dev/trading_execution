@@ -167,6 +167,7 @@ func (recorder *ReconciliationRecorder) CompleteWithState(ctx context.Context, r
 		resolvers := []func(context.Context, *sql.Tx, domain.ReconciliationRun) (int, error){
 			resolveFillLagDriftIssues, resolvePolymarketPositionPrecisionIssues,
 			resolveRecoveredSellPositionDriftIssues, resolveVerifiedTransientIssues,
+			resolveRecoveredSellPositionTrajectoryIssues,
 		}
 		// Wallet migration crosses scopes and retains its original full-scan guard.
 		if run.Status == domain.ReconciliationRunCompleted {
@@ -373,6 +374,81 @@ func resolveRecoveredSellPositionDriftIssues(ctx context.Context, tx *sql.Tx, ru
 		return 0, fmt.Errorf("count recovered SELL position drift issues: %w", err)
 	}
 	return int(resolved), nil
+}
+
+// resolveRecoveredSellPositionTrajectoryIssues handles a stale remote snapshot
+// that became an intermediate balance while several confirmed fills were being
+// recovered. Every share-changing event must link to an exact finalized fill,
+// form a continuous path from the observed local balance through the old remote
+// balance to the independently verified current balance, and predate this sweep.
+// A missing event, unrelated adjustment, or concurrent application leaves it open.
+func resolveRecoveredSellPositionTrajectoryIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
+	result, err := tx.ExecContext(ctx, `
+ UPDATE reconciliation_issues issue
+ SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+     details=issue.details || '; independently verified current position and a continuous finalized-fill ledger path through the observed remote position'
+ FROM execution_positions position
+ WHERE issue.execution_account_id=$1 AND issue.status='OPEN'
+   AND issue.resolution='MANUAL_REVIEW' AND issue.issue_type='POSITION_DRIFT'
+   AND issue.run_id<>$2 AND issue.source='POLYMARKET_DATA_API'
+   AND issue.market_id<>'' AND issue.condition_id<>'' AND issue.token_id<>''
+   AND issue.local_value>issue.remote_value
+   AND $4::jsonb->>('verified_position:' || issue.token_id)='1'
+   AND position.execution_account_id=issue.execution_account_id
+   AND position.market_id=issue.market_id AND position.condition_id=issue.condition_id
+   AND position.token_id=issue.token_id AND position.total_shares<>issue.remote_value
+   AND NOT EXISTS (
+     SELECT 1 FROM reconciliation_issues active
+     WHERE active.execution_account_id=issue.execution_account_id AND active.run_id=$2
+       AND active.status='OPEN' AND active.token_id=issue.token_id
+   )
+   AND NOT EXISTS (
+     SELECT 1 FROM position_events concurrent
+     WHERE concurrent.execution_account_id=issue.execution_account_id
+       AND concurrent.token_id=issue.token_id AND concurrent.shares_delta<>0
+       AND concurrent.occurred_at>$5
+   )
+   AND EXISTS (
+     WITH trajectory AS (
+       SELECT event.fill_key,event.shares_delta,event.shares_after,event.event_type,
+         LAG(event.shares_after,1,issue.local_value) OVER (
+           ORDER BY event.occurred_at,event.position_event_id
+         ) AS previous_shares,
+         COALESCE(
+           event.market_id=issue.market_id AND event.order_id=fill.order_id
+           AND fill.execution_account_id=issue.execution_account_id
+           AND fill.market_id=issue.market_id AND fill.condition_id=issue.condition_id
+           AND fill.token_id=issue.token_id AND fill.venue='polymarket'
+           AND fill.status='CONFIRMED' AND fill.fee_source='POLYGON_V2_ORDER_FILLED'
+           AND fill.venue_fill_id<>'' AND fill.venue_order_id<>'' AND fill.order_id<>''
+           AND fill.applied_at>issue.observed_at AND fill.applied_at<=$5
+           AND ((event.event_type='SOLD' AND fill.side='SELL' AND event.shares_delta=-fill.shares)
+             OR (event.event_type='BOUGHT' AND fill.side='BUY' AND event.shares_delta=fill.shares))
+           AND local_order.execution_account_id=issue.execution_account_id
+           AND local_order.venue='polymarket' AND local_order.market_id=issue.market_id
+           AND local_order.token_id=issue.token_id
+           AND local_order.venue_order_id=fill.venue_order_id
+           AND local_order.intent->>'condition_id'=issue.condition_id
+           AND local_order.intent->>'side'=fill.side, false
+         ) AS exact_finalized_fill
+       FROM position_events event
+       LEFT JOIN execution_fills fill ON fill.fill_key=event.fill_key
+       LEFT JOIN execution_orders local_order ON local_order.order_id=fill.order_id
+       WHERE event.execution_account_id=issue.execution_account_id
+         AND event.token_id=issue.token_id AND event.shares_delta<>0
+         AND event.occurred_at>issue.observed_at AND event.occurred_at<=$5
+     )
+     SELECT 1 FROM trajectory
+     HAVING BOOL_AND(exact_finalized_fill AND shares_after-shares_delta=previous_shares)
+       AND BOOL_OR(event_type='SOLD') AND BOOL_OR(shares_after=issue.remote_value)
+       AND COUNT(*)=COUNT(DISTINCT fill_key)
+       AND SUM(shares_delta)=position.total_shares-issue.local_value
+   )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), verificationJSON(run), run.StartedAt.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("resolve finalized-fill position trajectory: %w", err)
+	}
+	count, err := result.RowsAffected()
+	return int(count), err
 }
 
 // resolveWalletMigrationIssues closes only discrepancies that are made stale
