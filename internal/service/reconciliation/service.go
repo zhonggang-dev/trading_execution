@@ -238,7 +238,13 @@ func (service *Service) RunAccount(ctx context.Context, params RunAccountParams)
 	}
 	scope.scanAfter = applyAccountOwnershipBaseline(scope.scanAfter, balance)
 	evidence, venueErr := state.collectVenueEvidence(ctx, scope, orders)
+	if ctx.Err() != nil {
+		return service.finish(ctx, state, errors.Join(venueErr, ctx.Err(), errors.Join(state.errors...)))
+	}
 	state.reconcileOrders(ctx, reconcileOrdersParams{orders: orders, focusOrderID: scope.focusOrderID, evidence: evidence})
+	if ctx.Err() != nil {
+		return service.finish(ctx, state, errors.Join(venueErr, ctx.Err(), errors.Join(state.errors...)))
+	}
 	// Without the in-flight redemption view a missing settled position or a
 	// payout-sized balance gain cannot be told apart from real drift, so the
 	// asset comparison is skipped for this run rather than risking a permanent
@@ -327,6 +333,13 @@ func (state *runState) issue(ctx context.Context, params domain.ReconciliationIs
 
 // addInfrastructureIssue 累加或记录 Infrastructure Issue。
 func (state *runState) addInfrastructureIssue(ctx context.Context, source, operation string, err error) {
+	// A cancelled sweep did not verify this source. It must end as FAILED,
+	// without inventing a durable account-wide outage for an unattempted read.
+	// A dependency timeout while the parent is active remains a real issue.
+	if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		state.errors = append(state.errors, err)
+		return
+	}
 	state.issue(ctx, domain.ReconciliationIssueParams{
 		Type: domain.ReconciliationIssueSourceUnavailable, Resolution: domain.ReconciliationResolutionRetry,
 		Status: domain.ReconciliationIssueOpen, Source: source,

@@ -415,6 +415,9 @@ func TestRunAccountFinalizesFailedRunAfterShutdownCancellation(t *testing.T) {
 	if recorder.completeContextErr != nil {
 		t.Fatalf("completion context error = %v, want independent active context", recorder.completeContextErr)
 	}
+	if len(recorder.issues) != 0 || result.Impact.AccountWide {
+		t.Fatalf("shutdown invented a durable source outage: issues=%#v impact=%#v", recorder.issues, result.Impact)
+	}
 }
 
 func TestRunAccountFinalizesFailedRunWhenDependenciesIgnoreShutdownCancellation(t *testing.T) {
