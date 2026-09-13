@@ -356,7 +356,13 @@ func (repository *OrderRepository) listPending(
 			AND failure_code IN ('CLOB_FILL_DETAILS_UNAVAILABLE', 'VENUE_FILL_EVIDENCE_PENDING')
 			AND LOWER(BTRIM(venue)) <> 'kalshi'
 		  )
-		  AND updated_at <= $1`+accountClause+`
+		  AND updated_at <= $1
+  AND NOT EXISTS (
+   SELECT 1 FROM order_recovery_leases recovery
+   WHERE recovery.order_id=execution_orders.order_id
+    AND ((recovery.holder<>'' AND recovery.expires_at>clock_timestamp())
+      OR recovery.next_retry_at>clock_timestamp())
+  )`+accountClause+`
 		ORDER BY updated_at, order_id
 		LIMIT $2`, arguments...)
 	if err != nil {

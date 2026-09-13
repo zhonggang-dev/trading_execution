@@ -49,10 +49,10 @@ func (store *OrderRecoveryLeaseStore) AcquireOrderRecoveryLease(_ context.Contex
 		if current.HeldAt(now, request.Holder) {
 			return current, port.ErrOrderRecoveryLeaseHeld
 		}
-		if current.OrderRevision > request.OrderRevision {
+		if current.ExecutionAccountID != request.ExecutionAccountID || current.OrderRevision > request.OrderRevision {
 			return current, port.ErrOrderRecoveryStaleView
 		}
-		if !request.BypassBackoff && !current.RetryDueAt(now) {
+		if !current.RetryDueAt(now) {
 			return current, port.ErrOrderRecoveryBackoff
 		}
 	} else {

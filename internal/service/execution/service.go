@@ -862,8 +862,12 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 	if order.Status == domain.OrderStatusFilled {
 		return order, nil
 	}
-	if order.Status != domain.OrderStatusCancelled || observed.ObservedAt.IsZero() ||
-		service.now().UTC().Sub(observed.ObservedAt.UTC()) < service.cancelFillFinalityGrace {
+	// A fresh GET timestamps the read, not the cancellation. Starting grace
+	// from every GET would postpone release forever even with complete evidence.
+	// VenueLastObservedAt is the persisted cancellation observation; evidence-only
+	// deferrals do not move it. A missing anchor still fails closed.
+	if order.Status != domain.OrderStatusCancelled || order.VenueLastObservedAt == nil ||
+		service.now().UTC().Sub(order.VenueLastObservedAt.UTC()) < service.cancelFillFinalityGrace {
 		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_GRACE_PENDING", "authoritative venue observation is still inside the fill-finality grace period")
 		return order, errors.Join(ErrCancelFinalityPending, deferErr)
 	}
@@ -876,6 +880,9 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 }
 
 func (service *Service) deferCancellationFinality(ctx context.Context, order *domain.Order, code, reason string) error {
+	if order.Status == domain.OrderStatusCancelled && order.FailureCode == strings.TrimSpace(code) && order.FailureReason == strings.TrimSpace(reason) {
+		return nil
+	}
 	return service.transition(ctx, order, domain.OrderStatusCancelled, domain.TransitionTriggerReconciliation, transitionDetails{
 		reasonCode: strings.TrimSpace(code),
 		reason:     strings.TrimSpace(reason),

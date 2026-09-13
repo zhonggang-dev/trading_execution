@@ -124,11 +124,20 @@ func (state *runState) markUnresolved(ctx context.Context, entry orderRecoveryOu
 	switch {
 	case entry.outcome.Skipped:
 		state.recordRecoveryPending(ctx, entry, "recovery is "+strings.ToLower(strings.ReplaceAll(string(entry.outcome.SkipReason), "_", " ")))
+	case entry.outcome.StoreErr != nil:
+		state.recordRecoveryPending(ctx, entry, "order recovery lease store failed: "+entry.outcome.StoreErr.Error())
 	case entry.outcome.Err != nil:
-		// The failing step already recorded an order-scoped SOURCE_UNAVAILABLE
-		// issue; a second issue for the same run adds nothing.
-		if entry.outcome.StoreErr != nil {
-			state.recordRecoveryPending(ctx, entry, "order recovery lease store failed: "+entry.outcome.StoreErr.Error())
+		// A timeout can be detected by the guard after a dependency returns nil.
+		// Never assume the step already persisted an issue in that case.
+		reported := false
+		for _, issue := range state.issues {
+			if issue.OrderID == entry.order.ID && issue.Status == domain.ReconciliationIssueOpen {
+				reported = true
+				break
+			}
+		}
+		if !reported {
+			state.recordRecoveryPending(ctx, entry, "recovery attempt failed: "+entry.outcome.Err.Error())
 		}
 	default:
 		if lease.PendingSince(state.now) < state.service.recoveryPendingGrace {

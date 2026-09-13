@@ -80,8 +80,15 @@ func TestGuardFailureBacksOffAndBlocksEarlyRetry(t *testing.T) {
 	focused := guard.Run(context.Background(), RunParams{Order: order, Holder: "worker-b", BypassBackoff: true, Work: func(context.Context) (domain.OrderRecoveryOutcomeKind, error) {
 		return domain.OrderRecoveryOutcomeFailed, venueDown
 	}})
-	if focused.Skipped || focused.Lease.Attempts != 2 || !focused.Lease.NextRetryAt.Equal(clock.now.Add(time.Minute)) {
-		t.Fatalf("focused outcome = %#v, want second attempt with 60s backoff", focused)
+	if !focused.Skipped || focused.SkipReason != SkipReasonBackoff || focused.Lease.Attempts != 1 {
+		t.Fatalf("focused trigger bypassed durable backoff: %#v", focused)
+	}
+	clock.now = guardTestNow.Add(30 * time.Second)
+	retry := guard.Run(context.Background(), RunParams{Order: order, Holder: "worker-b", Work: func(context.Context) (domain.OrderRecoveryOutcomeKind, error) {
+		return domain.OrderRecoveryOutcomeFailed, venueDown
+	}})
+	if retry.Lease.Attempts != 2 || !retry.Lease.NextRetryAt.Equal(clock.now.Add(time.Minute)) {
+		t.Fatalf("retry=%#v", retry)
 	}
 
 	clock.now = clock.now.Add(2 * time.Minute)
@@ -177,16 +184,57 @@ func TestGuardEscalatesAfterWindowWithoutResettingOnWaiting(t *testing.T) {
 	if !third.Escalated || third.Lease.EscalatedAt == nil || !third.Lease.EscalatedAt.Equal(clock.now) {
 		t.Fatalf("third waiting outcome = %#v, want escalation", third)
 	}
-	// Escalation is sticky until the order resolves; a later attempt keeps it.
-	clock.now = clock.now.Add(time.Minute)
+	// Escalated retries run only at the capped interval.
+	clock.now = clock.now.Add(10 * time.Minute)
 	fourth := guard.Run(context.Background(), RunParams{Order: order, Holder: "a", Work: wait})
 	if !fourth.Escalated || !fourth.Lease.EscalatedAt.Equal(guardTestNow.Add(10*time.Minute)) {
 		t.Fatalf("fourth waiting outcome = %#v, want sticky escalation", fourth)
 	}
+	clock.now = clock.now.Add(10 * time.Minute)
 	resolved := guard.Run(context.Background(), RunParams{Order: order, Holder: "a", Work: func(context.Context) (domain.OrderRecoveryOutcomeKind, error) {
 		return domain.OrderRecoveryOutcomeResolved, nil
 	}})
 	if !resolved.Resolved() || resolved.Escalated {
 		t.Fatalf("resolved outcome = %#v", resolved)
+	}
+}
+
+func TestSameWorkerLabelCannotReenterActiveRecovery(t *testing.T) {
+	store := memory.NewOrderRecoveryLeaseStore()
+	clock := &guardClock{now: guardTestNow}
+	guard := newTestGuard(t, store, clock, Policy{})
+	order := recoveryOrder("same-label", 1)
+	entered, release := make(chan struct{}), make(chan struct{})
+	done := make(chan Outcome, 1)
+	go func() {
+		done <- guard.Run(context.Background(), RunParams{Order: order, Holder: "coordinator", Work: func(context.Context) (domain.OrderRecoveryOutcomeKind, error) {
+			close(entered)
+			<-release
+			return domain.OrderRecoveryOutcomeWaiting, nil
+		}})
+	}()
+	<-entered
+	for i := 0; i < 100; i++ {
+		outcome := guard.Run(context.Background(), RunParams{Order: order, Holder: "coordinator", BypassBackoff: true, Work: func(context.Context) (domain.OrderRecoveryOutcomeKind, error) {
+			t.Error("same label reentered lease")
+			return domain.OrderRecoveryOutcomeWaiting, nil
+		}})
+		if !outcome.Skipped || outcome.SkipReason != SkipReasonHeld {
+			t.Errorf("concurrent acquisition=%#v", outcome)
+		}
+	}
+	close(release)
+	outcome := <-done
+	if outcome.StoreErr != nil || outcome.Lease.NextRetryAt == nil {
+		t.Fatalf("release=%#v", outcome)
+	}
+	for i := 0; i < 100; i++ {
+		outcome := guard.Run(context.Background(), RunParams{Order: order, Holder: "coordinator", BypassBackoff: true, Work: func(context.Context) (domain.OrderRecoveryOutcomeKind, error) {
+			t.Error("focus storm bypassed waiting backoff")
+			return domain.OrderRecoveryOutcomeWaiting, nil
+		}})
+		if !outcome.Skipped || outcome.SkipReason != SkipReasonBackoff {
+			t.Errorf("waiting storm=%#v", outcome)
+		}
 	}
 }

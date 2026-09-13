@@ -42,12 +42,12 @@ type OrderRecoveryLease struct {
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
-// HeldAt reports whether another worker currently owns the lease.
+// HeldAt reports whether any acquisition currently owns the lease. Labels are not reentrant.
 func (lease OrderRecoveryLease) HeldAt(now time.Time, holder string) bool {
 	if strings.TrimSpace(lease.Holder) == "" || lease.ExpiresAt == nil {
 		return false
 	}
-	return lease.Holder != holder && lease.ExpiresAt.After(now)
+	return lease.ExpiresAt.After(now)
 }
 
 // RetryDueAt reports whether the persisted backoff allows a new attempt.
@@ -80,8 +80,8 @@ type OrderRecoveryLeaseRequest struct {
 	OrderRevision      int64
 	Now                time.Time
 	TTL                time.Duration
-	// BypassBackoff lets an immediate, order-focused trigger run ahead of the
-	// persisted retry schedule. It never overrides an active holder.
+	// BypassBackoff is retained for caller compatibility. Stores always honor
+	// the persisted retry schedule, including focused trigger bursts.
 	BypassBackoff bool
 }
 

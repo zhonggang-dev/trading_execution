@@ -12,6 +12,8 @@ package orderrecovery
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -32,8 +34,7 @@ type Policy struct {
 	// every other order in the same sweep.
 	Timeout time.Duration
 	// BaseBackoff and MaxBackoff shape the exponential retry schedule after a
-	// failed attempt. A WAITING outcome (order still propagating) never backs
-	// off.
+	// failed attempt. WAITING polls at BaseBackoff; escalated waits use MaxBackoff.
 	BaseBackoff time.Duration
 	MaxBackoff  time.Duration
 	// EscalateAfter is the pending age after which the order is handed to the
@@ -181,7 +182,7 @@ func (guard *Guard) Policy() Policy { return guard.policy }
 type RunParams struct {
 	Order  domain.Order
 	Holder string
-	// BypassBackoff is used by an order-focused immediate trigger.
+	// BypassBackoff is a legacy hint; focused triggers also respect retry pacing.
 	BypassBackoff bool
 	Work          Work
 }
@@ -194,8 +195,17 @@ func (guard *Guard) Run(ctx context.Context, params RunParams) Outcome {
 	if holder == "" || params.Work == nil {
 		return Outcome{Skipped: true, SkipReason: SkipReasonLeaseUnavailable, StoreErr: fmt.Errorf("order recovery holder and work are required")}
 	}
+	// A worker label is not an ownership token: two processes may use the same
+	// label and a delayed release must never release a later acquisition.
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return Outcome{Skipped: true, SkipReason: SkipReasonLeaseUnavailable, StoreErr: err}
+	}
+	holder += ":" + hex.EncodeToString(nonce[:])
 	now := guard.now().UTC()
-	lease, err := guard.store.AcquireOrderRecoveryLease(ctx, domain.OrderRecoveryLeaseRequest{
+	acquireCtx, acquireCancel := context.WithTimeout(ctx, guard.policy.Timeout)
+	defer acquireCancel()
+	lease, err := guard.store.AcquireOrderRecoveryLease(acquireCtx, domain.OrderRecoveryLeaseRequest{
 		OrderID: params.Order.ID, ExecutionAccountID: params.Order.Intent.ExecutionAccountID,
 		Holder: holder, OrderRevision: params.Order.Revision, Now: now, TTL: guard.policy.LeaseTTL,
 		BypassBackoff: params.BypassBackoff,
@@ -204,14 +214,14 @@ func (guard *Guard) Run(ctx context.Context, params RunParams) Outcome {
 	case errors.Is(err, port.ErrOrderRecoveryLeaseHeld):
 		return Outcome{Skipped: true, SkipReason: SkipReasonHeld, Lease: lease}
 	case errors.Is(err, port.ErrOrderRecoveryBackoff):
-		return Outcome{Skipped: true, SkipReason: SkipReasonBackoff, Lease: lease}
+		return Outcome{Skipped: true, SkipReason: SkipReasonBackoff, Lease: lease, Escalated: lease.Escalated()}
 	case errors.Is(err, port.ErrOrderRecoveryStaleView):
 		return Outcome{Skipped: true, SkipReason: SkipReasonStaleView, Lease: lease}
 	case err != nil:
 		return Outcome{Skipped: true, SkipReason: SkipReasonLeaseUnavailable, StoreErr: err}
 	}
 
-	workCtx, cancel := context.WithTimeout(ctx, guard.policy.Timeout)
+	workCtx, cancel := context.WithCancel(acquireCtx)
 	kind, workErr := params.Work(workCtx)
 	timedOut := workCtx.Err() != nil && ctx.Err() == nil
 	cancel()
@@ -241,7 +251,7 @@ func (guard *Guard) Run(ctx context.Context, params RunParams) Outcome {
 	case domain.OrderRecoveryOutcomeFailed:
 		release.NextRetryAt = finished.Add(guard.policy.Backoff(lease.Attempts + 1))
 	case domain.OrderRecoveryOutcomeWaiting:
-		release.NextRetryAt = finished
+		release.NextRetryAt = finished.Add(guard.policy.BaseBackoff)
 	}
 	pendingSince := lease.PendingSince(finished)
 	if kind != domain.OrderRecoveryOutcomeResolved && lease.FirstPendingAt == nil {
@@ -249,13 +259,13 @@ func (guard *Guard) Run(ctx context.Context, params RunParams) Outcome {
 	}
 	if kind != domain.OrderRecoveryOutcomeResolved && (lease.Escalated() || pendingSince >= guard.policy.EscalateAfter) {
 		release.Escalate = true
+		release.NextRetryAt = finished.Add(guard.policy.MaxBackoff)
 	}
 	// Release with the parent context even when the attempt itself timed out.
-	releaseCtx := ctx
+	releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer releaseCancel()
 	if ctx.Err() != nil {
-		var releaseCancel context.CancelFunc
-		releaseCtx, releaseCancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer releaseCancel()
+		release.NextRetryAt = finished
 	}
 	released, releaseErr := guard.store.ReleaseOrderRecoveryLease(releaseCtx, release)
 	outcome := Outcome{Lease: released, Kind: kind, TimedOut: timedOut, Escalated: released.Escalated(), Err: workErr, StoreErr: releaseErr}

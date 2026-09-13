@@ -191,6 +191,8 @@ func TestComplementarySellRecoveryPostgresIntegration(t *testing.T) {
 			t.Fatalf("premature issue closure=%d err=%v", open, err)
 		}
 		clean := startReconciliationFixtureRun(t, recorder, order.Intent.ExecutionAccountID, fmt.Sprintf("paired-clean-%d", i), base.Add(30*time.Second))
+		clean.VerifyReconciliation("balance", "")
+		clean.VerifyReconciliation("position", "42")
 		completeReconciliationFixtureRun(t, recorder, clean, domain.ReconciliationRunCompleted, base.Add(31*time.Second))
 		if err := db.QueryRow(`SELECT count(*) FROM reconciliation_issues WHERE execution_account_id=$1 AND status='OPEN'`, order.Intent.ExecutionAccountID).Scan(&open); err != nil || open != i {
 			t.Fatalf("stale gates after clean sweep=%d err=%v", open, err)

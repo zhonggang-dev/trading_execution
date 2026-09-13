@@ -54,33 +54,36 @@ func (store *OrderRecoveryLeaseStore) AcquireOrderRecoveryLease(ctx context.Cont
 		return domain.OrderRecoveryLease{}, fmt.Errorf("begin order recovery lease: %w", err)
 	}
 	defer tx.Rollback()
-	current, err := scanOrderRecoveryLease(tx.QueryRowContext(ctx, `
-		SELECT `+orderRecoveryLeaseColumns+` FROM order_recovery_leases WHERE order_id=$1 FOR UPDATE`, request.OrderID))
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		lease, err := scanOrderRecoveryLease(tx.QueryRowContext(ctx, `
-			INSERT INTO order_recovery_leases (
-				order_id, execution_account_id, holder, order_revision, acquired_at, expires_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$5)
-			RETURNING `+orderRecoveryLeaseColumns,
-			request.OrderID, request.ExecutionAccountID, request.Holder, request.OrderRevision, now, expiresAt))
-		if err != nil {
-			return domain.OrderRecoveryLease{}, fmt.Errorf("insert order recovery lease: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return domain.OrderRecoveryLease{}, fmt.Errorf("commit order recovery lease: %w", err)
-		}
-		return lease, nil
-	case err != nil:
+	// Lock the actual order too: a lease row can lag behind lifecycle writes.
+	var accountID string
+	var revision int64
+	if err := tx.QueryRowContext(ctx, `SELECT execution_account_id, revision FROM execution_orders
+  WHERE order_id=$1 FOR SHARE`, request.OrderID).Scan(&accountID, &revision); err != nil {
+		return domain.OrderRecoveryLease{}, fmt.Errorf("read recovery order version: %w", err)
+	}
+	if accountID != request.ExecutionAccountID || revision != request.OrderRevision {
+		return domain.OrderRecoveryLease{}, port.ErrOrderRecoveryStaleView
+	}
+	// A SELECT of a missing row locks nothing. Concurrent first acquisitions
+	// must converge on one row before deciding ownership.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO order_recovery_leases
+  (order_id, execution_account_id, order_revision, updated_at)
+  VALUES ($1,$2,$3,$4) ON CONFLICT (order_id) DO NOTHING`,
+		request.OrderID, request.ExecutionAccountID, request.OrderRevision, now); err != nil {
+		return domain.OrderRecoveryLease{}, fmt.Errorf("initialize order recovery lease: %w", err)
+	}
+	current, err := scanOrderRecoveryLease(tx.QueryRowContext(ctx, `SELECT `+orderRecoveryLeaseColumns+`
+  FROM order_recovery_leases WHERE order_id=$1 FOR UPDATE`, request.OrderID))
+	if err != nil {
 		return domain.OrderRecoveryLease{}, fmt.Errorf("lock order recovery lease: %w", err)
 	}
 	if current.HeldAt(now, request.Holder) {
 		return current, port.ErrOrderRecoveryLeaseHeld
 	}
-	if current.OrderRevision > request.OrderRevision {
+	if current.ExecutionAccountID != request.ExecutionAccountID || current.OrderRevision > request.OrderRevision {
 		return current, port.ErrOrderRecoveryStaleView
 	}
-	if !request.BypassBackoff && !current.RetryDueAt(now) {
+	if !current.RetryDueAt(now) {
 		return current, port.ErrOrderRecoveryBackoff
 	}
 	lease, err := scanOrderRecoveryLease(tx.QueryRowContext(ctx, `

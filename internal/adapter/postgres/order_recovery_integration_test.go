@@ -62,8 +62,12 @@ func TestOrderRecoveryLeaseStorePostgresIntegration(t *testing.T) {
 		t.Fatalf("early retry error = %v, want backoff", err)
 	}
 	early.BypassBackoff = true
+	if _, err := store.AcquireOrderRecoveryLease(ctx, early); !errors.Is(err, port.ErrOrderRecoveryBackoff) {
+		t.Fatalf("focused trigger bypassed retry schedule: %v", err)
+	}
+	early.Now = now.Add(31 * time.Second)
 	if _, err := store.AcquireOrderRecoveryLease(ctx, early); err != nil {
-		t.Fatalf("focused bypass error = %v", err)
+		t.Fatal(err)
 	}
 	escalated, err := store.ReleaseOrderRecoveryLease(ctx, domain.OrderRecoveryRelease{
 		OrderID: order.ID, Holder: "reconciliation", Now: now.Add(11 * time.Second), Kind: domain.OrderRecoveryOutcomeWaiting,
@@ -81,6 +85,12 @@ func TestOrderRecoveryLeaseStorePostgresIntegration(t *testing.T) {
 	fresh := request
 	fresh.Now = now.Add(time.Minute)
 	fresh.OrderRevision = 2
+	if _, err := store.AcquireOrderRecoveryLease(ctx, fresh); !errors.Is(err, port.ErrOrderRecoveryStaleView) {
+		t.Fatalf("future snapshot=%v", err)
+	}
+	if _, err := db.Exec(`UPDATE execution_orders SET revision=2 WHERE order_id=$1`, order.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.AcquireOrderRecoveryLease(ctx, fresh); err != nil {
 		t.Fatalf("fresh acquire error = %v", err)
 	}

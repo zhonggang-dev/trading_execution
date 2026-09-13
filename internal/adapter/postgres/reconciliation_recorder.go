@@ -130,114 +130,153 @@ func (recorder *ReconciliationRecorder) RecordIssue(ctx context.Context, issue d
 
 // Complete 持久化一次对账运行的完成状态和摘要。
 func (recorder *ReconciliationRecorder) Complete(ctx context.Context, run domain.ReconciliationRun) error {
+	_, _, err := recorder.CompleteWithState(ctx, run)
+	return err
+}
+
+var _ port.ReconciliationCompletionRecorder = (*ReconciliationRecorder)(nil)
+
+// CompleteWithState atomically closes verified scopes, calculates the persisted
+// trading boundary, and finishes the run. A partially successful sweep can
+// resolve a recovered source without declaring unrelated orders safe.
+func (recorder *ReconciliationRecorder) CompleteWithState(ctx context.Context, run domain.ReconciliationRun) (domain.ReconciliationRun, []domain.ReconciliationIssue, error) {
 	if run.CompletedAt == nil {
-		return fmt.Errorf("completed reconciliation run requires completed_at")
+		return run, nil, fmt.Errorf("completed reconciliation run requires completed_at")
 	}
+	// Own the map: callers may keep a prior snapshot for readiness or display.
+	summaryCopy := make(map[string]int, len(run.Summary))
+	for key, value := range run.Summary {
+		summaryCopy[key] = value
+	}
+	run.Summary = summaryCopy
 	tx, err := recorder.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return fmt.Errorf("begin reconciliation run completion: %w", err)
+		return run, nil, fmt.Errorf("begin reconciliation run completion: %w", err)
 	}
 	defer tx.Rollback()
-	if run.Status == domain.ReconciliationRunCompleted {
-		resolved, resolveErr := resolveFillLagDriftIssues(ctx, tx, run)
-		if resolveErr != nil {
-			return resolveErr
+	// Serialize completion before resolving anything, including a duplicate call.
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM reconciliation_runs WHERE run_id=$1
+  AND execution_account_id=$2 FOR UPDATE`, run.RunID, run.ExecutionAccountID).Scan(&status); err != nil {
+		return run, nil, fmt.Errorf("lock reconciliation completion: %w", err)
+	}
+	if status != "RUNNING" {
+		return run, nil, fmt.Errorf("reconciliation run is missing or already completed")
+	}
+	if run.Status == domain.ReconciliationRunCompleted || run.Status == domain.ReconciliationRunAttentionRequired {
+		resolvers := []func(context.Context, *sql.Tx, domain.ReconciliationRun) (int, error){
+			resolveFillLagDriftIssues, resolvePolymarketPositionPrecisionIssues,
+			resolveRecoveredSellPositionDriftIssues, resolveVerifiedTransientIssues,
 		}
-		if resolved > 0 {
-			if run.Summary == nil {
-				run.Summary = make(map[string]int)
+		// Wallet migration crosses scopes and retains its original full-scan guard.
+		if run.Status == domain.ReconciliationRunCompleted {
+			resolvers = append(resolvers, resolveWalletMigrationIssues)
+		}
+		for _, resolve := range resolvers {
+			count, err := resolve(ctx, tx, run)
+			if err != nil {
+				return run, nil, err
 			}
-			run.Summary["issues_total"] += resolved
-			run.Summary["issues_resolved"] += resolved
-			run.Summary["issues_automatic"] += resolved
+			run.Summary["issues_total"] += count
+			run.Summary["issues_resolved"] += count
+			run.Summary["issues_automatic"] += count
 		}
 	}
-	if run.Status == domain.ReconciliationRunCompleted {
-		resolved, resolveErr := resolvePolymarketPositionPrecisionIssues(ctx, tx, run)
-		if resolveErr != nil {
-			return resolveErr
-		}
-		if resolved > 0 {
-			if run.Summary == nil {
-				run.Summary = make(map[string]int)
-			}
-			run.Summary["issues_total"] += resolved
-			run.Summary["issues_resolved"] += resolved
-			run.Summary["issues_automatic"] += resolved
-		}
+	open, err := readOpenReconciliationIssues(ctx, tx, run.ExecutionAccountID)
+	if err != nil {
+		return run, nil, err
 	}
-	if run.Status == domain.ReconciliationRunCompleted {
-		// A confirmed SELL can be applied by the fast order coordinator after a
-		// position sweep has already recorded drift.  The next healthy sweep must
-		// be able to close that stale gate even though it did not itself apply the
-		// fill.  Resolution remains evidence-bound: the exact local identity and
-		// quantity must now match, the current run must not reproduce the issue,
-		// and finalized local-order fills after the observation must account for
-		// the complete share delta.
-		resolved, resolveErr := resolveRecoveredSellPositionDriftIssues(ctx, tx, run)
-		if resolveErr != nil {
-			return resolveErr
-		}
-		if resolved > 0 {
-			if run.Summary == nil {
-				run.Summary = make(map[string]int)
-			}
-			run.Summary["issues_total"] += resolved
-			run.Summary["issues_resolved"] += resolved
-			run.Summary["issues_automatic"] += resolved
-		}
+	if len(open) > 0 && run.Status == domain.ReconciliationRunCompleted {
+		run.Status = domain.ReconciliationRunAttentionRequired
 	}
-	if run.Status == domain.ReconciliationRunCompleted {
-		resolved, resolveErr := resolveWalletMigrationIssues(ctx, tx, run)
-		if resolveErr != nil {
-			return resolveErr
-		}
-		if resolved > 0 {
-			if run.Summary == nil {
-				run.Summary = make(map[string]int)
-			}
-			run.Summary["issues_total"] += resolved
-			run.Summary["issues_resolved"] += resolved
-			run.Summary["issues_automatic"] += resolved
-		}
+	impact := domain.SummarizeReconciliationImpact(open)
+	run.Summary["open_issues_total"] = len(open)
+	run.Summary["impact_account_wide"] = 0
+	if impact.AccountWide {
+		run.Summary["impact_account_wide"] = 1
 	}
+	run.Summary["impact_scoped_orders"] = len(impact.OrderIDs)
+	run.Summary["impact_scoped_tokens"] = len(impact.TokenIDs)
 	summary, err := json.Marshal(run.Summary)
 	if err != nil {
-		return fmt.Errorf("encode reconciliation summary: %w", err)
+		return run, nil, fmt.Errorf("encode reconciliation summary: %w", err)
 	}
-	result, err := tx.ExecContext(ctx, `
-		UPDATE reconciliation_runs
-		SET status=$2, summary=$3::jsonb, error=$4, completed_at=$5
-		WHERE run_id=$1 AND status='RUNNING'`, run.RunID, string(run.Status),
-		summary, run.Error, run.CompletedAt.UTC())
+	result, err := tx.ExecContext(ctx, `UPDATE reconciliation_runs
+  SET status=$2, summary=$3::jsonb, error=$4, completed_at=$5
+  WHERE run_id=$1 AND status='RUNNING'`, run.RunID, string(run.Status), summary, run.Error, run.CompletedAt.UTC())
 	if err != nil {
-		return fmt.Errorf("complete reconciliation run: %w", err)
+		return run, nil, fmt.Errorf("complete reconciliation run: %w", err)
 	}
 	if !oneRow(result) {
-		return fmt.Errorf("reconciliation run is missing or already completed")
-	}
-	if run.Status == domain.ReconciliationRunCompleted {
-		// RETRY_LATER means infrastructure uncertainty, not a permanent manual
-		// discrepancy. If a fully completed later sweep did not reproduce the
-		// fingerprint, close it; manual-review issues remain fail-closed until an
-		// operator or attributable repair explicitly resolves them.
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE reconciliation_issues
-			SET status='RESOLVED', resolved_at=$3
-			WHERE execution_account_id=$1 AND status='OPEN'
-			  AND resolution='RETRY_LATER' AND run_id <> $2`,
-			run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC()); err != nil {
-			return fmt.Errorf("resolve recovered reconciliation infrastructure issues: %w", err)
-		}
+		return run, nil, fmt.Errorf("reconciliation run is missing or already completed")
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit reconciliation run completion: %w", err)
+		return run, nil, fmt.Errorf("commit reconciliation completion: %w", err)
 	}
-	return nil
+	return run, open, nil
+}
+
+func verificationJSON(run domain.ReconciliationRun) []byte {
+	value, _ := json.Marshal(run.Summary) // map[string]int is always JSON encodable.
+	return value
+}
+
+func resolveVerifiedTransientIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE reconciliation_issues issue
+  SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+      details=issue.details || '; independently reverified by reconciliation ' || $2
+  WHERE issue.execution_account_id=$1 AND issue.status='OPEN' AND issue.run_id<>$2
+  AND (issue.resolution='RETRY_LATER' OR issue.issue_type='ORDER_RECOVERY_STALLED')
+  AND (
+   (issue.order_id<>'' AND $4::jsonb->>('verified_order:' || issue.order_id)='1')
+   OR (issue.order_id='' AND issue.issue_type='SOURCE_UNAVAILABLE' AND $4::jsonb->>('verified_source:' || issue.source)='1')
+   OR (issue.issue_type='BALANCE_DRIFT' AND $4::jsonb->>'verified_balance:'='1')
+   OR (issue.issue_type='POSITION_DRIFT' AND issue.token_id<>'' AND $4::jsonb->>('verified_position:' || issue.token_id)='1')
+   OR (issue.issue_type='SOURCE_UNAVAILABLE' AND issue.order_id='' AND issue.source='EVM_ERC1155_ETH_CALL' AND issue.token_id<>'' AND $4::jsonb->>('verified_position:' || issue.token_id)='1')
+  )
+  AND NOT EXISTS (
+   SELECT 1 FROM reconciliation_issues active
+   WHERE active.execution_account_id=issue.execution_account_id AND active.run_id=$2 AND active.status='OPEN'
+   AND (
+    (issue.order_id<>'' AND active.order_id=issue.order_id)
+    OR (issue.order_id='' AND issue.issue_type='SOURCE_UNAVAILABLE' AND active.source=issue.source
+     AND (issue.token_id='' OR active.token_id='' OR active.token_id=issue.token_id))
+    OR (issue.issue_type='BALANCE_DRIFT' AND active.issue_type='BALANCE_DRIFT')
+    OR (issue.issue_type='POSITION_DRIFT' AND active.token_id=issue.token_id)
+   )
+  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), verificationJSON(run))
+	if err != nil {
+		return 0, fmt.Errorf("resolve independently verified issues: %w", err)
+	}
+	count, err := result.RowsAffected()
+	return int(count), err
+}
+
+func readOpenReconciliationIssues(ctx context.Context, tx *sql.Tx, accountID string) ([]domain.ReconciliationIssue, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT issue_id, run_id, fingerprint, execution_account_id,
+  issue_type, resolution, status, order_id, venue_order_id, venue_trade_id, market_id, condition_id, token_id,
+  COALESCE(local_value::text,''), COALESCE(remote_value::text,''), source, details, observed_at, impact_scope
+  FROM reconciliation_issues WHERE execution_account_id=$1 AND status='OPEN' ORDER BY observed_at, issue_id`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("read durable reconciliation issues: %w", err)
+	}
+	defer rows.Close()
+	issues := make([]domain.ReconciliationIssue, 0)
+	for rows.Next() {
+		var issue domain.ReconciliationIssue
+		if err := rows.Scan(&issue.IssueID, &issue.RunID, &issue.Fingerprint, &issue.ExecutionAccountID,
+			&issue.Type, &issue.Resolution, &issue.Status, &issue.OrderID, &issue.VenueOrderID, &issue.VenueTradeID,
+			&issue.MarketID, &issue.ConditionID, &issue.TokenID, &issue.LocalValue, &issue.RemoteValue, &issue.Source,
+			&issue.Details, &issue.ObservedAt, &issue.ImpactScope); err != nil {
+			return nil, fmt.Errorf("scan durable reconciliation issue: %w", err)
+		}
+		issues = append(issues, issue)
+	}
+	return issues, rows.Err()
 }
 
 // resolveRecoveredSellPositionDriftIssues closes a stale POSITION_DRIFT only
-// after a later, fully successful reconciliation proves that an exact set of
+// after a later reconciliation independently verifies that token and an exact set of
 // confirmed SELL-ledger applications already present before that sweep account
 // for the whole observed deficit.
 // It never creates an order or fill and cannot infer execution from a balance
@@ -254,6 +293,7 @@ func resolveRecoveredSellPositionDriftIssues(ctx context.Context, tx *sql.Tx, ru
 		  AND issue.resolution='MANUAL_REVIEW'
 		  AND issue.issue_type='POSITION_DRIFT'
 		  AND issue.run_id<>$2
+          AND $6::jsonb->>('verified_position:' || issue.token_id)='1'
 		  AND issue.source='POLYMARKET_DATA_API'
 		  AND issue.market_id<>'' AND issue.condition_id<>'' AND issue.token_id<>''
 		  AND issue.local_value IS NOT NULL AND issue.remote_value IS NOT NULL
@@ -324,7 +364,7 @@ func resolveRecoveredSellPositionDriftIssues(ctx context.Context, tx *sql.Tx, ru
 		      AND local_order.intent->>'condition_id'=fill.condition_id
 		      AND local_order.intent->>'side'=fill.side
 		  )=issue.remote_value-issue.local_value`,
-		run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, run.StartedAt.UTC())
+		run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, run.StartedAt.UTC(), verificationJSON(run))
 	if err != nil {
 		return 0, fmt.Errorf("resolve recovered SELL position drift issues: %w", err)
 	}
@@ -404,7 +444,7 @@ func resolveWalletMigrationIssues(ctx context.Context, tx *sql.Tx, run domain.Re
 
 // resolveFillLagDriftIssues closes only stale drift observations now represented
 // by the authoritative ledger after a finalized fill. The fill may have been
-// applied by an earlier attention-required run; a later fully healthy sweep is
+// applied by an earlier attention-required run; a later verified asset comparison is
 // what proves that the temporary drift disappeared.
 func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
 	const resolvedDetails = "; automatically resolved after finalized fill evidence made the local ledger match the previously observed remote value"
@@ -417,6 +457,7 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		WHERE issue.execution_account_id=$1 AND issue.status='OPEN'
 		  AND issue.resolution='MANUAL_REVIEW' AND issue.issue_type='BALANCE_DRIFT'
 		  AND issue.run_id<>$2
+          AND $5::jsonb->>'verified_balance:'='1'
 		  AND account.execution_account_id=issue.execution_account_id
 		  AND issue.source='EVM_ERC20_ETH_CALL'
 		  AND issue.local_value IS NOT NULL AND issue.remote_value IS NOT NULL
@@ -447,7 +488,7 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		    WHERE reproduced.execution_account_id=issue.execution_account_id
 		      AND reproduced.run_id=$2 AND reproduced.status='OPEN'
 		      AND reproduced.issue_type=issue.issue_type
-		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails)
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, verificationJSON(run))
 	if err != nil {
 		return 0, fmt.Errorf("resolve finalized-fill balance drift issues: %w", err)
 	}
@@ -469,6 +510,7 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		  -- Do not let this legacy fill-lag branch bypass its identity/delta checks.
 		  AND (issue.local_value IS NULL OR issue.remote_value>=issue.local_value)
 		  AND issue.run_id<>$2
+          AND $5::jsonb->>('verified_position:' || issue.token_id)='1'
 		  AND position.execution_account_id=issue.execution_account_id
 		  AND position.token_id=issue.token_id
 		  AND issue.remote_value IS NOT NULL
@@ -493,7 +535,7 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
 		      AND reproduced.run_id=$2 AND reproduced.status='OPEN'
 		      AND reproduced.issue_type=issue.issue_type
 		      AND reproduced.token_id=issue.token_id
-		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails)
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, verificationJSON(run))
 	if err != nil {
 		return 0, fmt.Errorf("resolve finalized-fill position drift issues: %w", err)
 	}
@@ -520,6 +562,7 @@ func resolvePolymarketPositionPrecisionIssues(ctx context.Context, tx *sql.Tx, r
 		  AND issue.resolution='MANUAL_REVIEW'
 		  AND issue.issue_type='POSITION_DRIFT'
 		  AND issue.run_id<>$2
+          AND $5::jsonb->>('verified_position:' || issue.token_id)='1'
 		  AND issue.source='POLYMARKET_DATA_API'
 		  AND issue.market_id<>'' AND issue.condition_id<>'' AND issue.token_id<>''
 		  AND issue.local_value IS NOT NULL AND issue.remote_value IS NOT NULL
@@ -539,7 +582,7 @@ func resolvePolymarketPositionPrecisionIssues(ctx context.Context, tx *sql.Tx, r
 		      AND reproduced.market_id=issue.market_id
 		      AND reproduced.condition_id=issue.condition_id
 		      AND reproduced.token_id=issue.token_id
-		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails)
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, verificationJSON(run))
 	if err != nil {
 		return 0, fmt.Errorf("resolve Polymarket position precision issues: %w", err)
 	}

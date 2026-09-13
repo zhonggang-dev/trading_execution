@@ -73,6 +73,7 @@ func (state *runState) loadInFlightRedemptions(ctx context.Context, executionAcc
 		state.redemptions.byCondition[conditionID] = value
 	}
 	state.run.Summary["in_flight_redemptions"] = len(state.redemptions.byCondition)
+	state.run.VerifyReconciliation("source", "POSTGRES_REDEMPTIONS")
 	return nil
 }
 
