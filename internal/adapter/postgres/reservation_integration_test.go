@@ -547,7 +547,9 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 		t.Fatal(err)
 	}
 	secondCompleted := now.Add(4 * time.Second)
-	secondRun.Status, secondRun.CompletedAt = domain.ReconciliationRunCompleted, &secondCompleted
+	secondRun.Status, secondRun.CompletedAt = domain.ReconciliationRunAttentionRequired, &secondCompleted
+	secondRun.VerifyReconciliation("balance", "")
+	secondRun.VerifyReconciliation("position", "token-fill-lag")
 	if err := recorder.Complete(context.Background(), secondRun); err != nil {
 		t.Fatal(err)
 	}

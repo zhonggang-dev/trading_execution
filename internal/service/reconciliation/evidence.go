@@ -74,6 +74,7 @@ func (state *runState) loadLocalAuthority(ctx context.Context, scope accountRunS
 		return domain.AccountBalance{}, nil, err
 	}
 	state.run.Summary["local_orders"] = len(orders)
+	state.run.VerifyReconciliation("source", "POSTGRES_ORDERS")
 	return balance, orders, nil
 }
 
@@ -117,6 +118,7 @@ func (state *runState) collectVenueEvidence(ctx context.Context, scope accountRu
 // recordVenueReadError 把非空的外部读取错误转换为可追踪的基础设施问题。
 func (state *runState) recordVenueReadError(ctx context.Context, source, operation string, err error) {
 	if err == nil {
+		state.run.VerifyReconciliation("source", source)
 		return
 	}
 	state.addInfrastructureIssue(ctx, source, operation, err)

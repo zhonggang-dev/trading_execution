@@ -67,6 +67,7 @@ func (state *runState) loadFinalityPendingFills(ctx context.Context, executionAc
 		state.recordStalledFinalityPendingFill(ctx, fill)
 	}
 	state.run.Summary["finality_pending_fills"] = len(state.finality.fills)
+	state.run.VerifyReconciliation("source", "POSTGRES_FILLS")
 	return nil
 }
 

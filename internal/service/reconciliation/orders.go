@@ -62,10 +62,14 @@ func (state *runState) reconcileOrder(ctx context.Context, params reconcileOrder
 		state.recordUnconfirmedSubmission(ctx, params.order)
 		return
 	}
-	if !domain.IsOrderRecoveryStatus(params.order.Status) {
+	_, tradeReferenced := params.evidence.ordersWithTrades[normalizedID(params.order.VenueOrderID)]
+	if !shouldSyncOrderFills(params.order, params.focusOrderID, tradeReferenced) && !orderNeedsRefresh(params.order) {
 		stepCtx, cancel := context.WithTimeout(ctx, state.service.recovery.Policy().Timeout)
 		defer cancel()
-		state.reconcileOrderSteps(stepCtx, params)
+		result := state.reconcileOrderSteps(stepCtx, params)
+		if result.err == nil && !result.evidencePending && stepCtx.Err() == nil {
+			state.run.VerifyReconciliation("order", params.order.ID)
+		}
 		return
 	}
 	var (
@@ -81,6 +85,9 @@ func (state *runState) reconcileOrder(ctx context.Context, params reconcileOrder
 		},
 	})
 	state.recordRecoveryOutcome(params.order, outcome, executed && result.evidencePending, true)
+	if outcome.Resolved() {
+		state.run.VerifyReconciliation("order", params.order.ID)
+	}
 }
 
 // kind maps the evidence steps to the recovery outcome the lease persists.
@@ -88,7 +95,7 @@ func (result orderStepResult) kind() domain.OrderRecoveryOutcomeKind {
 	switch {
 	case result.err != nil:
 		return domain.OrderRecoveryOutcomeFailed
-	case result.evidencePending || domain.IsOrderRecoveryStatus(result.refreshed.Status):
+	case result.evidencePending || domain.IsOrderRecoveryStatus(result.refreshed.Status) || result.refreshed.Status == domain.OrderStatusManualReview:
 		return domain.OrderRecoveryOutcomeWaiting
 	default:
 		return domain.OrderRecoveryOutcomeResolved
@@ -112,11 +119,22 @@ func (state *runState) reconcileOrderSteps(ctx context.Context, params reconcile
 		fillEvidenceComplete = params.evidence.tradesAvailable && !pendingTrade && orderFillEvidenceComplete
 	}
 	if params.order.Status == domain.OrderStatusCancelled {
-		result.err = errors.Join(result.err, state.finalizeCancellationWhenSafe(ctx, params.order, fillEvidenceComplete))
+		finalityErr := state.finalizeCancellationWhenSafe(ctx, params.order, fillEvidenceComplete)
+		if !fillEvidenceComplete || errors.Is(finalityErr, port.ErrCancelFinalityPending) {
+			result.evidencePending = true
+			finalityErr = nil
+		}
+		result.err = errors.Join(result.err, finalityErr)
 		return result
 	}
 	refreshed, refreshErr := state.refreshOrder(ctx, params.order, fillEvidenceComplete)
 	result.refreshed = refreshed
+	if errors.Is(refreshErr, port.ErrCancelFinalityPending) || (refreshed.Status == domain.OrderStatusCancelled && !fillEvidenceComplete) {
+		result.evidencePending = true
+		if errors.Is(refreshErr, port.ErrCancelFinalityPending) {
+			refreshErr = nil
+		}
+	}
 	result.err = errors.Join(result.err, refreshErr)
 	return result
 }
@@ -179,6 +197,9 @@ func (state *runState) syncOrderFills(ctx context.Context, order domain.Order) (
 	state.run.Summary["fill_observations"] += result.Observed
 	state.run.Summary["fills_applied"] += result.Applied
 	for _, application := range result.Applications {
+		if err := ctx.Err(); err != nil {
+			return false, false, err
+		}
 		if isFinalityPendingFill(application.Fill) && !application.Applied && !application.Duplicate {
 			state.run.Summary["fills_finality_pending"]++
 		}
@@ -267,7 +288,7 @@ func (state *runState) finalizeCancellation(ctx context.Context, order domain.Or
 	_, err := state.service.orderRefresher.FinalizeCancellation(ctx, order.ID)
 	if errors.Is(err, port.ErrCancelFinalityPending) {
 		state.run.Summary["cancel_finality_pending"]++
-		return nil
+		return port.ErrCancelFinalityPending
 	}
 	if err != nil {
 		state.addOrderSourceIssue(ctx, orderSourceIssueParams{order: order, source: "CANCEL_FINALITY", operation: "release cancelled order reservation", err: err})

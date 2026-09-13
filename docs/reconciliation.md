@@ -92,7 +92,7 @@ Content-Type: application/json
 
 ## 单笔异常订单的隔离
 
-一张 `UNKNOWN/RECONCILING/CANCEL_PENDING/SUBMITTING` 订单的恢复失败，不应让同一账户的其它市场
+一张 `UNKNOWN/RECONCILING/CANCEL_PENDING/SUBMITTING` 或仍有冻结预占的 `CANCELLED` 订单的恢复失败，不应让同一账户的其它市场
 停止交易，也不应把正常的账本比较误判成人工漂移。实现位置：
 
 - `internal/service/orderrecovery`：订单级恢复守卫（租约、单笔超时、退避、升级）；
@@ -106,11 +106,11 @@ Content-Type: application/json
 快速订单扫描（`ordercoordinator`，秒级）与定时对账（分钟级）都会恢复同一张不确定订单。除了已有的
 revision compare-and-swap，两者现在先按 `order_id` 获取同一条 `order_recovery_leases` 租约：
 
-- 另一持有者的租约未过期 → 本轮跳过该订单（`orders_recovery_deferred`），不重复调用交易所；
-- 租约里记录的 `order_revision` 比调用方看到的更新 → 视为过期快照，跳过；
-- `next_retry_at` 未到 → 跳过；只有 `ORDER_UNKNOWN` 即时触发的 focus 订单可以越过退避；
+- 任一获取任务的租约未过期（每次获取生成独立随机持有令牌，同名进程不能重入） → 本轮跳过该订单（`orders_recovery_deferred`），不重复调用交易所；
+- 获取时锁定实际订单并核验 account/revision，再插入或锁定租约行；首次获取竞争、陈旧版本均不能绕过互斥；
+- `next_retry_at` 未到 → 跳过；即时 focus 触发也不能绕过，避免异常触发风暴；快速扫描在 SQL 的 LIMIT 之前排除被占用或未到重试时间的订单；
 - 工作完成后释放：脱离恢复状态 → 删除租约；仍在等待（成交明细传播中、revision 冲突）→ 不消耗重试
-  预算；数据源失败或单笔超时 → `attempts+1`，`next_retry_at = now + min(30s × 2^(attempts-1), 10m)`。
+  预算，每次至少等待基础重试间隔；升级人工队列后使用最大退避；数据源失败或单笔超时 → `attempts+1`，`next_retry_at = now + min(30s × 2^(attempts-1), 10m)`。
 
 ### 单笔超时、退避与人工队列
 
@@ -159,13 +159,30 @@ run 状态不变：无 OPEN issue 为 `COMPLETED`，有 OPEN issue 为 `ATTENTIO
 `RUNNING/FAILED` 仍不计。`Result.Impact` 和 run summary 中的 `impact_account_wide / impact_scoped_orders /
 impact_scoped_tokens` 给出影响范围；`/health/ready` 只在账户级问题或扫描过期时报不就绪。
 
+### 按核验范围关闭历史问题
+
+`CompleteWithState` 在同一事务中完成历史问题收敛、读取该账户所有持久化 OPEN issue、计算影响范围并写入 run。
+“本轮没有重现”本身不足以关闭历史问题；摘要中的 `verified_source:<source>`、`verified_position:<token>`、
+`verified_order:<order>`、`verified_balance:` 必须来自本轮实际成功的检查。缺失字段（包括旧版本的 run）视为未核验。
+即使 run 为 `ATTENTION_REQUIRED`，已恢复的数据源、已核实订单或资产也可独立关闭相应历史问题。
+跳过的 token、仅由冻结预占范围解释的现金差额、当前仍重现的异常，以及失败 run 都不能据此关闭问题。
+余额/仓位的人工漂移继续要求现有的已确认成交与账本事件归因；不会通过设置核验标记制造成交或改写余额。
+
+每个账户有独立工作线程和最多一项待处理请求；重复触发合并为一次账户扫描。单账户扫描默认超时为
+`min(2 × interval, 2m)`，其他账户的扫描和心跳独立推进。该超时必须小于结果新鲜度窗口，且不会启动
+脱离 context 的后台恢复。下单门控结果包含历史未解决问题，不会再出现本轮日志显示“仅局部异常”而
+数据库仍存在账户级拦截的差异。
+
+撤单终局也共享恢复租约。宽限期以已持久化的撤单观察为起点，不能因每次 GET 的新读取时间重置。
+相同错误不再重复追加 CANCELLED→CANCELLED 事件；交易所 404、成交明细不足或累计成交量不符仍保持预占。
+
 ## 自动修复白名单
 
 | 事实 | 证据要求 | 自动动作 |
 | --- | --- | --- |
 | 漏 BUY Fill | `/data/trades` 中属于本地 `venue_order_id` 的 `CONFIRMED` trade component | FillLedger 原子扣现金、增仓位/lot、更新订单和预占、写 outbox |
 | 漏 SELL Fill | 同上 | FillLedger 原子加现金、减少目标 lot、计算 PnL、更新订单和预占 |
-| 已补 SELL Fill 后遗留旧 `POSITION_DRIFT` | 后续对账全部数据源成功、精确 account/market/condition/token 当前本地值等于旧 remote value，且 issue 后已确认 BUY/SELL fills 的净 shares 精确解释全部差额 | 仅把旧 issue 幂等改为 `RESOLVED + AUTOMATIC`；不创建第二笔 Fill，也不直接改仓位 |
+| 已补 SELL Fill 后遗留旧 `POSITION_DRIFT` | 后续对账独立核验该 token 成功、精确 account/market/condition/token 当前本地值等于旧 remote value，且 issue 后已确认 BUY/SELL fills 的净 shares 精确解释全部差额 | 仅把旧 issue 幂等改为 `RESOLVED + AUTOMATIC`；不创建第二笔 Fill，也不直接改仓位 |
 | 本地仍 LIVE、远端已取消 | CLOB 单订单查询明确返回 cancelled，且真实 Fill 已先同步 | 走订单状态机到 `CANCELLED`；保留预占，经过 Fill grace 并再查 Trades 后释放 |
 | Market 已结算 | 外部持仓源明确 `redeemable=true`，且多个已配置来源一致 | 仓位/lot 改为 `SETTLED_PENDING_REDEEM`；不清 shares、不提前记 payout |
 | 待赎回 condition | settlement price 已冻结为精确 `0/1`、所有 managed lot 的 `neg_risk` 一致、该 condition 无剩余 external baseline、adapter 授权已确认 | 先持久化 `*_SUBMITTING`，再提交精确 `redeemPositions`；只有 canonical `PositionsRedeemed` 回执达到确认深度后，才关闭 lot/position 并增加现金、实现 PnL |

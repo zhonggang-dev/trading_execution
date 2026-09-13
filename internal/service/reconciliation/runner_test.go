@@ -14,6 +14,7 @@ import (
 
 // fakeAccountReconciler 表示后端使用的 fakeAccountReconciler 类型。
 type fakeAccountReconciler struct {
+	mu              sync.Mutex
 	calls           []request
 	now             func() time.Time
 	omitCompletedAt bool
@@ -21,6 +22,8 @@ type fakeAccountReconciler struct {
 
 // RunAccount 执行测试模拟流程。
 func (reconciler *fakeAccountReconciler) RunAccount(_ context.Context, params RunAccountParams) (Result, error) {
+	reconciler.mu.Lock()
+	defer reconciler.mu.Unlock()
 	reconciler.calls = append(reconciler.calls, request{accountID: params.ExecutionAccountID, trigger: params.Trigger, orderID: params.FocusOrderID})
 	completedAt := time.Now().UTC()
 	if reconciler.now != nil {
@@ -64,7 +67,7 @@ func TestRunnerStartupSweepCoversEveryConfiguredAccount(t *testing.T) {
 	if len(result.Errors) != 0 || len(result.Runs) != 2 || len(service.calls) != 2 {
 		t.Fatalf("sweep = %#v, calls = %#v", result, service.calls)
 	}
-	if service.calls[0].accountID != "account-1" || service.calls[1].accountID != "account-2" {
+	if result.Runs[0].Run.ExecutionAccountID != "account-1" || result.Runs[1].Run.ExecutionAccountID != "account-2" {
 		t.Fatalf("accounts = %#v", service.calls)
 	}
 }

@@ -26,20 +26,23 @@ type RunnerParams struct {
 	Interval            time.Duration
 	Now                 func() time.Time
 	MaxResultAge        time.Duration
+	AccountTimeout      time.Duration
 	Logger              *slog.Logger
 }
 
 // Runner 表示后端使用的 Runner 类型。
 type Runner struct {
-	service     AccountReconciler
-	accounts    []string
-	active      map[string]struct{}
-	quarantined map[string]struct{}
-	interval    time.Duration
-	now         func() time.Time
-	maxAge      time.Duration
-	logger      *slog.Logger
-	requests    chan request
+	service        AccountReconciler
+	accounts       []string
+	active         map[string]struct{}
+	quarantined    map[string]struct{}
+	interval       time.Duration
+	now            func() time.Time
+	maxAge         time.Duration
+	accountTimeout time.Duration
+	accountSlots   map[string]chan struct{}
+	logger         *slog.Logger
+	requests       chan request
 
 	mu               sync.Mutex
 	lastResults      map[string]Result
@@ -100,6 +103,12 @@ func NewRunner(params RunnerParams) (*Runner, error) {
 	if params.MaxResultAge > maximumRunnerAge {
 		return nil, fmt.Errorf("reconciliation max result age must not exceed %s", maximumRunnerAge)
 	}
+	if params.AccountTimeout == 0 {
+		params.AccountTimeout = min(2*params.Interval, 2*time.Minute)
+	}
+	if params.AccountTimeout < time.Second || params.AccountTimeout >= params.MaxResultAge {
+		return nil, fmt.Errorf("reconciliation account timeout must be at least one second and below max result age")
+	}
 	accounts, active, err := normalizeRunnerAccounts(params.Accounts, nil)
 	if err != nil {
 		return nil, err
@@ -114,7 +123,12 @@ func NewRunner(params RunnerParams) (*Runner, error) {
 	if params.Logger == nil {
 		params.Logger = slog.Default()
 	}
+	slots := make(map[string]chan struct{}, len(accounts))
+	for _, account := range accounts {
+		slots[account] = make(chan struct{}, 1)
+	}
 	return &Runner{
+		accountTimeout: params.AccountTimeout, accountSlots: slots,
 		service: params.Service, accounts: accounts, active: active, quarantined: quarantined,
 		interval: params.Interval, now: params.Now, maxAge: params.MaxResultAge, logger: params.Logger,
 		requests: make(chan request, 1024), lastResults: make(map[string]Result),
@@ -216,28 +230,64 @@ func (runner *Runner) runLoop(ctx context.Context, initialErrors []error, ready 
 		close(ready)
 	}
 
+	// One bounded queue and one worker per configured account. A stuck account
+	// cannot consume another account's worker, queue, or heartbeat.
+	workCtx, cancel := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	defer func() { cancel(); workers.Wait() }()
+	queues := make(map[string]chan request, len(runner.accounts))
+	failures := make(chan error, len(runner.accounts))
+	for _, accountID := range runner.accounts {
+		queue := make(chan request, 1)
+		queues[accountID] = queue
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-workCtx.Done():
+					return
+				case requested := <-queue:
+					_, err := runner.runAccount(workCtx, RunAccountParams{ExecutionAccountID: requested.accountID,
+						Trigger: requested.trigger, FocusOrderID: requested.orderID})
+					if err != nil {
+						select {
+						case failures <- err:
+						case <-workCtx.Done():
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+	enqueue := func(requested request) {
+		// Coalesce a burst into at most one pending account sweep. Every sweep
+		// scans all pending orders, so dropping duplicate focus hints loses no work.
+		if queue := queues[requested.accountID]; queue != nil {
+			select {
+			case queue <- requested:
+			default:
+			}
+		}
+	}
 	ticker := time.NewTicker(runner.interval)
 	defer ticker.Stop()
-	var accumulated []error
-	accumulated = append(accumulated, initialErrors...)
+	accumulated := append([]error(nil), initialErrors...)
 	for {
 		select {
 		case <-ctx.Done():
 			return errors.Join(append(accumulated, ctx.Err())...)
 		case <-ticker.C:
 			runner.recordLoopActivity()
-			result := runner.Sweep(ctx, domain.ReconciliationTriggerScheduled)
-			accumulated = appendBounded(accumulated, result.Errors...)
-			runner.recordLoopActivity()
+			for _, accountID := range runner.accounts {
+				enqueue(request{accountID: accountID, trigger: domain.ReconciliationTriggerScheduled})
+			}
 		case requested := <-runner.requests:
 			runner.recordLoopActivity()
-			params := RunAccountParams{ExecutionAccountID: requested.accountID, Trigger: requested.trigger, FocusOrderID: requested.orderID}
-			result, err := runner.service.RunAccount(ctx, params)
-			runner.remember(requested.accountID, result)
-			if err != nil {
-				accumulated = appendBounded(accumulated, err)
-			}
-			runner.recordLoopActivity()
+			enqueue(requested)
+		case err := <-failures:
+			accumulated = appendBounded(accumulated, err)
 		}
 	}
 }
@@ -396,21 +446,46 @@ func (runner *Runner) recordLoopActivity() {
 
 // Sweep 执行一次有界扫描并处理选中的记录。
 func (runner *Runner) Sweep(ctx context.Context, trigger domain.ReconciliationTrigger) SweepResult {
-	result := SweepResult{Trigger: trigger}
-	for _, accountID := range runner.accounts {
-		if err := ctx.Err(); err != nil {
-			result.Errors = append(result.Errors, err)
-			break
-		}
-		params := RunAccountParams{ExecutionAccountID: accountID, Trigger: trigger}
-		run, err := runner.service.RunAccount(ctx, params)
-		result.Runs = append(result.Runs, run)
-		runner.remember(accountID, run)
+	result := SweepResult{Trigger: trigger, Runs: make([]Result, len(runner.accounts))}
+	failures := make([]error, len(runner.accounts))
+	var workers sync.WaitGroup
+	for index, accountID := range runner.accounts {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			result.Runs[index], failures[index] = runner.runAccount(ctx, RunAccountParams{ExecutionAccountID: accountID, Trigger: trigger})
+		}()
+	}
+	workers.Wait()
+	for _, err := range failures {
 		if err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("reconcile %s: %w", accountID, err))
+			result.Errors = append(result.Errors, err)
 		}
 	}
 	return result
+}
+
+func (runner *Runner) runAccount(ctx context.Context, params RunAccountParams) (Result, error) {
+	runCtx, cancel := context.WithTimeout(ctx, runner.accountTimeout)
+	defer cancel()
+	slot := runner.accountSlots[params.ExecutionAccountID]
+	select {
+	case slot <- struct{}{}:
+		defer func() { <-slot }()
+	case <-runCtx.Done():
+		return Result{}, runCtx.Err()
+	}
+	result, err := runner.service.RunAccount(runCtx, params)
+	if runCtx.Err() != nil {
+		err = errors.Join(err, runCtx.Err())
+		result.Run.Status = domain.ReconciliationRunFailed
+		result.Run.Error = err.Error()
+	}
+	runner.remember(params.ExecutionAccountID, result)
+	if err != nil {
+		return result, fmt.Errorf("reconcile %s: %w", params.ExecutionAccountID, err)
+	}
+	return result, nil
 }
 
 // LastResult 返回指定账户最近一次对账结果。

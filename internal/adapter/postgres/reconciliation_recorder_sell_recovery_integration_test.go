@@ -213,6 +213,24 @@ func completeReconciliationFixtureRun(
 	t.Helper()
 	run.Status = status
 	run.CompletedAt = &completedAt
+	if status == domain.ReconciliationRunCompleted {
+		rows, err := recorder.db.Query(`SELECT token_id FROM execution_positions WHERE execution_account_id=$1`, run.ExecutionAccountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var token string
+			if err := rows.Scan(&token); err != nil {
+				t.Fatal(err)
+			}
+			run.VerifyReconciliation("position", token)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := recorder.Complete(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}

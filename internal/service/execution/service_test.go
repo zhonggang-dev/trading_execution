@@ -1609,7 +1609,7 @@ func TestFinalizeCancellationRequiresMatchingAuthoritativeFillTotal(t *testing.T
 	currentTime = now.Add(31 * time.Second)
 	venue.getOrder = &port.VenueOrder{
 		ID: cancelled.VenueOrderID, State: port.VenueOrderCancelled, RawStatus: "canceled",
-		FilledSize: "3", AverageFillPrice: "0.5", ObservedAt: now,
+		FilledSize: "3", AverageFillPrice: "0.5", ObservedAt: currentTime,
 	}
 	if _, err := service.FinalizeCancellation(context.Background(), cancelled.ID); !errors.Is(err, execution.ErrCancelFinalityPending) {
 		t.Fatalf("FinalizeCancellation(missing fill) error = %v", err)
@@ -1671,6 +1671,16 @@ func TestFinalizeCancellationKeepsReservationWhenVenueReadFails(t *testing.T) {
 	if !found || reservation.Status != domain.ReservationStatusReconciliationRequired || reservations.reconcileCalls.Load() != 0 {
 		t.Fatalf("reservation after failed finality read = %#v, found=%v", reservation, found)
 	}
+	for index := 0; index < 20; index++ {
+		again, err := service.FinalizeCancellation(context.Background(), cancelled.ID)
+		if err == nil || again.Revision != deferred.Revision {
+			t.Fatalf("identical uncertainty rewrote order: %#v %v", again, err)
+		}
+	}
+	if reservations.reconcileCalls.Load() != 0 {
+		t.Fatal("uncertain reservation was released")
+	}
+
 }
 
 // TestAuthoritativeFillsStillReleaseDefinitiveRejection verifies that an order

@@ -284,6 +284,13 @@ type ReconciliationRecorder interface {
 	Complete(ctx context.Context, run domain.ReconciliationRun) error
 }
 
+// ReconciliationCompletionRecorder closes independently recovered issues and
+// returns the durable open-issue boundary in the same transaction as completion.
+// Production recorders implement this so readiness cannot hide historical gates.
+type ReconciliationCompletionRecorder interface {
+	CompleteWithState(context.Context, domain.ReconciliationRun) (domain.ReconciliationRun, []domain.ReconciliationIssue, error)
+}
+
 // ReconciliationTriggerer 在订单路径中以异步方式触发对账，进程崩溃造成的遗漏由启动扫描补偿。
 type ReconciliationTriggerer interface {
 	Trigger(executionAccountID string, trigger domain.ReconciliationTrigger, focusOrderID string)

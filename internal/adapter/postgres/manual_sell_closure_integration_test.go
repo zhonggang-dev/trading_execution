@@ -187,6 +187,10 @@ func TestAuditedPartialSellClosurePostgresIntegration(t *testing.T) {
 					t.Fatal("failed release must preserve reservation with resumable audit state")
 				}
 				p.Reservations = reservations
+				if _, retryErr := manualsellclosure.Run(ctx, p, true); !errors.Is(retryErr, port.ErrOrderRecoveryBackoff) {
+					t.Fatalf("manual retry bypassed backoff: %v", retryErr)
+				}
+				now = now.Add(time.Minute)
 				result, err = manualsellclosure.Run(ctx, p, true)
 				if err != nil {
 					t.Fatal(err)

@@ -76,6 +76,7 @@ func (state *runState) reconcilePositions(ctx context.Context, executionAccountI
 		return err
 	}
 	state.run.Summary["local_positions"] = len(positions)
+	state.run.VerifyReconciliation("source", "POSTGRES_POSITIONS")
 	baselineValues, err := state.service.positionBaselines.ListExternalPositionBaselines(ctx, executionAccountID)
 	if err != nil {
 		state.addInfrastructureIssue(ctx, "POSTGRES_EXTERNAL_POSITION_BASELINES", "read external position ownership baseline", err)
@@ -87,15 +88,17 @@ func (state *runState) reconcilePositions(ctx context.Context, executionAccountI
 		return err
 	}
 	state.run.Summary["unmanaged_position_baselines"] = len(baselines.Positions)
+	state.run.VerifyReconciliation("source", "POSTGRES_EXTERNAL_POSITION_BASELINES")
 	external, conflict := state.readPositionConsensus(ctx, walletAddress)
 	if conflict {
 		return nil
 	}
+	state.run.VerifyReconciliation("source", "EXTERNAL_POSITIONS")
 	// The Data API can omit sub-centish share dust even with sizeThreshold=0.
 	// Verify the actual ERC1155 balance instead of declaring it zero, widening
 	// tolerances, or mutating the managed ledger. No settlement is inferred.
 	if state.service.knownPositionBalances != nil {
-		verified := make(map[string]bool)
+		handled := make(map[string]bool)
 		for _, p := range positions {
 			if _, found := external.Positions[p.TokenID]; found {
 				continue
@@ -110,8 +113,13 @@ func (state *runState) reconcilePositions(ctx context.Context, executionAccountI
 			}
 			actual, readErr := state.service.knownPositionBalances.GetKnownPositionBalance(ctx, walletAddress, p.TokenID)
 			if readErr != nil {
-				state.addInfrastructureIssue(ctx, "EVM_ERC1155_ETH_CALL", "verify omitted managed dust", readErr)
-				return nil
+				state.issue(ctx, domain.ReconciliationIssueParams{Type: domain.ReconciliationIssueSourceUnavailable,
+					Resolution: domain.ReconciliationResolutionRetry, Status: domain.ReconciliationIssueOpen,
+					MarketID: p.MarketID, ConditionID: p.ConditionID, TokenID: p.TokenID, Source: "EVM_ERC1155_ETH_CALL",
+					Details: "verify omitted managed dust: " + readErr.Error()})
+				state.errors = append(state.errors, readErr)
+				handled[p.TokenID] = true
+				continue
 			}
 			comparison, compareErr := actual.Compare(p.TotalShares)
 			if compareErr != nil || comparison != 0 {
@@ -119,16 +127,20 @@ func (state *runState) reconcilePositions(ctx context.Context, executionAccountI
 					Resolution: domain.ReconciliationResolutionManual, Status: domain.ReconciliationIssueOpen,
 					MarketID: p.MarketID, ConditionID: p.ConditionID, TokenID: p.TokenID, LocalValue: p.TotalShares,
 					RemoteValue: actual, Source: "EVM_ERC1155_ETH_CALL", Details: "omitted managed dust differs from exact on-chain balance"})
-				return nil
+				handled[p.TokenID] = true
+				continue
 			}
 			state.run.Summary["missing_dust_verified_onchain"]++
-			// Remove only exactly verified positions from this comparison. Keep
-			// the ledger untouched and keep all other tokens subject to comparison.
-			verified[p.TokenID] = true
+			if !state.tokenUnresolved(p.TokenID) {
+				state.run.VerifyReconciliation("position", p.TokenID)
+			}
+			// A token already checked (or explicitly reported as uncertain)
+			// must not be compared again as an absent snapshot row. Other tokens continue.
+			handled[p.TokenID] = true
 		}
 		filtered := make([]domain.Position, 0, len(positions))
 		for _, p := range positions {
-			if !verified[p.TokenID] {
+			if !handled[p.TokenID] {
 				filtered = append(filtered, p)
 			}
 		}
@@ -146,8 +158,16 @@ func (state *runState) reconcileBalance(ctx context.Context, executionAccountID 
 		return err
 	}
 	external, conflict := state.readBalanceConsensus(ctx, balance.WalletAddress, balance.CollateralAsset)
-	if conflict || within(balance.TotalBalance, external.Amount, state.service.balanceEpsilon) ||
-		state.balanceExplainedByRedemptions(balance.TotalBalance, external.Amount) {
+	state.run.VerifyReconciliation("source", "POSTGRES_LEDGER")
+	if conflict {
+		return nil
+	}
+	state.run.VerifyReconciliation("source", "EXTERNAL_BALANCE")
+	if within(balance.TotalBalance, external.Amount, state.service.balanceEpsilon) {
+		state.run.VerifyReconciliation("balance", "")
+		return nil
+	}
+	if state.balanceExplainedByRedemptions(balance.TotalBalance, external.Amount) {
 		return nil
 	}
 	if state.balanceExplainedByFinalityPendingFills(balance.TotalBalance, external.Amount) {
@@ -356,6 +376,7 @@ func (state *runState) compareBaselinedPosition(ctx context.Context, params comp
 		})
 		return
 	}
+	state.run.VerifyReconciliation("position", params.tokenID)
 	if !params.hasLocal {
 		return
 	}
@@ -388,6 +409,7 @@ func (state *runState) compareExternalPosition(ctx context.Context, params compa
 	sharesMatch := managedPositionSharesMatch(position.TotalShares, params.external, state.service.positionEpsilon)
 	state.settlePositionIfNeeded(ctx, settlePositionParams{tokenID: params.tokenID, position: position, external: params.external, sharesMatch: sharesMatch})
 	if sharesMatch {
+		state.run.VerifyReconciliation("position", params.tokenID)
 		return
 	}
 	if state.positionExplainedByFinalityPendingFills(params.tokenID, position.TotalShares, params.external.Shares) {
@@ -494,6 +516,7 @@ func (state *runState) settlePositionIfNeeded(ctx context.Context, params settle
 // recordMissingExternalPosition 记录本地存在但外部持仓快照缺失的非零仓位。
 func (state *runState) recordMissingExternalPosition(ctx context.Context, params missingExternalPositionParams) {
 	if sign, err := params.position.TotalShares.Sign(); err == nil && sign == 0 {
+		state.run.VerifyReconciliation("position", params.tokenID)
 		return
 	}
 	state.issue(ctx, domain.ReconciliationIssueParams{

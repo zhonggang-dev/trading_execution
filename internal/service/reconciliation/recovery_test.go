@@ -190,9 +190,9 @@ func TestUnknownOrderHeldByAnotherWorkerIsDeferred(t *testing.T) {
 	}
 }
 
-// TestFocusOrderBypassesBackoffButScheduledRunHonorsIt 验证退避期内定时对账推迟该
-// 订单，而 ORDER_UNKNOWN 即时触发的关注订单可以立即重试。
-func TestFocusOrderBypassesBackoffButScheduledRunHonorsIt(t *testing.T) {
+// TestFocusedAndScheduledRecoveryBothHonorBackoff 验证退避期内定时对账推迟该
+// 订单，ORDER_UNKNOWN 即时触发同样不能绕过退避。
+func TestFocusedAndScheduledRecoveryBothHonorBackoff(t *testing.T) {
 	fixture := newRecoveryFixture()
 	fixture.refresher.errors = map[string]error{"order-unknown": errVenueDown}
 	fixture.balance = "100"
@@ -213,12 +213,12 @@ func TestFocusOrderBypassesBackoffButScheduledRunHonorsIt(t *testing.T) {
 	if err != nil && !errors.Is(err, errVenueDown) {
 		t.Fatalf("focused RunAccount() error = %v", err)
 	}
-	if fixture.refresher.calls != 2 || focused.Run.Summary["orders_recovery_failed"] != 1 {
-		t.Fatalf("focused run refresh calls = %d summary = %#v, want backoff bypass", fixture.refresher.calls, focused.Run.Summary)
+	if fixture.refresher.calls != 1 || focused.Run.Summary["orders_recovery_deferred"] != 1 {
+		t.Fatalf("focused run refresh calls = %d summary = %#v, want durable backoff", fixture.refresher.calls, focused.Run.Summary)
 	}
 	lease, _ := fixture.leases.Lease("order-unknown")
-	if lease.Attempts != 2 {
-		t.Fatalf("lease attempts = %d, want 2", lease.Attempts)
+	if lease.Attempts != 1 {
+		t.Fatalf("lease attempts = %d, want 1", lease.Attempts)
 	}
 }
 

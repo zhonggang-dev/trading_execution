@@ -276,14 +276,15 @@ func (params RunAccountParams) normalize() RunAccountParams {
 
 // runState 表示后端使用的 runState 类型。
 type runState struct {
-	service     *Service
-	run         *domain.ReconciliationRun
-	now         time.Time
-	issues      []domain.ReconciliationIssue
-	errors      []error
-	redemptions inFlightRedemptions
-	finality    finalityPendingFills
-	recovery    recoveryState
+	service           *Service
+	run               *domain.ReconciliationRun
+	now               time.Time
+	issues            []domain.ReconciliationIssue
+	errors            []error
+	persistenceFailed bool
+	redemptions       inFlightRedemptions
+	finality          finalityPendingFills
+	recovery          recoveryState
 }
 
 // recoveryState collects the per-order recovery results of one run.
@@ -308,10 +309,14 @@ func (state *runState) issue(ctx context.Context, params domain.ReconciliationIs
 	issue, err := domain.ReconciliationIssueParams(issue).Build()
 	if err != nil {
 		state.errors = append(state.errors, err)
+		state.persistenceFailed = true
 		return
 	}
-	if err := state.service.recorder.RecordIssue(ctx, issue); err != nil {
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reconciliationFinalizeTimeout)
+	defer cancel()
+	if err := state.service.recorder.RecordIssue(recordCtx, issue); err != nil {
 		state.errors = append(state.errors, err)
+		state.persistenceFailed = true
 	}
 	state.issues = append(state.issues, issue)
 	state.run.Summary["issues_total"]++
@@ -342,7 +347,10 @@ func (service *Service) finish(ctx context.Context, state runState, cause error)
 	}
 	if cause != nil {
 		state.run.Error = cause.Error()
-		if ctx.Err() != nil {
+		if state.run.Status == domain.ReconciliationRunCompleted {
+			state.run.Status = domain.ReconciliationRunAttentionRequired
+		}
+		if ctx.Err() != nil || state.persistenceFailed {
 			// A shutdown can arrive after Start committed but before the evidence
 			// scan returns. Record a terminal failure with an independent bounded
 			// context so the per-account RUNNING lease never blocks the next
@@ -357,31 +365,36 @@ func (service *Service) finish(ctx context.Context, state runState, cause error)
 			state.run.Status = domain.ReconciliationRunFailed
 		}
 	}
-	impact := domain.SummarizeReconciliationImpact(state.issues)
-	if impact.AccountWide {
-		state.run.Summary["impact_account_wide"] = 1
-	} else {
-		state.run.Summary["impact_account_wide"] = 0
-	}
-	state.run.Summary["impact_scoped_orders"] = len(impact.OrderIDs)
-	state.run.Summary["impact_scoped_tokens"] = len(impact.TokenIDs)
-	if state.run.Status == domain.ReconciliationRunAttentionRequired {
-		if impact.AccountWide {
-			service.logger.Warn("reconciliation finished with account-wide issues; new placements for the account are blocked",
-				"execution_account_id", state.run.ExecutionAccountID, "run_id", state.run.RunID, "reasons", impact.Reasons)
-		} else {
-			service.logger.Warn("reconciliation finished with scoped issues; only the listed orders/tokens are gated",
-				"execution_account_id", state.run.ExecutionAccountID, "run_id", state.run.RunID,
-				"order_ids", impact.OrderIDs, "token_ids", impact.TokenIDs, "reasons", impact.ScopedReasons)
+	completeContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), reconciliationFinalizeTimeout)
+	defer cancel()
+	var completeErr error
+	if recorder, ok := service.recorder.(port.ReconciliationCompletionRecorder); ok {
+		var persisted domain.ReconciliationRun
+		var open []domain.ReconciliationIssue
+		persisted, open, completeErr = recorder.CompleteWithState(completeContext, *state.run)
+		if completeErr == nil {
+			*state.run = persisted
+			current := state.issues[:0]
+			for _, issue := range state.issues {
+				if issue.Status == domain.ReconciliationIssueResolved {
+					current = append(current, issue)
+				}
+			}
+			state.issues = append(current, open...)
 		}
+	} else {
+		completeErr = service.recorder.Complete(completeContext, *state.run)
 	}
-	completeContext := ctx
-	var cancel context.CancelFunc
-	if ctx.Err() != nil {
-		completeContext, cancel = context.WithTimeout(context.Background(), reconciliationFinalizeTimeout)
-		defer cancel()
+	if completeErr != nil {
+		state.run.Status = domain.ReconciliationRunFailed
+		state.run.Error = errors.Join(cause, completeErr).Error()
 	}
-	completeErr := service.recorder.Complete(completeContext, *state.run)
+	impact := domain.SummarizeReconciliationImpact(state.issues)
+	if state.run.Status == domain.ReconciliationRunAttentionRequired {
+		service.logger.Warn("reconciliation partially completed", "execution_account_id", state.run.ExecutionAccountID,
+			"run_id", state.run.RunID, "account_wide", impact.AccountWide, "order_ids", impact.OrderIDs,
+			"token_ids", impact.TokenIDs, "reasons", impact.Reasons, "scoped_reasons", impact.ScopedReasons)
+	}
 	return Result{Run: *state.run, Issues: state.issues, Impact: impact}, errors.Join(cause, completeErr)
 }
 

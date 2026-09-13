@@ -136,6 +136,9 @@ func (coordinator *Coordinator) Sweep(ctx context.Context) SweepResult {
 			break
 		}
 		action, err := coordinator.processOrder(ctx, order, now)
+		if errors.Is(err, port.ErrCancelFinalityPending) {
+			continue
+		}
 		if err != nil {
 			result.Errors = append(result.Errors, err)
 			continue
@@ -184,10 +187,38 @@ func (coordinator *Coordinator) processOrder(ctx context.Context, order domain.O
 }
 
 func (coordinator *Coordinator) finalizeCancellation(ctx context.Context, order domain.Order) (sweepAction, error) {
+	if coordinator.recovery == nil {
+		return coordinator.finalizeCancellationWork(ctx, order)
+	}
+	outcome := coordinator.recovery.Run(ctx, orderrecovery.RunParams{Order: order, Holder: coordinator.recoveryHolder,
+		Work: func(workCtx context.Context) (domain.OrderRecoveryOutcomeKind, error) {
+			_, err := coordinator.finalizeCancellationWork(workCtx, order)
+			if errors.Is(err, port.ErrCancelFinalityPending) || errors.Is(err, port.ErrOrderRevisionConflict) {
+				return domain.OrderRecoveryOutcomeWaiting, nil
+			}
+			if err != nil {
+				return domain.OrderRecoveryOutcomeFailed, err
+			}
+			return domain.OrderRecoveryOutcomeResolved, nil
+		},
+	})
+	if outcome.StoreErr != nil {
+		return sweepActionNone, outcome.StoreErr
+	}
+	if outcome.Skipped {
+		return sweepActionDeferred, nil
+	}
+	if outcome.Err != nil {
+		return sweepActionNone, outcome.Err
+	}
+	if outcome.Kind != domain.OrderRecoveryOutcomeResolved {
+		return sweepActionDeferred, nil
+	}
+	return sweepActionFinalizeCancellation, nil
+}
+
+func (coordinator *Coordinator) finalizeCancellationWork(ctx context.Context, order domain.Order) (sweepAction, error) {
 	if _, err := coordinator.execution.FinalizeCancellation(ctx, order.ID); err != nil {
-		if errors.Is(err, port.ErrCancelFinalityPending) {
-			return sweepActionNone, nil
-		}
 		return sweepActionNone, fmt.Errorf("finalize cancelled order %s: %w", order.ID, err)
 	}
 	return sweepActionFinalizeCancellation, nil
@@ -195,6 +226,35 @@ func (coordinator *Coordinator) finalizeCancellation(ctx context.Context, order 
 
 // cancelOrder 撤销一张已经过期的活动订单。
 func (coordinator *Coordinator) cancelOrder(ctx context.Context, order domain.Order) (sweepAction, error) {
+	if coordinator.recovery == nil {
+		return coordinator.cancelOrderWork(ctx, order)
+	}
+	outcome := coordinator.recovery.Run(ctx, orderrecovery.RunParams{Order: order, Holder: coordinator.recoveryHolder,
+		Work: func(workCtx context.Context) (domain.OrderRecoveryOutcomeKind, error) {
+			_, err := coordinator.cancelOrderWork(workCtx, order)
+			if errors.Is(err, port.ErrOrderRevisionConflict) {
+				return domain.OrderRecoveryOutcomeWaiting, nil
+			}
+			if err != nil {
+				return domain.OrderRecoveryOutcomeFailed, err
+			}
+			// A cancellation acknowledgement still awaits fill finality.
+			return domain.OrderRecoveryOutcomeWaiting, nil
+		},
+	})
+	if outcome.StoreErr != nil {
+		return sweepActionNone, outcome.StoreErr
+	}
+	if outcome.Skipped {
+		return sweepActionDeferred, nil
+	}
+	if outcome.Err != nil {
+		return sweepActionNone, outcome.Err
+	}
+	return sweepActionCancel, nil
+}
+
+func (coordinator *Coordinator) cancelOrderWork(ctx context.Context, order domain.Order) (sweepAction, error) {
 	if _, err := coordinator.execution.Cancel(ctx, order.ID); err != nil {
 		return sweepActionNone, fmt.Errorf("cancel expired order %s: %w", order.ID, err)
 	}
@@ -212,7 +272,7 @@ func (coordinator *Coordinator) resumeOrder(ctx context.Context, order domain.Or
 // refreshOrder 刷新一张已经进入交易所生命周期的订单。结果不确定的恢复状态经过
 // 订单级租约：同一订单同时只有一个恢复者，失败后按持久化退避重试。
 func (coordinator *Coordinator) refreshOrder(ctx context.Context, order domain.Order) (sweepAction, error) {
-	if coordinator.recovery == nil || !domain.IsOrderRecoveryStatus(order.Status) {
+	if coordinator.recovery == nil {
 		if _, err := coordinator.execution.Refresh(ctx, order.ID); err != nil {
 			return sweepActionNone, ignoreRevisionConflict("refresh", order.ID, err)
 		}

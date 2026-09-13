@@ -10,6 +10,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/ordercoordinator"
 	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
@@ -122,7 +123,7 @@ func (execution *fakeExecution) Cancel(_ context.Context, orderID string) (domai
 
 func (execution *fakeExecution) FinalizeCancellation(_ context.Context, orderID string) (domain.Order, error) {
 	execution.finalized = append(execution.finalized, orderID)
-	return domain.Order{ID: orderID}, nil
+	return domain.Order{ID: orderID}, execution.failures[orderID]
 }
 
 // createOrder 模拟创建并返回测试记录。
@@ -155,7 +156,7 @@ func TestSweepSerializesRecoveryOrdersThroughTheLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	execution := &fakeExecution{failures: map[string]error{"failing": errors.New("clob 503")}}
+	execution := &fakeExecution{failures: map[string]error{"failing": errors.New("clob 503")}, resolved: map[string]domain.OrderStatus{"live": domain.OrderStatusLive}}
 	coordinator, err := ordercoordinator.New(ordercoordinator.Params{
 		Repository: repository, Execution: execution, PollInterval: time.Second,
 		Now: func() time.Time { return clock }, Recovery: guard, RecoveryHolder: "ordercoordinator:test",
@@ -177,7 +178,7 @@ func TestSweepSerializesRecoveryOrdersThroughTheLease(t *testing.T) {
 		t.Fatalf("failing lease = %#v exists=%v, want one failed attempt with 30s backoff", lease, exists)
 	}
 	if _, exists := leases.Lease("live"); exists {
-		t.Fatal("LIVE order must not use the recovery lease")
+		t.Fatal("healthy LIVE order must release its recovery lease after refresh")
 	}
 
 	// Inside the backoff window the failing order is deferred, not retried.
@@ -198,5 +199,50 @@ func TestSweepSerializesRecoveryOrdersThroughTheLease(t *testing.T) {
 	}
 	if _, exists := leases.Lease("failing"); exists {
 		t.Fatal("resolved order still holds a recovery lease")
+	}
+}
+
+func TestCancelledFinalityUsesSharedLeaseAndBackoff(t *testing.T) {
+	now := time.Now().UTC()
+	repo := memory.NewOrderRepository()
+	for _, id := range []string{"cancelled", "healthy"} {
+		status := domain.OrderStatusCancelled
+		if id == "healthy" {
+			status = domain.OrderStatusLive
+		}
+		createOrder(t, repo, domain.Order{ID: id, Intent: domain.OrderIntent{ClientOrderID: id, ExecutionAccountID: "wallet-6", TokenID: id}, Status: status, FilledSize: "0", Revision: 1, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour)})
+	}
+	store := memory.NewOrderRecoveryLeaseStore()
+	guard, err := orderrecovery.NewGuard(orderrecovery.GuardParams{Store: store, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := &fakeExecution{failures: map[string]error{"cancelled": port.ErrCancelFinalityPending}, resolved: map[string]domain.OrderStatus{"healthy": domain.OrderStatusLive}}
+	coordinator, err := ordercoordinator.New(ordercoordinator.Params{Repository: repo, Execution: execution, Recovery: guard, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := coordinator.Sweep(context.Background())
+	if len(first.Errors) != 0 || first.Deferred != 1 || first.Refreshed != 1 {
+		t.Fatalf("first=%#v", first)
+	}
+	for index := 0; index < 100; index++ {
+		coordinator.Sweep(context.Background())
+	}
+	if len(execution.finalized) != 1 || len(execution.refreshed) != 101 {
+		t.Fatalf("calls finality=%d healthy=%d", len(execution.finalized), len(execution.refreshed))
+	}
+	lease, exists := store.Lease("cancelled")
+	if !exists || lease.NextRetryAt == nil || !lease.NextRetryAt.After(now) {
+		t.Fatalf("lease=%#v", lease)
+	}
+	now = now.Add(31 * time.Second)
+	delete(execution.failures, "cancelled")
+	final := coordinator.Sweep(context.Background())
+	if final.Finalized != 1 {
+		t.Fatalf("final=%#v", final)
+	}
+	if _, exists := store.Lease("cancelled"); exists {
+		t.Fatal("resolved finality retained lease")
 	}
 }
