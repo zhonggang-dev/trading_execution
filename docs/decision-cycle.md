@@ -12,8 +12,8 @@ Go 启动时注入绑定表，例如：
 ```text
 echo / multfactor_v2 / main
 echo / multfactor_v1 / wallet-1
-v4_1_flash_masked / multfactor_v1 / wallet-6
-v4_1_flash_masked / multfactor_v2 / wallet-7
+deepseek_masked / multfactor_v1 / wallet-6
+deepseek_masked / multfactor_v2 / wallet-7
 ```
 
 框架拒绝重复的 model/strategy 组合，也拒绝把同一个 execution account 绑定两次。
@@ -26,7 +26,7 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 当前四钱包配置中，`#0` 是现有 literal account ID `main`，不是隐式的
 `wallet-0` 别名。上线前必须从当前 PIT snapshot 确认 `prediction_model_id`；
 新 masked producer 当前配置为 `v4.1 flash`；实际值必须以新 Worker 回调后
-快照中的 `model.name` 为准，不能由 `v4_1_flash_masked` 业务名猜测。
+快照中的 `model.name` 为准，不能由 `deepseek_masked` 业务名猜测。
 新二进制在禁单部署阶段仍接受原 `gemini_masked` 或临时 `qwen_masked`
 四钱包绑定，以便在旧 lot 后继路由切换前安全启动和回滚；钱包 6/7
 不能混用不同的 masked 逻辑名。
@@ -254,12 +254,12 @@ recorders 持久化共享盘口、完整 binding 输入、输出与订单意图�
 [
   {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
   {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-  {"prediction_model_id":"v4.1 flash","model_id":"v4_1_flash_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-  {"prediction_model_id":"v4.1 flash","model_id":"v4_1_flash_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 ]
 ```
 
-`execution_strategy_bindings.model_id` 必须使用逻辑名 `echo` / `v4_1_flash_masked`，并与
+`execution_strategy_bindings.model_id` 必须使用逻辑名 `echo` / `deepseek_masked`，并与
 `strategy_id + execution_account_id` 组成相同的四条绑定；上游真实名只存在运行配置中。
 因为 SELL intent 和目标 lot 会端到端严格比对 `model_id`，从上游原始名切换到
 逻辑名前，四个账户必须没有仍归属旧模型名的 OPEN lot。不能只改 env 或
@@ -268,7 +268,7 @@ recorders 持久化共享盘口、完整 binding 输入、输出与订单意图�
 `position_lot_model_routes.logical_model_id=qwen_masked` 审计记录。正式名称切换时，
 必须在全局禁单且无进行中订单的窗口，为每个仍开放的旧 lot 插入
 `position_lot_model_route_successors`，使读取、退出和卖出预占看到
-`v4_1_flash_masked`；该表也只能追加，不能改写既有审计路线。
+`deepseek_masked`；该表也只能追加，不能改写既有审计路线。
 最新 BBO 和价格保护由独立 Market Validation 层负责，详见
 [`market-validation.md`](market-validation.md)；余额、仓位、敞口与暂停检查由 Go Hard Risk
 负责，详见 [`risk-control.md`](risk-control.md)。

@@ -985,7 +985,7 @@ func validateDecisionPredictionSourceModes(
 			if mode != domain.PredictionSourceModeDirect {
 				return fmt.Errorf("this release requires logical model echo to use DIRECT prediction source mode")
 			}
-		case "gemini_masked", "qwen_masked", "v4_1_flash_masked":
+		case "gemini_masked", "qwen_masked", "deepseek_masked":
 			if mode != domain.PredictionSourceModeSandbox {
 				return fmt.Errorf("this release requires logical model %s to use SANDBOX prediction source mode", logicalModelID)
 			}
@@ -1110,7 +1110,7 @@ func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBin
 			return fmt.Errorf("live decision submission cannot mix masked wallet routes")
 		}
 	}
-	if maskedModelID != "gemini_masked" && maskedModelID != "qwen_masked" && maskedModelID != "v4_1_flash_masked" {
+	if maskedModelID != "gemini_masked" && maskedModelID != "qwen_masked" && maskedModelID != "deepseek_masked" {
 		return fmt.Errorf("live decision submission requires a supported masked wallet route")
 	}
 	expectedRoutes := map[string]string{

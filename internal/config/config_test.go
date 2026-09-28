@@ -197,12 +197,12 @@ func TestLoadAcceptsV41FlashWallet67Route(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"echoz","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
 		{"prediction_model_id":"echoz","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"v4.1 flash","model_id":"v4_1_flash_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"v4.1 flash","model_id":"v4_1_flash_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echoz":"DIRECT","v4.1 flash":"SANDBOX"}`)
 	config, err := Load()
-	if err != nil || config.DecisionCycle.Bindings[2].ModelID != "v4_1_flash_masked" {
+	if err != nil || config.DecisionCycle.Bindings[2].ModelID != "deepseek_masked" {
 		t.Fatalf("v4.1 flash route config = %#v, error = %v", config.DecisionCycle.Bindings, err)
 	}
 }

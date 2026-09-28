@@ -60,7 +60,7 @@ $preflight$;
 INSERT INTO position_lot_model_route_successors (
     lot_id, prior_logical_model_id, logical_model_id, reason, actor
 )
-SELECT lot.lot_id, 'qwen_masked', 'v4_1_flash_masked',
+SELECT lot.lot_id, 'qwen_masked', 'deepseek_masked',
        'Replace temporary Qwen logical identity with the confirmed v4.1 flash model',
        'wallet67-v41-flash-cutover'
 FROM position_lots AS lot
@@ -79,14 +79,14 @@ UPDATE execution_strategy_bindings
 INSERT INTO execution_strategy_bindings (
     model_id, strategy_id, execution_account_id, enabled
 ) VALUES
-    ('v4_1_flash_masked','multfactor_v1','wallet-6',TRUE),
-    ('v4_1_flash_masked','multfactor_v2','wallet-7',TRUE);
+    ('deepseek_masked','multfactor_v1','wallet-6',TRUE),
+    ('deepseek_masked','multfactor_v2','wallet-7',TRUE);
 
 DO $verify$
 BEGIN
     IF (SELECT count(*) FROM execution_strategy_bindings WHERE enabled=TRUE) <> 4
        OR (SELECT count(*) FROM execution_strategy_bindings
-            WHERE enabled=TRUE AND model_id='v4_1_flash_masked'
+            WHERE enabled=TRUE AND model_id='deepseek_masked'
               AND (strategy_id, execution_account_id) IN
                   (('multfactor_v1','wallet-6'),('multfactor_v2','wallet-7'))) <> 2
        OR EXISTS (
@@ -94,7 +94,7 @@ BEGIN
             LEFT JOIN position_lot_model_routes_effective AS route USING (lot_id)
             WHERE lot.execution_account_id IN ('wallet-6','wallet-7')
               AND lot.status='OPEN'
-              AND route.logical_model_id IS DISTINCT FROM 'v4_1_flash_masked'
+              AND route.logical_model_id IS DISTINCT FROM 'deepseek_masked'
        ) THEN
         RAISE EXCEPTION 'v4.1 flash wallet-6/7 cutover verification failed';
     END IF;

@@ -2289,7 +2289,7 @@ func TestPositionLotModelRouteSuccessorPostgresIntegration(t *testing.T) {
 		accountID = "account-route-successor"
 		tokenID   = "token-route-successor"
 		lotID     = "lot-route-successor"
-		finalID   = "v4_1_flash_masked"
+		finalID   = "deepseek_masked"
 	)
 	insertAccount(t, db, accountID, "0xroutesuccessor", "20", "20", "0")
 	if _, err := db.Exec(`
@@ -2308,7 +2308,7 @@ func TestPositionLotModelRouteSuccessorPostgresIntegration(t *testing.T) {
 	if _, err := db.Exec(`
 		INSERT INTO position_lot_model_route_successors
 			(lot_id, prior_logical_model_id, logical_model_id, reason, actor)
-		VALUES ($1,'wrong','v4_1_flash_masked','final model name','integration-test')`, lotID); err == nil {
+		VALUES ($1,'wrong','deepseek_masked','final model name','integration-test')`, lotID); err == nil {
 		t.Fatal("successor accepted a mismatched prior identity")
 	}
 	if _, err := db.Exec(`
@@ -2409,11 +2409,11 @@ func TestWallet67V41FlashCutoverSQLPostgresIntegration(t *testing.T) {
 		t.Fatalf("execute reviewed wallet-6/7 cutover: %v", err)
 	}
 	var model string
-	if err := db.QueryRow(`SELECT logical_model_id FROM position_lot_model_routes_effective WHERE lot_id='lot-cutover'`).Scan(&model); err != nil || model != "v4_1_flash_masked" {
+	if err := db.QueryRow(`SELECT logical_model_id FROM position_lot_model_routes_effective WHERE lot_id='lot-cutover'`).Scan(&model); err != nil || model != "deepseek_masked" {
 		t.Fatalf("effective route = %q, error = %v", model, err)
 	}
 	var enabled int
-	if err := db.QueryRow(`SELECT count(*) FROM execution_strategy_bindings WHERE enabled=TRUE AND model_id='v4_1_flash_masked'`).Scan(&enabled); err != nil || enabled != 2 {
+	if err := db.QueryRow(`SELECT count(*) FROM execution_strategy_bindings WHERE enabled=TRUE AND model_id='deepseek_masked'`).Scan(&enabled); err != nil || enabled != 2 {
 		t.Fatalf("enabled final bindings = %d, error = %v", enabled, err)
 	}
 }

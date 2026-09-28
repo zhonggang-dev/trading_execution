@@ -1075,8 +1075,8 @@ func TestAccountEntryGateRoutesOnlyV41FlashPredictionsToWallet6AndWallet7(t *tes
 	bindings := []domain.StrategyExecutionBinding{
 		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main"},
 		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-1"},
-		{PredictionModelID: "v4.1 flash", ModelID: "v4_1_flash_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
-		{PredictionModelID: "v4.1 flash", ModelID: "v4_1_flash_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+		{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
+		{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
 	}
 	strategy := &matrixStrategy{}
 	service, err := newTestService(Params{
@@ -1121,7 +1121,7 @@ func TestAccountEntryGateRoutesOnlyV41FlashPredictionsToWallet6AndWallet7(t *tes
 			}
 		case "wallet-6", "wallet-7":
 			if len(request.Predictions) != 1 || !run.EntrySubmissionEnabled || run.EntryBlockReason != "" ||
-				request.Predictions[0].Model.Name != "v4_1_flash_masked" || request.Predictions[0].PredictionID != maskedPrediction.PredictionID {
+				request.Predictions[0].Model.Name != "deepseek_masked" || request.Predictions[0].PredictionID != maskedPrediction.PredictionID {
 				t.Fatalf("wallet67 entry request/run=%#v/%#v", request, run)
 			}
 		default:
