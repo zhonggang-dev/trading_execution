@@ -12,8 +12,8 @@ Go 启动时注入绑定表，例如：
 ```text
 echo / multfactor_v2 / main
 echo / multfactor_v1 / wallet-1
-gemini_masked / multfactor_v1 / wallet-6
-gemini_masked / multfactor_v2 / wallet-7
+qwen_masked / multfactor_v1 / wallet-6
+qwen_masked / multfactor_v2 / wallet-7
 ```
 
 框架拒绝重复的 model/strategy 组合，也拒绝把同一个 execution account 绑定两次。
@@ -25,8 +25,10 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
 
 当前四钱包配置中，`#0` 是现有 literal account ID `main`，不是隐式的
 `wallet-0` 别名。上线前必须从当前 PIT snapshot 确认 `prediction_model_id`；
-例如已验证过的 masked producer 可能是 `gemini-3.6-flash`，但该值不能由
-`gemini_masked` 业务名猜测。
+新 masked producer 暂以 `qwen` 为例；实际值必须以新 Worker 回调后
+快照中的 `model.name` 为准，不能由 `qwen_masked` 业务名猜测。
+新二进制在禁单部署阶段仍接受原 `gemini_masked` 四钱包绑定，以便在旧 lot
+路由切换前安全启动和回滚；同一组绑定不允许混用 Gemini 与 Qwen。
 
 ## 周期顺序
 
@@ -251,12 +253,12 @@ recorders 持久化共享盘口、完整 binding 输入、输出与订单意图�
 [
   {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
   {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-  {"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-  {"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+  {"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+  {"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 ]
 ```
 
-`execution_strategy_bindings.model_id` 必须使用逻辑名 `echo` / `gemini_masked`，并与
+`execution_strategy_bindings.model_id` 必须使用逻辑名 `echo` / `qwen_masked`，并与
 `strategy_id + execution_account_id` 组成相同的四条绑定；上游真实名只存在运行配置中。
 因为 SELL intent 和目标 lot 会端到端严格比对 `model_id`，从上游原始名切换到
 逻辑名前，四个账户必须没有仍归属旧模型名的 OPEN lot。不能只改 env 或

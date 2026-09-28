@@ -147,7 +147,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure live execution account scope: %w", err)
 	}
-	activeAuthorizations, err := currentLiveWallet67Authorizations(reconciliationAccountIDs)
+	activeAuthorizations, err := currentLiveWallet67Authorizations(reconciliationAccountIDs, cfg.DecisionCycle.Bindings)
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +601,25 @@ func validateCurrentLiveWallet67Release(configured, quarantined []string) error 
 
 func currentLiveWallet67Authorizations(
 	activeAccountIDs []string,
+	bindings []domain.StrategyExecutionBinding,
 ) ([]postgresadapter.ExpectedActiveExecutionAccount, error) {
+	maskedModelID := ""
+	for _, rawBinding := range bindings {
+		binding := rawBinding.Normalize()
+		if binding.ExecutionAccountID != "wallet-6" && binding.ExecutionAccountID != "wallet-7" {
+			continue
+		}
+		if binding.ModelID != "gemini_masked" && binding.ModelID != "qwen_masked" {
+			return nil, fmt.Errorf("wallet-6/wallet-7 require a Gemini or Qwen masked model route")
+		}
+		if maskedModelID != "" && maskedModelID != binding.ModelID {
+			return nil, fmt.Errorf("wallet-6/wallet-7 cannot mix Gemini and Qwen routes")
+		}
+		maskedModelID = binding.ModelID
+	}
+	if maskedModelID == "" {
+		return nil, fmt.Errorf("wallet-6/wallet-7 masked model route is required")
+	}
 	routes := map[string]postgresadapter.ExpectedActiveExecutionAccount{
 		"main": {
 			ExecutionAccountID: "main",
@@ -615,12 +633,12 @@ func currentLiveWallet67Authorizations(
 		},
 		"wallet-6": {
 			ExecutionAccountID: "wallet-6",
-			ModelID:            "gemini_masked",
+			ModelID:            maskedModelID,
 			StrategyID:         domain.StrategyIDMultfactorV1,
 		},
 		"wallet-7": {
 			ExecutionAccountID: "wallet-7",
-			ModelID:            "gemini_masked",
+			ModelID:            maskedModelID,
 			StrategyID:         domain.StrategyIDMultfactorV2,
 		},
 	}

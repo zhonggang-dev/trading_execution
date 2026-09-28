@@ -272,6 +272,38 @@ func TestRunRoutesPredictionProducerToLogicalModelForRoutedLot(t *testing.T) {
 	}
 }
 
+func TestRunExitsQwenMaskedLotWithoutDirectPrediction(t *testing.T) {
+	fixture := newFixture(t)
+	fixture.predictionSource.snapshot.Predictions[0].Model.Name = "qwen"
+	fixture.predictionSource.snapshot.Predictions[0].SandboxID = "sandbox-qwen"
+	fixture.tradeSource.trades[0].OriginModelID = "qwen"
+	fixture.tradeSource.trades[0].ModelID = "qwen_masked"
+	fixture.strategy.build = func(request domain.PositionExitRequest) domain.PositionExitResponse {
+		if request.Context.ModelID != "qwen_masked" || len(request.Predictions) != 0 || len(request.Trades) != 1 {
+			t.Fatalf("Qwen exit input = %#v, want position-only input", request)
+		}
+		return sellResponse(request)
+	}
+	params := fixture.params()
+	params.Bindings = []domain.StrategyExecutionBinding{{
+		PredictionModelID: "qwen", ModelID: "qwen_masked",
+		StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-model-a-v1",
+	}}
+	service, err := New(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Run(context.Background(), fixture.decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(result.Runs) != 1 || len(result.Runs[0].Intents) != 1 ||
+		len(fixture.executor.intents) != 1 || fixture.executor.intents[0].ModelID != "qwen_masked" ||
+		fixture.executor.intents[0].Side != domain.SideSell {
+		t.Fatalf("Qwen exit result = %#v, intents = %#v", result, fixture.executor.intents)
+	}
+}
+
 // TestLegacyThreeFieldBindingDefaultsPredictionSource keeps old configuration
 // valid when prediction_model_id is omitted.
 func TestLegacyThreeFieldBindingDefaultsPredictionSource(t *testing.T) {
