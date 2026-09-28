@@ -23,6 +23,17 @@ POSITION_EXIT_JOB_TOKEN=DEDICATED_32_BYTE_OR_LONGER_SECRET
 execution_risk_global_control.kill_switch=true
 ```
 
+For the new wallet-6/wallet-7 route, `qwen_masked` is the logical trading identity.
+The upstream `qwen` value below is provisional and must be replaced with the
+exact `model.name` observed in a fresh Sandbox prediction snapshot. Previous
+Gemini rollout evidence does not approve this new route. Keep order submission
+disabled while preparing and validating the new binding.
+The new binary can start with the existing Gemini wallet-6/wallet-7 bindings
+while the decision cycle and order submission remain disabled. This is a
+compatibility deployment, not the Qwen database cutover; the Qwen preflight
+and its approval evidence apply only after the binding and legacy-lot route
+transition has been prepared separately.
+
 The same reviewed environment must explicitly pin execution-format safety and
 the v2 history window; monetary allocation belongs to the upstream AI strategy:
 
@@ -30,7 +41,7 @@ the v2 history window; monetary allocation belongs to the upstream AI strategy:
 EXECUTION_ALLOW_MARKET_ORDERS=false
 POLYMARKET_MAX_BUY_FEE_RATE_BPS=EXACT_REVIEWED_NON_NEGATIVE_DECIMAL
 POLYGON_ORDER_FILLED_CONFIRMATIONS=EXACT_REVIEWED_POSITIVE_INTEGER
-DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON={"EXACT_ECHO_SNAPSHOT_MODEL_NAME":"DIRECT","gemini-3.6-flash":"SANDBOX"}
+DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON={"EXACT_ECHO_SNAPSHOT_MODEL_NAME":"DIRECT","EXACT_NEW_SNAPSHOT_MODEL_NAME":"SANDBOX"}
 ```
 
 The preflight binds these values into the configuration SHA and verifies the
@@ -39,7 +50,7 @@ must be exactly `main,wallet-1`. The Go runtime also enforces the
 source-mode map on every cycle: `DIRECT` accepts only an empty `sandbox_id`,
 while `SANDBOX` requires a non-empty `sandbox_id`. The map must exactly cover
 all configured upstream models; the current release pins echo to `DIRECT` and
-`gemini_masked` to `SANDBOX`. Market orders must remain disabled for the
+`qwen_masked` to `SANDBOX`. Market orders must remain disabled for the
 four-wallet activation; changing any other value invalidates disabled-pass
 evidence and requires a new review.
 
@@ -52,8 +63,8 @@ Resume, decision delivery, and crash recovery.
 
 The `DECISION_CYCLE_BINDINGS_JSON` array must be replaced atomically as one
 environment-file value. The routes are exact: `echo/multfactor_v2 -> main`,
-`echo/multfactor_v1 -> wallet-1`, `gemini_masked/multfactor_v1 -> wallet-6`,
-and `gemini_masked/multfactor_v2 -> wallet-7`. The database must contain the
+`echo/multfactor_v1 -> wallet-1`, `qwen_masked/multfactor_v1 -> wallet-6`,
+and `qwen_masked/multfactor_v2 -> wallet-7`. The database must contain the
 same four `(model_id, strategy_id, execution_account_id)` authorization rows.
 All four authorization rows are enabled in shadow. main/wallet-1 remain active
 so their existing OPEN lots can be reconciled and exited; new BUY entries are
@@ -113,7 +124,7 @@ PREDICTION_RESULT_TOKEN=...
 
 `DIRECT_PREDICTION_MODEL_IDS_JSON` must equal the `DIRECT` subset in Trading's
 source-mode map, so it contains the echo source model and must not contain the
-Sandbox Gemini source. Unknown, blank, duplicated, missing, or extra models
+new Sandbox model source. Unknown, blank, duplicated, missing, or extra models
 fail preflight. Prediction result callbacks and Trading input must both be
 enabled. `TRADING_INPUT_TOKEN` must equal Trading's
 `DECISION_CYCLE_PREDICTION_INFRA_TOKEN`; both Prediction tokens and Trading's
@@ -195,7 +206,7 @@ The preflight exits non-zero if any of these invariants is false:
   `ENTRY_SUBMISSION_DISABLED` account policy, or wallet-6/wallet-7 do not have
   at least one prediction with no entry block;
 - the PIT snapshot does not contain at least one fresh, PIT-visible effective
-  Gemini Sandbox result with a non-empty `sandbox_id`, or contains an
+  new-model Sandbox result with a non-empty `sandbox_id`, or contains an
   ambiguous equally-timed result. The Direct manifest market count must be
   zero for this Sandbox-only entry cohort;
 - any Direct consumer group is supplied for the Sandbox-only entry cohort;

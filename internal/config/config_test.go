@@ -124,7 +124,7 @@ func TestLoadRejectsInvalidDecisionPredictionSourceModes(t *testing.T) {
 		{
 			name:  "wrong masked release mode",
 			value: `{"echo-source":"DIRECT","masked-source":"DIRECT"}`,
-			want:  "logical model gemini_masked to use SANDBOX",
+			want:  "logical model qwen_masked to use SANDBOX",
 		},
 		{
 			name:  "duplicate model key",
@@ -151,8 +151,8 @@ func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"echo-producer-current","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
 		{"prediction_model_id":"echo-producer-current","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-producer-current":"DIRECT","masked-producer-current":"SANDBOX"}`)
@@ -166,8 +166,41 @@ func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
 		config.DecisionCycle.Bindings[1].ExecutionAccountID != "wallet-1" ||
 		config.DecisionCycle.Bindings[1].StrategyID != "multfactor_v1" ||
 		config.DecisionCycle.Bindings[2].PredictionModelID != "masked-producer-current" ||
-		config.DecisionCycle.Bindings[2].ModelID != "gemini_masked" {
+		config.DecisionCycle.Bindings[2].ModelID != "qwen_masked" {
 		t.Fatalf("decision routes = %#v", config.DecisionCycle.Bindings)
+	}
+}
+
+func TestLoadAcceptsLegacyGeminiWallet67Route(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echoz","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echoz","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+	]`)
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echoz":"DIRECT","gemini-3.6-flash":"SANDBOX"}`)
+	config, err := Load()
+	if err != nil || config.DecisionCycle.Bindings[2].ModelID != "gemini_masked" {
+		t.Fatalf("legacy Gemini route config = %#v, error = %v", config.DecisionCycle.Bindings, err)
+	}
+}
+
+func TestLoadRejectsMixedGeminiQwenWalletRoutes(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"echoz","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
+		{"prediction_model_id":"echoz","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+	]`)
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echoz":"DIRECT","gemini-3.6-flash":"SANDBOX","qwen":"SANDBOX"}`)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "cannot mix Gemini and Qwen") {
+		t.Fatalf("Load() error = %v, want mixed route rejection", err)
 	}
 }
 
@@ -177,7 +210,7 @@ func TestLoadRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
 	setCompleteDecisionCycleEnvironment(t)
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"producer-a","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
-		{"prediction_model_id":"producer-a","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"account-b"}
+		{"prediction_model_id":"producer-a","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"account-b"}
 	]`)
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "multiple logical models") {
 		t.Fatalf("Load() error = %v", err)
@@ -191,8 +224,8 @@ func TestLoadAcceptsExplicitShadowDecisionCycle(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"echo-producer-current","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
 		{"prediction_model_id":"echo-producer-current","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"masked-producer-current","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "false")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
@@ -223,8 +256,8 @@ func TestLoadRejectsRemappedFourWalletRoutes(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
 		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-7"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-6"}
+		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-7"},
+		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-6"}
 	]`)
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must use execution account") {
@@ -239,8 +272,8 @@ func TestLoadRejectsRemappedRetainedWalletRoutes(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"wallet-1"},
 		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"main"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
@@ -256,8 +289,8 @@ func TestLoadRejectsRetiredWalletTopology(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
 		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
+		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
+		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
 	]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
@@ -273,13 +306,13 @@ func TestLoadAcceptsRequiredMainWallet1EntryDisabledAccounts(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
 		{"prediction_model_id":"echo-producer-v7","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `[" wallet-1 ","main"]`)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "false")
 	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-producer-v7":"DIRECT","gemini-3.6-flash":"SANDBOX"}`)
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"echo-producer-v7":"DIRECT","qwen":"SANDBOX"}`)
 	config, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -399,7 +432,7 @@ func TestLoadRejectsInvalidEntryDisabledAccounts(t *testing.T) {
 func TestDecodeKalshiLiveBindingsRequiresExactIsolatedRoutes(t *testing.T) {
 	bindings, err := decodeKalshiLiveBindings(`[
 		{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"echo-key","private_key_path":"/run/secrets/kalshi-echo.pem"},
-		{"model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7","api_key_id":"gemini-key","private_key_path":"/run/secrets/kalshi-gemini.pem"}
+		{"model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7","api_key_id":"gemini-key","private_key_path":"/run/secrets/kalshi-gemini.pem"}
 	]`)
 	if err != nil || len(bindings) != 2 {
 		t.Fatalf("bindings=%#v err=%v", bindings, err)
@@ -409,7 +442,7 @@ func TestDecodeKalshiLiveBindingsRequiresExactIsolatedRoutes(t *testing.T) {
 	}
 	for _, invalid := range []string{
 		`[{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"same","private_key_path":"relative.pem"}]`,
-		`[{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"same","private_key_path":"/a.pem"},{"model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7","api_key_id":"same","private_key_path":"/b.pem"}]`,
+		`[{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"same","private_key_path":"/a.pem"},{"model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7","api_key_id":"same","private_key_path":"/b.pem"}]`,
 	} {
 		if _, err := decodeKalshiLiveBindings(invalid); err == nil {
 			t.Fatalf("invalid bindings accepted: %s", invalid)
@@ -697,8 +730,8 @@ func setCompleteDecisionCycleEnvironment(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
 		{"prediction_model_id":"echo-source","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
 		{"prediction_model_id":"echo-source","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"masked-source","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"masked-source","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+		{"prediction_model_id":"masked-source","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"masked-source","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 	]`)
 	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[]`)
 	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `["main","wallet-1"]`)

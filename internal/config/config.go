@@ -985,9 +985,9 @@ func validateDecisionPredictionSourceModes(
 			if mode != domain.PredictionSourceModeDirect {
 				return fmt.Errorf("this release requires logical model echo to use DIRECT prediction source mode")
 			}
-		case "gemini_masked":
+		case "gemini_masked", "qwen_masked":
 			if mode != domain.PredictionSourceModeSandbox {
-				return fmt.Errorf("this release requires logical model gemini_masked to use SANDBOX prediction source mode")
+				return fmt.Errorf("this release requires logical model %s to use SANDBOX prediction source mode", logicalModelID)
 			}
 		}
 	}
@@ -1098,11 +1098,26 @@ func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBin
 	expectedAccounts := map[string]struct{}{
 		"main": {}, "wallet-1": {}, "wallet-6": {}, "wallet-7": {},
 	}
+	maskedModelID := ""
+	for _, rawBinding := range bindings {
+		binding := rawBinding.Normalize()
+		if binding.ModelID == "echo" {
+			continue
+		}
+		if maskedModelID == "" {
+			maskedModelID = binding.ModelID
+		} else if maskedModelID != binding.ModelID {
+			return fmt.Errorf("live decision submission cannot mix Gemini and Qwen wallet routes")
+		}
+	}
+	if maskedModelID != "gemini_masked" && maskedModelID != "qwen_masked" {
+		return fmt.Errorf("live decision submission requires a Gemini or Qwen masked wallet route")
+	}
 	expectedRoutes := map[string]string{
-		"echo\x00" + domain.StrategyIDMultfactorV2:          "main",
-		"echo\x00" + domain.StrategyIDMultfactorV1:          "wallet-1",
-		"gemini_masked\x00" + domain.StrategyIDMultfactorV1: "wallet-6",
-		"gemini_masked\x00" + domain.StrategyIDMultfactorV2: "wallet-7",
+		"echo\x00" + domain.StrategyIDMultfactorV2:             "main",
+		"echo\x00" + domain.StrategyIDMultfactorV1:             "wallet-1",
+		maskedModelID + "\x00" + domain.StrategyIDMultfactorV1: "wallet-6",
+		maskedModelID + "\x00" + domain.StrategyIDMultfactorV2: "wallet-7",
 	}
 	accounts := make(map[string]struct{}, len(bindings))
 	logicalModels := make(map[string]struct{}, 2)
@@ -1136,7 +1151,7 @@ func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBin
 	}
 	for pair := range expectedRoutes {
 		if _, exists := pairs[pair]; !exists {
-			return fmt.Errorf("live decision submission requires the exact echo/gemini_masked route matrix")
+			return fmt.Errorf("live decision submission requires the exact echo/%s route matrix", maskedModelID)
 		}
 	}
 	return nil

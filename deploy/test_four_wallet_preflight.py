@@ -25,21 +25,21 @@ VALID_BINDINGS = [
         "execution_account_id": "wallet-1",
     },
     {
-        "prediction_model_id": "gemini-3.6-flash",
-        "model_id": "gemini_masked",
+        "prediction_model_id": "qwen",
+        "model_id": "qwen_masked",
         "strategy_id": "multfactor_v1",
         "execution_account_id": "wallet-6",
     },
     {
-        "prediction_model_id": "gemini-3.6-flash",
-        "model_id": "gemini_masked",
+        "prediction_model_id": "qwen",
+        "model_id": "qwen_masked",
         "strategy_id": "multfactor_v2",
         "execution_account_id": "wallet-7",
     },
 ]
 SOURCE_MODES = {
     "echo-producer-v7": "DIRECT",
-    "gemini-3.6-flash": "SANDBOX",
+    "qwen": "SANDBOX",
 }
 MODEL_GROUPS = {"echo-producer-v7": "predict-echo-v1"}
 TRADING_COMMIT = "a" * 40
@@ -58,7 +58,7 @@ STATIC_TRADING_DRIFT = {
     "POLYMARKET_MAX_BUY_FEE_RATE_BPS": "9999",
     "POLYGON_ORDER_FILLED_CONFIRMATIONS": "65",
     "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON": (
-        '{"echo-producer-v7":"SANDBOX","gemini-3.6-flash":"DIRECT"}'
+        '{"echo-producer-v7":"SANDBOX","qwen":"DIRECT"}'
     ),
     "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON": '["main","wallet-6"]',
 }
@@ -125,7 +125,7 @@ def complete_snapshot(decision_at: dt.datetime, snapshot_id: str) -> dict[str, o
         prediction_result(
             decision_at,
             prediction_id="pred-sandbox-2",
-            model_id="gemini-3.6-flash",
+            model_id="qwen",
             sandbox_id="sandbox-gemini",
         ),
     ]
@@ -417,6 +417,14 @@ class DatabaseStateTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "missing configured"):
             self.validate(state)
 
+    def test_rejects_legacy_gemini_wallet67_authorizations(self) -> None:
+        state = database_state()
+        for binding in state["bindings"]:
+            if binding["execution_account_id"] in {"wallet-6", "wallet-7"}:
+                binding["model_id"] = "gemini_masked"
+        with self.assertRaisesRegex(preflight.PreflightError, "missing configured"):
+            self.validate(state)
+
     def test_rejects_unexpected_enabled_authorization(self) -> None:
         state = database_state()
         state["bindings"].append(
@@ -533,7 +541,7 @@ class DatabaseStateTests(unittest.TestCase):
         )
         state["bindings"].append(
             {
-                "model_id": "gemini_masked",
+                "model_id": "qwen_masked",
                 "strategy_id": "multfactor_v1",
                 "execution_account_id": "wallet-2",
                 "enabled": False,
@@ -659,7 +667,7 @@ class EnvironmentTests(unittest.TestCase):
             SOURCE_MODES,
         )
         for payload, message in (
-            ({"echo-producer-v7": "DIRECT"}, "gemini-3.6-flash"),
+            ({"echo-producer-v7": "DIRECT"}, "qwen"),
             (
                 {
                     **SOURCE_MODES,
@@ -670,21 +678,21 @@ class EnvironmentTests(unittest.TestCase):
             (
                 {
                     "echo-producer-v7": "SANDBOX",
-                    "gemini-3.6-flash": "DIRECT",
+                    "qwen": "DIRECT",
                 },
                 "echo source model",
             ),
             (
                 {
                     "echo-producer-v7": "direct",
-                    "gemini-3.6-flash": "SANDBOX",
+                    "qwen": "SANDBOX",
                 },
                 "exactly DIRECT or SANDBOX",
             ),
             (
                 {
                     "echo-producer-v7": {"mode": "DIRECT"},
-                    "gemini-3.6-flash": "SANDBOX",
+                    "qwen": "SANDBOX",
                 },
                 "exactly DIRECT or SANDBOX",
             ),
@@ -698,7 +706,7 @@ class EnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "duplicate model"):
             preflight.decode_prediction_model_source_modes(
                 '{"echo-producer-v7":"DIRECT","echo-producer-v7":"DIRECT",'
-                '"gemini-3.6-flash":"SANDBOX"}',
+                '"qwen":"SANDBOX"}',
                 bindings,
             )
 
@@ -979,15 +987,15 @@ class PredictionEnvironmentTests(unittest.TestCase):
         self.validate()
 
     def test_rejects_different_direct_model_set(self) -> None:
-        self.environment["DIRECT_PREDICTION_MODEL_IDS_JSON"] = '["gemini-3.6-flash"]'
+        self.environment["DIRECT_PREDICTION_MODEL_IDS_JSON"] = '["qwen"]'
         with self.assertRaisesRegex(preflight.PreflightError, "DIRECT source-mode subset"):
             self.validate()
 
     def test_rejects_sandbox_model_in_direct_set(self) -> None:
         self.environment["DIRECT_PREDICTION_MODEL_IDS_JSON"] = (
-            '["echo-producer-v7","gemini-3.6-flash"]'
+            '["echo-producer-v7","qwen"]'
         )
-        with self.assertRaisesRegex(preflight.PreflightError, "gemini-3.6-flash"):
+        with self.assertRaisesRegex(preflight.PreflightError, "qwen"):
             self.validate()
 
     def test_requires_explicit_redis_identity(self) -> None:
@@ -1004,7 +1012,7 @@ class PredictionEnvironmentTests(unittest.TestCase):
         entry_bindings = preflight.entry_enabled_rollout_bindings(
             self.bindings, ("main", "wallet-1")
         )
-        entry_modes = {"gemini-3.6-flash": "SANDBOX"}
+        entry_modes = {"qwen": "SANDBOX"}
         sandbox_environment = dict(self.environment)
         for key in (
             "REDIS_ENABLED",
@@ -1175,7 +1183,7 @@ class RuntimeEvidenceTests(unittest.TestCase):
     def test_rejects_prediction_source_mode_runtime_drift(self) -> None:
         self.state["trading"]["environment"][
             "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON"
-        ] = '{"gemini-3.6-flash":"SANDBOX","echo-producer-v7":"DIRECT"}'
+        ] = '{"qwen":"SANDBOX","echo-producer-v7":"DIRECT"}'
         with self.assertRaisesRegex(
             preflight.PreflightError,
             "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON",
@@ -1333,7 +1341,7 @@ class SnapshotManifestTests(unittest.TestCase):
         direct_expectation = self.snapshot["data"]["expected_predictions"][0]
         direct_expectation["status"] = "PENDING"
         direct_expectation.pop("result_available_at")
-        entry_source_modes = {"gemini-3.6-flash": "SANDBOX"}
+        entry_source_modes = {"qwen": "SANDBOX"}
         self.assertEqual(
             preflight.validate_snapshot_manifest(
                 self.snapshot,
@@ -1515,7 +1523,7 @@ class SnapshotManifestTests(unittest.TestCase):
         expectation = dict(self.snapshot["data"]["expected_predictions"][0])
         expectation["prediction_id"] = "pred-sandbox-2"
         expectation["source_job_id"] = "pm-direct:gemini"
-        expectation["prediction_model_id"] = "gemini-3.6-flash"
+        expectation["prediction_model_id"] = "qwen"
         self.snapshot["data"]["expected_predictions"].append(expectation)
         with self.assertRaisesRegex(preflight.PreflightError, "must not have a Direct"):
             self.validate()
@@ -1544,11 +1552,21 @@ class SnapshotManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "not PIT-visible"):
             self.validate()
 
+    def test_ignores_legacy_gemini_when_qwen_is_bound(self) -> None:
+        old_gemini = prediction_result(
+            self.decision_at,
+            prediction_id="pred-old-gemini",
+            model_id="gemini-3.6-flash",
+            sandbox_id="sandbox-old-gemini",
+        )
+        self.snapshot["data"]["predictions"].append(old_gemini)
+        self.assertEqual(self.validate(), 1)
+
     def test_sandbox_mode_ignores_newer_direct_result(self) -> None:
         newer = prediction_result(
             self.decision_at,
             prediction_id="pred-gemini-direct-newer",
-            model_id="gemini-3.6-flash",
+            model_id="qwen",
             sandbox_id="",
         )
         newer["prediction_as_of"] = iso(self.decision_at - dt.timedelta(minutes=5))
@@ -1654,7 +1672,7 @@ class ConsumerEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(
             preflight.decode_model_groups(
-                "{}", entry_bindings, {"gemini-3.6-flash": "SANDBOX"}
+                "{}", entry_bindings, {"qwen": "SANDBOX"}
             ),
             {},
         )
@@ -1666,12 +1684,12 @@ class ConsumerEvidenceTests(unittest.TestCase):
 
     def test_rejects_sandbox_model_group(self) -> None:
         bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
-        with self.assertRaisesRegex(preflight.PreflightError, "gemini-3.6-flash"):
+        with self.assertRaisesRegex(preflight.PreflightError, "qwen"):
             preflight.decode_model_groups(
                 json.dumps(
                     {
                         **MODEL_GROUPS,
-                        "gemini-3.6-flash": "predict-gemini-v1",
+                        "qwen": "predict-gemini-v1",
                     }
                 ),
                 bindings,
@@ -1722,7 +1740,7 @@ class ConsumerEvidenceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(preflight.PreflightError, "echo-producer-v7"):
             preflight.decode_model_groups(
-                json.dumps({"gemini-3.6-flash": "predict-gemini-v1"}),
+                json.dumps({"qwen": "predict-gemini-v1"}),
                 bindings,
                 SOURCE_MODES,
             )
@@ -1910,7 +1928,7 @@ class CredentialAndConfigurationTests(unittest.TestCase):
     def test_configuration_hash_binds_prediction_source_modes(self) -> None:
         original = self.configuration_hash()
         self.trading["DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON"] = (
-            '{"gemini-3.6-flash":"SANDBOX","echo-producer-v7":"DIRECT"}'
+            '{"qwen":"SANDBOX","echo-producer-v7":"DIRECT"}'
         )
         self.assertNotEqual(self.configuration_hash(), original)
 
