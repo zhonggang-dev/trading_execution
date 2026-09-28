@@ -383,7 +383,7 @@ func lockTargetSellLot(ctx context.Context, tx *sql.Tx, order domain.Order, befo
 		       lot.model_id, COALESCE(route.logical_model_id, lot.model_id), lot.strategy_id,
 		       lot.remaining_shares::text, lot.remaining_cost::text
 		FROM position_lots AS lot
-		LEFT JOIN position_lot_model_routes AS route ON route.lot_id=lot.lot_id
+		LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot.lot_id
 		WHERE lot.execution_account_id=$1 AND lot.token_id=$2 AND lot.status='OPEN'
 		ORDER BY lot.opened_at, lot.lot_id FOR UPDATE OF lot`, order.Intent.ExecutionAccountID, order.Intent.TokenID)
 	if err != nil {
@@ -633,7 +633,7 @@ func (ledger *FillLedger) ListLots(ctx context.Context, accountID, tokenID strin
 		       lot.original_cost::text, lot.remaining_cost::text, lot.average_entry_price::text,
 		       lot.status, lot.opened_at, lot.closed_at
 		FROM position_lots AS lot
-		LEFT JOIN position_lot_model_routes AS route ON route.lot_id=lot.lot_id
+		LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot.lot_id
 		WHERE lot.execution_account_id=$1 AND lot.token_id=$2
 		ORDER BY lot.opened_at, lot.lot_id`, accountID, tokenID)
 	if err != nil {
@@ -684,7 +684,7 @@ func (ledger *FillLedger) ListOpenLots(ctx context.Context, accountID string) ([
 		       lot.original_cost::text, lot.remaining_cost::text, lot.average_entry_price::text,
 		       lot.status, lot.opened_at, lot.closed_at
 		FROM position_lots AS lot
-		LEFT JOIN position_lot_model_routes AS route ON route.lot_id=lot.lot_id
+		LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot.lot_id
 		WHERE lot.execution_account_id=$1 AND lot.status='OPEN'
 		ORDER BY lot.opened_at, lot.lot_id`, accountID)
 	if err != nil {
@@ -720,7 +720,7 @@ func (ledger *FillLedger) ListOpenPositionExitTrades(ctx context.Context, accoun
 		       lot.strategy_id, lot.execution_account_id
 		FROM position_lots AS lot
 		LEFT JOIN execution_fills AS fill ON fill.fill_key = lot.opening_fill_key
-		LEFT JOIN position_lot_model_routes AS route ON route.lot_id=lot.lot_id
+		LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot.lot_id
 		LEFT JOIN (
 			SELECT execution_account_id, target_lot_id,
 			       SUM(remaining_reserved_shares) AS shares

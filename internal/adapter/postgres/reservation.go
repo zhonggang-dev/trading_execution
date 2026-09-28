@@ -183,7 +183,7 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 				       COALESCE(route.logical_model_id, lot.model_id),
 				       lot.strategy_id, lot.status, lot.remaining_shares::text
 				FROM position_lots AS lot
-				LEFT JOIN position_lot_model_routes AS route ON route.lot_id=lot.lot_id
+				LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot.lot_id
 				WHERE lot.lot_id=$1 AND lot.execution_account_id=$2
 				FOR UPDATE OF lot`, order.Intent.TargetLotID, order.Intent.ExecutionAccountID).Scan(
 				&lotToken, &lotMarket, &lotOriginModel, &lotModel, &lotStrategy, &lotStatus, &lotRemaining)
