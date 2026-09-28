@@ -609,11 +609,11 @@ func currentLiveWallet67Authorizations(
 		if binding.ExecutionAccountID != "wallet-6" && binding.ExecutionAccountID != "wallet-7" {
 			continue
 		}
-		if binding.ModelID != "gemini_masked" && binding.ModelID != "qwen_masked" {
-			return nil, fmt.Errorf("wallet-6/wallet-7 require a Gemini or Qwen masked model route")
+		if binding.ModelID != "gemini_masked" && binding.ModelID != "qwen_masked" && binding.ModelID != "v4_1_flash_masked" {
+			return nil, fmt.Errorf("wallet-6/wallet-7 require a supported masked model route")
 		}
 		if maskedModelID != "" && maskedModelID != binding.ModelID {
-			return nil, fmt.Errorf("wallet-6/wallet-7 cannot mix Gemini and Qwen routes")
+			return nil, fmt.Errorf("wallet-6/wallet-7 cannot mix masked model routes")
 		}
 		maskedModelID = binding.ModelID
 	}

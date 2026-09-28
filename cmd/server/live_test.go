@@ -207,8 +207,8 @@ func TestCurrentLiveReleaseAcceptsOnlyEmptyQuarantine(t *testing.T) {
 
 func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
 	bindings := []domain.StrategyExecutionBinding{
-		{ModelID: "qwen_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
-		{ModelID: "qwen_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+		{ModelID: "v4_1_flash_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
+		{ModelID: "v4_1_flash_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
 	}
 	authorizations, err := currentLiveWallet67Authorizations(
 		[]string{"main", "wallet-1", "wallet-6", "wallet-7"},
@@ -219,7 +219,7 @@ func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
 	}
 	if len(authorizations) != 4 ||
 		authorizations[2].ExecutionAccountID != "wallet-6" ||
-		authorizations[2].ModelID != "qwen_masked" ||
+		authorizations[2].ModelID != "v4_1_flash_masked" ||
 		authorizations[2].StrategyID != domain.StrategyIDMultfactorV1 ||
 		authorizations[3].ExecutionAccountID != "wallet-7" ||
 		authorizations[3].StrategyID != domain.StrategyIDMultfactorV2 {
@@ -235,6 +235,12 @@ func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
 	if err != nil || len(legacy) != 4 || legacy[2].ModelID != "gemini_masked" || legacy[3].ModelID != "gemini_masked" {
 		t.Fatalf("legacy authorizations = %#v, error = %v", legacy, err)
 	}
+	bindings[0].ModelID = "qwen_masked"
+	bindings[1].ModelID = "qwen_masked"
+	if _, err := currentLiveWallet67Authorizations([]string{"wallet-6", "wallet-7"}, bindings); err != nil {
+		t.Fatalf("temporary Qwen route is needed for disabled deployment: %v", err)
+	}
+	bindings[0].ModelID = "gemini_masked"
 	bindings[1].ModelID = "qwen_masked"
 	if _, err := currentLiveWallet67Authorizations([]string{"wallet-6", "wallet-7"}, bindings); err == nil {
 		t.Fatal("mixed Gemini/Qwen wallet routes were accepted")

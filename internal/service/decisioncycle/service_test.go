@@ -1055,13 +1055,18 @@ func TestAccountEntryGateCallsMainStrategyWithPositionAndSubmitsExitButNeverBuy(
 	}
 }
 
-func TestAccountEntryGateRoutesOnlyQwenPredictionsToWallet6AndWallet7(t *testing.T) {
+func TestAccountEntryGateRoutesOnlyV41FlashPredictionsToWallet6AndWallet7(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	maskedPrediction := validPrediction(decisionAt)
 	maskedPrediction.PredictionID = "pred-masked-entry"
 	maskedPrediction.SourceJobID = "job-masked-entry"
-	maskedPrediction.SandboxID = "sandbox-qwen"
-	maskedPrediction.Model.Name = "qwen"
+	maskedPrediction.SandboxID = "sandbox-v41-flash"
+	maskedPrediction.Model.Name = "v4.1 flash"
+	oldQwenPrediction := maskedPrediction
+	oldQwenPrediction.PredictionID = "pred-old-qwen"
+	oldQwenPrediction.SourceJobID = "job-old-qwen"
+	oldQwenPrediction.SandboxID = "sandbox-qwen"
+	oldQwenPrediction.Model.Name = "qwen"
 	oldGeminiPrediction := maskedPrediction
 	oldGeminiPrediction.PredictionID = "pred-old-gemini"
 	oldGeminiPrediction.SourceJobID = "job-old-gemini"
@@ -1070,8 +1075,8 @@ func TestAccountEntryGateRoutesOnlyQwenPredictionsToWallet6AndWallet7(t *testing
 	bindings := []domain.StrategyExecutionBinding{
 		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main"},
 		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-1"},
-		{PredictionModelID: "qwen", ModelID: "qwen_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
-		{PredictionModelID: "qwen", ModelID: "qwen_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+		{PredictionModelID: "v4.1 flash", ModelID: "v4_1_flash_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
+		{PredictionModelID: "v4.1 flash", ModelID: "v4_1_flash_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
 	}
 	strategy := &matrixStrategy{}
 	service, err := newTestService(Params{
@@ -1079,7 +1084,7 @@ func TestAccountEntryGateRoutesOnlyQwenPredictionsToWallet6AndWallet7(t *testing
 			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
 			SnapshotID:    "predsnap-wallet67-entry",
 			DecisionAt:    decisionAt,
-			Predictions:   []domain.Prediction{maskedPrediction, oldGeminiPrediction},
+			Predictions:   []domain.Prediction{maskedPrediction, oldQwenPrediction, oldGeminiPrediction},
 		}},
 		PositionSource:               fakePositionSource{},
 		OrderBookSource:              &fakeOrderBookSource{},
@@ -1092,7 +1097,7 @@ func TestAccountEntryGateRoutesOnlyQwenPredictionsToWallet6AndWallet7(t *testing
 		Bindings:                     bindings,
 		PredictionSourceModes: map[string]domain.PredictionSourceMode{
 			"echo-producer-v7": domain.PredictionSourceModeDirect,
-			"qwen":             domain.PredictionSourceModeSandbox,
+			"v4.1 flash":       domain.PredictionSourceModeSandbox,
 		},
 		Venue: "polymarket-paper",
 		Now:   func() time.Time { return decisionAt.Add(2 * time.Second) },
@@ -1116,7 +1121,7 @@ func TestAccountEntryGateRoutesOnlyQwenPredictionsToWallet6AndWallet7(t *testing
 			}
 		case "wallet-6", "wallet-7":
 			if len(request.Predictions) != 1 || !run.EntrySubmissionEnabled || run.EntryBlockReason != "" ||
-				request.Predictions[0].Model.Name != "qwen_masked" || request.Predictions[0].PredictionID != maskedPrediction.PredictionID {
+				request.Predictions[0].Model.Name != "v4_1_flash_masked" || request.Predictions[0].PredictionID != maskedPrediction.PredictionID {
 				t.Fatalf("wallet67 entry request/run=%#v/%#v", request, run)
 			}
 		default:

@@ -26,13 +26,13 @@ VALID_BINDINGS = [
     },
     {
         "prediction_model_id": "qwen",
-        "model_id": "qwen_masked",
+        "model_id": "v4_1_flash_masked",
         "strategy_id": "multfactor_v1",
         "execution_account_id": "wallet-6",
     },
     {
         "prediction_model_id": "qwen",
-        "model_id": "qwen_masked",
+        "model_id": "v4_1_flash_masked",
         "strategy_id": "multfactor_v2",
         "execution_account_id": "wallet-7",
     },
@@ -541,7 +541,7 @@ class DatabaseStateTests(unittest.TestCase):
         )
         state["bindings"].append(
             {
-                "model_id": "qwen_masked",
+                "model_id": "v4_1_flash_masked",
                 "strategy_id": "multfactor_v1",
                 "execution_account_id": "wallet-2",
                 "enabled": False,

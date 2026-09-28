@@ -33,8 +33,8 @@ EXPECTED_STRATEGIES = frozenset({"multfactor_v1", "multfactor_v2"})
 EXPECTED_ROUTES = {
     ("echo", "multfactor_v2"): "main",
     ("echo", "multfactor_v1"): "wallet-1",
-    ("qwen_masked", "multfactor_v1"): "wallet-6",
-    ("qwen_masked", "multfactor_v2"): "wallet-7",
+    ("v4_1_flash_masked", "multfactor_v1"): "wallet-6",
+    ("v4_1_flash_masked", "multfactor_v2"): "wallet-7",
 }
 EXPECTED_ACCOUNTS = frozenset(EXPECTED_ROUTES.values())
 CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS = frozenset()
@@ -483,9 +483,9 @@ def decode_prediction_model_source_modes(
         )
     if logical_modes.get("echo") != {PREDICTION_SOURCE_DIRECT}:
         raise PreflightError("current rollout requires the echo source model to be DIRECT")
-    if logical_modes.get("qwen_masked") != {PREDICTION_SOURCE_SANDBOX}:
+    if logical_modes.get("v4_1_flash_masked") != {PREDICTION_SOURCE_SANDBOX}:
         raise PreflightError(
-            "current rollout requires the qwen_masked source model to be SANDBOX"
+            "current rollout requires the v4_1_flash_masked source model to be SANDBOX"
         )
     return dict(sorted(result.items()))
 
@@ -608,7 +608,7 @@ def validate_topology(bindings: list[Binding] | tuple[Binding, ...]) -> tuple[Bi
 
     expected_pairs = set(EXPECTED_ROUTES)
     if pairs != expected_pairs:
-        raise PreflightError("bindings must contain the exact echo/qwen_masked route matrix")
+        raise PreflightError("bindings must contain the exact echo/v4_1_flash_masked route matrix")
     for binding in normalized:
         expected_account = EXPECTED_ROUTES[(binding.model_id, binding.strategy_id)]
         if binding.execution_account_id != expected_account:

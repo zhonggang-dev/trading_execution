@@ -2276,6 +2276,148 @@ func TestPositionLotModelRoutePostgresIntegration(t *testing.T) {
 	}
 }
 
+// TestPositionLotModelRouteSuccessorPostgresIntegration proves a temporary
+// logical name can be superseded without changing the opening lot or its first
+// append-only route. The final identity must be used by SELL reservation.
+func TestPositionLotModelRouteSuccessorPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	const (
+		accountID = "account-route-successor"
+		tokenID   = "token-route-successor"
+		lotID     = "lot-route-successor"
+		finalID   = "v4_1_flash_masked"
+	)
+	insertAccount(t, db, accountID, "0xroutesuccessor", "20", "20", "0")
+	if _, err := db.Exec(`
+		INSERT INTO execution_positions (
+			execution_account_id, market_id, condition_id, token_id, outcome_index, outcome_name,
+			total_shares, available_shares, reserved_shares, cost_basis, average_cost_price
+		) VALUES ($1,'market-1','condition-1',$2,0,'Yes',5,5,0,2.5,0.5)`, accountID, tokenID); err != nil {
+		t.Fatal(err)
+	}
+	insertOpenLotFixtureNamedWithModel(t, db, accountID, tokenID, lotID, "5", "gemini_masked")
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_routes (lot_id, origin_model_id, logical_model_id, reason, actor)
+		VALUES ($1,'gemini_masked','qwen_masked','temporary model route','integration-test')`, lotID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_route_successors
+			(lot_id, prior_logical_model_id, logical_model_id, reason, actor)
+		VALUES ($1,'wrong','v4_1_flash_masked','final model name','integration-test')`, lotID); err == nil {
+		t.Fatal("successor accepted a mismatched prior identity")
+	}
+	if _, err := db.Exec(`
+		UPDATE execution_risk_global_control SET kill_switch=FALSE, version=version+1
+		WHERE singleton=TRUE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_route_successors
+			(lot_id, prior_logical_model_id, logical_model_id, reason, actor)
+		VALUES ($1,'qwen_masked',$2,'final model name','integration-test')`, lotID, finalID); err == nil {
+		t.Fatal("successor was accepted with the global kill switch off")
+	}
+	if _, err := db.Exec(`
+		UPDATE execution_risk_global_control SET kill_switch=TRUE, version=version+1
+		WHERE singleton=TRUE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_route_successors
+			(lot_id, prior_logical_model_id, logical_model_id, reason, actor)
+		VALUES ($1,'qwen_masked',$2,'final model name','integration-test')`, lotID, finalID); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := NewFillLedger(FillLedgerParams{DB: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lots, err := ledger.ListOpenLots(context.Background(), accountID)
+	if err != nil || len(lots) != 1 || lots[0].OriginModelID != "gemini_masked" || lots[0].ModelID != finalID {
+		t.Fatalf("effective open lot=%#v err=%v", lots, err)
+	}
+	trades, err := ledger.ListOpenPositionExitTrades(context.Background(), accountID)
+	if err != nil || len(trades) != 1 || trades[0].OriginModelID != "gemini_masked" || trades[0].ModelID != finalID {
+		t.Fatalf("effective exit trade=%#v err=%v", trades, err)
+	}
+	reservations, err := NewReservationManager(ReservationManagerParams{DB: db, MaxBuyFeeRateBPS: "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSell := integrationOrder("old-successor-sell", accountID, tokenID, domain.SideSell, "1", "0.4")
+	oldSell.Intent.ModelID = "qwen_masked"
+	oldSell.Intent.TargetLotID = lotID
+	if _, err := reservations.Reserve(context.Background(), oldSell); err == nil {
+		t.Fatal("temporary logical name still reserved the superseded lot")
+	} else {
+		assertRejectionCode(t, err, "TARGET_LOT_IDENTITY_MISMATCH")
+	}
+	newSell := integrationOrder("final-successor-sell", accountID, tokenID, domain.SideSell, "1", "0.4")
+	newSell.Intent.ModelID = finalID
+	newSell.Intent.TargetLotID = lotID
+	if _, err := reservations.Reserve(context.Background(), newSell); err != nil {
+		t.Fatalf("final logical name failed to reserve the lot: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE position_lot_model_route_successors SET reason='mutated' WHERE lot_id=$1`, lotID); err == nil {
+		t.Fatal("append-only successor UPDATE succeeded")
+	}
+	if _, err := db.Exec(`DELETE FROM position_lot_model_route_successors WHERE lot_id=$1`, lotID); err == nil {
+		t.Fatal("append-only successor DELETE succeeded")
+	}
+}
+
+func TestWallet67V41FlashCutoverSQLPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	for _, account := range []string{"main", "wallet-1", "wallet-6", "wallet-7"} {
+		insertAccount(t, db, account, "0x"+account, "20", "20", "0")
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_positions (
+			execution_account_id, market_id, condition_id, token_id, outcome_index, outcome_name,
+			total_shares, available_shares, reserved_shares, cost_basis, average_cost_price
+		) VALUES ('wallet-6','market-1','condition-1','token-cutover',0,'Yes',5,5,0,2.5,0.5)`); err != nil {
+		t.Fatal(err)
+	}
+	insertOpenLotFixtureNamedWithModel(t, db, "wallet-6", "token-cutover", "lot-cutover", "5", "gemini_masked")
+	if _, err := db.Exec(`
+		INSERT INTO position_lot_model_routes (lot_id, origin_model_id, logical_model_id, reason, actor)
+		VALUES ('lot-cutover','gemini_masked','qwen_masked','temporary model route','integration-test')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_strategy_bindings (model_id,strategy_id,execution_account_id,enabled)
+		VALUES ('echo','multfactor_v2','main',TRUE),
+		       ('echo','multfactor_v1','wallet-1',TRUE),
+		       ('qwen_masked','multfactor_v1','wallet-6',TRUE),
+		       ('qwen_masked','multfactor_v2','wallet-7',TRUE)`); err != nil {
+		t.Fatal(err)
+	}
+	cutover, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "wallet67_v41_flash_cutover.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(cutover)); err != nil {
+		t.Fatalf("execute reviewed wallet-6/7 cutover: %v", err)
+	}
+	var model string
+	if err := db.QueryRow(`SELECT logical_model_id FROM position_lot_model_routes_effective WHERE lot_id='lot-cutover'`).Scan(&model); err != nil || model != "v4_1_flash_masked" {
+		t.Fatalf("effective route = %q, error = %v", model, err)
+	}
+	var enabled int
+	if err := db.QueryRow(`SELECT count(*) FROM execution_strategy_bindings WHERE enabled=TRUE AND model_id='v4_1_flash_masked'`).Scan(&enabled); err != nil || enabled != 2 {
+		t.Fatalf("enabled final bindings = %d, error = %v", enabled, err)
+	}
+}
+
 // TestBuyFeeReservationPostgresIntegration 验证手续费上限被预占，且超上限 Fill 不会消费未预占资金。
 func TestBuyFeeReservationPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
@@ -2571,7 +2713,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 			t.Fatalf("apply migration %s: %v", name, err)
 		}
 	}
-	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql"} {
+	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql", "0029_position_lot_model_route_successors.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatal(err)
