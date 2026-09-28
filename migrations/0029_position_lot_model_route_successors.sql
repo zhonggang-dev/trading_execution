@@ -3,8 +3,9 @@ BEGIN;
 -- Preserve the original Gemini -> qwen_masked audit route.  A successor is a
 -- second, append-only decision about the logical owner of that exact lot.
 CREATE TABLE position_lot_model_route_successors (
-    lot_id TEXT PRIMARY KEY REFERENCES position_lot_model_routes (lot_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    -- The insert guard checks the immutable base route. A foreign key would
+    -- additionally require REFERENCES on the production app role's base table.
+    lot_id TEXT PRIMARY KEY,
     prior_logical_model_id TEXT NOT NULL,
     logical_model_id TEXT NOT NULL,
     reason TEXT NOT NULL,

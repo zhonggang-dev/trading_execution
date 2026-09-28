@@ -165,7 +165,6 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('position_lot_model_routes_identity_nonempty'),
 			('position_lot_model_routes_audit_nonempty'),
 			('position_lot_model_route_successors_pkey'),
-			('position_lot_model_route_successors_lot_id_fkey'),
 			('position_lot_model_route_successors_identity_nonempty'),
 			('position_lot_model_route_successors_audit_nonempty'),
 			('execution_fills_platform_fee_rate_nonnegative'),

@@ -23,7 +23,7 @@ POSITION_EXIT_JOB_TOKEN=DEDICATED_32_BYTE_OR_LONGER_SECRET
 execution_risk_global_control.kill_switch=true
 ```
 
-For the wallet-6/wallet-7 route, `v4_1_flash_masked` is the final logical trading
+For the wallet-6/wallet-7 route, `deepseek_masked` is the final logical trading
 identity. The upstream `model.name` is `v4.1 flash` and must be confirmed in a
 fresh Sandbox prediction snapshot before enabling strategy requests. Previous
 Gemini rollout evidence does not approve this new route. Keep order submission
@@ -50,7 +50,7 @@ must be exactly `main,wallet-1`. The Go runtime also enforces the
 source-mode map on every cycle: `DIRECT` accepts only an empty `sandbox_id`,
 while `SANDBOX` requires a non-empty `sandbox_id`. The map must exactly cover
 all configured upstream models; the current release pins echo to `DIRECT` and
-`v4_1_flash_masked` to `SANDBOX`. Market orders must remain disabled for the
+`deepseek_masked` to `SANDBOX`. Market orders must remain disabled for the
 four-wallet activation; changing any other value invalidates disabled-pass
 evidence and requires a new review.
 
@@ -63,8 +63,8 @@ Resume, decision delivery, and crash recovery.
 
 The `DECISION_CYCLE_BINDINGS_JSON` array must be replaced atomically as one
 environment-file value. The routes are exact: `echo/multfactor_v2 -> main`,
-`echo/multfactor_v1 -> wallet-1`, `v4_1_flash_masked/multfactor_v1 -> wallet-6`,
-and `v4_1_flash_masked/multfactor_v2 -> wallet-7`. The database must contain the
+`echo/multfactor_v1 -> wallet-1`, `deepseek_masked/multfactor_v1 -> wallet-6`,
+and `deepseek_masked/multfactor_v2 -> wallet-7`. The database must contain the
 same four `(model_id, strategy_id, execution_account_id)` authorization rows.
 All four authorization rows are enabled in shadow. main/wallet-1 remain active
 so their existing OPEN lots can be reconciled and exited; new BUY entries are
@@ -73,7 +73,7 @@ blocked by the account gate. Source
 The 15 previously routed Gemini OPEN lots retain their immutable
 `gemini_masked -> qwen_masked` audit rows. Apply migration `0029` and insert
 one append-only successor per still-open lot from `qwen_masked` to
-`v4_1_flash_masked` while the service is stopped and the global kill switch
+`deepseek_masked` while the service is stopped and the global kill switch
 is on. The effective route view is used by strategy input, exit checks, and
 SELL reservation; changing only the binding rows would strand those lots.
 
