@@ -523,42 +523,57 @@ func resolveWalletMigrationIssues(ctx context.Context, tx *sql.Tx, run domain.Re
 // applied by an earlier attention-required run; a later verified asset comparison is
 // what proves that the temporary drift disappeared.
 func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
-	const resolvedDetails = "; automatically resolved after finalized fill evidence made the local ledger match the previously observed remote value"
+	const resolvedDetails = "; automatically resolved after confirmed fills explained the observed balance drift and a later reconciliation verified the current balance"
 	resolved := 0
 	result, err := tx.ExecContext(ctx, `
 		UPDATE reconciliation_issues issue
 		SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
 		    details=issue.details || $4
-		FROM execution_accounts account
 		WHERE issue.execution_account_id=$1 AND issue.status='OPEN'
 		  AND issue.resolution='MANUAL_REVIEW' AND issue.issue_type='BALANCE_DRIFT'
 		  AND issue.run_id<>$2
           AND $5::jsonb->>'verified_balance:'='1'
-		  AND account.execution_account_id=issue.execution_account_id
 		  AND issue.source='EVM_ERC20_ETH_CALL'
 		  AND issue.local_value IS NOT NULL AND issue.remote_value IS NOT NULL
-		  AND account.total_balance=issue.remote_value
 		  AND EXISTS (
 		    SELECT 1
-		    FROM execution_account_events event
-		    JOIN execution_fills fill ON fill.fill_key=event.fill_key
-		    WHERE event.execution_account_id=issue.execution_account_id
-		      AND event.total_balance_after=issue.remote_value
-		      AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
-		      AND fill.applied_at>issue.observed_at
-		      AND fill.applied_at<=$3
+		    FROM execution_account_events milestone
+		    JOIN execution_fills milestone_fill ON milestone_fill.fill_key=milestone.fill_key
+		    WHERE milestone.execution_account_id=issue.execution_account_id
+		      AND milestone.total_balance_after=issue.remote_value
+		      AND milestone.event_type IN ('FILL_SETTLED','BUY_FILL','SELL_FILL')
+		      AND milestone_fill.execution_account_id=issue.execution_account_id
+		      AND milestone_fill.order_id=milestone.order_id
+		      AND milestone_fill.status='CONFIRMED' AND milestone_fill.applied_at IS NOT NULL
+		      AND milestone.occurred_at>issue.observed_at AND milestone.occurred_at<=$3
+		      AND milestone_fill.applied_at>issue.observed_at AND milestone_fill.applied_at<=$3
+		      AND (
+		        SELECT COALESCE(SUM(event.total_balance_delta),0)
+		        FROM execution_account_events event
+		        JOIN execution_fills fill ON fill.fill_key=event.fill_key
+		        WHERE event.execution_account_id=issue.execution_account_id
+		          AND fill.execution_account_id=issue.execution_account_id
+		          AND event.order_id=fill.order_id
+		          AND event.event_type IN ('FILL_SETTLED','BUY_FILL','SELL_FILL')
+		          AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
+		          AND fill.applied_at>issue.observed_at AND fill.applied_at<=$3
+		          AND event.occurred_at>issue.observed_at
+		          AND event.occurred_at<=milestone.occurred_at
+		      )=issue.remote_value-issue.local_value
+		      AND NOT EXISTS (
+		        SELECT 1 FROM execution_account_events event
+		        LEFT JOIN execution_fills fill ON fill.fill_key=event.fill_key
+		          AND fill.execution_account_id=event.execution_account_id
+		          AND fill.order_id=event.order_id
+		          AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
+		          AND fill.applied_at>issue.observed_at AND fill.applied_at<=$3
+		        WHERE event.execution_account_id=issue.execution_account_id
+		          AND event.occurred_at>issue.observed_at
+		          AND event.occurred_at<=milestone.occurred_at
+		          AND event.total_balance_delta<>0
+		          AND (event.event_type NOT IN ('FILL_SETTLED','BUY_FILL','SELL_FILL') OR fill.fill_key IS NULL)
+		      )
 		  )
-		  AND (
-		    SELECT COALESCE(SUM(event.total_balance_delta),0)
-		    FROM execution_account_events event
-		    JOIN execution_fills fill ON fill.fill_key=event.fill_key
-		    WHERE event.execution_account_id=issue.execution_account_id
-		      AND fill.execution_account_id=issue.execution_account_id
-		      AND event.order_id=fill.order_id
-		      AND event.event_type IN ('FILL_SETTLED','BUY_FILL','SELL_FILL')
-		      AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
-		      AND fill.applied_at>issue.observed_at AND fill.applied_at<=$3
-		  )=issue.remote_value-issue.local_value
 		  AND NOT EXISTS (
 		    SELECT 1 FROM reconciliation_issues reproduced
 		    WHERE reproduced.execution_account_id=issue.execution_account_id

@@ -536,6 +536,50 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 		)`, accountID, fillAppliedAt); err != nil {
 		t.Fatal(err)
 	}
+	// A later confirmed fill must not make the earlier, fully explained drift permanent.
+	laterFillAt := now.Add(2750 * time.Millisecond)
+	if _, err := db.Exec(`
+		INSERT INTO execution_orders (
+			order_id,client_order_id,execution_account_id,venue,market_id,token_id,
+			intent,venue_order_id,status,filled_size,filled_notional,total_fees,
+			average_fill_price,revision,created_at,updated_at
+		) VALUES (
+			'order-after-fill-lag','client-after-fill-lag',$1,'polymarket','market-fill-lag',$2,
+			'{}'::jsonb,'venue-order-after-fill-lag','FILLED',1,0.4,0,0.4,1,$3,$4
+		)`, accountID, "token-fill-lag", now, laterFillAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_fills (
+			fill_key,venue,venue_fill_id,order_id,venue_order_id,execution_account_id,
+			market_id,token_id,side,liquidity_role,status,shares,price,gross_notional,
+			fee_rate_bps,platform_fee,builder_fee_rate_bps,builder_fee,total_fee,
+			net_cash_delta,fee_source,matched_at,first_observed_at,last_observed_at,
+			confirmed_at,applied_at
+		) VALUES (
+			'fill-after-fill-lag','polymarket','venue-after-fill-lag','order-after-fill-lag',
+			'venue-order-after-fill-lag',$1,'market-fill-lag',$2,'BUY','TAKER','CONFIRMED',
+			1,0.4,0.4,0,0,0,0,0,-0.4,'TEST_FINALIZED_FILL',$3,$3,$3,$3,$3
+		)`, accountID, "token-fill-lag", laterFillAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO execution_account_events (
+			account_event_id,execution_account_id,event_type,order_id,fill_key,
+			total_balance_delta,available_balance_delta,reserved_balance_delta,
+			total_balance_after,available_balance_after,reserved_balance_after,occurred_at
+		) VALUES (
+			'account-event-after-fill-lag',$1,'BUY_FILL','order-after-fill-lag','fill-after-fill-lag',
+			-0.4,-0.4,0,8.1,8.1,0,$2
+		)`, accountID, laterFillAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		UPDATE execution_accounts
+		SET total_balance=8.1,available_balance=8.1,reserved_balance=0
+		WHERE execution_account_id=$1`, accountID); err != nil {
+		t.Fatal(err)
+	}
 	secondRun, err := (domain.ReconciliationRunParams{
 		RunID: "run-fill-lag-resolved", ExecutionAccountID: accountID,
 		Trigger: domain.ReconciliationTriggerScheduled, StartedAt: now.Add(3 * time.Second),
