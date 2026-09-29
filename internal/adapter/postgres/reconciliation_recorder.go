@@ -103,6 +103,7 @@ func (recorder *ReconciliationRecorder) RecordIssue(ctx context.Context, issue d
 				source = EXCLUDED.source,
 				local_value = EXCLUDED.local_value,
 				remote_value = EXCLUDED.remote_value,
+				remote_block_number = EXCLUDED.remote_block_number,
 				observed_at = EXCLUDED.observed_at,
 				impact_scope = EXCLUDED.impact_scope`
 	}
@@ -110,18 +111,18 @@ func (recorder *ReconciliationRecorder) RecordIssue(ctx context.Context, issue d
 		INSERT INTO reconciliation_issues (
 			issue_id, run_id, fingerprint, execution_account_id, issue_type,
 			resolution, status, order_id, venue_order_id, venue_trade_id,
-			market_id, condition_id, token_id, local_value, remote_value, source,
+			market_id, condition_id, token_id, local_value, remote_value, remote_block_number, source,
 			details, observed_at, resolved_at, impact_scope
 		) VALUES (
 			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
-			NULLIF($14,'')::numeric,NULLIF($15,'')::numeric,$16,$17,$18,$19,$20
+			NULLIF($14,'')::numeric,NULLIF($15,'')::numeric,$16,$17,$18,$19,$20,$21
 		)
 		`+conflictClause,
 		issue.IssueID, issue.RunID, issue.Fingerprint, issue.ExecutionAccountID,
 		string(issue.Type), string(issue.Resolution), string(issue.Status),
 		issue.OrderID, issue.VenueOrderID, issue.VenueTradeID, issue.MarketID,
 		issue.ConditionID, issue.TokenID, issue.LocalValue.String(), issue.RemoteValue.String(),
-		issue.Source, issue.Details, issue.ObservedAt.UTC(), issue.ResolvedAt, string(impactScope))
+		issue.RemoteBlockNumber, issue.Source, issue.Details, issue.ObservedAt.UTC(), issue.ResolvedAt, string(impactScope))
 	if err != nil {
 		return fmt.Errorf("record reconciliation issue: %w", err)
 	}
@@ -256,7 +257,7 @@ func resolveVerifiedTransientIssues(ctx context.Context, tx *sql.Tx, run domain.
 func readOpenReconciliationIssues(ctx context.Context, tx *sql.Tx, accountID string) ([]domain.ReconciliationIssue, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT issue_id, run_id, fingerprint, execution_account_id,
   issue_type, resolution, status, order_id, venue_order_id, venue_trade_id, market_id, condition_id, token_id,
-  COALESCE(local_value::text,''), COALESCE(remote_value::text,''), source, details, observed_at, impact_scope
+  COALESCE(local_value::text,''), COALESCE(remote_value::text,''), remote_block_number, source, details, observed_at, impact_scope
   FROM reconciliation_issues WHERE execution_account_id=$1 AND status='OPEN' ORDER BY observed_at, issue_id`, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("read durable reconciliation issues: %w", err)
@@ -267,7 +268,7 @@ func readOpenReconciliationIssues(ctx context.Context, tx *sql.Tx, accountID str
 		var issue domain.ReconciliationIssue
 		if err := rows.Scan(&issue.IssueID, &issue.RunID, &issue.Fingerprint, &issue.ExecutionAccountID,
 			&issue.Type, &issue.Resolution, &issue.Status, &issue.OrderID, &issue.VenueOrderID, &issue.VenueTradeID,
-			&issue.MarketID, &issue.ConditionID, &issue.TokenID, &issue.LocalValue, &issue.RemoteValue, &issue.Source,
+			&issue.MarketID, &issue.ConditionID, &issue.TokenID, &issue.LocalValue, &issue.RemoteValue, &issue.RemoteBlockNumber, &issue.Source,
 			&issue.Details, &issue.ObservedAt, &issue.ImpactScope); err != nil {
 			return nil, fmt.Errorf("scan durable reconciliation issue: %w", err)
 		}
@@ -523,7 +524,7 @@ func resolveWalletMigrationIssues(ctx context.Context, tx *sql.Tx, run domain.Re
 // applied by an earlier attention-required run; a later verified asset comparison is
 // what proves that the temporary drift disappeared.
 func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
-	const resolvedDetails = "; automatically resolved after confirmed fills explained the observed balance drift and a later reconciliation verified the current balance"
+	const resolvedDetails = "; automatically resolved after confirmed fills at or before the recorded balance snapshot block explained the drift and a later reconciliation verified the current balance"
 	resolved := 0
 	result, err := tx.ExecContext(ctx, `
 		UPDATE reconciliation_issues issue
@@ -535,45 +536,21 @@ func resolveFillLagDriftIssues(ctx context.Context, tx *sql.Tx, run domain.Recon
           AND $5::jsonb->>'verified_balance:'='1'
 		  AND issue.source='EVM_ERC20_ETH_CALL'
 		  AND issue.local_value IS NOT NULL AND issue.remote_value IS NOT NULL
-		  AND EXISTS (
-		    SELECT 1
-		    FROM execution_account_events milestone
-		    JOIN execution_fills milestone_fill ON milestone_fill.fill_key=milestone.fill_key
-		    WHERE milestone.execution_account_id=issue.execution_account_id
-		      AND milestone.total_balance_after=issue.remote_value
-		      AND milestone.event_type IN ('FILL_SETTLED','BUY_FILL','SELL_FILL')
-		      AND milestone_fill.execution_account_id=issue.execution_account_id
-		      AND milestone_fill.order_id=milestone.order_id
-		      AND milestone_fill.status='CONFIRMED' AND milestone_fill.applied_at IS NOT NULL
-		      AND milestone.occurred_at>issue.observed_at AND milestone.occurred_at<=$3
-		      AND milestone_fill.applied_at>issue.observed_at AND milestone_fill.applied_at<=$3
-		      AND (
-		        SELECT COALESCE(SUM(event.total_balance_delta),0)
-		        FROM execution_account_events event
-		        JOIN execution_fills fill ON fill.fill_key=event.fill_key
-		        WHERE event.execution_account_id=issue.execution_account_id
-		          AND fill.execution_account_id=issue.execution_account_id
-		          AND event.order_id=fill.order_id
-		          AND event.event_type IN ('FILL_SETTLED','BUY_FILL','SELL_FILL')
-		          AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
-		          AND fill.applied_at>issue.observed_at AND fill.applied_at<=$3
-		          AND event.occurred_at>issue.observed_at
-		          AND event.occurred_at<=milestone.occurred_at
-		      )=issue.remote_value-issue.local_value
-		      AND NOT EXISTS (
-		        SELECT 1 FROM execution_account_events event
-		        LEFT JOIN execution_fills fill ON fill.fill_key=event.fill_key
-		          AND fill.execution_account_id=event.execution_account_id
-		          AND fill.order_id=event.order_id
-		          AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
-		          AND fill.applied_at>issue.observed_at AND fill.applied_at<=$3
-		        WHERE event.execution_account_id=issue.execution_account_id
-		          AND event.occurred_at>issue.observed_at
-		          AND event.occurred_at<=milestone.occurred_at
-		          AND event.total_balance_delta<>0
-		          AND (event.event_type NOT IN ('FILL_SETTLED','BUY_FILL','SELL_FILL') OR fill.fill_key IS NULL)
-		      )
-		  )
+		  AND issue.remote_block_number>0
+		  AND (
+		    SELECT COALESCE(SUM(event.total_balance_delta),0)
+		    FROM execution_account_events event
+		    JOIN execution_fills fill ON fill.fill_key=event.fill_key
+		    WHERE event.execution_account_id=issue.execution_account_id
+		      AND fill.execution_account_id=issue.execution_account_id
+		      AND fill.order_id=event.order_id
+		      AND event.event_type IN ('FILL_SETTLED','BUY_FILL','SELL_FILL')
+		      AND fill.fee_source='POLYGON_V2_ORDER_FILLED'
+		      AND (fill.settlement_evidence->>'block_number')::numeric<=issue.remote_block_number
+		      AND fill.status='CONFIRMED' AND fill.applied_at IS NOT NULL
+		      AND event.occurred_at>issue.observed_at AND event.occurred_at<=$3
+		      AND fill.applied_at>issue.observed_at AND fill.applied_at<=$3
+		  )=issue.remote_value-issue.local_value
 		  AND NOT EXISTS (
 		    SELECT 1 FROM reconciliation_issues reproduced
 		    WHERE reproduced.execution_account_id=issue.execution_account_id

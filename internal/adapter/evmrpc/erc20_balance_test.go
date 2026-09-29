@@ -22,12 +22,23 @@ func TestERC20BalanceClientReadsExactBaseUnits(t *testing.T) {
 	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
 	wallet := "0x1111111111111111111111111111111111111111"
 	token := "0x2222222222222222222222222222222222222222"
+	calls := 0
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
 		body, _ := io.ReadAll(request.Body)
+		if calls == 1 {
+			if !strings.Contains(string(body), `"method":"eth_blockNumber"`) {
+				t.Fatalf("block RPC body = %s", body)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":1,"result":"0x64"}`)),
+				Request: request,
+			}, nil
+		}
 		if !strings.Contains(string(body), `"method":"eth_call"`) ||
 			!strings.Contains(string(body), "0x70a08231"+strings.Repeat("0", 24)+strings.TrimPrefix(wallet, "0x")) ||
-			!strings.Contains(string(body), token) {
-			t.Fatalf("RPC body = %s", body)
+			!strings.Contains(string(body), token) || !strings.Contains(string(body), `"0x64"`) {
+			t.Fatalf("balance RPC body = %s", body)
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":1,"result":"0x75bcd15"}`)),
@@ -45,7 +56,7 @@ func TestERC20BalanceClientReadsExactBaseUnits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if balance.Amount != "123.456789" || balance.Asset != "USDC" || balance.ObservedAt != now {
+	if balance.Amount != "123.456789" || balance.Asset != "USDC" || balance.BlockNumber != 100 || balance.ObservedAt != now || calls != 2 {
 		t.Fatalf("balance = %#v", balance)
 	}
 }

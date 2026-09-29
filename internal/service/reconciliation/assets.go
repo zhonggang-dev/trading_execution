@@ -179,7 +179,7 @@ func (state *runState) reconcileBalance(ctx context.Context, executionAccountID 
 	state.issue(ctx, domain.ReconciliationIssueParams{
 		Type: domain.ReconciliationIssueBalanceDrift, Resolution: domain.ReconciliationResolutionManual,
 		Status: domain.ReconciliationIssueOpen, LocalValue: balance.TotalBalance,
-		RemoteValue: external.Amount, Source: external.Source,
+		RemoteValue: external.Amount, RemoteBlockNumber: external.BlockNumber, Source: external.Source,
 		Details: "local total balance differs from the on-chain collateral balance; do not overwrite the ledger without attributable cash/fill/redeem evidence",
 	})
 	return nil
@@ -252,7 +252,9 @@ func (state *runState) readBalanceConsensus(ctx context.Context, wallet, asset s
 func (state *runState) requireBalanceConsensus(ctx context.Context, snapshots []domain.ExternalBalance) (domain.ExternalBalance, bool) {
 	for index := 1; index < len(snapshots); index++ {
 		if snapshots[0].Asset == snapshots[index].Asset &&
-			within(snapshots[0].Amount, snapshots[index].Amount, state.service.balanceEpsilon) {
+			within(snapshots[0].Amount, snapshots[index].Amount, state.service.balanceEpsilon) &&
+			(snapshots[0].BlockNumber == 0 || snapshots[index].BlockNumber == 0 ||
+				snapshots[0].BlockNumber == snapshots[index].BlockNumber) {
 			continue
 		}
 		state.issue(ctx, domain.ReconciliationIssueParams{

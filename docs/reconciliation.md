@@ -230,6 +230,10 @@ Data API 找候选交易并用 Polygon 回执验证，禁止盲目重发。
 - `PHANTOM_POSITION`：钱包有 shares，但本地没有可归因的 order/fill/position；
 - `EXTERNAL_TRADE`：成交无法映射到本系统订单，无法区分人工或其他程序交易；
 - `BALANCE_DRIFT`：链上余额和本地 total balance 不同，但没有可归因的 Fill/redeem/cash event；
+- EVM ERC20 余额快照必须先读取确定的区块号，再对该区块执行 `eth_call`，并把区块号持久化到
+  `reconciliation_issues.remote_block_number`。成交延迟导致的 `BALANCE_DRIFT` 只能由该区块及之前的
+  已确认 `OrderFilled` 事件解释；不得按观察时间、当前余额或本地入账顺序猜测快照包含了哪些成交。
+- 没有 `remote_block_number` 的历史余额告警保持人工处理，不能自动关闭。
 - `SOURCE_CONFLICT`：Data API、链上或多个 RPC 相互矛盾；本轮关闭所有相关自动修复；
 - `FILL_FINALITY_STALLED`：CLOB 已 `CONFIRMED` 的成交在 `match_time` 之后超过
   `POLYGON_FILL_FINALITY_MAX_AGE`（默认 30m）仍未达到确认阈值。确认数只会因为交易被丢弃、

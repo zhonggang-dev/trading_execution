@@ -448,7 +448,7 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 			IssueID: "issue-fill-lag-balance", RunID: firstRun.RunID, Fingerprint: "fill-lag-balance",
 			ExecutionAccountID: accountID, Type: domain.ReconciliationIssueBalanceDrift,
 			Resolution: domain.ReconciliationResolutionManual, Status: domain.ReconciliationIssueOpen,
-			LocalValue: "10", RemoteValue: "8.5", Source: "EVM_ERC20_ETH_CALL",
+			LocalValue: "10", RemoteValue: "8.5", RemoteBlockNumber: 100, Source: "EVM_ERC20_ETH_CALL",
 			Details: "fill reached chain before the local ledger", ObservedAt: now,
 		},
 		{
@@ -479,6 +479,16 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 			t.Fatal(err)
 		}
 	}
+	legacyIssue := domain.ReconciliationIssue{
+		IssueID: "issue-fill-lag-balance-without-block", RunID: firstRun.RunID,
+		Fingerprint: "fill-lag-balance-without-block", ExecutionAccountID: accountID,
+		Type: domain.ReconciliationIssueBalanceDrift, Resolution: domain.ReconciliationResolutionManual,
+		Status: domain.ReconciliationIssueOpen, LocalValue: "10", RemoteValue: "8.5",
+		Source: "EVM_ERC20_ETH_CALL", Details: "legacy drift lacks a snapshot block", ObservedAt: now,
+	}
+	if err := recorder.RecordIssue(context.Background(), legacyIssue); err != nil {
+		t.Fatal(err)
+	}
 	firstCompleted := now.Add(time.Second)
 	firstRun.Status, firstRun.CompletedAt = domain.ReconciliationRunAttentionRequired, &firstCompleted
 	if err := recorder.Complete(context.Background(), firstRun); err != nil {
@@ -500,6 +510,8 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 		t.Fatal(err)
 	}
 	fillAppliedAt := now.Add(2500 * time.Millisecond)
+	fillOrderHash := "0x" + strings.Repeat("11", 32)
+	fillTransactionHash := "0x" + strings.Repeat("aa", 32)
 	if _, err := db.Exec(`
 		INSERT INTO execution_orders (
 			order_id,client_order_id,execution_account_id,venue,market_id,token_id,
@@ -507,8 +519,8 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 			average_fill_price,revision,created_at,updated_at
 		) VALUES (
 			'order-fill-lag','client-fill-lag',$1,'polymarket','market-fill-lag',$2,
-			'{}'::jsonb,'venue-order-fill-lag','FILLED',5,1.5,0,0.3,1,$3,$4
-		)`, accountID, "token-fill-lag", now, fillAppliedAt); err != nil {
+			'{}'::jsonb,$5,'FILLED',5,1.5,0,0.3,1,$3,$4
+		)`, accountID, "token-fill-lag", now, fillAppliedAt, fillOrderHash); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`
@@ -516,13 +528,15 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 			fill_key,venue,venue_fill_id,order_id,venue_order_id,execution_account_id,
 			market_id,token_id,side,liquidity_role,status,shares,price,gross_notional,
 			fee_rate_bps,platform_fee,builder_fee_rate_bps,builder_fee,total_fee,
-			net_cash_delta,fee_source,matched_at,first_observed_at,last_observed_at,
-			confirmed_at,applied_at
+			net_cash_delta,fee_source,transaction_hash,matched_at,first_observed_at,last_observed_at,
+			settlement_evidence,confirmed_at,applied_at
 		) VALUES (
 			'fill-fill-lag','polymarket','venue-fill-lag','order-fill-lag',
-			'venue-order-fill-lag',$1,'market-fill-lag',$2,'BUY','TAKER','CONFIRMED',
-			5,0.3,1.5,0,0,0,0,0,-1.5,'TEST_FINALIZED_FILL',$3,$3,$3,$3,$3
-		)`, accountID, "token-fill-lag", fillAppliedAt); err != nil {
+			$4,$1,'market-fill-lag',$2,'BUY','TAKER','CONFIRMED',
+			5,0.3,1.5,0,0,0,0,0,-1.5,'POLYGON_V2_ORDER_FILLED',$5,$3,$3,$3,$6,$3,$3
+		)`, accountID, "token-fill-lag", fillAppliedAt,
+		fillOrderHash, fillTransactionHash,
+		polygonSettlementEvidenceJSON(t, 100, 1, fillOrderHash, fillTransactionHash, "token-fill-lag", "1500000", "5000000")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`
@@ -532,12 +546,15 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 			total_balance_after,available_balance_after,reserved_balance_after,occurred_at
 		) VALUES (
 			'account-event-fill-lag',$1,'BUY_FILL','order-fill-lag','fill-fill-lag',
-			-1.5,-1.5,0,8.5,8.5,0,$2
+			-1.5,-1.5,0,8.1,8.1,0,$2
 		)`, accountID, fillAppliedAt); err != nil {
 		t.Fatal(err)
 	}
-	// A later confirmed fill must not make the earlier, fully explained drift permanent.
-	laterFillAt := now.Add(2750 * time.Millisecond)
+	// The local ledger may apply a later chain fill first and never pass through
+	// the historical on-chain balance recorded by the drift issue.
+	laterFillAt := now.Add(2250 * time.Millisecond)
+	laterOrderHash := "0x" + strings.Repeat("22", 32)
+	laterTransactionHash := "0x" + strings.Repeat("bb", 32)
 	if _, err := db.Exec(`
 		INSERT INTO execution_orders (
 			order_id,client_order_id,execution_account_id,venue,market_id,token_id,
@@ -545,8 +562,8 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 			average_fill_price,revision,created_at,updated_at
 		) VALUES (
 			'order-after-fill-lag','client-after-fill-lag',$1,'polymarket','market-fill-lag',$2,
-			'{}'::jsonb,'venue-order-after-fill-lag','FILLED',1,0.4,0,0.4,1,$3,$4
-		)`, accountID, "token-fill-lag", now, laterFillAt); err != nil {
+			'{}'::jsonb,$5,'FILLED',1,0.4,0,0.4,1,$3,$4
+		)`, accountID, "token-fill-lag", now, laterFillAt, laterOrderHash); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`
@@ -554,13 +571,15 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 			fill_key,venue,venue_fill_id,order_id,venue_order_id,execution_account_id,
 			market_id,token_id,side,liquidity_role,status,shares,price,gross_notional,
 			fee_rate_bps,platform_fee,builder_fee_rate_bps,builder_fee,total_fee,
-			net_cash_delta,fee_source,matched_at,first_observed_at,last_observed_at,
-			confirmed_at,applied_at
+			net_cash_delta,fee_source,transaction_hash,matched_at,first_observed_at,last_observed_at,
+			settlement_evidence,confirmed_at,applied_at
 		) VALUES (
 			'fill-after-fill-lag','polymarket','venue-after-fill-lag','order-after-fill-lag',
-			'venue-order-after-fill-lag',$1,'market-fill-lag',$2,'BUY','TAKER','CONFIRMED',
-			1,0.4,0.4,0,0,0,0,0,-0.4,'TEST_FINALIZED_FILL',$3,$3,$3,$3,$3
-		)`, accountID, "token-fill-lag", laterFillAt); err != nil {
+			$4,$1,'market-fill-lag',$2,'BUY','TAKER','CONFIRMED',
+			1,0.4,0.4,0,0,0,0,0,-0.4,'POLYGON_V2_ORDER_FILLED',$5,$3,$3,$3,$6,$3,$3
+		)`, accountID, "token-fill-lag", laterFillAt,
+		laterOrderHash, laterTransactionHash,
+		polygonSettlementEvidenceJSON(t, 101, 2, laterOrderHash, laterTransactionHash, "token-fill-lag", "400000", "1000000")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`
@@ -570,7 +589,7 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 			total_balance_after,available_balance_after,reserved_balance_after,occurred_at
 		) VALUES (
 			'account-event-after-fill-lag',$1,'BUY_FILL','order-after-fill-lag','fill-after-fill-lag',
-			-0.4,-0.4,0,8.1,8.1,0,$2
+			-0.4,-0.4,0,9.6,9.6,0,$2
 		)`, accountID, laterFillAt); err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +620,7 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 	rows, err := db.Query(`
 		SELECT issue_type,status,resolution
 		FROM reconciliation_issues
-		WHERE execution_account_id=$1 ORDER BY issue_type`, accountID)
+		WHERE execution_account_id=$1 AND issue_id<>$2 ORDER BY issue_type`, accountID, legacyIssue.IssueID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,6 +648,13 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 	if got := statuses[domain.ReconciliationIssueExternalTrade]; got != [2]string{"OPEN", "MANUAL_REVIEW"} {
 		t.Fatalf("unrelated issue status = %v, want OPEN/MANUAL_REVIEW", got)
 	}
+	var legacyStatus string
+	if err := db.QueryRow(`SELECT status FROM reconciliation_issues WHERE issue_id=$1`, legacyIssue.IssueID).Scan(&legacyStatus); err != nil {
+		t.Fatal(err)
+	}
+	if legacyStatus != "OPEN" {
+		t.Fatalf("legacy drift without snapshot block status = %s, want OPEN", legacyStatus)
+	}
 	var summaryJSON []byte
 	if err := db.QueryRow(`SELECT summary FROM reconciliation_runs WHERE run_id=$1`, secondRun.RunID).Scan(&summaryJSON); err != nil {
 		t.Fatal(err)
@@ -640,6 +666,42 @@ func TestReconciliationRecorderClosesFillLagDriftAfterAuthoritativeFill(t *testi
 	if summary["issues_resolved"] != 3 || summary["issues_automatic"] != 3 || summary["issues_total"] != 3 {
 		t.Fatalf("resolution summary = %#v, want three automatic resolutions", summary)
 	}
+}
+
+func polygonSettlementEvidenceJSON(
+	t *testing.T,
+	blockNumber, logIndex uint64,
+	orderHash, transactionHash, tokenID, makerAmount, takerAmount string,
+) []byte {
+	t.Helper()
+	value, err := json.Marshal(map[string]any{
+		"schema_version":          domain.SettlementEvidenceSchemaV1,
+		"source":                  domain.FeeSourcePolygonV2OrderFilled,
+		"chain_id":                domain.SettlementEvidencePolygonChainID,
+		"exchange_address":        "0x" + strings.Repeat("ab", 20),
+		"transaction_hash":        transactionHash,
+		"block_number":            blockNumber,
+		"block_hash":              "0x" + strings.Repeat("cd", 32),
+		"log_index":               logIndex,
+		"confirmations":           64,
+		"order_hash":              orderHash,
+		"maker_address":           "0x" + strings.Repeat("ef", 20),
+		"token_id":                tokenID,
+		"side":                    "BUY",
+		"maker_amount_base_units": makerAmount,
+		"taker_amount_base_units": takerAmount,
+		"total_fee_base_units":    "0",
+		"builder_code":            "0x" + strings.Repeat("00", 32),
+		"builder_fee_known":       true,
+		"builder_fee_base_units":  "0",
+		"builder_fee_source":      domain.SettlementEvidenceZeroBuilder,
+		"collateral_decimals":     6,
+		"outcome_token_decimals":  6,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
 }
 
 // TestAtomicLiveRiskPostgresIntegration verifies that LIVE_CHECK orders are
@@ -2757,7 +2819,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 			t.Fatalf("apply migration %s: %v", name, err)
 		}
 	}
-	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql", "0029_position_lot_model_route_successors.sql"} {
+	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql", "0029_position_lot_model_route_successors.sql", "0030_reconciliation_balance_snapshot_block.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatal(err)

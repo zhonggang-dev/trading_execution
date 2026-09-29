@@ -100,6 +100,7 @@ type ReconciliationIssue struct {
 	TokenID            string                    `json:"token_id,omitempty"`
 	LocalValue         Decimal                   `json:"local_value,omitempty"`
 	RemoteValue        Decimal                   `json:"remote_value,omitempty"`
+	RemoteBlockNumber  uint64                    `json:"remote_block_number,omitempty"`
 	Source             string                    `json:"source,omitempty"`
 	Details            string                    `json:"details"`
 	ObservedAt         time.Time                 `json:"observed_at"`
@@ -180,10 +181,11 @@ type ExternalPositionDispositionTrade struct {
 
 // ExternalBalance 表示后端使用的 ExternalBalance 类型。
 type ExternalBalance struct {
-	Asset      string    `json:"asset"`
-	Amount     Decimal   `json:"amount"`
-	Source     string    `json:"source"`
-	ObservedAt time.Time `json:"observed_at"`
+	Asset       string    `json:"asset"`
+	Amount      Decimal   `json:"amount"`
+	BlockNumber uint64    `json:"block_number,omitempty"`
+	Source      string    `json:"source"`
+	ObservedAt  time.Time `json:"observed_at"`
 }
 
 // PositionLifecycleStatus 表示后端使用的 PositionLifecycleStatus 类型。
