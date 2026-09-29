@@ -286,7 +286,7 @@ func (service *Service) prepareBinding(ctx context.Context, binding domain.Strat
 	if !errors.Is(err, port.ErrPositionExitRunNotFound) {
 		return preparedBinding{binding: binding, err: fmt.Errorf("read stored position exit input: %w", err)}
 	}
-	trades, err := service.tradeSource.ListOpenPositionExitTrades(ctx, binding.ExecutionAccountID)
+	trades, err := service.tradeSource.ListOpenPositionExitTrades(ctx, binding.Context())
 	if err != nil {
 		return preparedBinding{binding: binding, err: fmt.Errorf("load open position trades: %w", err)}
 	}

@@ -3190,12 +3190,12 @@ SELECT json_build_object(
            WHERE total_shares<>0 OR reserved_shares<>0 OR cost_basis<>0) x),
   'lots',(SELECT COALESCE(json_agg(row_to_json(x) ORDER BY execution_account_id,opened_at,lot_id),'[]'::json)
     FROM (SELECT lot.lot_id,lot.execution_account_id,lot.market_id,lot.condition_id,lot.token_id,
-                 lot.outcome_index,lot.outcome_name,lot.neg_risk,lot.model_id origin_model_id,
-                 COALESCE(route.logical_model_id,lot.model_id) model_id,lot.strategy_id,
+                 lot.outcome_index,lot.outcome_name,lot.neg_risk,lot.model_id,
+                 lot.strategy_id,
                  lot.original_shares::text,lot.remaining_shares::text,
                  lot.original_cost::text,lot.remaining_cost::text,
                  lot.average_entry_price::text,lot.status,lot.opened_at
-            FROM position_lots lot LEFT JOIN position_lot_model_routes route ON route.lot_id=lot.lot_id
+            FROM position_lots lot
            WHERE lot.status IN ('OPEN','SETTLED_PENDING_REDEEM')) x),
   'baselines',(SELECT COALESCE(json_agg(row_to_json(x) ORDER BY execution_account_id,token_id),'[]'::json)
     FROM (SELECT header.baseline_id,header.execution_account_id,header.observed_at,
@@ -6498,11 +6498,10 @@ SELECT COALESCE(json_agg(row_to_json(x) ORDER BY execution_account_id,entered_at
 FROM (
   SELECT lot.lot_id,lot.execution_account_id,lot.market_id,lot.condition_id,
          lot.outcome_index,lot.outcome_name,lot.token_id,lot.neg_risk,
-         COALESCE(route.logical_model_id,lot.model_id) model_id,lot.strategy_id,
+         lot.model_id,lot.strategy_id,
          lot.opened_at AS entered_at,lot.remaining_shares::text AS shares,
          lot.average_entry_price::text AS entry_price
     FROM position_lots lot
-    LEFT JOIN position_lot_model_routes route ON route.lot_id=lot.lot_id
    WHERE lot.execution_account_id IN ('main','wallet-1','wallet-2','wallet-3')
      AND lot.status='OPEN'
 ) x;

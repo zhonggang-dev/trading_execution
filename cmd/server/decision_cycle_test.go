@@ -14,7 +14,7 @@ import (
 
 type decisionRunnerTestPositionSource struct{}
 
-func (decisionRunnerTestPositionSource) ListOpenLots(context.Context, string) ([]domain.PositionLot, error) {
+func (decisionRunnerTestPositionSource) ListOpenLots(context.Context, domain.StrategyExecutionContext) ([]domain.PositionLot, error) {
 	return nil, nil
 }
 

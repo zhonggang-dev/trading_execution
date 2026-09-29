@@ -31,14 +31,17 @@ func New(source port.StrategyPositionSource, routes []Route) (*Router, error) {
 	return router, nil
 }
 
-func (router *Router) ListOpenLots(ctx context.Context, logical string) ([]domain.PositionLot, error) {
-	logical = strings.TrimSpace(logical)
-	lots, err := router.source.ListOpenLots(ctx, logical)
+func (router *Router) ListOpenLots(ctx context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionLot, error) {
+	binding = binding.Normalize()
+	logical := binding.ExecutionAccountID
+	lots, err := router.source.ListOpenLots(ctx, binding)
 	if err != nil {
 		return nil, err
 	}
 	for _, internal := range router.routes[logical] {
-		additional, err := router.source.ListOpenLots(ctx, internal)
+		internalBinding := binding
+		internalBinding.ExecutionAccountID = internal
+		additional, err := router.source.ListOpenLots(ctx, internalBinding)
 		if err != nil {
 			return nil, err
 		}

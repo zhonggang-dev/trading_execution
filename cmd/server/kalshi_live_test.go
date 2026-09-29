@@ -43,8 +43,8 @@ func (*routeTestExecution) Attempts(context.Context, string) ([]domain.OrderAtte
 
 type routeTestPositions struct{ accounts []string }
 
-func (source *routeTestPositions) ListOpenLots(_ context.Context, accountID string) ([]domain.PositionLot, error) {
-	source.accounts = append(source.accounts, accountID)
+func (source *routeTestPositions) ListOpenLots(_ context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionLot, error) {
+	source.accounts = append(source.accounts, binding.ExecutionAccountID)
 	return nil, nil
 }
 
@@ -98,7 +98,9 @@ func TestKalshiPreflightFailureLeavesPolymarketRouteOperational(t *testing.T) {
 	if _, err := composition.execution.Submit(context.Background(), kalshiIntent); err == nil {
 		t.Fatal("failed Kalshi route submission must fail closed")
 	}
-	if _, err := composition.positionSource.ListOpenLots(context.Background(), "main"); err != nil {
+	if _, err := composition.positionSource.ListOpenLots(context.Background(), domain.StrategyExecutionContext{
+		ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(positions.accounts, []string{"main"}) {
