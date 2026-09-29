@@ -32,15 +32,16 @@ type quarantinePositionSource struct {
 }
 
 // ListOpenLots 返回模拟数据源中的测试列表。
-func (source fakePositionSource) ListOpenLots(context.Context, string) ([]domain.PositionLot, error) {
+func (source fakePositionSource) ListOpenLots(context.Context, domain.StrategyExecutionContext) ([]domain.PositionLot, error) {
 	return source.lots, nil
 }
 
-func (source accountPositionSource) ListOpenLots(_ context.Context, executionAccountID string) ([]domain.PositionLot, error) {
-	return source[executionAccountID], nil
+func (source accountPositionSource) ListOpenLots(_ context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionLot, error) {
+	return source[binding.ExecutionAccountID], nil
 }
 
-func (source *quarantinePositionSource) ListOpenLots(_ context.Context, executionAccountID string) ([]domain.PositionLot, error) {
+func (source *quarantinePositionSource) ListOpenLots(_ context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionLot, error) {
+	executionAccountID := binding.ExecutionAccountID
 	source.calls = append(source.calls, executionAccountID)
 	if executionAccountID == source.rejectedAccount {
 		return nil, fmt.Errorf("quarantined account must not be queried")

@@ -28,11 +28,9 @@ identity. The upstream `model.name` is `v4.1 flash` and must be confirmed in a
 fresh Sandbox prediction snapshot before enabling strategy requests. Previous
 Gemini rollout evidence does not approve this new route. Keep order submission
 disabled while preparing and validating the new binding.
-The new binary can start with the existing `qwen_masked` wallet-6/wallet-7 bindings
-while the decision cycle and order submission remain disabled. This is a
-compatibility deployment, not the final database cutover; the preflight and
-its approval evidence apply only after the binding and legacy-lot successor
-transition has been prepared separately.
+The new binary can start while the decision cycle and order submission remain
+disabled. OPEN lots retain their opening `model_id`; a new model does not take
+ownership of an old model's lots.
 
 The same reviewed environment must explicitly pin execution-format safety and
 the v2 history window; monetary allocation belongs to the upstream AI strategy:
@@ -70,12 +68,11 @@ All four authorization rows are enabled in shadow. main/wallet-1 remain active
 so their existing OPEN lots can be reconciled and exited; new BUY entries are
 blocked by the account gate. Source
 `prediction_model_id` values never belong in the database authorization table.
-The 15 previously routed Gemini OPEN lots retain their immutable
-`gemini_masked -> qwen_masked` audit rows. Apply migration `0029` and insert
-one append-only successor per still-open lot from `qwen_masked` to
-`deepseek_masked` while the service is stopped and the global kill switch
-is on. The effective route view is used by strategy input, exit checks, and
-SELL reservation; changing only the binding rows would strand those lots.
+Strategy and position-exit readers select OPEN lots by the exact
+`model_id + strategy_id + execution_account_id` binding. Old-model lots remain
+in the ledger for settlement or redemption and never transfer ownership to the
+new model. Sub-centish Polymarket dust is retained in the ledger but omitted
+from strategy requests because SELL sizes support at most two decimals.
 
 Apply `migrations/0017_enabled_strategy_binding_uniqueness.sql` while the
 service is stopped and the global kill switch is on. The migration replaces

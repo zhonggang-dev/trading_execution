@@ -168,19 +168,19 @@ type LiveOperationsStatusWriter interface {
 type PositionLedger interface {
 	GetPosition(ctx context.Context, executionAccountID, tokenID string) (domain.Position, error)
 	ListLots(ctx context.Context, executionAccountID, tokenID string) ([]domain.PositionLot, error)
-	ListOpenLots(ctx context.Context, executionAccountID string) ([]domain.PositionLot, error)
+	ListOpenLots(ctx context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionLot, error)
 	ListPositionEvents(ctx context.Context, executionAccountID, tokenID string) ([]domain.PositionEvent, error)
 	MarkPosition(ctx context.Context, mark domain.PositionMark) (domain.Position, error)
 }
 
 // StrategyPositionSource 提供单个隔离执行账户的精确开放批次，退出策略按批次寻址，禁止按 Token 合并。
 type StrategyPositionSource interface {
-	ListOpenLots(ctx context.Context, executionAccountID string) ([]domain.PositionLot, error)
+	ListOpenLots(ctx context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionLot, error)
 }
 
 // PositionExitTradeSource 返回开放批次及其有效预占，不能仅根据 Token 净仓位推导可卖数量。
 type PositionExitTradeSource interface {
-	ListOpenPositionExitTrades(ctx context.Context, executionAccountID string) ([]domain.PositionExitTrade, error)
+	ListOpenPositionExitTrades(ctx context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionExitTrade, error)
 }
 
 // FundsLedger 表示后端使用的 FundsLedger 类型。

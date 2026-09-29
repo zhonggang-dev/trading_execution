@@ -369,7 +369,6 @@ type lotBalance struct {
 	account  string
 	market   string
 	token    string
-	origin   string
 	model    string
 	strategy string
 	shares   domain.Decimal
@@ -380,10 +379,9 @@ type lotBalance struct {
 func lockTargetSellLot(ctx context.Context, tx *sql.Tx, order domain.Order, before domain.Position) (lotBalance, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT lot.lot_id, lot.execution_account_id, lot.market_id, lot.token_id,
-		       lot.model_id, COALESCE(route.logical_model_id, lot.model_id), lot.strategy_id,
+		       lot.model_id, lot.strategy_id,
 		       lot.remaining_shares::text, lot.remaining_cost::text
 		FROM position_lots AS lot
-		LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot.lot_id
 		WHERE lot.execution_account_id=$1 AND lot.token_id=$2 AND lot.status='OPEN'
 		ORDER BY lot.opened_at, lot.lot_id FOR UPDATE OF lot`, order.Intent.ExecutionAccountID, order.Intent.TokenID)
 	if err != nil {
@@ -392,7 +390,7 @@ func lockTargetSellLot(ctx context.Context, tx *sql.Tx, order domain.Order, befo
 	var lots []lotBalance
 	for rows.Next() {
 		var lot lotBalance
-		if err := rows.Scan(&lot.id, &lot.account, &lot.market, &lot.token, &lot.origin, &lot.model, &lot.strategy, &lot.shares, &lot.cost); err != nil {
+		if err := rows.Scan(&lot.id, &lot.account, &lot.market, &lot.token, &lot.model, &lot.strategy, &lot.shares, &lot.cost); err != nil {
 			rows.Close()
 			return lotBalance{}, err
 		}
@@ -626,14 +624,13 @@ func (ledger *FillLedger) ListLots(ctx context.Context, accountID, tokenID strin
 	rows, err := ledger.db.QueryContext(ctx, `
 		SELECT lot.lot_id, lot.execution_account_id, lot.market_id, lot.condition_id, lot.token_id,
 		       lot.outcome_index, lot.outcome_name, lot.neg_risk,
-		       lot.model_id, COALESCE(route.logical_model_id, lot.model_id), lot.strategy_id,
+		       lot.model_id, lot.strategy_id,
 		       COALESCE(lot.opening_order_id,'external-adoption:'||lot.external_adoption_id),
 		       COALESCE(lot.opening_fill_key,'external-adoption:'||lot.external_adoption_id),
 		       lot.original_shares::text, lot.remaining_shares::text,
 		       lot.original_cost::text, lot.remaining_cost::text, lot.average_entry_price::text,
 		       lot.status, lot.opened_at, lot.closed_at
 		FROM position_lots AS lot
-		LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot.lot_id
 		WHERE lot.execution_account_id=$1 AND lot.token_id=$2
 		ORDER BY lot.opened_at, lot.lot_id`, accountID, tokenID)
 	if err != nil {
@@ -648,7 +645,7 @@ func (ledger *FillLedger) ListLots(ctx context.Context, accountID, tokenID strin
 		var outcome sql.NullInt64
 		var negRisk sql.NullBool
 		if err := rows.Scan(&lot.LotID, &lot.ExecutionAccountID, &lot.MarketID, &lot.ConditionID, &lot.TokenID,
-			&outcome, &lot.OutcomeName, &negRisk, &lot.OriginModelID, &lot.ModelID, &lot.StrategyID, &lot.OpeningOrderID, &lot.OpeningFillKey,
+			&outcome, &lot.OutcomeName, &negRisk, &lot.ModelID, &lot.StrategyID, &lot.OpeningOrderID, &lot.OpeningFillKey,
 			&lot.OriginalShares, &lot.RemainingShares, &lot.OriginalCost, &lot.RemainingCost,
 			&lot.AverageEntryPrice, &status, &lot.OpenedAt, &closed); err != nil {
 			return nil, err
@@ -673,20 +670,23 @@ func (ledger *FillLedger) ListLots(ctx context.Context, accountID, tokenID strin
 }
 
 // ListOpenLots 查询指定账户所有未关闭的持仓批次。
-func (ledger *FillLedger) ListOpenLots(ctx context.Context, accountID string) ([]domain.PositionLot, error) {
+func (ledger *FillLedger) ListOpenLots(ctx context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionLot, error) {
+	binding = binding.Normalize()
 	rows, err := ledger.db.QueryContext(ctx, `
 		SELECT lot.lot_id, lot.execution_account_id, lot.market_id, lot.condition_id, lot.token_id,
 		       lot.outcome_index, lot.outcome_name, lot.neg_risk,
-		       lot.model_id, COALESCE(route.logical_model_id, lot.model_id), lot.strategy_id,
+		       lot.model_id, lot.strategy_id,
 		       COALESCE(lot.opening_order_id,'external-adoption:'||lot.external_adoption_id),
 		       COALESCE(lot.opening_fill_key,'external-adoption:'||lot.external_adoption_id),
 		       lot.original_shares::text, lot.remaining_shares::text,
 		       lot.original_cost::text, lot.remaining_cost::text, lot.average_entry_price::text,
 		       lot.status, lot.opened_at, lot.closed_at
 		FROM position_lots AS lot
-		LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot.lot_id
-		WHERE lot.execution_account_id=$1 AND lot.status='OPEN'
-		ORDER BY lot.opened_at, lot.lot_id`, accountID)
+		WHERE lot.execution_account_id=$1 AND lot.model_id=$2
+		  AND execution_canonical_strategy_id(lot.strategy_id)=execution_canonical_strategy_id($3)
+		  AND lot.status='OPEN'
+		  AND (lot.token_id LIKE 'kalshi:%' OR lot.remaining_shares >= 0.01)
+		ORDER BY lot.opened_at, lot.lot_id`, binding.ExecutionAccountID, binding.ModelID, binding.StrategyID)
 	if err != nil {
 		return nil, fmt.Errorf("query open position lots: %w", err)
 	}
@@ -703,7 +703,8 @@ func (ledger *FillLedger) ListOpenLots(ctx context.Context, accountID string) ([
 }
 
 // ListOpenPositionExitTrades 查询可供退出策略评估的开放持仓批次和预占。
-func (ledger *FillLedger) ListOpenPositionExitTrades(ctx context.Context, accountID string) ([]domain.PositionExitTrade, error) {
+func (ledger *FillLedger) ListOpenPositionExitTrades(ctx context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionExitTrade, error) {
+	binding = binding.Normalize()
 	rows, err := ledger.db.QueryContext(ctx, `
 		SELECT lot.lot_id,
 		       COALESCE(fill.venue_fill_id,'external-adoption:'||lot.external_adoption_id),
@@ -716,11 +717,10 @@ func (ledger *FillLedger) ListOpenPositionExitTrades(ctx context.Context, accoun
 		       CASE WHEN legacy.token_id IS NOT NULL THEN lot.remaining_shares
 		            ELSE COALESCE(reserved.shares, 0) END::text,
 		       lot.average_entry_price::text, lot.remaining_cost::text,
-		       lot.model_id, COALESCE(route.logical_model_id, lot.model_id),
+		       lot.model_id,
 		       lot.strategy_id, lot.execution_account_id
 		FROM position_lots AS lot
 		LEFT JOIN execution_fills AS fill ON fill.fill_key = lot.opening_fill_key
-		LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot.lot_id
 		LEFT JOIN (
 			SELECT execution_account_id, target_lot_id,
 			       SUM(remaining_reserved_shares) AS shares
@@ -740,8 +740,11 @@ func (ledger *FillLedger) ListOpenPositionExitTrades(ctx context.Context, accoun
 		) AS legacy
 		  ON legacy.execution_account_id = lot.execution_account_id
 		 AND legacy.token_id = lot.token_id
-		WHERE lot.execution_account_id = $1 AND lot.status = 'OPEN'
-		ORDER BY lot.opened_at, lot.lot_id`, accountID)
+		WHERE lot.execution_account_id=$1 AND lot.model_id=$2
+		  AND execution_canonical_strategy_id(lot.strategy_id)=execution_canonical_strategy_id($3)
+		  AND lot.status='OPEN'
+		  AND (lot.token_id LIKE 'kalshi:%' OR lot.remaining_shares >= 0.01)
+		ORDER BY lot.opened_at, lot.lot_id`, binding.ExecutionAccountID, binding.ModelID, binding.StrategyID)
 	if err != nil {
 		return nil, fmt.Errorf("query open position exit trades: %w", err)
 	}
@@ -757,7 +760,7 @@ func (ledger *FillLedger) ListOpenPositionExitTrades(ctx context.Context, accoun
 			&trade.TokenID, &negRisk, &trade.EnteredAt,
 			&trade.OriginalShares, &trade.RemainingShares, &trade.AvailableShares,
 			&trade.ReservedShares, &trade.EntryPrice, &trade.RemainingCost,
-			&trade.OriginModelID, &trade.ModelID, &trade.StrategyID, &trade.ExecutionAccountID,
+			&trade.ModelID, &trade.StrategyID, &trade.ExecutionAccountID,
 		); err != nil {
 			return nil, fmt.Errorf("scan position exit trade: %w", err)
 		}
@@ -783,7 +786,7 @@ func scanPositionLot(row rowScanner) (domain.PositionLot, error) {
 	var negRisk sql.NullBool
 	var closed sql.NullTime
 	if err := row.Scan(&lot.LotID, &lot.ExecutionAccountID, &lot.MarketID, &lot.ConditionID, &lot.TokenID,
-		&outcome, &lot.OutcomeName, &negRisk, &lot.OriginModelID, &lot.ModelID, &lot.StrategyID, &lot.OpeningOrderID, &lot.OpeningFillKey,
+		&outcome, &lot.OutcomeName, &negRisk, &lot.ModelID, &lot.StrategyID, &lot.OpeningOrderID, &lot.OpeningFillKey,
 		&lot.OriginalShares, &lot.RemainingShares, &lot.OriginalCost, &lot.RemainingCost,
 		&lot.AverageEntryPrice, &status, &lot.OpenedAt, &closed); err != nil {
 		return domain.PositionLot{}, fmt.Errorf("scan position lot: %w", err)
