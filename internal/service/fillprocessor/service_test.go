@@ -120,6 +120,25 @@ func TestCalculateMoneyValidatesOfficialFiveDecimalFeeTruncation(t *testing.T) {
 	}
 }
 
+func TestCalculateMoneyAcceptsExactSettlementPriceWithinDisplayTick(t *testing.T) {
+	raw := authoritativeMoneyFill(domain.SideBuy, domain.LiquidityRoleTaker)
+	raw.Shares = "40"
+	raw.Price = "0.24875"
+	raw.PriceTickSize = "0.01"
+	raw.GrossNotional = "9.95"
+	raw.PlatformFeeRate = "0.04"
+	raw.FeeExponent = "1"
+	raw.PlatformFee = "0.29899"
+	raw.TotalFee = "0.29899"
+	fill, err := calculateMoney(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fill.NetCashDelta.Equal("-10.24899") {
+		t.Fatalf("net cash delta = %s, want -10.24899", fill.NetCashDelta)
+	}
+}
+
 func TestCalculateMoneyAcceptsProductionV2SellFeeQuantum(t *testing.T) {
 	raw := authoritativeMoneyFill(domain.SideSell, domain.LiquidityRoleTaker)
 	raw.Shares = "5"

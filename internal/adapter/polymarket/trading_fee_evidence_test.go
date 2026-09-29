@@ -3,6 +3,7 @@ package polymarket
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 )
@@ -89,6 +90,55 @@ func TestApplyFillFeeEvidenceAcceptsProductionV2SellFeeQuantum(t *testing.T) {
 		zeroBytes32,
 	); err == nil {
 		t.Fatal("half-up fee quantum was accepted instead of the protocol-truncated fee")
+	}
+}
+
+func TestApplyFillFeeEvidenceUsesExactOrderFilledPriceForWallet7(t *testing.T) {
+	fill := feeEvidenceFill(domain.LiquidityRoleTaker)
+	fill.Shares = "40"
+	fill.Price = "0.25"
+	fill.TransactionHash = "0x" + strings.Repeat("a", 64)
+	fill.VenueOrderID = "0x" + strings.Repeat("b", 64)
+	evidence := feeEvidence()
+	evidence.TransactionHash = fill.TransactionHash
+	evidence.OrderHash = fill.VenueOrderID
+	evidence.MakerAddress = "0x" + strings.Repeat("c", 40)
+	evidence.BlockHash = "0x" + strings.Repeat("d", 64)
+	evidence.MakerAmountBaseUnits = "9950000"
+	evidence.TakerAmountBaseUnits = "40000000"
+	evidence.TotalFeeBaseUnits = "298990"
+	result, err := applyFillFeeEvidence(
+		fill,
+		marketFeeSchedule{Rate: "0.04", Exponent: "1", TakerOnly: true},
+		evidence, "0.01", evidence.ExchangeAddress, evidence.MakerAddress, zeroBytes32,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Price.Equal("0.24875") || !result.GrossNotional.Equal("9.95") ||
+		!result.PlatformFee.Equal("0.29899") {
+		t.Fatalf("wallet-7 chain settlement = %#v", result)
+	}
+	now := time.Now().UTC()
+	result.Key = "fill-wallet-7"
+	result.OrderID = "order-wallet-7"
+	result.ExecutionAccountID = "wallet-7"
+	result.MarketID = "market-wallet-7"
+	result.Status = domain.FillStatusConfirmed
+	result.MatchedAt = now
+	result.ObservedAt = now
+	result.ConfirmedAt = &now
+	result.NetCashDelta = "-10.24899"
+	if err := result.Normalize().ValidateAccounting(); err != nil {
+		t.Fatalf("wallet-7 fill accounting: %v", err)
+	}
+	evidence.TotalFeeBaseUnits = "298980"
+	if _, err := applyFillFeeEvidence(
+		fill,
+		marketFeeSchedule{Rate: "0.04", Exponent: "1", TakerOnly: true},
+		evidence, "0.01", evidence.ExchangeAddress, evidence.MakerAddress, zeroBytes32,
+	); err == nil {
+		t.Fatal("incorrect chain fee was accepted for the exact settlement price")
 	}
 }
 
