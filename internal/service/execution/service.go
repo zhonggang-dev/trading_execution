@@ -665,6 +665,18 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 				// for audit; only local synchronization/retention failures escape.
 				return order, errors.Join(syncErr, transitionErr, pendingErr)
 			}
+			if code == "CLOB_ORDER_NOT_FOUND" && service.authoritativeFills {
+				_, syncErr := service.fillSynchronizer.SyncOrder(ctx, order.ID)
+				refreshed, reloadErr := service.repository.Get(ctx, order.ID)
+				if reloadErr == nil {
+					order = refreshed
+				}
+				if syncErr == nil && reloadErr == nil && order.Status == domain.OrderStatusFilled {
+					return order, nil
+				}
+				_ = service.reservations.MarkUncertain(ctx, order, "RECONCILE_FAILED: "+getErr.Error())
+				return order, errors.Join(fmt.Errorf("get venue order: %w", getErr), syncErr, reloadErr)
+			}
 			_ = service.reservations.MarkUncertain(ctx, order, "RECONCILE_FAILED: "+getErr.Error())
 		}
 		return order, fmt.Errorf("get venue order: %w", getErr)

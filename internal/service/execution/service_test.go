@@ -1451,6 +1451,66 @@ func TestRetryableKalshiReadFailuresNeverConsumeGenericRetryBudget(t *testing.T)
 	}
 }
 
+func TestRefreshCLOBOrderNotFoundRecoversConfirmedFill(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 29, 6, 20, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	synchronizer := &fakeFillSynchronizer{sync: func(ctx context.Context, orderID string) error {
+		return persistConfirmedFill(ctx, repository, orderID, domain.OrderStatusFilled, "10", "0.24875")
+	}}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		Now: func() time.Time { return now }, NewID: func() string { return "ord-clob-not-found-filled" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(ctx, validIntent("client-clob-not-found-filled"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	venue.getErr = &port.VenueError{Kind: port.VenueErrorUnavailable, Code: "CLOB_ORDER_NOT_FOUND", Message: "CLOB returned no order"}
+	refreshed, err := service.Refresh(ctx, result.Order.ID)
+	if err != nil || refreshed.Status != domain.OrderStatusFilled || !refreshed.FilledSize.Equal("10") {
+		t.Fatalf("Refresh() = %#v, %v; want confirmed FILLED", refreshed, err)
+	}
+	if synchronizer.calls.Load() != 1 || venue.getCalls.Load() != 1 {
+		t.Fatalf("sync/get calls = %d/%d, want 1/1", synchronizer.calls.Load(), venue.getCalls.Load())
+	}
+}
+
+func TestRefreshCLOBOrderNotFoundWithoutFillStaysUnknown(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 29, 6, 20, 0, 0, time.UTC)
+	repository := memory.NewOrderRepository()
+	venue := &fakeVenue{}
+	reservations := &trackingReservations{delegate: paper.NewReservationManager()}
+	synchronizer := &fakeFillSynchronizer{}
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{}, MarketValidator: allowMarketValidator{},
+		Reservations: reservations, FillSynchronizer: synchronizer, AuthoritativeFills: true,
+		Now: func() time.Time { return now }, NewID: func() string { return "ord-clob-not-found-unknown" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Submit(ctx, validIntent("client-clob-not-found-unknown"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	venue.getErr = &port.VenueError{Kind: port.VenueErrorUnavailable, Code: "CLOB_ORDER_NOT_FOUND", Message: "CLOB returned no order"}
+	refreshed, err := service.Refresh(ctx, result.Order.ID)
+	if err == nil || refreshed.Status != domain.OrderStatusUnknown || refreshed.FailureCode != "CLOB_ORDER_NOT_FOUND" {
+		t.Fatalf("Refresh() = %#v, %v; want recoverable UNKNOWN", refreshed, err)
+	}
+	if synchronizer.calls.Load() != 1 || reservations.uncertainCalls.Load() == 0 {
+		t.Fatalf("sync/uncertain calls = %d/%d, want fill check and frozen reservation", synchronizer.calls.Load(), reservations.uncertainCalls.Load())
+	}
+}
+
 func TestRefreshFillDetailsUnavailableReturnsOrderReloadedFromFillLedger(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
