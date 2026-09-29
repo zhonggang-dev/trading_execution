@@ -1698,7 +1698,23 @@ func applyFillFeeEvidence(
 			return domain.Fill{}, err
 		}
 		if !platformFee.Equal(expectedFee) {
-			return domain.Fill{}, fmt.Errorf("OrderFilled platform fee %s does not match V2 fee curve %s", platformFee, expectedFee)
+			shares, err := decimalRat(eventShares)
+			if err != nil {
+				return domain.Fill{}, err
+			}
+			gross, err := decimalRat(eventGross)
+			if err != nil {
+				return domain.Fill{}, err
+			}
+			chainPrice, err := exactRatDecimal(new(big.Rat).Quo(gross, shares), 18)
+			if err != nil {
+				return domain.Fill{}, fmt.Errorf("OrderFilled price from exact amounts: %w", err)
+			}
+			chainFee, err := calculateV2PlatformFee(eventShares, chainPrice, schedule.Rate, schedule.Exponent)
+			if err != nil || !platformFee.Equal(chainFee) {
+				return domain.Fill{}, fmt.Errorf("OrderFilled platform fee %s does not match V2 fee curve %s", platformFee, expectedFee)
+			}
+			fill.Price = chainPrice
 		}
 	}
 	builderRate := evidence.BuilderFeeRateBPS
