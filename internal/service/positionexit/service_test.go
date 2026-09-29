@@ -45,7 +45,7 @@ func (universe *fakeMarketUniverse) FindByCondition(context.Context, string) (do
 }
 
 // ListOpenPositionExitTrades 返回模拟数据源中的测试列表。
-func (source *fakeTradeSource) ListOpenPositionExitTrades(context.Context, string) ([]domain.PositionExitTrade, error) {
+func (source *fakeTradeSource) ListOpenPositionExitTrades(context.Context, domain.StrategyExecutionContext) ([]domain.PositionExitTrade, error) {
 	source.calls++
 	return append([]domain.PositionExitTrade(nil), source.trades...), nil
 }
@@ -227,7 +227,6 @@ func TestRunRoutesPredictionProducerToLogicalModelForRoutedLot(t *testing.T) {
 		logicalModel    = "gemini_masked"
 	)
 	fixture.predictionSource.snapshot.Predictions[0].Model.Name = predictionModel
-	fixture.tradeSource.trades[0].OriginModelID = predictionModel
 	fixture.tradeSource.trades[0].ModelID = logicalModel
 	fixture.strategy.build = func(request domain.PositionExitRequest) domain.PositionExitResponse {
 		if request.Context.ModelID != logicalModel || len(request.Predictions) != 1 ||
@@ -276,7 +275,6 @@ func TestRunExitsQwenMaskedLotWithoutDirectPrediction(t *testing.T) {
 	fixture := newFixture(t)
 	fixture.predictionSource.snapshot.Predictions[0].Model.Name = "qwen"
 	fixture.predictionSource.snapshot.Predictions[0].SandboxID = "sandbox-qwen"
-	fixture.tradeSource.trades[0].OriginModelID = "qwen"
 	fixture.tradeSource.trades[0].ModelID = "qwen_masked"
 	fixture.strategy.build = func(request domain.PositionExitRequest) domain.PositionExitResponse {
 		if request.Context.ModelID != "qwen_masked" || len(request.Predictions) != 0 || len(request.Trades) != 1 {

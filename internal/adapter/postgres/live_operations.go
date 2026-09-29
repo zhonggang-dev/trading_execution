@@ -248,15 +248,13 @@ func loadLivePositions(ctx context.Context, tx *sql.Tx, clause string, args []an
 		FROM execution_positions AS position
 		LEFT JOIN LATERAL (
 			SELECT string_agg(
-			           DISTINCT COALESCE(route.logical_model_id, lot_row.model_id), ','
-			           ORDER BY COALESCE(route.logical_model_id, lot_row.model_id)
+			           DISTINCT lot_row.model_id, ',' ORDER BY lot_row.model_id
 			       ) AS model_id,
 			       string_agg(
 			           DISTINCT execution_canonical_strategy_id(lot_row.strategy_id), ','
 			           ORDER BY execution_canonical_strategy_id(lot_row.strategy_id)
 			       ) AS strategy_id
 			FROM position_lots AS lot_row
-			LEFT JOIN position_lot_model_routes_effective AS route ON route.lot_id=lot_row.lot_id
 			WHERE lot_row.execution_account_id=position.execution_account_id AND lot_row.token_id=position.token_id
 			  AND lot_row.status IN ('OPEN','SETTLED_PENDING_REDEEM')
 		) AS lot ON TRUE

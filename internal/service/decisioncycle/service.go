@@ -444,7 +444,7 @@ func (service *Service) loadPositionLots(ctx context.Context, decisionAt time.Ti
 	result := make(map[string][]domain.StrategyPositionLot, len(service.strategyBindings))
 	kalshiWithheld := 0
 	for _, binding := range service.strategyBindings {
-		lots, err := service.positionSource.ListOpenLots(ctx, binding.ExecutionAccountID)
+		lots, err := service.positionSource.ListOpenLots(ctx, binding.Context())
 		if err != nil {
 			return nil, 0, fmt.Errorf("load position lots for %s: %w", binding.ExecutionAccountID, err)
 		}

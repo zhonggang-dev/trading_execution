@@ -261,14 +261,10 @@ recorders 持久化共享盘口、完整 binding 输入、输出与订单意图�
 
 `execution_strategy_bindings.model_id` 必须使用逻辑名 `echo` / `deepseek_masked`，并与
 `strategy_id + execution_account_id` 组成相同的四条绑定；上游真实名只存在运行配置中。
-因为 SELL intent 和目标 lot 会端到端严格比对 `model_id`，从上游原始名切换到
-逻辑名前，四个账户必须没有仍归属旧模型名的 OPEN lot。不能只改 env 或
-`execution_strategy_bindings` 就带仓切换；历史已关闭订单也不应被改写。
-钱包 6/7 已有的 Gemini 微量 lot 保留原始 `model_id=gemini_masked` 和首次
-`position_lot_model_routes.logical_model_id=qwen_masked` 审计记录。正式名称切换时，
-必须在全局禁单且无进行中订单的窗口，为每个仍开放的旧 lot 插入
-`position_lot_model_route_successors`，使读取、退出和卖出预占看到
-`deepseek_masked`；该表也只能追加，不能改写既有审计路线。
+OPEN lot 保留开仓时的 `model_id` 和 `strategy_id`。每个策略周期只查询与当前
+`model_id + strategy_id + execution_account_id` 完全匹配且至少 0.01 shares 的 lot；
+旧模型的持仓不会被新模型接管，也不会阻塞新模型周期。小于交易所两位小数 SELL
+精度的真实链上 dust 留在账本等待结算/赎回，不会被舍入为零。
 最新 BBO 和价格保护由独立 Market Validation 层负责，详见
 [`market-validation.md`](market-validation.md)；余额、仓位、敞口与暂停检查由 Go Hard Risk
 负责，详见 [`risk-control.md`](risk-control.md)。
