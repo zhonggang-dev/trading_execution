@@ -45,6 +45,7 @@ type Params struct {
 	Strategy         port.StrategyClient
 	Recorder         port.DecisionRecorder
 	Executor         port.OrderExecutor
+	AccountGate      port.ExecutionAccountGate
 	SubmissionPolicy IntentSubmissionPolicy
 	// SubmitEnabled is an independent, fail-closed gate. A disabled cycle still
 	// records the validated strategy output but never invokes execution.Submit.
@@ -96,6 +97,7 @@ type Service struct {
 	strategy                     port.StrategyClient
 	recorder                     port.DecisionRecorder
 	executor                     port.OrderExecutor
+	accountGate                  port.ExecutionAccountGate
 	submissionPolicy             IntentSubmissionPolicy
 	submitEnabled                bool
 	submissionDisabledAccounts   []string
@@ -250,6 +252,7 @@ func New(params Params) (*Service, error) {
 		strategy:                         params.Strategy,
 		recorder:                         params.Recorder,
 		executor:                         params.Executor,
+		accountGate:                      params.AccountGate,
 		submissionPolicy:                 params.SubmissionPolicy,
 		submitEnabled:                    params.SubmitEnabled,
 		submissionDisabledAccounts:       disabledAccounts,
@@ -604,7 +607,11 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 		}
 		return run, nil
 	}
-	delivered, deliveryErr := service.deliverPending(ctx, response.CycleID)
+	accountDelivery, claimErr := service.deliverPendingForAccount(
+		ctx, params.binding.ExecutionAccountID, response.CycleID, "",
+	)
+	delivered := accountDelivery.intents
+	deliveryErr := errors.Join(errors.Join(accountDelivery.errors...), claimErr)
 	deliveryByID := make(map[string]IntentResult, len(delivered))
 	for _, result := range delivered {
 		deliveryByID[result.Intent.ClientOrderID] = result
@@ -717,57 +724,86 @@ func (service *Service) deliverPending(ctx context.Context, cycleID string) ([]I
 	results := make([]IntentResult, 0)
 	deliveryErrors := make([]error, 0)
 	for _, cohort := range service.deliveryCohorts() {
-		for {
-			deliveries, err := service.recorder.ClaimPendingIntents(
-				ctx, cohort.executionAccountIDs, cycleID, cohort.side, defaultDeliveryBatch,
-			)
+		for _, accountID := range cohort.executionAccountIDs {
+			accountResult, err := service.deliverPendingForAccount(ctx, accountID, cycleID, cohort.side)
+			results = append(results, accountResult.intents...)
+			deliveryErrors = append(deliveryErrors, accountResult.errors...)
 			if err != nil {
-				return results, errors.Join(errors.Join(deliveryErrors...), fmt.Errorf("claim strategy intents: %w", err))
-			}
-			if len(deliveries) == 0 {
-				break
-			}
-			for _, delivery := range deliveries {
-				result := IntentResult{
-					Intent: delivery.Intent, DeliveryStatus: delivery.Status, DeliveryAttempt: delivery.Attempt,
-				}
-				// A persisted delivery may predate a venue route entering
-				// maintenance-only mode. Keep the lease durable without creating a
-				// new execution order or failing process startup; a later healthy
-				// restart requeues and resumes the exact frozen intent.
-				if service.submissionPolicy != nil && !service.submissionPolicy.Enabled(delivery.Intent) {
-					result.SubmissionDisabled = true
-					results = append(results, result)
-					continue
-				}
-				result.Result, result.Error = service.executor.Submit(ctx, delivery.Intent)
-				completion, complete := decisionIntentCompletion(result.Result, result.Error)
-				if complete {
-					if completeErr := service.recorder.CompleteIntent(ctx, delivery.ClientOrderID, delivery.Attempt, completion); completeErr != nil {
-						result.Error = errors.Join(result.Error, fmt.Errorf("complete durable strategy intent: %w", completeErr))
-					} else {
-						result.DeliveryStatus = completion.Status
-						if completion.Status == domain.DecisionIntentFailed || completion.Status == domain.DecisionIntentUnknown {
-							result.Error = errors.Join(result.Error, fmt.Errorf(
-								"execution order %s completed durable delivery as %s (%s)",
-								completion.OrderID, completion.Status, completion.OrderStatus,
-							))
-						}
-					}
-				} else if result.Error == nil {
-					result.Error = fmt.Errorf("execution did not return a durable order id; delivery remains leased for recovery")
-				}
-				if result.Error != nil {
-					deliveryErrors = append(deliveryErrors, fmt.Errorf("submit %s: %w", delivery.ClientOrderID, result.Error))
-				}
-				results = append(results, result)
-			}
-			if len(deliveries) < defaultDeliveryBatch {
-				break
+				return results, errors.Join(errors.Join(deliveryErrors...), err)
 			}
 		}
 	}
 	return results, errors.Join(deliveryErrors...)
+}
+
+type accountDeliveryResult struct {
+	intents []IntentResult
+	errors  []error
+}
+
+func (service *Service) deliverPendingForAccount(
+	ctx context.Context,
+	executionAccountID, cycleID string,
+	side domain.Side,
+) (accountDeliveryResult, error) {
+	result := accountDeliveryResult{}
+	if service.accountGate != nil {
+		release, err := service.accountGate.AcquireExecutionAccount(ctx, executionAccountID)
+		if err != nil {
+			return result, fmt.Errorf("acquire execution account %q for strategy delivery: %w", executionAccountID, err)
+		}
+		defer release()
+	}
+	for {
+		deliveries, err := service.recorder.ClaimPendingIntents(
+			ctx, []string{executionAccountID}, cycleID, side, defaultDeliveryBatch,
+		)
+		if err != nil {
+			return result, fmt.Errorf("claim strategy intents for execution account %q: %w", executionAccountID, err)
+		}
+		if len(deliveries) == 0 {
+			break
+		}
+		for _, delivery := range deliveries {
+			intentResult := IntentResult{
+				Intent: delivery.Intent, DeliveryStatus: delivery.Status, DeliveryAttempt: delivery.Attempt,
+			}
+			// A persisted delivery may predate a venue route entering
+			// maintenance-only mode. Keep the lease durable without creating a
+			// new execution order or failing process startup; a later healthy
+			// restart requeues and resumes the exact frozen intent.
+			if service.submissionPolicy != nil && !service.submissionPolicy.Enabled(delivery.Intent) {
+				intentResult.SubmissionDisabled = true
+				result.intents = append(result.intents, intentResult)
+				continue
+			}
+			intentResult.Result, intentResult.Error = service.executor.Submit(ctx, delivery.Intent)
+			completion, complete := decisionIntentCompletion(intentResult.Result, intentResult.Error)
+			if complete {
+				if completeErr := service.recorder.CompleteIntent(ctx, delivery.ClientOrderID, delivery.Attempt, completion); completeErr != nil {
+					intentResult.Error = errors.Join(intentResult.Error, fmt.Errorf("complete durable strategy intent: %w", completeErr))
+				} else {
+					intentResult.DeliveryStatus = completion.Status
+					if completion.Status == domain.DecisionIntentFailed || completion.Status == domain.DecisionIntentUnknown {
+						intentResult.Error = errors.Join(intentResult.Error, fmt.Errorf(
+							"execution order %s completed durable delivery as %s (%s)",
+							completion.OrderID, completion.Status, completion.OrderStatus,
+						))
+					}
+				}
+			} else if intentResult.Error == nil {
+				intentResult.Error = fmt.Errorf("execution did not return a durable order id; delivery remains leased for recovery")
+			}
+			if intentResult.Error != nil {
+				result.errors = append(result.errors, fmt.Errorf("submit %s: %w", delivery.ClientOrderID, intentResult.Error))
+			}
+			result.intents = append(result.intents, intentResult)
+		}
+		if len(deliveries) < defaultDeliveryBatch {
+			break
+		}
+	}
+	return result, nil
 }
 
 type deliveryCohort struct {

@@ -30,6 +30,12 @@ func (decisionRunnerTestExecutor) Submit(context.Context, domain.OrderIntent) (p
 	return port.OrderSubmitResult{}, nil
 }
 
+type decisionRunnerTestAccountGate struct{}
+
+func (decisionRunnerTestAccountGate) AcquireExecutionAccount(context.Context, string) (func(), error) {
+	return func() {}, nil
+}
+
 func TestBuildDecisionRunnerWiresSnapshotRecorder(t *testing.T) {
 	database, err := sql.Open("pgx", "postgres://unused")
 	if err != nil {
@@ -40,13 +46,14 @@ func TestBuildDecisionRunnerWiresSnapshotRecorder(t *testing.T) {
 		PredictionModelID: "producer", ModelID: "model", StrategyID: domain.StrategyIDMultfactorV1,
 		ExecutionAccountID: "account",
 	}
-	runner, err := buildDecisionRunner(buildDecisionRunnerParams{
+	params := buildDecisionRunnerParams{
 		cfg: config.Config{
 			Execution: config.Execution{Venue: "polymarket"},
 			DecisionCycle: config.DecisionCycle{
 				Enabled: true, PredictionInfraBaseURL: "https://prediction.example",
 				PredictionInfraToken: "prediction-token", StrategyBaseURL: "https://strategy.example",
 				StrategyToken: "strategy-token", Interval: 10 * time.Minute, Timeout: time.Minute,
+				OrderSubmissionEnabled: true, RequireCompleteModelCoverage: true,
 				PredictionLookback: 3 * time.Hour, Bindings: []domain.StrategyExecutionBinding{binding},
 				PredictionSourceModes: map[string]domain.PredictionSourceMode{
 					"producer": domain.PredictionSourceModeDirect,
@@ -55,10 +62,15 @@ func TestBuildDecisionRunnerWiresSnapshotRecorder(t *testing.T) {
 		},
 		database: database, positionSource: decisionRunnerTestPositionSource{},
 		orderBooks: decisionRunnerTestOrderBookSource{}, executor: decisionRunnerTestExecutor{},
-		accountIDs: []string{"account"},
-	})
+		accountGate: decisionRunnerTestAccountGate{}, accountIDs: []string{"account"},
+	}
+	runner, err := buildDecisionRunner(params)
 	if err != nil || runner == nil {
 		t.Fatalf("buildDecisionRunner() = %#v, error %v", runner, err)
+	}
+	params.accountGate = nil
+	if _, err := buildDecisionRunner(params); err == nil || !strings.Contains(err.Error(), "shared execution account gate") {
+		t.Fatalf("buildDecisionRunner() without shared gate error = %v", err)
 	}
 }
 

@@ -23,6 +23,7 @@ type buildDecisionRunnerParams struct {
 	positionSource   port.StrategyPositionSource
 	orderBooks       port.OrderBookSource
 	executor         port.OrderExecutor
+	accountGate      port.ExecutionAccountGate
 	accountIDs       []string
 	logger           *slog.Logger
 	submissionPolicy decisioncycle.IntentSubmissionPolicy
@@ -38,6 +39,9 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 	}
 	if params.database == nil || params.positionSource == nil || params.orderBooks == nil || params.executor == nil {
 		return nil, fmt.Errorf("decision cycle requires postgres, position, orderbook, and execution dependencies")
+	}
+	if cycleConfig.OrderSubmissionEnabled && params.accountGate == nil {
+		return nil, fmt.Errorf("live decision-cycle submission requires a shared execution account gate")
 	}
 	if err := validateDecisionAccounts(cycleConfig, params.accountIDs); err != nil {
 		return nil, err
@@ -96,6 +100,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		Strategy:                     strategyClient,
 		Recorder:                     recorder,
 		Executor:                     params.executor,
+		AccountGate:                  params.accountGate,
 		SubmissionPolicy:             params.submissionPolicy,
 		SubmitEnabled:                cycleConfig.OrderSubmissionEnabled,
 		SubmissionDisabledAccounts:   cycleConfig.SubmissionDisabledAccounts,

@@ -86,6 +86,12 @@ Runner 的异常队列不阻塞下单线程。即使进程在入队前崩溃，�
 `RISK_STATE_STALE` 只看最近一次完成的扫描（`COMPLETED` 或 `ATTENTION_REQUIRED`）的完成时间是否在
 `max_state_age_ms` 内；有问题的扫描由 OPEN issue 的 `impact_scope` 决定拦截范围，见下文。
 
+自动订单批次与对账还共享 Runner 的进程内账户执行门。同一钱包正在投递一批 durable intents 时，
+`STARTUP/SCHEDULED/ORDER_UNKNOWN/CANCEL_UNKNOWN/ASSET_DRIFT` 和手工触发的对账都会等待批次结束，
+避免在部分订单已经匹配、后续订单尚未提交时把正常结算延迟记成账户级漂移并拦截同批后续订单。
+互斥范围只覆盖同一 execution account；其它钱包继续独立对账。数据库中的订单幂等、预占、风险闸门
+和订单级恢复租约仍是权威安全边界，该进程内执行门不替代任何持久化保护。
+
 手工触发示例：
 
 ```http

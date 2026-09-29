@@ -390,6 +390,13 @@ type OrderExecutor interface {
 	Submit(ctx context.Context, intent domain.OrderIntent) (OrderSubmitResult, error)
 }
 
+// ExecutionAccountGate serializes account-wide work that must not observe or
+// publish a partially submitted order batch. The returned release function
+// must be called exactly once after the account operation finishes.
+type ExecutionAccountGate interface {
+	AcquireExecutionAccount(ctx context.Context, executionAccountID string) (release func(), err error)
+}
+
 // FillSyncResult 汇总一次真实成交同步产生的账本应用结果。
 type FillSyncResult struct {
 	OrderID      string                   `json:"order_id"`

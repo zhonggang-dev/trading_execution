@@ -2325,11 +2325,13 @@ func TestAccountEntryGateRecoveryClaimsMainWallet1OnlyForSellAndWallet67ForBothS
 	if err := service.RecoverStartup(context.Background()); err != nil {
 		t.Fatalf("RecoverStartup() error=%v", err)
 	}
-	if len(recorder.requeueAccountCalls) != 2 || len(recorder.claimAccountCalls) != 2 ||
+	if len(recorder.requeueAccountCalls) != 2 || len(recorder.claimAccountCalls) != 4 ||
 		!reflect.DeepEqual(recorder.requeueAccountCalls[0], []string{"wallet-6", "wallet-7"}) || recorder.requeueSideCalls[0] != "" ||
 		!reflect.DeepEqual(recorder.requeueAccountCalls[1], []string{"main", "wallet-1"}) || recorder.requeueSideCalls[1] != domain.SideSell ||
-		!reflect.DeepEqual(recorder.claimAccountCalls[0], []string{"wallet-6", "wallet-7"}) || recorder.claimSideCalls[0] != "" ||
-		!reflect.DeepEqual(recorder.claimAccountCalls[1], []string{"main", "wallet-1"}) || recorder.claimSideCalls[1] != domain.SideSell {
+		!reflect.DeepEqual(recorder.claimAccountCalls[0], []string{"wallet-6"}) || recorder.claimSideCalls[0] != "" ||
+		!reflect.DeepEqual(recorder.claimAccountCalls[1], []string{"wallet-7"}) || recorder.claimSideCalls[1] != "" ||
+		!reflect.DeepEqual(recorder.claimAccountCalls[2], []string{"main"}) || recorder.claimSideCalls[2] != domain.SideSell ||
+		!reflect.DeepEqual(recorder.claimAccountCalls[3], []string{"wallet-1"}) || recorder.claimSideCalls[3] != domain.SideSell {
 		t.Fatalf("recovery cohorts accounts=%#v/%#v sides=%#v/%#v", recorder.requeueAccountCalls, recorder.claimAccountCalls, recorder.requeueSideCalls, recorder.claimSideCalls)
 	}
 	if len(executor.intents) != 3 {

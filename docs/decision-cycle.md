@@ -207,6 +207,9 @@ intent；`exits[]` 的身份/格式错误仍会使整个策略响应被拒绝。
   有界租约和 attempt fencing 投递，进程崩溃后仍以稳定 `client_order_id` 恢复；
 - 执行层已经返回 `UNKNOWN/MANUAL_REVIEW` 的 intent 不会自动重投，必须由订单对账继续处理；
 - 单个订单失败：继续处理其余独立 intent，并返回组合错误；
+- 同一 execution account 的一批 durable intent 在提交期间持有账户执行门；定时、即时和手工对账必须
+  等待整批提交结束后才能读取该账户。门在成功、拒绝、UNKNOWN、调用错误和 context 取消时都释放，
+  不同 execution account 使用独立门，互不阻塞；
 - 周期重试：账户级 `cycle_id`、策略幂等键和 `client_order_id` 共同避免重复交易；
 - 生产 Runner 只在精确的十分钟 UTC 边界运行，并可在边界后等待配置的启动延迟；进程
   启动过晚、线程暂停超过 `DECISION_CYCLE_MAX_START_LATENESS` 或上一轮运行过长时直接跳过
