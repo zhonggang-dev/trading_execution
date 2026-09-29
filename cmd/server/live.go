@@ -529,7 +529,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	decisionRunner, err := buildDecisionRunner(buildDecisionRunnerParams{
 		cfg: cfg, database: database, positionSource: kalshiRuntime.positionSource, orderBooks: orderBooks,
 		executor: kalshiRuntime.execution, accountIDs: accountIDs, logger: logger,
-		submissionPolicy: kalshiRuntime.execution,
+		submissionPolicy: kalshiRuntime.execution, accountGate: runner,
 	})
 	if err != nil {
 		return nil, err

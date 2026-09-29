@@ -68,6 +68,7 @@ type SweepResult struct {
 }
 
 var _ port.ReconciliationTriggerer = (*Runner)(nil)
+var _ port.ExecutionAccountGate = (*Runner)(nil)
 
 const (
 	defaultRunnerInterval = 5 * time.Minute
@@ -468,13 +469,11 @@ func (runner *Runner) Sweep(ctx context.Context, trigger domain.ReconciliationTr
 func (runner *Runner) runAccount(ctx context.Context, params RunAccountParams) (Result, error) {
 	runCtx, cancel := context.WithTimeout(ctx, runner.accountTimeout)
 	defer cancel()
-	slot := runner.accountSlots[params.ExecutionAccountID]
-	select {
-	case slot <- struct{}{}:
-		defer func() { <-slot }()
-	case <-runCtx.Done():
-		return Result{}, runCtx.Err()
+	release, err := runner.AcquireExecutionAccount(runCtx, params.ExecutionAccountID)
+	if err != nil {
+		return Result{}, err
 	}
+	defer release()
 	result, err := runner.service.RunAccount(runCtx, params)
 	if runCtx.Err() != nil {
 		err = errors.Join(err, runCtx.Err())
@@ -486,6 +485,27 @@ func (runner *Runner) runAccount(ctx context.Context, params RunAccountParams) (
 		return result, fmt.Errorf("reconcile %s: %w", params.ExecutionAccountID, err)
 	}
 	return result, nil
+}
+
+// AcquireExecutionAccount shares the runner's existing per-account slot with
+// decision delivery. Reconciliation therefore waits until an account's whole
+// durable order batch has finished submitting, while unrelated accounts keep
+// running independently.
+func (runner *Runner) AcquireExecutionAccount(ctx context.Context, executionAccountID string) (func(), error) {
+	accountID := strings.TrimSpace(executionAccountID)
+	slot, exists := runner.accountSlots[accountID]
+	if !exists {
+		return nil, fmt.Errorf("execution account %q is not active for reconciliation", accountID)
+	}
+	select {
+	case slot <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-slot })
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // LastResult 返回指定账户最近一次对账结果。

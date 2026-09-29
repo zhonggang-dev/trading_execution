@@ -72,6 +72,42 @@ func TestRunnerStartupSweepCoversEveryConfiguredAccount(t *testing.T) {
 	}
 }
 
+func TestExecutionAccountGateBlocksOnlyTheSameAccountAndRespectsContext(t *testing.T) {
+	runner, err := NewRunner(RunnerParams{
+		Service: &fakeAccountReconciler{}, Accounts: []string{"wallet-6", "wallet-7"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseWallet6, err := runner.AcquireExecutionAccount(context.Background(), "wallet-6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseWallet7, err := runner.AcquireExecutionAccount(context.Background(), "wallet-7")
+	if err != nil {
+		t.Fatalf("unrelated account was blocked: %v", err)
+	}
+	releaseWallet7()
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := runner.AcquireExecutionAccount(waitCtx, "wallet-6"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("same-account acquire error = %v, want deadline exceeded", err)
+	}
+	releaseWallet6()
+	releaseWallet6()
+
+	reacquired, err := runner.AcquireExecutionAccount(context.Background(), "wallet-6")
+	if err != nil {
+		t.Fatalf("released account could not be reacquired: %v", err)
+	}
+	reacquired()
+	if _, err := runner.AcquireExecutionAccount(context.Background(), "wallet-missing"); err == nil ||
+		!strings.Contains(err.Error(), "not active") {
+		t.Fatalf("unknown account acquire error = %v", err)
+	}
+}
+
 func TestRunnerQuarantineExcludesStartupAndSuppressesAutomaticTrigger(t *testing.T) {
 	service := &fakeAccountReconciler{}
 	runner, err := NewRunner(RunnerParams{
