@@ -84,7 +84,7 @@ func TestComplementarySellRecoveryPostgresIntegration(t *testing.T) {
 		makers = append(makers, map[string]any{"order_id": orderHash, "asset_id": "42", "maker_address": signer.Address(), "side": "SELL", "matched_amount": "48", "price": "0.042", "fee_rate_bps": ""})
 		old := startReconciliationFixtureRun(t, recorder, accountID, fmt.Sprintf("paired-old-%d", i), base.Add(10*time.Second))
 		for _, issue := range []domain.ReconciliationIssue{
-			{IssueID: fmt.Sprintf("paired-balance-%d", i), Fingerprint: "paired-balance", Type: domain.ReconciliationIssueBalanceDrift, LocalValue: "10", RemoteValue: "12.016", Source: "EVM_ERC20_ETH_CALL"},
+			{IssueID: fmt.Sprintf("paired-balance-%d", i), Fingerprint: "paired-balance", Type: domain.ReconciliationIssueBalanceDrift, LocalValue: "10", RemoteValue: "12.016", RemoteBlockNumber: 123, Source: "EVM_ERC20_ETH_CALL"},
 			{IssueID: fmt.Sprintf("paired-position-%d", i), Fingerprint: "paired-position", Type: domain.ReconciliationIssuePositionDrift, MarketID: "market-1", ConditionID: "condition-1", TokenID: "42", LocalValue: "48", RemoteValue: "0", Source: "POLYMARKET_DATA_API"},
 		} {
 			issue.ExecutionAccountID, issue.RunID, issue.Status, issue.Resolution, issue.ObservedAt = accountID, old.RunID, domain.ReconciliationIssueOpen, domain.ReconciliationResolutionManual, base.Add(10*time.Second)
@@ -95,7 +95,7 @@ func TestComplementarySellRecoveryPostgresIntegration(t *testing.T) {
 		if i == 1 {
 			// Matching the ending balance is insufficient: this older difference
 			// includes an unexplained extra unit and must remain manual.
-			issue := domain.ReconciliationIssue{IssueID: "paired-unexplained", Fingerprint: "paired-unexplained", ExecutionAccountID: accountID, RunID: old.RunID, Type: domain.ReconciliationIssueBalanceDrift, Status: domain.ReconciliationIssueOpen, Resolution: domain.ReconciliationResolutionManual, LocalValue: "9", RemoteValue: "12.016", Source: "EVM_ERC20_ETH_CALL", ObservedAt: base.Add(10 * time.Second)}
+			issue := domain.ReconciliationIssue{IssueID: "paired-unexplained", Fingerprint: "paired-unexplained", ExecutionAccountID: accountID, RunID: old.RunID, Type: domain.ReconciliationIssueBalanceDrift, Status: domain.ReconciliationIssueOpen, Resolution: domain.ReconciliationResolutionManual, LocalValue: "9", RemoteValue: "12.016", RemoteBlockNumber: 123, Source: "EVM_ERC20_ETH_CALL", ObservedAt: base.Add(10 * time.Second)}
 			if err := recorder.RecordIssue(ctx, issue); err != nil {
 				t.Fatal(err)
 			}

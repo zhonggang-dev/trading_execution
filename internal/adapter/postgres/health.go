@@ -88,6 +88,7 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_fills', 'fee_exponent'),
 			('execution_fills', 'settlement_evidence'),
 			('reconciliation_issues', 'impact_scope'),
+			('reconciliation_issues', 'remote_block_number'),
 			('strategy_decision_runs', 'order_submission_enabled'),
 			('strategy_order_intent_deliveries', 'intent_payload'),
 			('strategy_order_intent_deliveries', 'status'),

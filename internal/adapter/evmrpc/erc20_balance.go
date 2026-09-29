@@ -79,15 +79,40 @@ func (client *ERC20BalanceClient) GetExternalBalance(
 	}
 	// balanceOf(address) selector + one left-padded address argument.
 	callData := "0x70a08231" + strings.Repeat("0", 24) + strings.TrimPrefix(wallet, "0x")
-	payload, _ := json.Marshal(map[string]any{
-		"jsonrpc": "2.0", "method": "eth_call", "id": 1,
-		"params": []any{map[string]string{"to": client.tokenAddress, "data": callData}, "latest"},
+	blockResult, err := client.rpcResult(ctx, map[string]any{
+		"jsonrpc": "2.0", "method": "eth_blockNumber", "id": 1, "params": []any{},
 	})
+	if err != nil {
+		return domain.ExternalBalance{}, fmt.Errorf("read balance snapshot block: %w", err)
+	}
+	blockNumber, err := parseCanonicalQuantity(blockResult, "balance snapshot block")
+	if err != nil || blockNumber == 0 {
+		return domain.ExternalBalance{}, fmt.Errorf("balance snapshot block is invalid")
+	}
+	result, err := client.rpcResult(ctx, map[string]any{
+		"jsonrpc": "2.0", "method": "eth_call", "id": 1,
+		"params": []any{map[string]string{"to": client.tokenAddress, "data": callData}, fmt.Sprintf("0x%x", blockNumber)},
+	})
+	if err != nil {
+		return domain.ExternalBalance{}, fmt.Errorf("read on-chain ERC20 balance: %w", err)
+	}
+	units := new(big.Int)
+	if _, ok := units.SetString(strings.TrimPrefix(result, "0x"), 16); !ok {
+		return domain.ExternalBalance{}, fmt.Errorf("RPC balance is not hexadecimal")
+	}
+	return domain.ExternalBalance{
+		Asset: client.asset, Amount: domain.Decimal(formatUnits(units, client.decimals)), BlockNumber: blockNumber,
+		Source: "EVM_ERC20_ETH_CALL", ObservedAt: client.now().UTC(),
+	}, nil
+}
+
+func (client *ERC20BalanceClient) rpcResult(ctx context.Context, requestBody map[string]any) (string, error) {
+	payload, _ := json.Marshal(requestBody)
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		request, err := http.NewRequestWithContext(ctx, http.MethodPost, client.rpcURL.String(), bytes.NewReader(payload))
 		if err != nil {
-			return domain.ExternalBalance{}, err
+			return "", err
 		}
 		request.Header.Set("Content-Type", "application/json")
 		response, err := client.httpClient.Do(request)
@@ -116,17 +141,9 @@ func (client *ERC20BalanceClient) GetExternalBalance(
 			}
 			continue
 		}
-		units := new(big.Int)
-		if _, ok := units.SetString(strings.TrimPrefix(result.Result, "0x"), 16); !ok {
-			lastErr = fmt.Errorf("RPC balance is not hexadecimal")
-			continue
-		}
-		return domain.ExternalBalance{
-			Asset: client.asset, Amount: domain.Decimal(formatUnits(units, client.decimals)),
-			Source: "EVM_ERC20_ETH_CALL", ObservedAt: client.now().UTC(),
-		}, nil
+		return result.Result, nil
 	}
-	return domain.ExternalBalance{}, fmt.Errorf("read on-chain ERC20 balance after 3 attempts: %w", lastErr)
+	return "", fmt.Errorf("RPC request failed after 3 attempts: %w", lastErr)
 }
 
 // normalizedAddress 规范化 d Address 的字段和表示。
