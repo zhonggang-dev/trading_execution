@@ -62,6 +62,24 @@ func TestHealthCheckerRejectsMissingOrderBookSnapshotSchemaPostgresIntegration(t
 	}
 }
 
+func TestHealthCheckerRejectsMissingBalanceSnapshotConstraintPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	if _, err := db.Exec(`ALTER TABLE reconciliation_issues DROP CONSTRAINT reconciliation_issues_remote_block_number_nonnegative`); err != nil {
+		t.Fatal(err)
+	}
+	checker, err := NewHealthChecker(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.Check(context.Background()); err == nil {
+		t.Fatal("health check succeeded without the balance snapshot block constraint")
+	}
+}
+
 func TestLiveLedgerBootstrapPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
 	if databaseURL == "" {
