@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -14,16 +13,15 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-func TestRedemptionStoreAppliesConfirmedBinaryPayoutAtomically(t *testing.T) {
+func TestRedemptionStoreAppliesConfirmedBinaryPayoutAtomicallyPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("REDEMPTION_TEST_DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("REDEMPTION_TEST_DATABASE_URL is not configured")
+		databaseURL = os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
 	}
-	database, err := sql.Open("pgx", databaseURL)
-	if err != nil {
-		t.Fatal(err)
+	if databaseURL == "" {
+		t.Skip("REDEMPTION_TEST_DATABASE_URL or TRADING_EXECUTION_TEST_DATABASE_URL is not configured")
 	}
-	defer database.Close()
+	database := newIntegrationDatabase(t, databaseURL)
 	ctx := context.Background()
 	suffix := fmt.Sprintf("%x", time.Now().UnixNano())
 	walletHash := sha256.Sum256([]byte(suffix))
@@ -31,15 +29,29 @@ func TestRedemptionStoreAppliesConfirmedBinaryPayoutAtomically(t *testing.T) {
 	wallet := fmt.Sprintf("0x%x", walletHash[:20])
 	condition := "0x" + strings.Repeat("44", 32)
 	tokenID := fmt.Sprintf("%d", time.Now().UnixNano())
+	losingTokenID := tokenID + "1"
 	lotID := "redeem-integration-lot-" + suffix
+	losingLotID := "redeem-integration-losing-lot-" + suffix
 	orderID := "redeem-integration-order-" + suffix
+	losingOrderID := "redeem-integration-losing-order-" + suffix
 	fillKey := "redeem-integration-fill-" + suffix
+	losingFillKey := "redeem-integration-losing-fill-" + suffix
 	now := time.Unix(1_800_000_000, 0).UTC()
 	if _, err := database.ExecContext(ctx, `
 		INSERT INTO execution_accounts (
 			execution_account_id, wallet_address, collateral_asset,
 			total_balance, available_balance, reserved_balance
 		) VALUES ($1,$2,'pUSD',100,100,0)`, accountID, wallet); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO execution_orders (
+			order_id, client_order_id, execution_account_id, venue, market_id, token_id,
+			intent, venue_order_id, status, filled_size, average_fill_price,
+			filled_notional, total_fees, revision, created_at, updated_at
+		) VALUES ($1,$2,$3,'POLYMARKET','market-1',$4,'{}'::jsonb,$5,'FILLED',12,0.30,
+		          3.60,0,1,$6,$6)`, losingOrderID, losingOrderID, accountID, losingTokenID,
+		losingOrderID, now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	// Audit and outbox tables are deliberately append-only, so this integration
@@ -61,6 +73,19 @@ func TestRedemptionStoreAppliesConfirmedBinaryPayoutAtomically(t *testing.T) {
 			platform_fee, builder_fee_rate_bps, builder_fee, total_fee,
 			net_cash_delta, fee_source, matched_at, first_observed_at, last_observed_at
 		) VALUES ($1,'POLYMARKET',$1,$2,$2,$3,'market-1',$4,$5,'BUY',
+		          'TAKER','MATCHED',12,0.30,3.60,0,0,0,0,0,-3.60,
+		          'INTEGRATION_TEST',$6,$6,$6)`, losingFillKey, losingOrderID, accountID,
+		condition, losingTokenID, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO execution_fills (
+			fill_key, venue, venue_fill_id, order_id, venue_order_id,
+			execution_account_id, market_id, condition_id, token_id, side,
+			liquidity_role, status, shares, price, gross_notional, fee_rate_bps,
+			platform_fee, builder_fee_rate_bps, builder_fee, total_fee,
+			net_cash_delta, fee_source, matched_at, first_observed_at, last_observed_at
+		) VALUES ($1,'POLYMARKET',$1,$2,$2,$3,'market-1',$4,$5,'BUY',
 		          'TAKER','MATCHED',48,0.21,10.08,0,0,0,0,0,-10.08,
 		          'INTEGRATION_TEST',$6,$6,$6)`, fillKey, orderID, accountID, condition, tokenID, now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
@@ -72,8 +97,32 @@ func TestRedemptionStoreAppliesConfirmedBinaryPayoutAtomically(t *testing.T) {
 			reserved_shares, cost_basis, average_cost_price, realized_pnl,
 			mark_price, market_value, unrealized_pnl, lifecycle_status,
 			settlement_price, settlement_source, settled_at
+		) VALUES ($1,'market-1',$2,$3,0,'Yes',12,12,0,3.60,0.30,0,0.50,6,2.40,
+		          'SETTLED_PENDING_REDEEM',0,'data-api:test',$4)`, accountID, condition,
+		losingTokenID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO execution_positions (
+			execution_account_id, market_id, condition_id, token_id,
+			outcome_index, outcome_name, total_shares, available_shares,
+			reserved_shares, cost_basis, average_cost_price, realized_pnl,
+			mark_price, market_value, unrealized_pnl, lifecycle_status,
+			settlement_price, settlement_source, settled_at
 		) VALUES ($1,'market-1',$2,$3,1,'No',48,48,0,10.08,0.21,0,1,48,37.92,
 		          'SETTLED_PENDING_REDEEM',1,'data-api:test',$4)`, accountID, condition, tokenID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+		INSERT INTO position_lots (
+			lot_id, execution_account_id, market_id, token_id, model_id, strategy_id,
+			opening_order_id, opening_fill_key, original_shares, remaining_shares,
+			original_cost, remaining_cost, average_entry_price, status, opened_at,
+			condition_id, outcome_index, outcome_name, neg_risk
+		) VALUES ($1,$2,'market-1',$3,'model','strategy',$4,$5,12,12,3.60,3.60,
+		          0.30,'SETTLED_PENDING_REDEEM',$6,$7,0,'Yes',TRUE)`,
+		losingLotID, accountID, losingTokenID, losingOrderID, losingFillKey,
+		now.Add(-time.Hour), condition); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(ctx, `
@@ -129,6 +178,11 @@ func TestRedemptionStoreAppliesConfirmedBinaryPayoutAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	redemption = requireTestRedemption(t, rows, accountID, condition, domain.RedemptionConfirmed)
+	if _, err := database.ExecContext(ctx, `
+		UPDATE execution_positions SET mark_price=0
+		WHERE execution_account_id=$1 AND token_id=$2`, accountID, losingTokenID); err == nil {
+		t.Fatal("zero mark price was accepted before the losing position closed")
+	}
 	if err := store.ApplyRedemption(ctx, redemption, now.Add(5*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +201,7 @@ func TestRedemptionStoreAppliesConfirmedBinaryPayoutAtomically(t *testing.T) {
 			JOIN polymarket_redemptions redemption
 			  ON redemption.execution_account_id=position.execution_account_id
 			 AND redemption.condition_id=position.condition_id
-		WHERE account.execution_account_id=$1`, accountID).Scan(
+		WHERE account.execution_account_id=$1 AND position.token_id=$2`, accountID, tokenID).Scan(
 		&total, &available, &realized, &shares, &cost, &lifecycle, &lotStatus, &redemptionStatus,
 	); err != nil {
 		t.Fatal(err)
@@ -156,6 +210,27 @@ func TestRedemptionStoreAppliesConfirmedBinaryPayoutAtomically(t *testing.T) {
 		lifecycle != "CLOSED" || lotStatus != "CLOSED" || redemptionStatus != "APPLIED" {
 		t.Fatalf("applied account/position/lot/redemption = %s/%s/%s/%s/%s/%s/%s/%s",
 			total, available, realized, shares, cost, lifecycle, lotStatus, redemptionStatus)
+	}
+	var losingRealized, losingShares, losingCost, losingMark domain.Decimal
+	var losingLifecycle, losingLotStatus string
+	if err := database.QueryRowContext(ctx, `
+		SELECT position.realized_pnl::text, position.total_shares::text,
+		       position.cost_basis::text, position.mark_price::text,
+		       position.lifecycle_status, lot.status
+		FROM execution_positions position
+		JOIN position_lots lot
+		  ON lot.execution_account_id=position.execution_account_id
+		 AND lot.token_id=position.token_id
+		WHERE position.execution_account_id=$1 AND position.token_id=$2`,
+		accountID, losingTokenID).Scan(
+		&losingRealized, &losingShares, &losingCost, &losingMark, &losingLifecycle, &losingLotStatus,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !losingRealized.Equal("-3.6") || !losingShares.Equal("0") || !losingCost.Equal("0") ||
+		!losingMark.Equal("0") || losingLifecycle != "CLOSED" || losingLotStatus != "CLOSED" {
+		t.Fatalf("zero-settlement position/lot = %s/%s/%s/%s/%s/%s",
+			losingRealized, losingShares, losingCost, losingMark, losingLifecycle, losingLotStatus)
 	}
 }
 

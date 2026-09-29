@@ -80,6 +80,27 @@ func TestHealthCheckerRejectsMissingBalanceSnapshotConstraintPostgresIntegration
 	}
 }
 
+func TestHealthCheckerRejectsLegacyPositionMarkPriceConstraintPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	if _, err := db.Exec(`
+		ALTER TABLE execution_positions
+		DROP CONSTRAINT execution_positions_mark_price_lifecycle_check,
+		ADD CONSTRAINT execution_positions_mark_price_check CHECK (mark_price > 0)`); err != nil {
+		t.Fatal(err)
+	}
+	checker, err := NewHealthChecker(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.Check(context.Background()); err == nil {
+		t.Fatal("health check succeeded with the legacy positive-only position mark-price constraint")
+	}
+}
+
 func TestLiveLedgerBootstrapPostgresIntegration(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
 	if databaseURL == "" {

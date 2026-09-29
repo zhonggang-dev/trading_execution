@@ -213,6 +213,11 @@ impact_scoped_tokens` 给出影响范围；`/health/ready` 只在账户级问题
 所有自动修改都复用现有的 PostgreSQL 事务边界和状态机。对账服务本身不能绕过 FillLedger 直接
 改余额、仓位数量或成交记录。
 
+二元市场输方的权威 settlement price 是 `0`。`execution_positions.mark_price` 对 OPEN 和
+`SETTLED_PENDING_REDEEM` 仓位仍必须为 NULL 或正数；只有赎回事务把仓位原子切换为 `CLOSED` 时才允许
+保存 `mark_price=0`。readiness 要求 `execution_positions_mark_price_lifecycle_check` 存在，避免旧的
+`mark_price > 0` 约束让输方仓位关闭失败并回滚整个 condition 的 payout 入账。
+
 Auto redeem 不使用“持有 48 小时”条件，也不使用 CLOB SELL。一次 condition 赎回会消耗钱包在该
 condition 下的完整 ERC-1155 余额，因此发现任何未消耗 ownership baseline、开放/预占 lot 或不一致的
 adapter identity 时都会进入 `MANUAL_REVIEW`。网络提交前先落 durable intent；若提交响应丢失，只能用
