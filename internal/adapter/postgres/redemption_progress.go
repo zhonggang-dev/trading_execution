@@ -48,7 +48,8 @@ func (reader *RedemptionProgressReader) ListInFlightRedemptions(
 		          WHERE position.execution_account_id=redemption.execution_account_id
 		            AND LOWER(position.condition_id)=redemption.condition_id
 		            AND position.lifecycle_status='SETTLED_PENDING_REDEEM')
-		       )
+		       ),
+		       redemption.confirmed_at
 		FROM polymarket_redemptions redemption
 		WHERE redemption.execution_account_id=$1
 		  AND redemption.status IN ('REDEEM_SUBMITTING','REDEEM_SUBMITTED','CONFIRMED')
@@ -60,17 +61,23 @@ func (reader *RedemptionProgressReader) ListInFlightRedemptions(
 	redemptions := make([]domain.InFlightRedemption, 0)
 	for rows.Next() {
 		var conditionID, status, payout string
-		if err := rows.Scan(&conditionID, &status, &payout); err != nil {
+		var confirmedAt sql.NullTime
+		if err := rows.Scan(&conditionID, &status, &payout, &confirmedAt); err != nil {
 			return nil, fmt.Errorf("scan in-flight redemption: %w", err)
 		}
 		expectedPayout, err := domain.ParseDecimal(payout)
 		if err != nil {
 			return nil, fmt.Errorf("in-flight redemption %s payout: %w", conditionID, err)
 		}
-		redemptions = append(redemptions, domain.InFlightRedemption{
+		redemption := domain.InFlightRedemption{
 			ExecutionAccountID: executionAccountID, ConditionID: conditionID,
 			Status: domain.RedemptionStatus(status), ExpectedPayout: expectedPayout,
-		})
+		}
+		if confirmedAt.Valid {
+			value := confirmedAt.Time.UTC()
+			redemption.ConfirmedAt = &value
+		}
+		redemptions = append(redemptions, redemption)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate in-flight redemptions: %w", err)

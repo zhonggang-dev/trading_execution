@@ -63,6 +63,11 @@ type Params struct {
 	// the redeem transaction and the ledger application is not recorded as
 	// manual drift. Nil means no redemption is ever in flight.
 	Redemptions port.RedemptionProgressSource
+	// RedemptionApplyStallAfter is how long a CONFIRMED redemption may wait for
+	// its ledger application before the run records an observation-only
+	// REDEMPTION_APPLY_STALLED issue. It mirrors the auto redeem ambiguity
+	// timeout. Zero selects the auto redeem default (15 minutes).
+	RedemptionApplyStallAfter time.Duration
 	// FillFinalityMaxAge bounds how long a CLOB-confirmed fill may wait for the
 	// configured Polygon confirmation depth before the wait is escalated to a
 	// manual FILL_FINALITY_STALLED issue. Zero selects the default.
@@ -104,6 +109,7 @@ type Service struct {
 	balanceEpsilon            domain.Decimal
 	accountScope              port.ExecutionAccountScope
 	redemptions               port.RedemptionProgressSource
+	redemptionApplyStallAfter time.Duration
 	fillFinalityMaxAge        time.Duration
 	recovery                  *orderrecovery.Guard
 	reservations              port.OrderReservationReader
@@ -169,6 +175,12 @@ func New(params Params) (*Service, error) {
 			return nil, fmt.Errorf("%s must be a non-negative decimal", name)
 		}
 	}
+	if params.RedemptionApplyStallAfter == 0 {
+		params.RedemptionApplyStallAfter = defaultRedemptionApplyStallAfter
+	}
+	if params.RedemptionApplyStallAfter < time.Minute {
+		return nil, fmt.Errorf("redemption apply stall threshold must be at least one minute")
+	}
 	if params.FillFinalityMaxAge == 0 {
 		params.FillFinalityMaxAge = defaultFillFinalityMaxAge
 	}
@@ -204,8 +216,9 @@ func New(params Params) (*Service, error) {
 		recorder: params.Recorder, tradeLookback: params.TradeLookback,
 		positionEpsilon: params.PositionEpsilon, balanceEpsilon: params.BalanceEpsilon,
 		accountScope: params.AccountScope, redemptions: params.Redemptions,
-		fillFinalityMaxAge: params.FillFinalityMaxAge,
-		recovery:           params.Recovery, reservations: params.Reservations,
+		redemptionApplyStallAfter: params.RedemptionApplyStallAfter,
+		fillFinalityMaxAge:        params.FillFinalityMaxAge,
+		recovery:                  params.Recovery, reservations: params.Reservations,
 		recoveryPendingGrace: params.RecoveryPendingGrace, chainCash: params.ChainCash, logger: params.Logger,
 		now: params.Now, newID: params.NewID,
 	}, nil

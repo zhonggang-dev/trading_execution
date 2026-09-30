@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -12,8 +13,9 @@ import (
 )
 
 type fakeStore struct {
-	events   []string
-	applyErr error
+	events     []string
+	applyErr   error
+	retryTimes []time.Time
 }
 
 func (store *fakeStore) SyncPendingRedemptions(context.Context) error { return nil }
@@ -47,8 +49,9 @@ func (store *fakeStore) ApplyRedemption(context.Context, domain.Redemption, time
 	store.events = append(store.events, "applied")
 	return nil
 }
-func (store *fakeStore) RetryRedemption(_ context.Context, _ domain.Redemption, reason string, _ time.Time) error {
+func (store *fakeStore) RetryRedemption(_ context.Context, _ domain.Redemption, reason string, next time.Time) error {
 	store.events = append(store.events, "retry:"+reason)
+	store.retryTimes = append(store.retryTimes, next)
 	return nil
 }
 func (store *fakeStore) ReviewRedemption(_ context.Context, _ domain.Redemption, reason string, _ time.Time) error {
@@ -201,23 +204,69 @@ func TestConfirmedApplyEvidenceMismatchMovesToManualReview(t *testing.T) {
 	}
 }
 
-func TestConfirmedApplyTransientFailureRetriesUntilAmbiguityTimeout(t *testing.T) {
-	now := time.Unix(3000, 0).UTC()
-	for name, tc := range map[string]struct {
-		confirmedAt time.Time
-		want        string
+func TestConfirmedApplyTransientFailureKeepsRetryingPastAmbiguityTimeout(t *testing.T) {
+	confirmedAt := time.Unix(3000, 0).UTC()
+	// Retry interval 30s, ambiguity timeout 10m (newTestService).
+	cases := []struct {
+		age  time.Duration
+		wait time.Duration
 	}{
-		"recent confirmation retries": {confirmedAt: now.Add(-time.Minute), want: "retry"},
-		"stale confirmation reviews":  {confirmedAt: now.Add(-11 * time.Minute), want: "review"},
+		{age: time.Minute, wait: 30 * time.Second},
+		{age: 10 * time.Minute, wait: 150 * time.Second},
+		{age: 12 * time.Minute, wait: 3 * time.Minute},
+		{age: 20 * time.Minute, wait: 5 * time.Minute},
+		{age: 6 * time.Hour, wait: 5 * time.Minute},
+	}
+	var logs strings.Builder
+	store := &fakeStore{applyErr: errors.New("postgres connection reset")}
+	service := newTestService(t, store, &fakeVenue{}, fakeReceipts{}, fakeActivities{})
+	service.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	redemption := confirmedRedemption(confirmedAt)
+	for index, tc := range cases {
+		now := confirmedAt.Add(tc.age)
+		err := service.process(context.Background(), redemption, now)
+		if err == nil || len(store.events) != index+1 || !strings.HasPrefix(store.events[index], "retry:") {
+			t.Fatalf("age %s error/events = %v/%v, want a retry and no MANUAL_REVIEW", tc.age, err, store.events)
+		}
+		if got := store.retryTimes[index].Sub(now); got != tc.wait {
+			t.Fatalf("age %s next attempt in %s, want %s", tc.age, got, tc.wait)
+		}
+	}
+	output := logs.String()
+	if strings.Count(output, "level=ERROR") != len(cases)-1 {
+		t.Fatalf("stalled apply ERROR logs = %q, want one per failure past the ambiguity timeout", output)
+	}
+	for _, field := range []string{
+		"execution_account_id=wallet-6", "condition_id=" + redemption.ConditionID,
+		"transaction_hash=" + redemption.TransactionHash, "failing_for=6h0m0s",
+		`last_error="postgres connection reset"`,
 	} {
-		t.Run(name, func(t *testing.T) {
-			store := &fakeStore{applyErr: errors.New("postgres connection reset")}
-			service := newTestService(t, store, &fakeVenue{}, fakeReceipts{}, fakeActivities{})
-			err := service.process(context.Background(), confirmedRedemption(tc.confirmedAt), now)
-			if err == nil || len(store.events) != 1 || firstEventKind(store) != tc.want {
-				t.Fatalf("transient apply failure error/events = %v/%v, want %s", err, store.events, tc.want)
-			}
-		})
+		if !strings.Contains(output, field) {
+			t.Fatalf("stalled apply log %q is missing %q", output, field)
+		}
+	}
+
+	store.applyErr = nil
+	if err := service.process(context.Background(), redemption, confirmedAt.Add(7*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if last := store.events[len(store.events)-1]; last != "applied" {
+		t.Fatalf("recovered apply events = %v, want applied", store.events)
+	}
+	for _, event := range store.events {
+		if strings.HasPrefix(event, "review:") {
+			t.Fatalf("confirmed redemption moved to MANUAL_REVIEW on a transient failure: %v", store.events)
+		}
+	}
+}
+
+func TestConfirmedApplyEvidenceMismatchStillReviewsAfterAmbiguityTimeout(t *testing.T) {
+	now := time.Unix(3000, 0).UTC()
+	store := &fakeStore{applyErr: &domain.RedemptionEvidenceError{Reason: "redemption payout does not match chain"}}
+	service := newTestService(t, store, &fakeVenue{}, fakeReceipts{}, fakeActivities{})
+	err := service.process(context.Background(), confirmedRedemption(now.Add(-time.Hour)), now)
+	if err == nil || len(store.events) != 1 || firstEventKind(store) != "review" {
+		t.Fatalf("permanent apply failure error/events = %v/%v, want one MANUAL_REVIEW", err, store.events)
 	}
 }
 

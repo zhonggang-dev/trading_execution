@@ -276,9 +276,12 @@ func TestPositionExitJobEndpointRejectsExecutionTokenFallback(t *testing.T) {
 
 // fakeReconciliationJob 表示后端使用的 fakeReconciliationJob 类型。
 type fakeReconciliationJob struct {
-	accountID string
-	trigger   domain.ReconciliationTrigger
-	orderID   string
+	accountID   string
+	trigger     domain.ReconciliationTrigger
+	orderID     string
+	err         error
+	deadline    time.Time
+	hasDeadline bool
 }
 
 // fakeTradeHistoryService 表示后端使用的 fakeTradeHistoryService 类型。
@@ -480,12 +483,117 @@ func TestDailyPnLEndpointAuthenticatesAndValidatesWindow(t *testing.T) {
 }
 
 // RunAccount 执行测试模拟流程。
-func (job *fakeReconciliationJob) RunAccount(_ context.Context, params reconciliation.RunAccountParams) (reconciliation.Result, error) {
+func (job *fakeReconciliationJob) RunAccount(ctx context.Context, params reconciliation.RunAccountParams) (reconciliation.Result, error) {
 	job.accountID, job.trigger, job.orderID = params.ExecutionAccountID, params.Trigger, params.FocusOrderID
+	job.deadline, job.hasDeadline = ctx.Deadline()
+	status := domain.ReconciliationRunCompleted
+	if job.err != nil {
+		status = domain.ReconciliationRunFailed
+	}
 	return reconciliation.Result{Run: domain.ReconciliationRun{
 		RunID: "recon-1", ExecutionAccountID: params.ExecutionAccountID, Trigger: params.Trigger,
-		Status: domain.ReconciliationRunCompleted, Summary: map[string]int{},
-	}}, nil
+		Status: status, Summary: map[string]int{},
+	}}, job.err
+}
+
+// The live composition injects the reconciliation runner, not the service.
+var _ reconciliationJob = (*reconciliation.Runner)(nil)
+
+func newReconciliationJobServer(t *testing.T, job *fakeReconciliationJob, writeTimeout time.Duration) *Server {
+	t.Helper()
+	server, err := New(Params{
+		Service: baseExecutionService(t), Reconciliation: job, WriteTimeout: writeTimeout,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		APIToken: "api-secret", JobToken: "job-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
+func TestReconciliationEndpointResponseShapes(t *testing.T) {
+	body := `{"execution_account_id":"wallet-6","trigger":"ASSET_DRIFT"}`
+	t.Run("success", func(t *testing.T) {
+		server := newReconciliationJobServer(t, &fakeReconciliationJob{}, 2*time.Minute)
+		response := performRequest(t, server, http.MethodPost, "/internal/jobs/reconciliation/run", body, "job-secret")
+		var payload map[string]json.RawMessage
+		decodeResponse(t, response, &payload)
+		if response.Code != http.StatusOK || len(payload) != 1 || payload["data"] == nil {
+			t.Fatalf("success status=%d body=%s, want 200 {data}", response.Code, response.Body.String())
+		}
+		var result reconciliation.Result
+		if err := json.Unmarshal(payload["data"], &result); err != nil || result.Run.RunID != "recon-1" ||
+			result.Run.Status != domain.ReconciliationRunCompleted {
+			t.Fatalf("success data = %#v/%v", result, err)
+		}
+	})
+	t.Run("incomplete", func(t *testing.T) {
+		job := &fakeReconciliationJob{err: errors.New("reconcile wallet-6: timed out waiting for the execution account lock; reconciliation did not run: context deadline exceeded")}
+		server := newReconciliationJobServer(t, job, 2*time.Minute)
+		response := performRequest(t, server, http.MethodPost, "/internal/jobs/reconciliation/run", body, "job-secret")
+		var payload struct {
+			Data  *reconciliation.Result `json:"data"`
+			Error map[string]string      `json:"error"`
+		}
+		decodeResponse(t, response, &payload)
+		if response.Code != http.StatusBadGateway || payload.Data == nil || payload.Data.Run.RunID != "recon-1" ||
+			len(payload.Error) != 2 || payload.Error["code"] != "RECONCILIATION_INCOMPLETE" ||
+			!strings.Contains(payload.Error["message"], "did not run") {
+			t.Fatalf("incomplete status=%d body=%s, want 502 {data,error{code,message}}", response.Code, response.Body.String())
+		}
+	})
+	for name, tc := range map[string]struct{ body, code string }{
+		"invalid json":        {body: `{`, code: "INVALID_JSON"},
+		"missing account":     {body: `{"trigger":"ASSET_DRIFT"}`, code: "INVALID_RECONCILIATION_TRIGGER"},
+		"unsupported trigger": {body: `{"execution_account_id":"wallet-6","trigger":"MANUAL"}`, code: "INVALID_RECONCILIATION_TRIGGER"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			job := &fakeReconciliationJob{}
+			server := newReconciliationJobServer(t, job, 2*time.Minute)
+			response := performRequest(t, server, http.MethodPost, "/internal/jobs/reconciliation/run", tc.body, "job-secret")
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), tc.code) || job.accountID != "" {
+				t.Fatalf("%s status=%d body=%s job=%#v", name, response.Code, response.Body.String(), job)
+			}
+		})
+	}
+}
+
+func TestReconciliationEndpointFinishesBeforeWriteTimeout(t *testing.T) {
+	job := &fakeReconciliationJob{}
+	server := newReconciliationJobServer(t, job, 2*time.Minute)
+	before := time.Now()
+	response := performRequest(t, server, http.MethodPost, "/internal/jobs/reconciliation/run",
+		`{"execution_account_id":"wallet-6","trigger":"ASSET_DRIFT"}`, "job-secret")
+	after := time.Now()
+	if response.Code != http.StatusOK || !job.hasDeadline {
+		t.Fatalf("status=%d hasDeadline=%v, want a bounded job context", response.Code, job.hasDeadline)
+	}
+	if job.deadline.Before(before.Add(110*time.Second)) || job.deadline.After(after.Add(110*time.Second)) {
+		t.Fatalf("job deadline = %s after request start, want HTTP_WRITE_TIMEOUT - 10s", job.deadline.Sub(before))
+	}
+
+	unbounded := &fakeReconciliationJob{}
+	server = newReconciliationJobServer(t, unbounded, 0)
+	performRequest(t, server, http.MethodPost, "/internal/jobs/reconciliation/run",
+		`{"execution_account_id":"wallet-6","trigger":"ASSET_DRIFT"}`, "job-secret")
+	if unbounded.hasDeadline {
+		t.Fatal("zero write timeout still bounded the job context")
+	}
+}
+
+func TestReconciliationJobBudget(t *testing.T) {
+	for writeTimeout, want := range map[time.Duration]time.Duration{
+		0:                0,
+		2 * time.Minute:  110 * time.Second,
+		30 * time.Second: 20 * time.Second,
+		20 * time.Second: 10 * time.Second,
+		8 * time.Second:  4 * time.Second,
+	} {
+		if got := reconciliationJobBudget(writeTimeout); got != want {
+			t.Errorf("reconciliationJobBudget(%s) = %s, want %s", writeTimeout, got, want)
+		}
+	}
 }
 
 // TestReconciliationEndpointUsesJobToken 验证 Reconciliation Endpoint Uses Job Token 场景下的行为。

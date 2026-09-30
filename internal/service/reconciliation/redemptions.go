@@ -3,6 +3,8 @@ package reconciliation
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,6 +17,10 @@ import (
 // configured confirmation depth, so the Data API normally catches up within
 // seconds; the window only absorbs an indexer that is unusually behind.
 const appliedRedemptionGracePeriod = 30 * time.Minute
+
+// defaultRedemptionApplyStallAfter equals the auto redeem default ambiguity
+// timeout (POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT).
+const defaultRedemptionApplyStallAfter = 15 * time.Minute
 
 // inFlightRedemptions is the per-run view of redemptions that may already have
 // mutated the chain. The window between the redeem transaction landing and
@@ -73,8 +79,38 @@ func (state *runState) loadInFlightRedemptions(ctx context.Context, executionAcc
 		state.redemptions.byCondition[conditionID] = value
 	}
 	state.run.Summary["in_flight_redemptions"] = len(state.redemptions.byCondition)
+	state.recordStalledRedemptionApplies(ctx)
 	state.run.VerifyReconciliation("source", "POSTGRES_REDEMPTIONS")
 	return nil
+}
+
+// recordStalledRedemptionApplies reports CONFIRMED redemptions whose ledger
+// application has been failing for longer than the auto redeem ambiguity
+// timeout. The chain outcome is final and auto redeem keeps retrying, so the
+// in-flight exemption stays and the issue is observation only: the wallet
+// holds more cash than the ledger and the settled position cannot trade. The
+// issue closes automatically once the redemption is APPLIED.
+func (state *runState) recordStalledRedemptionApplies(ctx context.Context) {
+	threshold := state.service.redemptionApplyStallAfter
+	for _, conditionID := range slices.Sorted(maps.Keys(state.redemptions.byCondition)) {
+		value := state.redemptions.byCondition[conditionID]
+		if value.Status != domain.RedemptionConfirmed || value.ConfirmedAt == nil ||
+			state.now.Before(value.ConfirmedAt.Add(threshold)) {
+			continue
+		}
+		state.run.Summary["redemption_apply_stalled"]++
+		state.issue(ctx, domain.ReconciliationIssueParams{
+			Type:        domain.ReconciliationIssueRedemptionApplyStalled,
+			Resolution:  domain.ReconciliationResolutionObserved,
+			Status:      domain.ReconciliationIssueOpen,
+			ConditionID: conditionID,
+			Source:      "POSTGRES_REDEMPTIONS",
+			Details: fmt.Sprintf(
+				"redemption confirmed on chain at %s is still not applied to the ledger after %s; auto redeem keeps retrying and the payout %s stays exempt as in flight",
+				value.ConfirmedAt.UTC().Format(time.RFC3339), state.now.Sub(*value.ConfirmedAt).Round(time.Second), value.ExpectedPayout,
+			),
+		})
+	}
 }
 
 // loadAppliedRedemptions reads redemptions applied within the grace period so a

@@ -78,11 +78,11 @@ func run() error {
 	}
 
 	var (
-		repository            port.OrderRepository
-		executionService      executionrouter.Execution
-		readiness             readinessChecker
-		reconciliationService *reconciliation.Service
-		live                  *liveRuntime
+		repository        port.OrderRepository
+		executionService  executionrouter.Execution
+		readiness         readinessChecker
+		reconciliationJob *reconciliation.Runner
+		live              *liveRuntime
 	)
 	if cfg.Execution.Mode == "live" {
 		startupContext, cancel := context.WithTimeout(rootContext, cfg.Polymarket.StartupTimeout)
@@ -97,7 +97,10 @@ func run() error {
 		repository = live.repository
 		executionService = live.execution
 		readiness = live.readiness
-		reconciliationService = live.reconciliation
+		// Manual reconciliation goes through the runner so it shares the
+		// per-account lock, account timeout, and latest-result bookkeeping
+		// with scheduled runs and decision delivery.
+		reconciliationJob = live.runner
 	} else {
 		repository, executionService, err = buildPaperRuntime(cfg, database, guard)
 		if err != nil {
@@ -121,12 +124,13 @@ func run() error {
 		APIToken:         cfg.HTTP.APIToken,
 		JobToken:         cfg.HTTP.JobToken,
 		ReadOnlyToken:    cfg.HTTP.ReadOnlyToken,
+		WriteTimeout:     cfg.HTTP.WriteTimeout,
 	}
 	if readiness != nil {
 		httpParams.Readiness = readiness
 	}
-	if reconciliationService != nil {
-		httpParams.Reconciliation = reconciliationService
+	if reconciliationJob != nil {
+		httpParams.Reconciliation = reconciliationJob
 	}
 	if live != nil {
 		httpParams.LiveOperations = live.operations

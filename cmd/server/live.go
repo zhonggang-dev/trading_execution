@@ -40,7 +40,6 @@ const polymarketCollateralAsset = "pUSD"
 type liveRuntime struct {
 	repository     *postgresadapter.OrderRepository
 	execution      executionrouter.Execution
-	reconciliation *reconciliation.Service
 	readiness      *readiness.All
 	heartbeat      *clobheartbeat.Service
 	runner         *reconciliation.Runner
@@ -436,6 +435,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		BalanceEpsilon:            cfg.Polymarket.BalanceEpsilon,
 		AccountScope:              executionAccountScope,
 		Redemptions:               redemptionProgress,
+		RedemptionApplyStallAfter: cfg.Polymarket.AutoRedeemAmbiguityTimeout,
 		FillFinalityMaxAge:        cfg.Polymarket.FillFinalityMaxAge,
 		Recovery:                  recoveryGuard,
 		Reservations:              reservations,
@@ -577,7 +577,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	)
 	return &liveRuntime{
 		repository: repository, execution: kalshiRuntime.execution,
-		reconciliation: reconciliationService, readiness: combinedReadiness,
+		readiness: combinedReadiness,
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
 		autoRedeem:     autoRedeemService,
 		activeAccounts: append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
