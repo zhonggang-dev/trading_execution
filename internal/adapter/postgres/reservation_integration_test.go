@@ -2505,7 +2505,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 			t.Fatalf("apply migration %s: %v", name, err)
 		}
 	}
-	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql", "0029_position_lot_model_route_successors.sql", "0030_remove_position_lot_model_routes.sql", "0031_reconciliation_balance_snapshot_block.sql", "0032_redeemed_zero_mark_price.sql"} {
+	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql", "0029_position_lot_model_route_successors.sql", "0030_remove_position_lot_model_routes.sql", "0031_reconciliation_balance_snapshot_block.sql", "0032_redeemed_zero_mark_price.sql", "0033_chain_cash_ledger.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatal(err)

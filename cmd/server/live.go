@@ -20,6 +20,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/accountscope"
 	"github.com/UniPat-AI/trading_execution/internal/service/autoredeem"
+	"github.com/UniPat-AI/trading_execution/internal/service/chaincash"
 	"github.com/UniPat-AI/trading_execution/internal/service/clobheartbeat"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
@@ -404,6 +405,10 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	chainCashLedger, err := composeChainCashLedger(cfg, database, accountIDs)
+	if err != nil {
+		return nil, err
+	}
 	recoveryLeases, err := postgresadapter.NewOrderRecoveryLeaseStore(database)
 	if err != nil {
 		return nil, err
@@ -435,6 +440,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		Recovery:                  recoveryGuard,
 		Reservations:              reservations,
 		RecoveryPendingGrace:      cfg.Execution.OrderRecoveryPendingGrace,
+		ChainCash:                 chainCashLedger,
 		Logger:                    logger,
 	})
 	if err != nil {
@@ -794,6 +800,46 @@ func noRedirectHTTPClient(timeout time.Duration) *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// composeChainCashLedger wires the on-chain pUSD cash ledger. It is inert for
+// every account until cmd/chaincashinit writes that account's cursor, so the
+// wiring itself never changes the balance comparison of main or wallet-1.
+func composeChainCashLedger(cfg config.Config, database *sql.DB, accountIDs []string) (*chaincash.Service, error) {
+	known := make(map[string]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		known[accountID] = struct{}{}
+	}
+	for accountID := range cfg.Polymarket.ChainCashDepositSources {
+		if _, exists := known[accountID]; !exists {
+			return nil, fmt.Errorf("CHAIN_CASH_DEPOSIT_SOURCES names unknown execution account %q", accountID)
+		}
+	}
+	// The same exchange set identifies trade settlement by counterparty and by
+	// the wallet OrderFilled logs of peer-to-peer V2 settlements.
+	chainCashExchanges := []string{evmrpc.PolygonCTFExchangeV2Address, evmrpc.PolygonNegRiskCTFExchangeV2Address}
+	logs, err := evmrpc.NewERC20TransferLogReader(evmrpc.ERC20TransferLogParams{
+		RPCURL: cfg.Polymarket.PolygonRPCURL, TokenAddress: polymarket.PUSDAddress, Decimals: 6,
+		ExchangeAddresses: chainCashExchanges,
+		ChunkBlocks:       uint64(cfg.Polymarket.ChainCashLogChunkBlocks),
+		HTTPClient:        noRedirectHTTPClient(cfg.Polymarket.RequestTimeout),
+		RequestTimeout:    cfg.Polymarket.RequestTimeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure pUSD transfer log reader: %w", err)
+	}
+	store, err := postgresadapter.NewChainCashStore(database)
+	if err != nil {
+		return nil, err
+	}
+	return chaincash.New(chaincash.Params{
+		Logs: logs, Store: store,
+		ExchangeAddresses: chainCashExchanges,
+		RewardSenders:     cfg.Polymarket.ChainCashRewardSenders,
+		DepositSources:    cfg.Polymarket.ChainCashDepositSources,
+		Confirmations:     uint64(cfg.Polymarket.OrderFilledConfirmations),
+		MaxBlocksPerRun:   uint64(cfg.Polymarket.ChainCashMaxBlocksPerRun),
+	})
 }
 
 // validateStartupReconciliation confirms that every configured account was

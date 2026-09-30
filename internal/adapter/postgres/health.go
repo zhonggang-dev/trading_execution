@@ -65,7 +65,9 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_risk_controls'),
 			('execution_strategy_bindings'),
 			('live_runtime_status'),
-			('live_cycle_funnel')
+			('live_cycle_funnel'),
+			('execution_chain_cash_cursors'),
+			('execution_chain_cash_transfers')
 		) AS required(name)
 		WHERE to_regclass(required.name) IS NULL`).Scan(&missing)
 	if err != nil {
@@ -89,6 +91,11 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_fills', 'settlement_evidence'),
 			('reconciliation_issues', 'impact_scope'),
 			('reconciliation_issues', 'remote_block_number'),
+			('reconciliation_issues', 'first_observed_at'),
+			('execution_chain_cash_cursors', 'processed_block'),
+			('execution_chain_cash_cursors', 'start_balance'),
+			('execution_chain_cash_transfers', 'classification'),
+			('execution_chain_cash_transfers', 'account_event_id'),
 			('strategy_decision_runs', 'order_submission_enabled'),
 			('strategy_order_intent_deliveries', 'intent_payload'),
 			('strategy_order_intent_deliveries', 'status'),
@@ -165,6 +172,13 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_fills_pending_polygon_evidence_unapplied'),
 			('execution_positions_mark_price_lifecycle_check'),
 			('reconciliation_issues_remote_block_number_nonnegative'),
+			('execution_chain_cash_cursors_pkey'),
+			('execution_chain_cash_cursors_shape'),
+			('execution_chain_cash_transfers_pkey'),
+			('execution_chain_cash_transfers_shape'),
+			('execution_chain_cash_transfers_direction_shape'),
+			('execution_chain_cash_transfers_credit_shape'),
+			('execution_chain_cash_transfers_account_event_id_key'),
 			('strategy_decision_runs_submission_mode_shape'),
 			('strategy_orderbook_snapshot_batches_pkey'),
 			('strategy_orderbook_snapshot_batches_set_unique'),
@@ -253,7 +267,9 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('strategy_order_intent_deliveries_cycle_sequence_unique'),
 			('execution_external_position_dispositions_accounted_trade_uidx'),
 			('execution_external_position_dispositions_false_attribution_uidx'),
-			('execution_external_position_dispositions_adoption_uidx')
+			('execution_external_position_dispositions_adoption_uidx'),
+			('execution_chain_cash_transfers_pkey'),
+			('execution_chain_cash_transfers_account_event_id_key')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -285,7 +301,9 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('strategy_order_intent_deliveries_stale_idx'),
 			('execution_external_position_baseline_items_account_idx'),
 			('execution_external_position_dispositions_baseline_idx'),
-			('execution_wallet_migrations_account_new_wallet_idx')
+			('execution_wallet_migrations_account_new_wallet_idx'),
+			('execution_chain_cash_transfers_account_block_idx'),
+			('reconciliation_issues_chain_cash_transfer_idx')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -337,7 +355,11 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_external_position_adoptions_append_only_trigger'),
 			('position_lots_origin_immutable_trigger'),
 			('position_events_external_adoption_immutable_trigger'),
-			('execution_account_events_external_adjustment_immutable_trigger')
+			('execution_account_events_external_adjustment_immutable_trigger'),
+			('execution_chain_cash_cursors_guard_trigger'),
+			('execution_chain_cash_transfers_guard_trigger'),
+			('execution_chain_cash_transfers_credit_trigger'),
+			('reconciliation_issues_first_observed_at_trigger')
 		) AS required(name)
 		WHERE NOT EXISTS (
 			SELECT 1
@@ -354,6 +376,29 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 	}
 	if missingTriggers != 0 {
 		return fmt.Errorf("postgres live schema is incomplete: %d required triggers are missing or disabled", missingTriggers)
+	}
+	// Migration 0033 is applied by a separate administrative role. Every
+	// reconciliation reads the chain cash cursor of every account, so a
+	// missing grant would surface later as an account-wide outage on all
+	// wallets; fail readiness at startup instead.
+	var missingPrivileges int
+	err = checker.db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM (VALUES
+			('execution_chain_cash_cursors', 'SELECT'),
+			('execution_chain_cash_cursors', 'INSERT'),
+			('execution_chain_cash_cursors', 'UPDATE'),
+			('execution_chain_cash_transfers', 'SELECT'),
+			('execution_chain_cash_transfers', 'INSERT'),
+			('execution_chain_cash_transfers', 'UPDATE')
+		) AS required(relation_name, privilege)
+		WHERE NOT has_table_privilege(
+			current_user, quote_ident(current_schema()) || '.' || quote_ident(required.relation_name), required.privilege)`).Scan(&missingPrivileges)
+	if err != nil {
+		return fmt.Errorf("inspect postgres chain cash privileges: %w", err)
+	}
+	if missingPrivileges != 0 {
+		return fmt.Errorf("postgres live schema is incomplete: %d required chain cash table privileges are missing", missingPrivileges)
 	}
 	return nil
 }
