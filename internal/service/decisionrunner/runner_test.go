@@ -340,3 +340,58 @@ func TestBindingRunSummariesExposeStrategyDisabledAccounts(t *testing.T) {
 		t.Fatalf("summaries = %#v", summaries)
 	}
 }
+
+func TestDecisionBusyCoversInFlightAndLeadWindow(t *testing.T) {
+	boundary := time.Date(2026, 9, 30, 9, 0, 0, 0, time.UTC)
+	dueAt := boundary.Add(15 * time.Second)
+	lead := 60 * time.Second
+	runner, err := New(Params{
+		Cycle: &countingCycle{}, Interval: RequiredInterval, StartupDelay: 15 * time.Second,
+		MaxStartLateness: 30 * time.Second, Timeout: time.Minute,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.DecisionBusy(dueAt, lead) {
+		t.Fatal("DecisionBusy() = true before the loop started")
+	}
+	if err := runner.beginLoop(); err != nil {
+		t.Fatal(err)
+	}
+	if runner.DecisionBusy(dueAt, lead) {
+		t.Fatal("DecisionBusy() = true before any schedule was published")
+	}
+	runner.setSchedule(boundary, dueAt)
+	for _, test := range []struct {
+		name string
+		now  time.Time
+		want bool
+	}{
+		{name: "before lead", now: dueAt.Add(-lead - time.Nanosecond), want: false},
+		{name: "lead start", now: dueAt.Add(-lead), want: true},
+		{name: "just before due", now: dueAt.Add(-time.Second), want: true},
+		{name: "due", now: dueAt, want: true},
+		{name: "inside start lateness", now: dueAt.Add(30*time.Second - time.Nanosecond), want: true},
+		{name: "start lateness passed", now: dueAt.Add(30 * time.Second), want: false},
+	} {
+		if got := runner.DecisionBusy(test.now, lead); got != test.want {
+			t.Fatalf("%s: DecisionBusy(%s) = %t, want %t", test.name, test.now, got, test.want)
+		}
+	}
+	farAfterDue := dueAt.Add(5 * time.Minute)
+	if !runner.beginCycle(dueAt) {
+		t.Fatal("beginCycle() = false")
+	}
+	if !runner.DecisionBusy(farAfterDue, lead) {
+		t.Fatal("DecisionBusy() = false while a cycle is in flight")
+	}
+	runner.completeCycle(farAfterDue, nil)
+	if runner.DecisionBusy(farAfterDue, lead) {
+		t.Fatal("DecisionBusy() = true after the cycle completed")
+	}
+	runner.endLoop()
+	if runner.DecisionBusy(dueAt, lead) {
+		t.Fatal("DecisionBusy() = true after the loop stopped")
+	}
+}

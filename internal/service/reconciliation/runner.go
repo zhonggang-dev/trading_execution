@@ -27,8 +27,23 @@ type RunnerParams struct {
 	Now                 func() time.Time
 	MaxResultAge        time.Duration
 	AccountTimeout      time.Duration
-	Logger              *slog.Logger
+	// ScheduleOffset pins SCHEDULED runs to wall-clock instants congruent to
+	// the offset modulo Interval (for example x3:30 and x8:30 with a 5-minute
+	// interval and a 3m30s offset). Nil keeps the start-relative ticker.
+	ScheduleOffset *time.Duration
+	Logger         *slog.Logger
 }
+
+// DecisionActivity reports whether a decision cycle is running or due within
+// lead. The decision runner implements it; reconciliation only reads it so the
+// dependency points from the decision side into this package.
+type DecisionActivity interface {
+	DecisionBusy(now time.Time, lead time.Duration) bool
+}
+
+// afterFunc returns a channel that fires after the duration. It is injectable
+// so schedule and deferral tests never sleep on the wall clock.
+type afterFunc func(time.Duration) <-chan time.Time
 
 // Runner 表示后端使用的 Runner 类型。
 type Runner struct {
@@ -43,6 +58,9 @@ type Runner struct {
 	accountSlots   map[string]chan struct{}
 	logger         *slog.Logger
 	requests       chan request
+	scheduleOffset *time.Duration
+	scheduleAfter  afterFunc
+	deferAfter     afterFunc
 
 	mu               sync.Mutex
 	lastResults      map[string]Result
@@ -51,6 +69,7 @@ type Runner struct {
 	loopLastActivity time.Time
 	loopStoppedAt    time.Time
 	suppressed       map[string]uint64
+	decisionActivity DecisionActivity
 }
 
 // request 表示后端使用的 request 类型。
@@ -73,6 +92,16 @@ var _ port.ExecutionAccountGate = (*Runner)(nil)
 const (
 	defaultRunnerInterval = 5 * time.Minute
 	maximumRunnerAge      = 24 * time.Hour
+
+	// decisionLead must cover one reconciliation run (about 51s worst case
+	// observed for wallet-6) so a deferred run cannot still hold the account
+	// lock when the decision cycle wants to submit its batch.
+	decisionLead = 60 * time.Second
+	// maxDecisionDefer bounds how long SCHEDULED reconciliation yields, so a
+	// stuck decision cycle cannot starve risk-state freshness. Interval plus
+	// this cap plus one run stays below the 600s placement max_state_age.
+	maxDecisionDefer   = 3 * time.Minute
+	decisionPollPeriod = 2 * time.Second
 )
 
 // NewRunner 校验账户和周期配置后创建对账运行器。
@@ -121,6 +150,13 @@ func NewRunner(params RunnerParams) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	if params.ScheduleOffset != nil {
+		if offset := *params.ScheduleOffset; offset < 0 || offset >= params.Interval {
+			return nil, fmt.Errorf("reconciliation schedule offset must be in [0, interval)")
+		}
+		offset := *params.ScheduleOffset
+		params.ScheduleOffset = &offset
+	}
 	if params.Logger == nil {
 		params.Logger = slog.Default()
 	}
@@ -133,8 +169,31 @@ func NewRunner(params RunnerParams) (*Runner, error) {
 		service: params.Service, accounts: accounts, active: active, quarantined: quarantined,
 		interval: params.Interval, now: params.Now, maxAge: params.MaxResultAge, logger: params.Logger,
 		requests: make(chan request, 1024), lastResults: make(map[string]Result),
-		suppressed: make(map[string]uint64),
+		suppressed:     make(map[string]uint64),
+		scheduleOffset: params.ScheduleOffset, scheduleAfter: time.After, deferAfter: time.After,
 	}, nil
+}
+
+// BindDecisionActivity installs the decision runner after construction; live
+// composition creates reconciliation first because decision delivery uses this
+// runner as its account gate. Unbound runners never defer.
+func (runner *Runner) BindDecisionActivity(activity DecisionActivity) error {
+	if activity == nil {
+		return fmt.Errorf("decision activity is required")
+	}
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if runner.decisionActivity != nil {
+		return fmt.Errorf("reconciliation runner decision activity is already bound")
+	}
+	runner.decisionActivity = activity
+	return nil
+}
+
+func (runner *Runner) boundDecisionActivity() DecisionActivity {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return runner.decisionActivity
 }
 
 func normalizeRunnerAccounts(rawAccounts []string, disallowed map[string]struct{}) ([]string, map[string]struct{}, error) {
@@ -249,7 +308,11 @@ func (runner *Runner) runLoop(ctx context.Context, initialErrors []error, ready 
 				case <-workCtx.Done():
 					return
 				case requested := <-queue:
-					_, err := runner.runAccount(workCtx, RunAccountParams{ExecutionAccountID: requested.accountID,
+					requested, err := runner.yieldToDecisionCycle(workCtx, requested, queue)
+					if err != nil {
+						return
+					}
+					_, err = runner.runAccount(workCtx, RunAccountParams{ExecutionAccountID: requested.accountID,
 						Trigger: requested.trigger, FocusOrderID: requested.orderID})
 					if err != nil {
 						select {
@@ -272,14 +335,34 @@ func (runner *Runner) runLoop(ctx context.Context, initialErrors []error, ready 
 			}
 		}
 	}
-	ticker := time.NewTicker(runner.interval)
-	defer ticker.Stop()
+	var scheduled <-chan time.Time
+	rearm := func() {}
+	if runner.scheduleOffset == nil {
+		ticker := time.NewTicker(runner.interval)
+		defer ticker.Stop()
+		scheduled = ticker.C
+	} else {
+		// Aligned mode recomputes the next wall-clock instant after every tick,
+		// so neither restarts nor slow iterations shift the phase.
+		var lastTick time.Time
+		rearm = func() {
+			now := runner.now().UTC()
+			next := nextAlignedTick(now, runner.interval, *runner.scheduleOffset)
+			if !lastTick.IsZero() && !next.After(lastTick) {
+				next = lastTick.Add(runner.interval)
+			}
+			lastTick = next
+			scheduled = runner.scheduleAfter(next.Sub(now))
+		}
+		rearm()
+	}
 	accumulated := append([]error(nil), initialErrors...)
 	for {
 		select {
 		case <-ctx.Done():
 			return errors.Join(append(accumulated, ctx.Err())...)
-		case <-ticker.C:
+		case <-scheduled:
+			rearm()
 			runner.recordLoopActivity()
 			for _, accountID := range runner.accounts {
 				enqueue(request{accountID: accountID, trigger: domain.ReconciliationTriggerScheduled})
@@ -289,6 +372,70 @@ func (runner *Runner) runLoop(ctx context.Context, initialErrors []error, ready 
 			enqueue(requested)
 		case err := <-failures:
 			accumulated = appendBounded(accumulated, err)
+		}
+	}
+}
+
+// nextAlignedTick returns the first instant strictly after now that is
+// congruent to offset modulo interval (on absolute UTC time).
+func nextAlignedTick(now time.Time, interval, offset time.Duration) time.Time {
+	now = now.UTC()
+	next := now.Truncate(interval).Add(offset)
+	if !next.After(now) {
+		next = next.Add(interval)
+	}
+	return next
+}
+
+// yieldToDecisionCycle delays a SCHEDULED run while a decision cycle is running
+// or due within decisionLead. The account lock has no priority, so a scheduled
+// run that grabs it first would make the decision batch wait until its signals
+// are stale. Waiting happens before AcquireExecutionAccount and never holds the
+// lock. Every other trigger runs immediately; if one arrives while deferring it
+// replaces the pending scheduled run, because each run scans the whole account.
+func (runner *Runner) yieldToDecisionCycle(ctx context.Context, requested request, queue <-chan request) (request, error) {
+	if requested.trigger != domain.ReconciliationTriggerScheduled {
+		return requested, nil
+	}
+	activity := runner.boundDecisionActivity()
+	if activity == nil {
+		return requested, nil
+	}
+	startedAt := runner.now().UTC()
+	if !activity.DecisionBusy(startedAt, decisionLead) {
+		return requested, nil
+	}
+	deadline := startedAt.Add(maxDecisionDefer)
+	const reason = "decision cycle running or due within lead"
+	runner.logger.Info("scheduled reconciliation deferred for decision cycle",
+		"execution_account_id", requested.accountID, "reason", reason,
+		"lead", decisionLead, "max_defer", maxDecisionDefer)
+	for {
+		select {
+		case <-ctx.Done():
+			return request{}, ctx.Err()
+		case next := <-queue:
+			if next.trigger != domain.ReconciliationTriggerScheduled {
+				runner.logger.Info("deferred scheduled reconciliation superseded by immediate trigger",
+					"execution_account_id", requested.accountID, "trigger", next.trigger,
+					"waited", runner.now().UTC().Sub(startedAt))
+				return next, nil
+			}
+			// A later tick coalesces into the run already being deferred.
+		case <-runner.deferAfter(decisionPollPeriod):
+		}
+		now := runner.now().UTC()
+		waited := now.Sub(startedAt)
+		if !activity.DecisionBusy(now, decisionLead) {
+			runner.logger.Info("scheduled reconciliation resumed after decision cycle",
+				"execution_account_id", requested.accountID, "reason", reason, "waited", waited)
+			return requested, nil
+		}
+		if !now.Before(deadline) {
+			runner.logger.Warn("scheduled reconciliation deferral limit exceeded; running during decision window",
+				"execution_account_id", requested.accountID, "reason", reason, "waited", waited,
+				"max_defer", maxDecisionDefer)
+			return requested, nil
 		}
 	}
 }

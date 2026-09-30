@@ -109,8 +109,11 @@ CHAIN_CASH_LOG_CHUNK_BLOCKS=100
 在服务机上用服务同一份环境执行（保证奖励地址、资金地址与服务一致；缺 `CHAIN_CASH_REWARD_SENDERS` 时命令直接拒绝）：
 
 ```bash
-set -a; . /etc/trading-execution/env; set +a
-export TRADING_EXECUTION_DATABASE_URL=<应用账号连接串>
+set -a; . /etc/trading-execution/env 2>/dev/null; set +a
+# The env file is not shell-quoted: a value containing `&` (the database URL) is
+# truncated by `.`. Re-read such values verbatim.
+export TRADING_EXECUTION_DATABASE_URL="$(awk -F= '$1=="TRADING_EXECUTION_DATABASE_URL" {print substr($0,index($0,"=")+1); exit}' /etc/trading-execution/env)"
+export POLYGON_RPC_URL="$(awk -F= '$1=="POLYGON_RPC_URL" {print substr($0,index($0,"=")+1); exit}' /etc/trading-execution/env)"
 cd /opt/trading-execution/current
 ```
 

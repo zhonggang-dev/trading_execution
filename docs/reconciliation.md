@@ -371,3 +371,10 @@ fillprocessor.Service + execution.Service + reconciliation.Service + reconciliat
 - <https://docs.polymarket.com/api-reference/trade/get-trades>
 - <https://docs.polymarket.com/api-reference/rate-limits>
 - <https://docs.polymarket.com/resources/contracts>
+
+## 定时对账与决策周期错峰
+
+钱包锁（`AcquireExecutionAccount`）让同一钱包的下单批次与对账互斥，但它先到先得、没有优先级：对账先拿到锁时，下单批次要等整轮对账结束，信号可能因此超过 `max_signal_age` 被拒（`SIGNAL_STALE`）。因此：
+
+- `RECONCILIATION_SCHEDULE_OFFSET` 把定时对账固定在墙上时钟 `offset (mod RECONCILIATION_INTERVAL)` 的时刻，不再随服务重启漂移。生产配置 `3m30s`：对账在每 10 分钟周期的 x3:30 与 x8:30 开始，决策在 x0:15 开始。未配置时保持启动后按间隔触发。
+- `SCHEDULED` 对账在拿锁前检查决策周期：正在运行，或 60 秒内将开始时推迟（每 2 秒复查，不持锁），最多推迟 3 分钟，超过后照常运行并打 WARN。启动对账、订单/撤单未知、资产漂移与手工触发不推迟。
