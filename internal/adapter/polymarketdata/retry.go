@@ -32,12 +32,7 @@ func (err *HTTPStatusError) Error() string {
 }
 
 func retryableDataAPIStatus(status int) bool {
-	switch status {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	default:
-		return false
-	}
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
 }
 
 // parseRetryAfter accepts delta-seconds or an HTTP date and caps the wait.
