@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/service/chaincash"
 	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
 
@@ -170,6 +171,12 @@ type Polymarket struct {
 	AutoRedeemRetryInterval    time.Duration
 	AutoRedeemAmbiguityTimeout time.Duration
 	AutoRedeemBatchSize        int
+	// ChainCash* configure the on-chain pUSD cash ledger. It is active only for
+	// accounts initialized with cmd/chaincashinit; address lists are lowercase.
+	ChainCashRewardSenders   []string
+	ChainCashDepositSources  map[string][]string
+	ChainCashMaxBlocksPerRun int
+	ChainCashLogChunkBlocks  int
 }
 
 // Kalshi keeps authenticated market-data credentials outside the repository.
@@ -378,6 +385,36 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	chainCashRewardSenders, err := chaincash.ParseAddressList(os.Getenv("CHAIN_CASH_REWARD_SENDERS"))
+	if err != nil {
+		return Config{}, fmt.Errorf("CHAIN_CASH_REWARD_SENDERS: %w", err)
+	}
+	chainCashDepositSources, err := chaincash.ParseDepositSources(os.Getenv("CHAIN_CASH_DEPOSIT_SOURCES"))
+	if err != nil {
+		return Config{}, fmt.Errorf("CHAIN_CASH_DEPOSIT_SOURCES: %w", err)
+	}
+	// 1500 blocks = 15 chunks x 4 eth_getLogs calls (Transfer IN/OUT, OrderFilled
+	// maker/taker) = 60 calls per catch-up run, about 12 seconds on the free
+	// dRPC plan, while still catching up ten times faster than Polygon grows
+	// (about 150 blocks per 5-minute reconciliation interval).
+	chainCashMaxBlocksPerRun, err := integer("CHAIN_CASH_MAX_BLOCKS_PER_RUN", 1500, 1, 3000)
+	if err != nil {
+		return Config{}, err
+	}
+	// The production dRPC plan rejects eth_getLogs spans above 101 blocks.
+	chainCashLogChunkBlocks, err := integer("CHAIN_CASH_LOG_CHUNK_BLOCKS", 100, 1, 100)
+	if err != nil {
+		return Config{}, err
+	}
+	// A catch-up run must stay well inside the per-account reconciliation
+	// timeout: at most 30 chunks (120 eth_getLogs calls, about 24 seconds).
+	// A run that cannot finish would time out before persisting anything and
+	// keep the account blocked on every later run.
+	if chunks := (chainCashMaxBlocksPerRun + chainCashLogChunkBlocks - 1) / chainCashLogChunkBlocks; chunks > 30 {
+		return Config{}, fmt.Errorf(
+			"CHAIN_CASH_MAX_BLOCKS_PER_RUN=%d with CHAIN_CASH_LOG_CHUNK_BLOCKS=%d needs %d log chunks per run; at most 30 are allowed",
+			chainCashMaxBlocksPerRun, chainCashLogChunkBlocks, chunks)
+	}
 	liveOperationsInterval, err := duration("LIVE_OPERATIONS_INTERVAL", 10*time.Second)
 	if err != nil {
 		return Config{}, err
@@ -468,6 +505,10 @@ func Load() (Config, error) {
 			AutoRedeemRetryInterval:    autoRedeemRetryInterval,
 			AutoRedeemAmbiguityTimeout: autoRedeemAmbiguityTimeout,
 			AutoRedeemBatchSize:        autoRedeemBatchSize,
+			ChainCashRewardSenders:     chainCashRewardSenders,
+			ChainCashDepositSources:    chainCashDepositSources,
+			ChainCashMaxBlocksPerRun:   chainCashMaxBlocksPerRun,
+			ChainCashLogChunkBlocks:    chainCashLogChunkBlocks,
 		},
 		Kalshi: Kalshi{
 			MarketDataEnabled: kalshiMarketDataEnabled,

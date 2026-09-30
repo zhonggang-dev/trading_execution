@@ -13,6 +13,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/chaincash"
 	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
 
@@ -25,6 +26,12 @@ const (
 type OrderRefresher interface {
 	Refresh(context.Context, string) (domain.Order, error)
 	FinalizeCancellation(context.Context, string) (domain.Order, error)
+}
+
+// ChainCashLedger synchronizes confirmed pUSD transfers up to the balance
+// snapshot block and returns the ledger total plus the known transfer offset.
+type ChainCashLedger interface {
+	Sync(context.Context, chaincash.SyncParams) (chaincash.SyncResult, error)
 }
 
 // KnownPositionBalanceSource only checks an already-owned token; it neither
@@ -71,9 +78,12 @@ type Params struct {
 	// evidence before the run reports ORDER_RECOVERY_PENDING. Zero selects the
 	// default.
 	RecoveryPendingGrace time.Duration
-	Logger               *slog.Logger
-	Now                  func() time.Time
-	NewID                func() string
+	// ChainCash is the on-chain pUSD transfer ledger. Nil, or an account
+	// without a chain cash cursor, keeps the legacy balance comparison.
+	ChainCash ChainCashLedger
+	Logger    *slog.Logger
+	Now       func() time.Time
+	NewID     func() string
 }
 
 // Service 表示后端使用的 Service 类型。
@@ -98,6 +108,7 @@ type Service struct {
 	recovery                  *orderrecovery.Guard
 	reservations              port.OrderReservationReader
 	recoveryPendingGrace      time.Duration
+	chainCash                 ChainCashLedger
 	logger                    *slog.Logger
 	now                       func() time.Time
 	newID                     func() string
@@ -195,7 +206,7 @@ func New(params Params) (*Service, error) {
 		accountScope: params.AccountScope, redemptions: params.Redemptions,
 		fillFinalityMaxAge: params.FillFinalityMaxAge,
 		recovery:           params.Recovery, reservations: params.Reservations,
-		recoveryPendingGrace: params.RecoveryPendingGrace, logger: params.Logger,
+		recoveryPendingGrace: params.RecoveryPendingGrace, chainCash: params.ChainCash, logger: params.Logger,
 		now: params.Now, newID: params.NewID,
 	}, nil
 }
@@ -424,12 +435,18 @@ func validTrigger(trigger domain.ReconciliationTrigger) bool {
 	}
 }
 
-// issueFingerprint 根据稳定业务身份生成幂等标识。
+// issueFingerprint 根据稳定业务身份生成幂等标识。A balance drift is identified
+// by account, type, and source only: its amounts are the latest observation,
+// so a changed amount updates the one OPEN row instead of opening another.
 func issueFingerprint(issue domain.ReconciliationIssue) string {
+	localValue, remoteValue := issue.LocalValue.String(), issue.RemoteValue.String()
+	if issue.Type == domain.ReconciliationIssueBalanceDrift {
+		localValue, remoteValue = "", ""
+	}
 	parts := []string{
 		string(issue.Type), issue.ExecutionAccountID, issue.OrderID, issue.VenueOrderID,
 		issue.VenueTradeID, issue.MarketID, issue.ConditionID, issue.TokenID, issue.Source,
-		issue.LocalValue.String(), issue.RemoteValue.String(),
+		localValue, remoteValue,
 	}
 	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(digest[:])

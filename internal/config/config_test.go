@@ -32,6 +32,53 @@ func TestLoadSafeDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadChainCashConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(config.Polymarket.ChainCashRewardSenders) != 0 || len(config.Polymarket.ChainCashDepositSources) != 0 ||
+		config.Polymarket.ChainCashMaxBlocksPerRun != 1500 || config.Polymarket.ChainCashLogChunkBlocks != 100 {
+		t.Fatalf("chain cash defaults = %#v", config.Polymarket)
+	}
+	t.Setenv("CHAIN_CASH_REWARD_SENDERS", " 0x607C8C9866EF3B4665C5A384188706BE738D8BF8 ,")
+	t.Setenv("CHAIN_CASH_DEPOSIT_SOURCES", "wallet-6=0x0AEFD80D00000000000000000000000000000001,wallet-7=0xc9ba353700000000000000000000000000000002")
+	t.Setenv("CHAIN_CASH_MAX_BLOCKS_PER_RUN", "500")
+	config, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if strings.Join(config.Polymarket.ChainCashRewardSenders, ",") != "0x607c8c9866ef3b4665c5a384188706be738d8bf8" ||
+		config.Polymarket.ChainCashDepositSources["wallet-6"][0] != "0x0aefd80d00000000000000000000000000000001" ||
+		config.Polymarket.ChainCashDepositSources["wallet-7"][0] != "0xc9ba353700000000000000000000000000000002" ||
+		config.Polymarket.ChainCashMaxBlocksPerRun != 500 {
+		t.Fatalf("chain cash config = %#v", config.Polymarket)
+	}
+	for name, values := range map[string]map[string]string{
+		"reward sender":           {"CHAIN_CASH_REWARD_SENDERS": "0x1234"},
+		"deposit source":          {"CHAIN_CASH_DEPOSIT_SOURCES": "0x0aefd80d00000000000000000000000000000001"},
+		"chunk above 100":         {"CHAIN_CASH_LOG_CHUNK_BLOCKS": "101"},
+		"blocks above 3000":       {"CHAIN_CASH_MAX_BLOCKS_PER_RUN": "3001"},
+		"too many chunks per run": {"CHAIN_CASH_MAX_BLOCKS_PER_RUN": "1500", "CHAIN_CASH_LOG_CHUNK_BLOCKS": "10"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			for key, value := range values {
+				t.Setenv(key, value)
+			}
+			if _, err := Load(); err == nil {
+				t.Fatalf("%v was accepted", values)
+			}
+		})
+	}
+	clearConfigEnvironment(t)
+	t.Setenv("CHAIN_CASH_MAX_BLOCKS_PER_RUN", "3000")
+	if config, err = Load(); err != nil || config.Polymarket.ChainCashMaxBlocksPerRun != 3000 {
+		t.Fatalf("30 chunks per run rejected: %v", err)
+	}
+}
+
 // TestLoadKalshiStrategyInputSwitch covers the venue-level "do not send Kalshi
 // to the strategy" switch: an explicit false turns it off, the default keeps
 // sending Kalshi, and a non-boolean value is rejected.
@@ -755,6 +802,8 @@ func clearConfigEnvironment(t *testing.T) {
 		"RECONCILIATION_POSITION_EPSILON", "RECONCILIATION_BALANCE_EPSILON",
 		"CANCEL_FILL_FINALITY_GRACE", "MAX_ORDER_RECONCILE_ATTEMPTS",
 		"POLYMARKET_MAX_BUY_FEE_RATE_BPS", "POLYGON_ORDER_FILLED_CONFIRMATIONS",
+		"CHAIN_CASH_REWARD_SENDERS", "CHAIN_CASH_DEPOSIT_SOURCES", "CHAIN_CASH_MAX_BLOCKS_PER_RUN",
+		"CHAIN_CASH_LOG_CHUNK_BLOCKS",
 		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",
 		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
 		"DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED",

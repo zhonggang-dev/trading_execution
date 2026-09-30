@@ -50,6 +50,14 @@ const (
 	// transaction was dropped or re-included by a reorganization, so this is a
 	// manual gate rather than an expected propagation wait.
 	ReconciliationIssueFillFinalityStalled ReconciliationIssueType = "FILL_FINALITY_STALLED"
+	// ReconciliationIssueUnattributedCashIn records one confirmed pUSD transfer
+	// into the wallet from an unknown sender. It is audit evidence only: the
+	// cash is never credited and trading is not blocked.
+	ReconciliationIssueUnattributedCashIn ReconciliationIssueType = "UNATTRIBUTED_CASH_IN"
+	// ReconciliationIssueUnattributedCashOut records one confirmed pUSD transfer
+	// out of the wallet that is neither a venue trade nor known system flow. It
+	// blocks the whole account and is never closed automatically.
+	ReconciliationIssueUnattributedCashOut ReconciliationIssueType = "UNATTRIBUTED_CASH_OUT"
 )
 
 // ReconciliationResolution 表示后端使用的 ReconciliationResolution 类型。
@@ -241,8 +249,11 @@ func ClassifyReconciliationImpact(issue ReconciliationIssue) ReconciliationImpac
 			return ReconciliationImpactNone
 		}
 		return ReconciliationImpactAccount
-	case ReconciliationIssueSourceConflict:
+	case ReconciliationIssueSourceConflict, ReconciliationIssueUnattributedCashOut:
 		return ReconciliationImpactAccount
+	case ReconciliationIssueUnattributedCashIn:
+		// Unknown incoming money never reduces what the account can pay.
+		return ReconciliationImpactNone
 	case ReconciliationIssueSourceUnavailable,
 		ReconciliationIssueSubmitUnconfirmed, ReconciliationIssueFillFinalityStalled,
 		ReconciliationIssueLocalOrderCancelled, ReconciliationIssueMissedBuyFill,

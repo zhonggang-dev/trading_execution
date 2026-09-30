@@ -163,17 +163,33 @@ func (state *runState) reconcileBalance(ctx context.Context, executionAccountID 
 		return nil
 	}
 	state.run.VerifyReconciliation("source", "EXTERNAL_BALANCE")
-	if within(balance.TotalBalance, external.Amount, state.service.balanceEpsilon) {
+	local := balance.TotalBalance
+	chainCash, err := state.syncChainCash(ctx, executionAccountID, balance.WalletAddress, external)
+	if err != nil {
+		// Unknown transfers cannot be told apart from drift: fail closed.
+		return nil
+	}
+	if chainCash.Enabled {
+		if local, err = addDecimals(chainCash.LedgerTotal, chainCash.Offset); err != nil {
+			state.addInfrastructureIssue(ctx, chainCashSource, "project the chain cash balance", err)
+			return err
+		}
+	}
+	if within(local, external.Amount, state.service.balanceEpsilon) {
 		state.run.VerifyReconciliation("balance", "")
 		return nil
 	}
-	if state.balanceExplainedByRedemptions(balance.TotalBalance, external.Amount) {
+	if state.balanceExplainedByRedemptions(local, external.Amount) {
 		return nil
 	}
-	if state.balanceExplainedByFinalityPendingFills(balance.TotalBalance, external.Amount) {
+	if state.balanceExplainedByFinalityPendingFills(local, external.Amount) {
 		return nil
 	}
-	if state.balanceExplainedByUnresolvedOrders(ctx, balance.TotalBalance, external.Amount) {
+	if state.balanceExplainedByUnresolvedOrders(ctx, local, external.Amount) {
+		return nil
+	}
+	if chainCash.Enabled {
+		state.recordChainCashBalanceDrift(ctx, chainCash, local, external)
 		return nil
 	}
 	state.issue(ctx, domain.ReconciliationIssueParams{

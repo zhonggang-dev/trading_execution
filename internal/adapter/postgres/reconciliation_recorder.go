@@ -107,15 +107,17 @@ func (recorder *ReconciliationRecorder) RecordIssue(ctx context.Context, issue d
 				observed_at = EXCLUDED.observed_at,
 				impact_scope = EXCLUDED.impact_scope`
 	}
+	// first_observed_at is written only by the first insert; the conflict
+	// update below never names it and a database trigger keeps it unchanged.
 	_, err := recorder.db.ExecContext(ctx, `
 		INSERT INTO reconciliation_issues (
 			issue_id, run_id, fingerprint, execution_account_id, issue_type,
 			resolution, status, order_id, venue_order_id, venue_trade_id,
 			market_id, condition_id, token_id, local_value, remote_value, remote_block_number, source,
-			details, observed_at, resolved_at, impact_scope
+			details, observed_at, resolved_at, impact_scope, first_observed_at
 		) VALUES (
 			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
-			NULLIF($14,'')::numeric,NULLIF($15,'')::numeric,$16,$17,$18,$19,$20,$21
+			NULLIF($14,'')::numeric,NULLIF($15,'')::numeric,$16,$17,$18,$19,$20,$21,$19
 		)
 		`+conflictClause,
 		issue.IssueID, issue.RunID, issue.Fingerprint, issue.ExecutionAccountID,
@@ -166,6 +168,7 @@ func (recorder *ReconciliationRecorder) CompleteWithState(ctx context.Context, r
 	}
 	if run.Status == domain.ReconciliationRunCompleted || run.Status == domain.ReconciliationRunAttentionRequired {
 		resolvers := []func(context.Context, *sql.Tx, domain.ReconciliationRun) (int, error){
+			resolveVerifiedChainCashBalanceIssues,
 			resolveFillLagDriftIssues, resolvePolymarketPositionPrecisionIssues,
 			resolveRecoveredSellPositionDriftIssues, resolveVerifiedTransientIssues,
 			resolveRecoveredSellPositionTrajectoryIssues,
@@ -517,6 +520,38 @@ func resolveWalletMigrationIssues(ctx context.Context, tx *sql.Tx, run domain.Re
 		return 0, fmt.Errorf("count resolved wallet-migration reconciliation issues: %w", err)
 	}
 	return int(resolved), nil
+}
+
+// resolveVerifiedChainCashBalanceIssues closes every OPEN BALANCE_DRIFT of an
+// account that uses the chain cash ledger once this run verified
+// ledger + known transfers = on-chain balance and did not reproduce a balance
+// drift. Unexplained outgoing cash is gated separately by its own
+// UNATTRIBUTED_CASH_OUT issue, which this resolver never touches. Accounts
+// without a cursor keep only the evidence-specific legacy resolvers.
+func resolveVerifiedChainCashBalanceIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
+	const resolvedDetails = "; automatically resolved after the chain cash ledger reconciled the ledger plus every known pUSD transfer with the on-chain balance"
+	result, err := tx.ExecContext(ctx, `
+		UPDATE reconciliation_issues issue
+		SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+		    details=issue.details || $4
+		WHERE issue.execution_account_id=$1 AND issue.status='OPEN'
+		  AND issue.issue_type='BALANCE_DRIFT'
+		  AND $5::jsonb->>'verified_balance:'='1'
+		  AND $5::jsonb->>'verified_source:EVM_ERC20_TRANSFER_LOGS'='1'
+		  AND EXISTS (
+		    SELECT 1 FROM execution_chain_cash_cursors chain_cursor
+		    WHERE chain_cursor.execution_account_id=issue.execution_account_id)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM reconciliation_issues reproduced
+		    WHERE reproduced.execution_account_id=issue.execution_account_id
+		      AND reproduced.run_id=$2 AND reproduced.status='OPEN'
+		      AND reproduced.issue_type='BALANCE_DRIFT')`,
+		run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, verificationJSON(run))
+	if err != nil {
+		return 0, fmt.Errorf("resolve chain cash verified balance drift issues: %w", err)
+	}
+	count, err := result.RowsAffected()
+	return int(count), err
 }
 
 // resolveFillLagDriftIssues closes only stale drift observations now represented
