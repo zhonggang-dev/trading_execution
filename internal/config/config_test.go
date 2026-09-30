@@ -862,3 +862,20 @@ func setCompleteLiveEnvironment(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `["main","wallet-1"]`)
 	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[]`)
 }
+
+func TestReconciliationScheduleOffset(t *testing.T) {
+	t.Setenv("RECONCILIATION_SCHEDULE_OFFSET", "")
+	if offset, err := reconciliationScheduleOffset(5 * time.Minute); err != nil || offset != nil {
+		t.Fatalf("unset offset = %v, %v; want nil", offset, err)
+	}
+	t.Setenv("RECONCILIATION_SCHEDULE_OFFSET", "3m30s")
+	if offset, err := reconciliationScheduleOffset(5 * time.Minute); err != nil || offset == nil || *offset != 210*time.Second {
+		t.Fatalf("3m30s offset = %v, %v", offset, err)
+	}
+	for _, value := range []string{"5m", "-1s", "soon"} {
+		t.Setenv("RECONCILIATION_SCHEDULE_OFFSET", value)
+		if _, err := reconciliationScheduleOffset(5 * time.Minute); err == nil {
+			t.Fatalf("offset %q accepted", value)
+		}
+	}
+}

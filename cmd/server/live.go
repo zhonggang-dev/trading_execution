@@ -451,6 +451,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		Accounts:            reconciliationAccountIDs,
 		QuarantinedAccounts: quarantinedAccountIDs,
 		Interval:            cfg.Polymarket.ReconciliationInterval,
+		ScheduleOffset:      cfg.Polymarket.ReconciliationScheduleOffset,
 		Logger:              logger,
 	})
 	if err != nil {
@@ -552,6 +553,9 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		)
 	}
 	if decisionRunner != nil {
+		if err := runner.BindDecisionActivity(decisionRunner); err != nil {
+			return nil, err
+		}
 		readinessChecks = append(readinessChecks, readiness.NamedChecker{Name: "decision_cycle", Checker: decisionRunner})
 	}
 	combinedReadiness, err := readiness.NewAll(readinessChecks...)

@@ -140,37 +140,41 @@ func (execution Execution) OrderRecoveryPolicy() orderrecovery.Policy {
 
 // Polymarket 保存 fail-closed 实盘装配配置，钱包秘密只留在受限文件中。
 type Polymarket struct {
-	LiveTradingEnabled         bool
-	AutoRedeemEnabled          bool
-	AccountsFile               string
-	CLOBURL                    string
-	RelayerURL                 string
-	GeoblockURL                string
-	FrontendOnlyAPICountries   []string
-	GammaURL                   string
-	DataAPIURL                 string
-	PolygonRPCURL              string
-	RequestTimeout             time.Duration
-	StartupTimeout             time.Duration
-	MaxClockSkew               time.Duration
-	HeartbeatInterval          time.Duration
-	HeartbeatCallTimeout       time.Duration
-	HeartbeatStaleAfter        time.Duration
-	ReconciliationInterval     time.Duration
-	ReconciliationLookback     time.Duration
-	PositionEpsilon            domain.Decimal
-	BalanceEpsilon             domain.Decimal
-	CancelFillFinalityGrace    time.Duration
-	MaxReconcileAttempts       int
-	MaxBuyFeeRateBPS           domain.Decimal
-	LatestBookMaxAge           time.Duration
-	FeeScheduleTTL             time.Duration
-	OrderFilledConfirmations   int
-	FillFinalityMaxAge         time.Duration
-	AutoRedeemInterval         time.Duration
-	AutoRedeemRetryInterval    time.Duration
-	AutoRedeemAmbiguityTimeout time.Duration
-	AutoRedeemBatchSize        int
+	LiveTradingEnabled       bool
+	AutoRedeemEnabled        bool
+	AccountsFile             string
+	CLOBURL                  string
+	RelayerURL               string
+	GeoblockURL              string
+	FrontendOnlyAPICountries []string
+	GammaURL                 string
+	DataAPIURL               string
+	PolygonRPCURL            string
+	RequestTimeout           time.Duration
+	StartupTimeout           time.Duration
+	MaxClockSkew             time.Duration
+	HeartbeatInterval        time.Duration
+	HeartbeatCallTimeout     time.Duration
+	HeartbeatStaleAfter      time.Duration
+	ReconciliationInterval   time.Duration
+	// ReconciliationScheduleOffset pins scheduled reconciliation to wall-clock
+	// instants congruent to the offset modulo ReconciliationInterval. Nil keeps
+	// the legacy start-relative ticker.
+	ReconciliationScheduleOffset *time.Duration
+	ReconciliationLookback       time.Duration
+	PositionEpsilon              domain.Decimal
+	BalanceEpsilon               domain.Decimal
+	CancelFillFinalityGrace      time.Duration
+	MaxReconcileAttempts         int
+	MaxBuyFeeRateBPS             domain.Decimal
+	LatestBookMaxAge             time.Duration
+	FeeScheduleTTL               time.Duration
+	OrderFilledConfirmations     int
+	FillFinalityMaxAge           time.Duration
+	AutoRedeemInterval           time.Duration
+	AutoRedeemRetryInterval      time.Duration
+	AutoRedeemAmbiguityTimeout   time.Duration
+	AutoRedeemBatchSize          int
 	// ChainCash* configure the on-chain pUSD cash ledger. It is active only for
 	// accounts initialized with cmd/chaincashinit; address lists are lowercase.
 	ChainCashRewardSenders   []string
@@ -329,6 +333,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	reconciliationScheduleOffset, err := reconciliationScheduleOffset(reconciliationInterval)
+	if err != nil {
+		return Config{}, err
+	}
 	reconciliationLookback, err := duration("RECONCILIATION_TRADE_LOOKBACK", 48*time.Hour)
 	if err != nil {
 		return Config{}, err
@@ -480,35 +488,36 @@ func Load() (Config, error) {
 			// Empty by default so a deployment cannot silently keep an old policy
 			// exception. Production must opt in after checking the current official
 			// geographic-restrictions page.
-			FrontendOnlyAPICountries:   commaSeparated(os.Getenv("POLYMARKET_FRONTEND_ONLY_API_COUNTRIES")),
-			GammaURL:                   env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"),
-			DataAPIURL:                 env("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com"),
-			PolygonRPCURL:              strings.TrimSpace(os.Getenv("POLYGON_RPC_URL")),
-			RequestTimeout:             polymarketRequestTimeout,
-			StartupTimeout:             startupTimeout,
-			MaxClockSkew:               maxClockSkew,
-			HeartbeatInterval:          heartbeatInterval,
-			HeartbeatCallTimeout:       heartbeatCallTimeout,
-			HeartbeatStaleAfter:        heartbeatStaleAfter,
-			ReconciliationInterval:     reconciliationInterval,
-			ReconciliationLookback:     reconciliationLookback,
-			PositionEpsilon:            positionEpsilon,
-			BalanceEpsilon:             balanceEpsilon,
-			CancelFillFinalityGrace:    cancelFillFinalityGrace,
-			MaxReconcileAttempts:       maxReconcileAttempts,
-			MaxBuyFeeRateBPS:           maxBuyFeeRateBPS,
-			LatestBookMaxAge:           latestBookMaxAge,
-			FeeScheduleTTL:             feeScheduleTTL,
-			OrderFilledConfirmations:   orderFilledConfirmations,
-			FillFinalityMaxAge:         fillFinalityMaxAge,
-			AutoRedeemInterval:         autoRedeemInterval,
-			AutoRedeemRetryInterval:    autoRedeemRetryInterval,
-			AutoRedeemAmbiguityTimeout: autoRedeemAmbiguityTimeout,
-			AutoRedeemBatchSize:        autoRedeemBatchSize,
-			ChainCashRewardSenders:     chainCashRewardSenders,
-			ChainCashDepositSources:    chainCashDepositSources,
-			ChainCashMaxBlocksPerRun:   chainCashMaxBlocksPerRun,
-			ChainCashLogChunkBlocks:    chainCashLogChunkBlocks,
+			FrontendOnlyAPICountries:     commaSeparated(os.Getenv("POLYMARKET_FRONTEND_ONLY_API_COUNTRIES")),
+			GammaURL:                     env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"),
+			DataAPIURL:                   env("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com"),
+			PolygonRPCURL:                strings.TrimSpace(os.Getenv("POLYGON_RPC_URL")),
+			RequestTimeout:               polymarketRequestTimeout,
+			StartupTimeout:               startupTimeout,
+			MaxClockSkew:                 maxClockSkew,
+			HeartbeatInterval:            heartbeatInterval,
+			HeartbeatCallTimeout:         heartbeatCallTimeout,
+			HeartbeatStaleAfter:          heartbeatStaleAfter,
+			ReconciliationInterval:       reconciliationInterval,
+			ReconciliationScheduleOffset: reconciliationScheduleOffset,
+			ReconciliationLookback:       reconciliationLookback,
+			PositionEpsilon:              positionEpsilon,
+			BalanceEpsilon:               balanceEpsilon,
+			CancelFillFinalityGrace:      cancelFillFinalityGrace,
+			MaxReconcileAttempts:         maxReconcileAttempts,
+			MaxBuyFeeRateBPS:             maxBuyFeeRateBPS,
+			LatestBookMaxAge:             latestBookMaxAge,
+			FeeScheduleTTL:               feeScheduleTTL,
+			OrderFilledConfirmations:     orderFilledConfirmations,
+			FillFinalityMaxAge:           fillFinalityMaxAge,
+			AutoRedeemInterval:           autoRedeemInterval,
+			AutoRedeemRetryInterval:      autoRedeemRetryInterval,
+			AutoRedeemAmbiguityTimeout:   autoRedeemAmbiguityTimeout,
+			AutoRedeemBatchSize:          autoRedeemBatchSize,
+			ChainCashRewardSenders:       chainCashRewardSenders,
+			ChainCashDepositSources:      chainCashDepositSources,
+			ChainCashMaxBlocksPerRun:     chainCashMaxBlocksPerRun,
+			ChainCashLogChunkBlocks:      chainCashLogChunkBlocks,
 		},
 		Kalshi: Kalshi{
 			MarketDataEnabled: kalshiMarketDataEnabled,
@@ -1271,6 +1280,22 @@ func nonNegativeDuration(key string, fallback time.Duration) (time.Duration, err
 		return 0, fmt.Errorf("%s must be a non-negative duration", key)
 	}
 	return parsed, nil
+}
+
+// reconciliationScheduleOffset reads the optional wall-clock phase of
+// scheduled reconciliation. Unset returns nil so existing deployments keep the
+// start-relative ticker.
+func reconciliationScheduleOffset(interval time.Duration) (*time.Duration, error) {
+	const key = "RECONCILIATION_SCHEDULE_OFFSET"
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed < 0 || parsed >= interval {
+		return nil, fmt.Errorf("%s must be a duration in [0, RECONCILIATION_INTERVAL=%s)", key, interval)
+	}
+	return &parsed, nil
 }
 
 // boolean 读取并解析布尔配置。

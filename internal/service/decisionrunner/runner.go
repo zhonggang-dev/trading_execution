@@ -343,6 +343,26 @@ func (runner *Runner) Check(ctx context.Context) error {
 	return nil
 }
 
+// DecisionBusy reports whether a cycle is running or the next boundary is due
+// within lead (and has not yet passed its start-lateness window). Scheduled
+// reconciliation uses it to yield the shared account lock to order delivery.
+// A loop that is not running never reports busy.
+func (runner *Runner) DecisionBusy(now time.Time, lead time.Duration) bool {
+	now = now.UTC()
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if !runner.loopRunning {
+		return false
+	}
+	if runner.inFlight {
+		return true
+	}
+	if runner.nextDueAt.IsZero() {
+		return false
+	}
+	return !now.Before(runner.nextDueAt.Add(-lead)) && now.Before(runner.nextDueAt.Add(runner.maxStartLateness))
+}
+
 func (runner *Runner) Snapshot() Status {
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
