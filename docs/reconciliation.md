@@ -54,7 +54,8 @@ side，再用该分量的数量和价格核验 finalized Polygon OrderFilled 回
 
 主动取消或整轮超时会将任务记为FAILED，并保留已有问题；取消后的未执行读取不能被记成
 新的账户级数据源故障。父任务仍正常时的依赖超时、独立数据库错误继续按原规则记录。
-日常验收使用SCHEDULED范围；ASSET_DRIFT明确扫描全部历史，不应作为普通健康检查调用。
+所有触发类型（含ASSET_DRIFT）都使用 `RECONCILIATION_TRADE_LOOKBACK` 回看窗口，有接管基线的账户取两者较晚者；
+非终态订单和受保护的终态订单不受时间窗口限制，始终被选中。ASSET_DRIFT 不再扫描全部历史。
 
 CLOB 已报告 `CONFIRMED`、Polygon receipt 也已稳定但确认数还没到阈值的成交，是预期中的传播
 状态，不是数据源故障。它会带着完整 OrderFilled 证据以 `MINED` 状态写入 `execution_fills`

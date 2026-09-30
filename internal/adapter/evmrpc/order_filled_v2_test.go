@@ -236,7 +236,9 @@ func TestOrderFilledEvidenceReaderRequiresConfirmationsAndStableChainHead(t *tes
 	}{
 		{name: "insufficient confirmations", confirmations: 5, firstLatest: "0x66", secondLatest: "0x66", wantError: "has 3 confirmations"},
 		{name: "latest below receipt", confirmations: 1, firstLatest: "0x63", secondLatest: "0x63", wantError: "behind receipt"},
-		{name: "latest falls between reads", confirmations: 1, firstLatest: "0x65", secondLatest: "0x64", wantError: "latest block fell"},
+		{name: "latest falls between reads beyond tolerated lag", confirmations: 1, firstLatest: "0x76", secondLatest: "0x65", wantError: "latest block fell from 118 to 101"},
+		{name: "tolerated fall does not overstate shallow depth", confirmations: 3, firstLatest: "0x66", secondLatest: "0x65", wantError: "has 2 confirmations"},
+		{name: "tolerated fall still rejects head behind receipt", confirmations: 1, firstLatest: "0x65", secondLatest: "0x63", wantError: "latest block 99 is behind receipt block 100"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -279,7 +281,39 @@ func TestOrderFilledEvidenceReaderReturnsTypedInsufficientConfirmations(t *testi
 	}
 }
 
-func TestOrderFilledEvidenceReaderRejectsLatestBlockFallbackAcrossReads(t *testing.T) {
+func TestOrderFilledEvidenceReaderToleratesSmallLatestBlockFallWithinRead(t *testing.T) {
+	receipt := validReceipt(PolygonCTFExchangeV2Address, OrderSideBuy, testTokenID, "1", "2", "0")
+	reader, _ := readerForSequence(t, 1,
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x69")),
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x68")),
+	)
+	evidence, err := reader.Read(context.Background(), validEvidenceRequest(OrderSideBuy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Receipt block 0x64; the lower head 0x68 gives 5 confirmations, not 6.
+	if evidence.Confirmations != 5 {
+		t.Fatalf("confirmations = %d, want 5 from the lower head", evidence.Confirmations)
+	}
+	if reader.highestLatestBlock != 0x69 {
+		t.Fatalf("highest latest block = %d, want 105", reader.highestLatestBlock)
+	}
+
+	boundary, _ := readerForSequence(t, 1,
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x74")),
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x64")),
+	)
+	if evidence, err := boundary.Read(context.Background(), validEvidenceRequest(OrderSideBuy)); err != nil ||
+		evidence.Confirmations != 1 {
+		t.Fatalf("16-block fall Read() = %#v, %v; want tolerated with 1 confirmation", evidence, err)
+	}
+}
+
+func TestOrderFilledEvidenceReaderToleratesSmallLatestBlockRegressionAcrossReads(t *testing.T) {
 	receipt := validReceipt(PolygonCTFExchangeV2Address, OrderSideBuy, testTokenID, "1", "2", "0")
 	reader, _ := readerForSequence(t, 1,
 		rpcResult("eth_getTransactionReceipt", receipt),
@@ -289,13 +323,70 @@ func TestOrderFilledEvidenceReaderRejectsLatestBlockFallbackAcrossReads(t *testi
 		rpcResult("eth_chainId", json.RawMessage(`"0x89"`)),
 		rpcResult("eth_getTransactionReceipt", receipt),
 		rpcResult("eth_blockNumber", json.RawMessage(`"0x68"`)),
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", json.RawMessage(`"0x68"`)),
+	)
+	if _, err := reader.Read(context.Background(), validEvidenceRequest(OrderSideBuy)); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := reader.Read(context.Background(), validEvidenceRequest(OrderSideBuy))
+	if err != nil {
+		t.Fatalf("second Read() error = %v, want one-block lag tolerated", err)
+	}
+	if evidence.Confirmations != 5 {
+		t.Fatalf("confirmations = %d, want 5 from the lagging head, not the high-water mark", evidence.Confirmations)
+	}
+	if reader.highestLatestBlock != 0x69 {
+		t.Fatalf("highest latest block = %d, want high-water mark 105 kept", reader.highestLatestBlock)
+	}
+}
+
+func TestOrderFilledEvidenceReaderToleratedLagKeepsTypedInsufficientConfirmations(t *testing.T) {
+	receipt := validReceipt(PolygonCTFExchangeV2Address, OrderSideBuy, testTokenID, "1", "2", "0")
+	reader, _ := readerForSequence(t, 6,
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x69")),
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x69")),
+		rpcResult("eth_chainId", json.RawMessage(`"0x89"`)),
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x68")),
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", quotedResult("0x68")),
+	)
+	if evidence, err := reader.Read(context.Background(), validEvidenceRequest(OrderSideBuy)); err != nil || evidence.Confirmations != 6 {
+		t.Fatalf("first Read() = %#v, %v", evidence, err)
+	}
+	evidence, err := reader.Read(context.Background(), validEvidenceRequest(OrderSideBuy))
+	var shallow *InsufficientConfirmationsError
+	if !errors.As(err, &shallow) || shallow.Evidence.Confirmations != 5 || shallow.Required != 6 {
+		t.Fatalf("second Read() error = %v, want typed 5 < 6 confirmations", err)
+	}
+	if evidence != (OrderFilledEvidence{}) {
+		t.Fatalf("second Read() evidence = %#v, want zero value", evidence)
+	}
+}
+
+func TestOrderFilledEvidenceReaderRejectsLatestBlockFallbackAcrossReads(t *testing.T) {
+	receipt := validReceipt(PolygonCTFExchangeV2Address, OrderSideBuy, testTokenID, "1", "2", "0")
+	reader, _ := readerForSequence(t, 1,
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", json.RawMessage(`"0x79"`)),
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", json.RawMessage(`"0x79"`)),
+		rpcResult("eth_chainId", json.RawMessage(`"0x89"`)),
+		rpcResult("eth_getTransactionReceipt", receipt),
+		rpcResult("eth_blockNumber", json.RawMessage(`"0x68"`)),
 	)
 	if _, err := reader.Read(context.Background(), validEvidenceRequest(OrderSideBuy)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reader.Read(context.Background(), validEvidenceRequest(OrderSideBuy)); err == nil ||
-		!strings.Contains(err.Error(), "regressed from previously observed 105 to 104") {
+		!strings.Contains(err.Error(), "regressed from previously observed 121 to 104") {
 		t.Fatalf("second Read() error = %v", err)
+	}
+	if reader.highestLatestBlock != 0x79 {
+		t.Fatalf("highest latest block = %d, want 121", reader.highestLatestBlock)
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -68,23 +67,9 @@ func (client *PositionClient) ListRedeemActivities(
 		if requestErr != nil {
 			return nil, requestErr
 		}
-		if waitErr := client.waitForRequest(ctx); waitErr != nil {
-			return nil, waitErr
-		}
-		response, requestErr := client.httpClient.Do(request)
+		body, requestErr := client.doWithRetry(ctx, request, "redemption activity")
 		if requestErr != nil {
-			return nil, fmt.Errorf("query Data API redemption activity: %w", requestErr)
-		}
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxPositionsResponseBytes+1))
-		response.Body.Close()
-		if readErr != nil {
-			return nil, fmt.Errorf("read Data API redemption activity: %w", readErr)
-		}
-		if len(body) > maxPositionsResponseBytes {
-			return nil, fmt.Errorf("Data API redemption activity response is too large")
-		}
-		if response.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("Data API redemption activity HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+			return nil, requestErr
 		}
 		var values []wireActivity
 		decoder := json.NewDecoder(bytes.NewReader(body))

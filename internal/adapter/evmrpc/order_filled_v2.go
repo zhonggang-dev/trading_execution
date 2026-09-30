@@ -32,6 +32,11 @@ const (
 	defaultRPCBodyLimit    = int64(1 << 20)
 	maximumRPCBodyLimit    = int64(16 << 20)
 	defaultRPCReadTimeout  = 10 * time.Second
+	// maxTolerableLatestBlockLag bounds how far a load-balanced RPC backend may
+	// lag the highest head already observed (about 30 seconds on Polygon).
+	// Confirmations are always computed from the lower head, so tolerating the
+	// lag can only underestimate finality depth, never overestimate it.
+	maxTolerableLatestBlockLag = uint64(16)
 )
 
 // OrderSide is the maker order side encoded by the V2 OrderFilled event.
@@ -197,8 +202,9 @@ func (reader *OrderFilledEvidenceReader) Read(
 		)
 	}
 
-	// Read both values again. A changed receipt or a falling head is a reorg/load-balanced
-	// RPC risk and must never be accepted as fee evidence.
+	// Read both values again. A changed receipt or a head that falls further than
+	// a lagging load-balanced backend could explain is a reorg/stale RPC risk and
+	// must never be accepted as fee evidence.
 	secondReceipt, err := reader.getTransactionReceipt(ctx, expected.transactionHash)
 	if err != nil {
 		return OrderFilledEvidence{}, err
@@ -214,7 +220,7 @@ func (reader *OrderFilledEvidenceReader) Read(
 	if err != nil {
 		return OrderFilledEvidence{}, err
 	}
-	if secondLatest < firstLatest {
+	if secondLatest < firstLatest && firstLatest-secondLatest > maxTolerableLatestBlockLag {
 		return OrderFilledEvidence{}, fmt.Errorf(
 			"RPC latest block fell from %d to %d; possible reorganization or stale backend",
 			firstLatest, secondLatest,
@@ -223,15 +229,18 @@ func (reader *OrderFilledEvidenceReader) Read(
 	if err := reader.observeLatestBlock(secondLatest); err != nil {
 		return OrderFilledEvidence{}, err
 	}
-	if secondLatest < secondEvidence.BlockNumber {
+	// Count confirmations from the lower of the two heads so a tolerated lag can
+	// only understate finality depth.
+	confirmedHead := min(firstLatest, secondLatest)
+	if confirmedHead < secondEvidence.BlockNumber {
 		return OrderFilledEvidence{}, fmt.Errorf(
-			"RPC latest block %d is behind receipt block %d", secondLatest, secondEvidence.BlockNumber,
+			"RPC latest block %d is behind receipt block %d", confirmedHead, secondEvidence.BlockNumber,
 		)
 	}
-	if secondLatest-secondEvidence.BlockNumber == math.MaxUint64 {
+	if confirmedHead-secondEvidence.BlockNumber == math.MaxUint64 {
 		return OrderFilledEvidence{}, fmt.Errorf("confirmation count overflows uint64")
 	}
-	confirmations := secondLatest - secondEvidence.BlockNumber + 1
+	confirmations := confirmedHead - secondEvidence.BlockNumber + 1
 	secondEvidence.Confirmations = confirmations
 	if confirmations < reader.requiredConfirmations {
 		// The receipt is canonical and stable, only not deep enough yet. Return
@@ -244,10 +253,13 @@ func (reader *OrderFilledEvidenceReader) Read(
 	return secondEvidence, nil
 }
 
+// observeLatestBlock tolerates a head up to maxTolerableLatestBlockLag below the
+// highest one already observed. The high-water mark is never lowered.
 func (reader *OrderFilledEvidenceReader) observeLatestBlock(latest uint64) error {
 	reader.mu.Lock()
 	defer reader.mu.Unlock()
-	if reader.hasLatestBlock && latest < reader.highestLatestBlock {
+	if reader.hasLatestBlock && latest < reader.highestLatestBlock &&
+		reader.highestLatestBlock-latest > maxTolerableLatestBlockLag {
 		return fmt.Errorf(
 			"RPC latest block regressed from previously observed %d to %d",
 			reader.highestLatestBlock, latest,

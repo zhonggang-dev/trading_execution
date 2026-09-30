@@ -570,8 +570,8 @@ func (config Config) Validate() error {
 		if comparison, err := config.Polymarket.MaxBuyFeeRateBPS.Compare("10000"); err != nil || comparison > 0 {
 			return fmt.Errorf("POLYMARKET_MAX_BUY_FEE_RATE_BPS must not exceed 10000")
 		}
-		if config.LiveOperations.Interval < 5*time.Second || config.LiveOperations.Interval > 15*time.Second {
-			return fmt.Errorf("LIVE_OPERATIONS_INTERVAL must be between 5s and 15s in live mode")
+		if config.LiveOperations.Interval < 5*time.Second || config.LiveOperations.Interval > 60*time.Second {
+			return fmt.Errorf("LIVE_OPERATIONS_INTERVAL must be between 5s and 60s in live mode")
 		}
 		if config.LiveOperations.RefreshTimeout >= config.LiveOperations.Interval {
 			return fmt.Errorf("LIVE_OPERATIONS_REFRESH_TIMEOUT must be less than LIVE_OPERATIONS_INTERVAL")

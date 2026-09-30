@@ -38,10 +38,9 @@ type accountRunScope struct {
 // non-terminal orders and protected terminal orders are selected independently
 // by ListForReconciliation, so a restart still recovers ambiguous work without
 // replaying every historical terminal order and venue trade before HTTP opens.
-func reconciliationScanStart(now time.Time, lookback time.Duration, trigger domain.ReconciliationTrigger) time.Time {
-	if trigger == domain.ReconciliationTriggerAssetDrift {
-		return time.Time{}
-	}
+// ASSET_DRIFT uses the same window: a full-history scan timed out on large
+// wallets and adds no coverage beyond the scheduled lookback scans.
+func reconciliationScanStart(now time.Time, lookback time.Duration, _ domain.ReconciliationTrigger) time.Time {
 	return now.Add(-lookback)
 }
 
