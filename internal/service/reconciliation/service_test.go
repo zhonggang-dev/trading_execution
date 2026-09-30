@@ -365,6 +365,35 @@ func TestStartupUsesBoundedLookbackWithoutAccountBaseline(t *testing.T) {
 	}
 }
 
+func TestAssetDriftUsesBoundedLookbackWithoutAccountBaseline(t *testing.T) {
+	venue := &fakeVenue{}
+	orders := &fakeOrders{}
+	service := newTestService(t, Params{
+		Orders: orders, Venue: venue, Ledger: &fakeLedger{balance: testBalance("100")},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{},
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{Asset: "USDC", Amount: "100", Source: "CHAIN", ObservedAt: testNow}, nil
+		})},
+	})
+
+	_, err := service.RunAccount(context.Background(), RunAccountParams{
+		ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerAssetDrift,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := testNow.Add(-defaultLookback)
+	if venue.tradesAfter.IsZero() || !venue.tradesAfter.Equal(want) {
+		t.Fatalf("venue trades after = %s, want asset-drift lookback %s", venue.tradesAfter, want)
+	}
+	if orders.updatedAfter.IsZero() || !orders.updatedAfter.Equal(want) {
+		t.Fatalf("local order scan after = %s, want asset-drift lookback %s", orders.updatedAfter, want)
+	}
+}
+
 func TestRunAccountFinalizesFailedRunAfterShutdownCancellation(t *testing.T) {
 	started := make(chan struct{})
 	venue := &blockingReconciliationVenue{started: started}

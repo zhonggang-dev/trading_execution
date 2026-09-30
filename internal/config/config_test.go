@@ -667,6 +667,43 @@ func TestLoadRejectsSharedLiveOperationsToken(t *testing.T) {
 	}
 }
 
+func TestLoadBoundsLiveOperationsInterval(t *testing.T) {
+	tests := []struct {
+		name      string
+		interval  string
+		maxAge    string
+		wantError string
+	}{
+		{name: "thirty seconds", interval: "30s", maxAge: "90s"},
+		{name: "upper bound", interval: "60s", maxAge: "90s"},
+		{name: "above upper bound", interval: "61s", maxAge: "90s", wantError: "between 5s and 60s"},
+		{name: "below lower bound", interval: "4s", maxAge: "30s", wantError: "between 5s and 60s"},
+		{name: "max age not greater than interval", interval: "30s", maxAge: "30s", wantError: "MAX_SNAPSHOT_AGE must be greater"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			t.Setenv("LIVE_OPERATIONS_INTERVAL", test.interval)
+			t.Setenv("LIVE_OPERATIONS_REFRESH_TIMEOUT", "3s")
+			t.Setenv("LIVE_OPERATIONS_MAX_SNAPSHOT_AGE", test.maxAge)
+			config, err := Load()
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if want, _ := time.ParseDuration(test.interval); config.LiveOperations.Interval != want {
+					t.Fatalf("interval = %s, want %s", config.LiveOperations.Interval, test.interval)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("Load() error = %v, want %q", err, test.wantError)
+			}
+		})
+	}
+}
+
 func TestLoadDoesNotRequireExecutionMonetaryCap(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)

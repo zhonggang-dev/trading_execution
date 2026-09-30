@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -35,6 +34,8 @@ type PositionClient struct {
 	interval      time.Duration
 	requestMu     sync.Mutex
 	nextRequestAt time.Time
+	sleep         func(context.Context, time.Duration) error
+	jitter        func(time.Duration) time.Duration
 }
 
 var _ port.ExternalPositionSource = (*PositionClient)(nil)
@@ -60,6 +61,7 @@ func NewPositionClient(params PositionClientParams) (*PositionClient, error) {
 	return &PositionClient{
 		baseURL: baseURL, httpClient: params.HTTPClient, now: params.Now,
 		interval: time.Second / time.Duration(params.RequestsPerSecond),
+		sleep:    sleepContext, jitter: defaultJitter,
 	}, nil
 }
 
@@ -98,23 +100,9 @@ func (client *PositionClient) ListExternalPositions(ctx context.Context, walletA
 		if err != nil {
 			return nil, err
 		}
-		if err := client.waitForRequest(ctx); err != nil {
-			return nil, err
-		}
-		response, err := client.httpClient.Do(request)
+		body, err := client.doWithRetry(ctx, request, "positions")
 		if err != nil {
-			return nil, fmt.Errorf("query Data API positions: %w", err)
-		}
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxPositionsResponseBytes+1))
-		response.Body.Close()
-		if readErr != nil {
-			return nil, fmt.Errorf("read Data API positions: %w", readErr)
-		}
-		if len(body) > maxPositionsResponseBytes {
-			return nil, fmt.Errorf("Data API positions response is too large")
-		}
-		if response.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("Data API positions HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+			return nil, err
 		}
 		var values []wirePosition
 		decoder := json.NewDecoder(bytes.NewReader(body))
