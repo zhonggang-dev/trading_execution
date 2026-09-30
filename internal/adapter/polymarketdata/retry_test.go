@@ -136,7 +136,7 @@ func TestPositionClientReturnsTypedErrorAfterRetryLimit(t *testing.T) {
 }
 
 func TestPositionClientDoesNotRetryNonTransientStatus(t *testing.T) {
-	for _, status := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
 		client, transport, waits := retryTestClient(t, time.Now(),
 			scriptedDataAPIResponse{status: status, body: "bad"},
 		)
@@ -256,5 +256,17 @@ func TestParseRetryAfterRejectsInvalidValues(t *testing.T) {
 	}
 	if wait, ok := parseRetryAfter(now.Add(-time.Minute).Format(http.TimeFormat), now); !ok || wait != 0 {
 		t.Fatalf("past HTTP date = %s, %v; want zero wait", wait, ok)
+	}
+}
+
+func TestPositionClientRetriesEveryServerError(t *testing.T) {
+	for _, status := range []int{http.StatusInternalServerError, http.StatusNotImplemented, http.StatusBadGateway} {
+		client, transport, _ := retryTestClient(t, time.Now(),
+			scriptedDataAPIResponse{status: status, body: "down"},
+			scriptedDataAPIResponse{status: http.StatusOK, body: "[]"},
+		)
+		if _, err := client.ListExternalPositions(context.Background(), "0xabc"); err != nil || transport.calls != 2 {
+			t.Fatalf("status %d: err = %v, calls = %d; want success after one retry", status, err, transport.calls)
+		}
 	}
 }
