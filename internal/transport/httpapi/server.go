@@ -79,10 +79,14 @@ type Params struct {
 	EdgeDistribution edgeDistributionService
 	Readiness        readinessChecker
 	ReadinessTimeout time.Duration
-	Logger           *slog.Logger
-	APIToken         string
-	JobToken         string
-	ReadOnlyToken    string
+	// WriteTimeout is the http.Server write deadline. The reconciliation job
+	// finishes its work before it so the response always reaches the caller.
+	// Zero leaves the request context unchanged.
+	WriteTimeout  time.Duration
+	Logger        *slog.Logger
+	APIToken      string
+	JobToken      string
+	ReadOnlyToken string
 }
 
 // Server 表示后端使用的 Server 类型。
@@ -95,6 +99,7 @@ type Server struct {
 	edgeDistribution edgeDistributionService
 	readinessChecker readinessChecker
 	readinessTimeout time.Duration
+	jobBudget        time.Duration
 	logger           *slog.Logger
 	apiToken         string
 	jobToken         string
@@ -136,6 +141,7 @@ func New(params Params) (*Server, error) {
 		edgeDistribution: params.EdgeDistribution,
 		readinessChecker: params.Readiness,
 		readinessTimeout: params.ReadinessTimeout,
+		jobBudget:        reconciliationJobBudget(params.WriteTimeout),
 		logger:           params.Logger,
 		apiToken:         apiToken,
 		jobToken:         jobToken,
@@ -595,7 +601,13 @@ func (server *Server) runReconciliation(writer http.ResponseWriter, request *htt
 		return
 	}
 	params := reconciliation.RunAccountParams{ExecutionAccountID: input.ExecutionAccountID, Trigger: input.Trigger, FocusOrderID: input.FocusOrderID}
-	result, err := server.reconciliation.RunAccount(request.Context(), params)
+	ctx := request.Context()
+	if server.jobBudget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, server.jobBudget)
+		defer cancel()
+	}
+	result, err := server.reconciliation.RunAccount(ctx, params)
 	if err != nil {
 		writeJSON(writer, http.StatusBadGateway, map[string]any{
 			"data": result,
@@ -606,6 +618,23 @@ func (server *Server) runReconciliation(writer http.ResponseWriter, request *htt
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{"data": result})
+}
+
+// reconciliationJobWriteMargin is reserved between the end of a manual
+// reconciliation and the HTTP write deadline for encoding the response.
+const reconciliationJobWriteMargin = 10 * time.Second
+
+// reconciliationJobBudget returns the deadline for a manual reconciliation so
+// the response is written before http.Server closes the connection. A short
+// write timeout keeps half of it for the response.
+func reconciliationJobBudget(writeTimeout time.Duration) time.Duration {
+	if writeTimeout <= 0 {
+		return 0
+	}
+	if writeTimeout <= 2*reconciliationJobWriteMargin {
+		return writeTimeout / 2
+	}
+	return writeTimeout - reconciliationJobWriteMargin
 }
 
 // handleExecutionError 将执行领域错误映射为稳定的 HTTP 状态和错误码。

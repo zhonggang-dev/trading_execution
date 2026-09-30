@@ -58,6 +58,12 @@ const (
 	// out of the wallet that is neither a venue trade nor known system flow. It
 	// blocks the whole account and is never closed automatically.
 	ReconciliationIssueUnattributedCashOut ReconciliationIssueType = "UNATTRIBUTED_CASH_OUT"
+	// ReconciliationIssueRedemptionApplyStalled records a redemption the chain
+	// confirmed longer than the ambiguity timeout ago that the ledger still has
+	// not applied. The chain outcome is final and auto redeem keeps retrying, so
+	// it is observation only: the in-flight exemption stays and nothing is
+	// blocked. It closes automatically once the redemption becomes APPLIED.
+	ReconciliationIssueRedemptionApplyStalled ReconciliationIssueType = "REDEMPTION_APPLY_STALLED"
 )
 
 // ReconciliationResolution 表示后端使用的 ReconciliationResolution 类型。
@@ -253,6 +259,10 @@ func ClassifyReconciliationImpact(issue ReconciliationIssue) ReconciliationImpac
 		return ReconciliationImpactAccount
 	case ReconciliationIssueUnattributedCashIn:
 		// Unknown incoming money never reduces what the account can pay.
+		return ReconciliationImpactNone
+	case ReconciliationIssueRedemptionApplyStalled:
+		// The wallet already holds the payout the ledger is missing, and the
+		// settled position cannot trade; a behind ledger never overspends.
 		return ReconciliationImpactNone
 	case ReconciliationIssueSourceUnavailable,
 		ReconciliationIssueSubmitUnconfirmed, ReconciliationIssueFillFinalityStalled,

@@ -21,6 +21,8 @@ func TestClassifyReconciliationImpact(t *testing.T) {
 		{"position drift", ReconciliationIssue{Type: ReconciliationIssuePositionDrift, Resolution: ReconciliationResolutionManual, Status: ReconciliationIssueOpen, TokenID: "t"}, ReconciliationImpactToken},
 		{"phantom without token", ReconciliationIssue{Type: ReconciliationIssuePhantomPosition, Resolution: ReconciliationResolutionManual, Status: ReconciliationIssueOpen}, ReconciliationImpactAccount},
 		{"external trade", ReconciliationIssue{Type: ReconciliationIssueExternalTrade, Resolution: ReconciliationResolutionManual, Status: ReconciliationIssueOpen, TokenID: "t"}, ReconciliationImpactToken},
+		{"stalled redemption apply", ReconciliationIssue{Type: ReconciliationIssueRedemptionApplyStalled, Resolution: ReconciliationResolutionObserved, Status: ReconciliationIssueOpen, ConditionID: "c"}, ReconciliationImpactNone},
+		{"stalled redemption apply never blocks", ReconciliationIssue{Type: ReconciliationIssueRedemptionApplyStalled, Resolution: ReconciliationResolutionManual, Status: ReconciliationIssueOpen}, ReconciliationImpactNone},
 		{"unknown type fails closed", ReconciliationIssue{Type: "SOMETHING_NEW", Resolution: ReconciliationResolutionRetry, Status: ReconciliationIssueOpen, TokenID: "t"}, ReconciliationImpactAccount},
 	}
 	for _, testCase := range cases {

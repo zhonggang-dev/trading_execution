@@ -172,6 +172,7 @@ func (recorder *ReconciliationRecorder) CompleteWithState(ctx context.Context, r
 			resolveFillLagDriftIssues, resolvePolymarketPositionPrecisionIssues,
 			resolveRecoveredSellPositionDriftIssues, resolveVerifiedTransientIssues,
 			resolveRecoveredSellPositionTrajectoryIssues,
+			resolveAppliedRedemptionStalledIssues,
 		}
 		// Wallet migration crosses scopes and retains its original full-scan guard.
 		if run.Status == domain.ReconciliationRunCompleted {
@@ -518,6 +519,44 @@ func resolveWalletMigrationIssues(ctx context.Context, tx *sql.Tx, run domain.Re
 	resolved, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("count resolved wallet-migration reconciliation issues: %w", err)
+	}
+	return int(resolved), nil
+}
+
+// resolveAppliedRedemptionStalledIssues closes an OPEN REDEMPTION_APPLY_STALLED
+// observation once the redemption of the same account and condition has been
+// applied to the ledger and the current run did not report it again. The
+// observation never blocked trading, so the APPLIED row is the whole evidence.
+func resolveAppliedRedemptionStalledIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
+	const resolvedDetails = "; automatically resolved after the confirmed redemption was applied to the ledger"
+	result, err := tx.ExecContext(ctx, `
+		UPDATE reconciliation_issues issue
+		SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+		    details=issue.details || $4
+		FROM polymarket_redemptions redemption
+		WHERE issue.execution_account_id=$1
+		  AND issue.status='OPEN'
+		  AND issue.issue_type='REDEMPTION_APPLY_STALLED'
+		  AND issue.run_id<>$2
+		  AND issue.condition_id<>''
+		  AND redemption.execution_account_id=issue.execution_account_id
+		  AND redemption.condition_id=LOWER(issue.condition_id)
+		  AND redemption.status='APPLIED'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM reconciliation_issues reproduced
+		    WHERE reproduced.execution_account_id=issue.execution_account_id
+		      AND reproduced.run_id=$2
+		      AND reproduced.status='OPEN'
+		      AND reproduced.issue_type='REDEMPTION_APPLY_STALLED'
+		      AND LOWER(reproduced.condition_id)=LOWER(issue.condition_id)
+		  )`,
+		run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails)
+	if err != nil {
+		return 0, fmt.Errorf("resolve applied redemption stall issues: %w", err)
+	}
+	resolved, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count resolved redemption stall issues: %w", err)
 	}
 	return int(resolved), nil
 }

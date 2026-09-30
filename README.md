@@ -113,8 +113,10 @@ transactional outbox 会与账本同事务写入，但生产消息 publisher 仍
 链上余额恰好增加对应 payout 都不会被记为 MANUAL_REVIEW 漂移，因此全自动赎回不会把账户的下单风控卡死。
 入账（APPLIED）后 30 分钟内，若 Data API 仍列出已烧毁的 token 且数量精确等于已赎回份额，只记 `RETRY_LATER`
 并在下一次干净对账自动关闭。CONFIRMED 回执与账本证据不一致（payout 不等于份额×结算价、lot 合计不等于仓位、
-baseline 残留）时不再无限重试，而是转 `MANUAL_REVIEW`，让对账如实报出漂移；relayer 长时间 pending、回执长时间
-不最终化的提交同样在 `POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT` 后升级为 `MANUAL_REVIEW`。
+baseline 残留）时不再无限重试，而是转 `MANUAL_REVIEW`，让对账如实报出漂移；其他入账失败按退避持续重试、
+不因超时转人工，超过 `POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT` 后每次失败打 ERROR 日志，对账记不拦单的
+`REDEMPTION_APPLY_STALLED`。relayer 长时间 pending、回执长时间不最终化的提交仍在
+`POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT` 后升级为 `MANUAL_REVIEW`。
 `POLYMARKET_AUTO_REDEEM_ENABLED` 默认 `false`；
 Deposit Wallet 还必须在受限钱包文件中配置独立 relayer key，缺少时 live 启动 fail closed。
 策略周期已经使用 prediction_infra HTTP snapshot、
@@ -169,7 +171,7 @@ GET  /api/v1/trades                              # 已确认且已入账的真�
 GET  /api/v1/ledger-activities                   # 统一账本活动：BUY / SELL 成交 + REDEEM 赎回结算
 GET  /api/v1/daily-pnl                           # UTC 日 × 执行账户 × 策略的净已实现盈亏（SELL 平仓 + REDEEM）
 POST /internal/jobs/position-exit-evaluation/run  # 仅在注入 PositionExitJob 后注册，当前 cmd/server 未装配
-POST /internal/jobs/reconciliation/run             # live 模式注册；paper 模式不注册
+POST /internal/jobs/reconciliation/run             # live 模式注册（经 Runner：共用钱包锁与账户超时）；paper 模式不注册
 ```
 
 查询交易记录：

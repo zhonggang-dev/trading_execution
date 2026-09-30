@@ -242,12 +242,18 @@ func (service *Service) processRedeemSubmitted(ctx context.Context, redemption d
 	return service.confirmReceipt(ctx, redemption, transactionHash, redemption.SubmittedAt, now)
 }
 
+// maxConfirmedApplyRetryInterval caps the backoff between ledger apply attempts
+// for a redemption the chain has already confirmed.
+const maxConfirmedApplyRetryInterval = 5 * time.Minute
+
 // applyConfirmed writes a confirmed redemption into the ledger. The chain has
-// already burned the shares and paid the collateral, so the ledger is behind
-// until this succeeds. A permanent evidence mismatch can never be repaired by
-// retrying; it moves to MANUAL_REVIEW so reconciliation stops treating the
-// condition as in flight and reports the resulting drift. Transient failures
-// retry until the confirmation is older than the ambiguity timeout.
+// already burned the shares and paid the collateral, so the outcome is final
+// and the ledger is merely behind until this succeeds. A permanent evidence
+// mismatch can never be repaired by retrying; it moves to MANUAL_REVIEW so
+// reconciliation stops treating the condition as in flight and reports the
+// resulting drift. Every other failure keeps retrying with a bounded backoff:
+// escalating on elapsed time alone would strand the ledger behind the chain
+// with no code path back to a processable state.
 func (service *Service) applyConfirmed(ctx context.Context, redemption domain.Redemption, now time.Time) error {
 	err := service.store.ApplyRedemption(ctx, redemption, now)
 	if err == nil {
@@ -256,10 +262,47 @@ func (service *Service) applyConfirmed(ctx context.Context, redemption domain.Re
 	if isPermanent(err) {
 		return service.review(ctx, redemption, "confirmed redemption cannot be applied to the ledger: "+err.Error(), now)
 	}
+	return service.retryConfirmed(ctx, redemption, err, now)
+}
+
+// retryConfirmed schedules the next ledger apply attempt of a confirmed
+// redemption. Before the ambiguity timeout the normal retry interval applies.
+// After it, the interval grows with the time elapsed since confirmation
+// (a quarter of it, at least the retry interval, at most five minutes) and
+// every failure is logged at ERROR so a stalled apply is never silent. The
+// backoff is derived from ConfirmedAt rather than an attempt counter because
+// RetryRedemption does not count attempts outside the submission phase.
+func (service *Service) retryConfirmed(ctx context.Context, redemption domain.Redemption, cause error, now time.Time) error {
+	next := now.Add(service.confirmedApplyRetryInterval(redemption.ConfirmedAt, now))
 	if expired(redemption.ConfirmedAt, now, service.ambiguityTimeout) {
-		return service.review(ctx, redemption, "confirmed redemption kept failing to apply beyond the ambiguity timeout: "+err.Error(), now)
+		elapsed := time.Duration(0)
+		if redemption.ConfirmedAt != nil {
+			elapsed = now.Sub(*redemption.ConfirmedAt)
+		}
+		service.logger.Error("confirmed Polymarket redemption keeps failing to apply to the ledger",
+			"execution_account_id", redemption.ExecutionAccountID,
+			"condition_id", redemption.ConditionID,
+			"transaction_hash", redemption.TransactionHash,
+			"failing_for", elapsed.String(),
+			"next_attempt_at", next,
+			"last_error", cause.Error(),
+		)
 	}
-	return service.retry(ctx, redemption, err, now)
+	if err := service.store.RetryRedemption(ctx, redemption, cause.Error(), next); err != nil {
+		return errors.Join(cause, err)
+	}
+	return cause
+}
+
+func (service *Service) confirmedApplyRetryInterval(confirmedAt *time.Time, now time.Time) time.Duration {
+	if !expired(confirmedAt, now, service.ambiguityTimeout) {
+		return service.retryInterval
+	}
+	if confirmedAt == nil {
+		return maxConfirmedApplyRetryInterval
+	}
+	interval := max(service.retryInterval, now.Sub(*confirmedAt)/4)
+	return min(interval, maxConfirmedApplyRetryInterval)
 }
 
 // pendingOrReview keeps waiting for a venue-reported pending submission until

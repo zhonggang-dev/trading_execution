@@ -93,6 +93,19 @@ Runner 的异常队列不阻塞下单线程。即使进程在入队前崩溃，�
 互斥范围只覆盖同一 execution account；其它钱包继续独立对账。数据库中的订单幂等、预占、风险闸门
 和订单级恢复租约仍是权威安全边界，该进程内执行门不替代任何持久化保护。
 
+手工触发接口经过 Runner（`Runner.RunAccount`），而不是直接调用对账服务：与定时对账、批量下单共用
+同一把钱包锁和同一个账户超时（默认 2 分钟，排队时间也计入），结果写入 Runner 的最新结果，下单前的
+就绪检查据此判断。手工触发不因决策周期推迟。HTTP 处理函数还把截止时间收紧为
+`HTTP_WRITE_TIMEOUT - 10s`（写超时不超过 20 秒时取其一半），保证在连接被关闭前写出响应。两种超时的区别：
+
+- 等锁超时（尚未开始执行）：不写最新结果、保留上一次结果，返回 502 `RECONCILIATION_INCOMPLETE`，
+  错误信息注明 “timed out waiting for the execution account lock; reconciliation did not run”。
+- 执行中超时：结果记为 `FAILED` 并写入最新结果，与定时对账失败一样使该钱包拒单，直到下一次成功的对账。
+
+只允许 Runner 管理的活动钱包；隔离（quarantined）或未配置的钱包直接报错。响应格式不变：
+成功 `200 {"data": Result}`；失败 `502 {"data": Result, "error": {"code": "RECONCILIATION_INCOMPLETE", ...}}`；
+参数错误仍为 400。
+
 手工触发示例：
 
 ```http
@@ -227,11 +240,20 @@ Data API 找候选交易并用 Polygon 回执验证，禁止盲目重发。
 赎回状态机的每个等待都有上界，避免一条记录永远占用对账豁免：
 
 - `CONFIRMED` 入账失败时区分原因。回执 payout 与 `shares × settlement_price` 不精确相等、settled lot 合计不等于
-  仓位、baseline 残留等证据类失败重试也不会改变，立即转 `MANUAL_REVIEW`；数据库等瞬时失败按 retry interval
-  重试，confirmed_at 超过 `POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT` 后同样转 `MANUAL_REVIEW`。
+  仓位、baseline 残留等证据类失败重试也不会改变，立即转 `MANUAL_REVIEW`。其他失败（数据库超时、锁冲突、网络、
+  可修复的约束错误）一律持续重试，永不因超时转人工：链上结果已经确定，账本只是落后，转人工只会让它永远落后。
+  confirmed_at 起 `POLYMARKET_AUTO_REDEEM_AMBIGUITY_TIMEOUT` 内按 retry interval 重试；之后间隔为
+  `min(5 分钟, max(retry interval, (now - confirmed_at) / 4))`，每次失败打 ERROR 日志
+  （`execution_account_id`、`condition_id`、`transaction_hash`、`failing_for`、`last_error`），
+  `polymarket_redemptions.last_error` 保存最近错误。
+- 对账同时对 confirmed_at 超过同一 ambiguity timeout 仍未入账的 `CONFIRMED` 赎回记
+  `REDEMPTION_APPLY_STALLED`（`OBSERVED_ONLY`、`impact_scope=NONE`、带 `condition_id`）。它不拦单，
+  在途豁免照常生效（钱包的钱只会比账本多，已结算仓位本来也不能交易）；该赎回变为 `APPLIED` 且
+  当轮未再现时自动关闭。
 - `APPROVAL_SUBMITTED` / `REDEEM_SUBMITTED` 在 relayer 持续返回 pending、没有 tx hash、或回执迟迟不最终化时，
   自 submitted_at 起超过 ambiguity timeout 即转 `MANUAL_REVIEW`。
-- 进入 `MANUAL_REVIEW` 后该 condition 不再被视为 in-flight，对账会如实报出仓位缺失与余额多出，由人工处理。
+- 进入 `MANUAL_REVIEW`（只可能来自永久证据错误，或提交/确认阶段的超时）后该 condition 不再被视为
+  in-flight，对账会如实报出仓位缺失与余额多出，由人工处理。
 
 ## 必须人工核查
 

@@ -3,11 +3,14 @@ package reconciliation
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
 
 type redemptionProgressFunc func(context.Context, string) ([]domain.InFlightRedemption, error)
@@ -392,5 +395,103 @@ func TestAppliedRedemptionReadFailureSkipsAssetComparisonWithoutManualDrift(t *t
 			}
 			assertIssue(t, result.Issues, domain.ReconciliationIssueSourceUnavailable, domain.ReconciliationIssueOpen)
 		})
+	}
+}
+
+func confirmedInFlightRedemption(confirmedAt time.Time) domain.InFlightRedemption {
+	redemption := inFlightRedemption(domain.RedemptionConfirmed, "3.35")
+	redemption.ConfirmedAt = &confirmedAt
+	return redemption
+}
+
+func TestStalledConfirmedRedemptionIsObservedWithoutBlocking(t *testing.T) {
+	for name, tc := range map[string]struct {
+		confirmedAgo time.Duration
+		stallAfter   time.Duration
+		wantStalled  bool
+	}{
+		"within default threshold":    {confirmedAgo: 14 * time.Minute, wantStalled: false},
+		"at default threshold":        {confirmedAgo: 15 * time.Minute, wantStalled: true},
+		"long past default threshold": {confirmedAgo: 6 * time.Hour, wantStalled: true},
+		"within configured threshold": {confirmedAgo: 20 * time.Minute, stallAfter: 30 * time.Minute, wantStalled: false},
+		"past configured threshold":   {confirmedAgo: 31 * time.Minute, stallAfter: 30 * time.Minute, wantStalled: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ledger := &fakeLedger{balance: testBalance("100"), positions: []domain.Position{settledPendingRedeemPosition()}}
+			service := newTestService(t, Params{
+				Orders: &fakeOrders{}, Venue: &fakeVenue{}, Ledger: ledger,
+				Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{},
+				RedemptionApplyStallAfter: tc.stallAfter,
+				Redemptions: redemptionProgressFunc(func(context.Context, string) ([]domain.InFlightRedemption, error) {
+					return []domain.InFlightRedemption{confirmedInFlightRedemption(testNow.Add(-tc.confirmedAgo))}, nil
+				}),
+				PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+					return nil, nil
+				})},
+				BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+					return domain.ExternalBalance{Asset: "USDC", Amount: "103.35", Source: "CHAIN", ObservedAt: testNow}, nil
+				})},
+			})
+			result, err := service.RunAccount(context.Background(), RunAccountParams{
+				ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+			})
+			if err != nil {
+				t.Fatalf("RunAccount() error = %v", err)
+			}
+			// The in-flight exemption stays: neither the vanished settled position
+			// nor the payout-sized balance gain is drift.
+			if hasIssue(result.Issues, domain.ReconciliationIssuePositionDrift) || hasIssue(result.Issues, domain.ReconciliationIssueBalanceDrift) {
+				t.Fatalf("stalled confirmed redemption lost its in-flight exemption: %#v", result.Issues)
+			}
+			if !tc.wantStalled {
+				if len(result.Issues) != 0 || result.Run.Status != domain.ReconciliationRunCompleted {
+					t.Fatalf("fresh confirmation status/issues = %s/%#v, want COMPLETED without issues", result.Run.Status, result.Issues)
+				}
+				return
+			}
+			if len(result.Issues) != 1 {
+				t.Fatalf("issues = %#v, want exactly one REDEMPTION_APPLY_STALLED", result.Issues)
+			}
+			issue := result.Issues[0]
+			if issue.Type != domain.ReconciliationIssueRedemptionApplyStalled || issue.Status != domain.ReconciliationIssueOpen ||
+				issue.Resolution != domain.ReconciliationResolutionObserved || issue.ImpactScope != domain.ReconciliationImpactNone ||
+				issue.ConditionID != "0xcondition-1" || issue.Source != "POSTGRES_REDEMPTIONS" {
+				t.Fatalf("stalled issue = %#v, want OPEN OBSERVED_ONLY NONE with the condition id", issue)
+			}
+			if result.Impact.AccountWide || len(result.Impact.TokenIDs) != 0 || len(result.Impact.OrderIDs) != 0 {
+				t.Fatalf("stalled redemption impact = %#v, want nothing blocked", result.Impact)
+			}
+			if result.Run.Summary["redemption_apply_stalled"] != 1 {
+				t.Fatalf("summary = %#v, want redemption_apply_stalled=1", result.Run.Summary)
+			}
+			intent := domain.OrderIntent{ExecutionAccountID: "account-1", MarketID: "market-1", ConditionID: "0xcondition-1", TokenID: "token-1"}
+			if issue.BlocksIntent(intent) {
+				t.Fatalf("stalled redemption observation blocks an intent on its own condition")
+			}
+		})
+	}
+}
+
+func TestRedemptionApplyStallThresholdIsValidated(t *testing.T) {
+	_, err := New(Params{
+		Orders: &fakeOrders{}, Venue: &fakeVenue{}, Ledger: &fakeLedger{balance: testBalance("0")},
+		Fills: &fakeFills{}, OrderRefresher: &fakeRefresher{}, Recorder: &fakeRecorder{},
+		PositionBaselines: positionBaselineSourceFunc(func(context.Context, string) ([]domain.ExternalPositionBaseline, error) {
+			return nil, nil
+		}),
+		PositionDispositionTrades: positionDispositionTradeSourceFunc(func(context.Context, string) ([]domain.ExternalPositionDispositionTrade, error) {
+			return nil, nil
+		}),
+		PositionSources: []port.ExternalPositionSource{positionSourceFunc(func(context.Context, string) ([]domain.ExternalPosition, error) {
+			return nil, nil
+		})},
+		BalanceSources: []port.ExternalBalanceSource{balanceSourceFunc(func(context.Context, string, string) (domain.ExternalBalance, error) {
+			return domain.ExternalBalance{}, nil
+		})},
+		Recovery:                  newTestRecoveryGuard(t, memory.NewOrderRecoveryLeaseStore(), orderrecovery.Policy{}),
+		RedemptionApplyStallAfter: 30 * time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "redemption apply stall threshold") {
+		t.Fatalf("New() error = %v, want the stall threshold validation", err)
 	}
 }

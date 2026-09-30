@@ -99,6 +99,9 @@ type InFlightRedemption struct {
 	// the confirmed receipt payout when known, otherwise the managed binary
 	// payout (shares × settlement price) that ApplyRedemption will enforce.
 	ExpectedPayout Decimal `json:"expected_payout"`
+	// ConfirmedAt is when the redeem receipt reached the configured depth. It
+	// is set only for CONFIRMED redemptions.
+	ConfirmedAt *time.Time `json:"confirmed_at,omitempty"`
 }
 
 // InFlight reports whether a redemption status may already have mutated the

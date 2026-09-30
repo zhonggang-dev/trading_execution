@@ -613,11 +613,36 @@ func (runner *Runner) Sweep(ctx context.Context, trigger domain.ReconciliationTr
 	return result
 }
 
+// RunAccount executes one on-demand reconciliation through the same
+// per-account slot, account timeout, and result bookkeeping as scheduled runs,
+// so a manual run can never overlap decision delivery or another
+// reconciliation of the same wallet. It never defers for the decision cycle.
+// If the account slot is not acquired before the deadline nothing runs, and
+// the previous result is kept; a run that times out after starting is
+// remembered as FAILED like any scheduled run.
+func (runner *Runner) RunAccount(ctx context.Context, params RunAccountParams) (Result, error) {
+	params = params.normalize()
+	if _, quarantined := runner.quarantined[params.ExecutionAccountID]; quarantined {
+		return Result{}, fmt.Errorf("execution account %q is quarantined from reconciliation", params.ExecutionAccountID)
+	}
+	if _, active := runner.active[params.ExecutionAccountID]; !active {
+		return Result{}, fmt.Errorf("execution account %q is not active for reconciliation", params.ExecutionAccountID)
+	}
+	return runner.runAccount(ctx, params)
+}
+
 func (runner *Runner) runAccount(ctx context.Context, params RunAccountParams) (Result, error) {
 	runCtx, cancel := context.WithTimeout(ctx, runner.accountTimeout)
 	defer cancel()
 	release, err := runner.AcquireExecutionAccount(runCtx, params.ExecutionAccountID)
 	if err != nil {
+		if runCtx.Err() != nil {
+			// Nothing ran, so there is no new evidence: keep the previous result
+			// instead of overwriting a healthy account with an unattempted run.
+			return Result{}, fmt.Errorf(
+				"reconcile %s: timed out waiting for the execution account lock; reconciliation did not run: %w",
+				params.ExecutionAccountID, err)
+		}
 		return Result{}, err
 	}
 	defer release()
