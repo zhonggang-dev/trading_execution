@@ -26,6 +26,7 @@ var (
 
 const (
 	clobFillDetailsUnavailableCode   = "CLOB_FILL_DETAILS_UNAVAILABLE"
+	clobOrderNotFoundCode            = "CLOB_ORDER_NOT_FOUND"
 	kalshiOrderVisibilityPendingCode = "KALSHI_ORDER_VISIBILITY_PENDING"
 	venueFillEvidencePendingCode     = "VENUE_FILL_EVIDENCE_PENDING"
 	accountNotActiveCode             = "EXECUTION_ACCOUNT_NOT_ACTIVE"
@@ -833,6 +834,9 @@ func (service *Service) FinalizeCancellation(ctx context.Context, orderID string
 	// coordinator pass.
 	observed, err := service.venue.Get(ctx, order)
 	if err != nil {
+		if errorCode(err, "") == clobOrderNotFoundCode {
+			return service.finalizeRetiredCancellation(ctx, order, err)
+		}
 		uncertainErr := service.reservations.MarkUncertain(ctx, order, "CANCEL_FINALITY_ORDER_READ_FAILED: "+err.Error())
 		deferErr := service.deferCancellationFinality(ctx, &order, "CANCEL_FINALITY_ORDER_READ_FAILED", err.Error())
 		return order, errors.Join(fmt.Errorf("read cancelled venue order before finality: %w", err), uncertainErr, deferErr)
