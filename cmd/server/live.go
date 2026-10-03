@@ -36,6 +36,8 @@ import (
 
 const polymarketCollateralAsset = "pUSD"
 
+const reconciliationAccountTimeout = 6 * time.Minute
+
 // liveRuntime 保存已经通过预检的实盘依赖图和后台服务。
 type liveRuntime struct {
 	repository     *postgresadapter.OrderRepository
@@ -452,7 +454,11 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		QuarantinedAccounts: quarantinedAccountIDs,
 		Interval:            cfg.Polymarket.ReconciliationInterval,
 		ScheduleOffset:      cfg.Polymarket.ReconciliationScheduleOffset,
-		Logger:              logger,
+		// Wallet 6 runs take ~150s against the free-tier RPC; the 2-minute
+		// default timed out 257 runs on 2026-10-01/02. Must stay below
+		// MaxResultAge (3 x interval, 15m at most).
+		AccountTimeout: reconciliationAccountTimeout,
+		Logger:         logger,
 	})
 	if err != nil {
 		return nil, err
