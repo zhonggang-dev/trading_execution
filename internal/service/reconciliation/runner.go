@@ -93,10 +93,11 @@ const (
 	defaultRunnerInterval = 5 * time.Minute
 	maximumRunnerAge      = 24 * time.Hour
 
-	// decisionLead must cover one reconciliation run (about 51s worst case
-	// observed for wallet-6) so a deferred run cannot still hold the account
-	// lock when the decision cycle wants to submit its batch.
-	decisionLead = 60 * time.Second
+	// decisionLead must cover one reconciliation run so a run that starts
+	// cannot still hold the account lock when the decision cycle wants to
+	// submit its batch. Wallet-6 runs took 150-230s on 2026-10-03 (51s on
+	// 2026-09-30); 240s keeps the x8:30 run behind the x0:00 decision cycle.
+	decisionLead = 240 * time.Second
 	// maxDecisionDefer bounds how long SCHEDULED reconciliation yields, so a
 	// stuck decision cycle cannot starve risk-state freshness. Interval plus
 	// this cap plus one run stays below the 600s placement max_state_age.
