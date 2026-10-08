@@ -201,6 +201,14 @@ type ReconciliationIssueOrderRepository interface {
 	ListWithOpenReconciliationIssues(ctx context.Context, executionAccountID string) ([]domain.Order, error)
 }
 
+// ReconciliationFillRepository lists the local fills that are CONFIRMED and
+// already applied to the ledger. Reconciliation uses it only to skip re-reading
+// a FILLED order whose venue trades are all accounted for; any read error must
+// leave the order on the full synchronization path.
+type ReconciliationFillRepository interface {
+	ListAppliedConfirmedFills(ctx context.Context, executionAccountID string, matchedAfter time.Time) ([]domain.AppliedFillRef, error)
+}
+
 // VenueReconciliationSource 表示后端使用的 VenueReconciliationSource 类型。
 type VenueReconciliationSource interface {
 	ListReconciliationOpenOrders(ctx context.Context, executionAccountID string) ([]domain.VenueOrderSnapshot, error)
