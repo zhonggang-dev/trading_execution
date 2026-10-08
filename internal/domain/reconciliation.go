@@ -147,6 +147,13 @@ type VenueTradeSnapshot struct {
 	ObservedAt   time.Time  `json:"observed_at"`
 }
 
+// AppliedFillRef identifies one CONFIRMED fill component that is already
+// applied to the local ledger.
+type AppliedFillRef struct {
+	VenueOrderID string `json:"venue_order_id"`
+	VenueFillID  string `json:"venue_fill_id"`
+}
+
 // ExternalPosition 表示后端使用的 ExternalPosition 类型。
 type ExternalPosition struct {
 	ConditionID  string    `json:"condition_id"`

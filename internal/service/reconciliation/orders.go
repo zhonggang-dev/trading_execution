@@ -23,7 +23,10 @@ type reconcileOrderParams struct {
 	order         domain.Order
 	focusOrderID  string
 	forceFillSync bool
-	evidence      venueEvidence
+	// settled marks a FILLED order whose every venue trade is CONFIRMED and
+	// already applied locally: its per-order trade re-read can change nothing.
+	settled  bool
+	evidence venueEvidence
 }
 
 // orderSourceIssueParams 收拢单张订单外部数据源异常的记录信息。
@@ -53,7 +56,11 @@ func (state *runState) reconcileOrders(ctx context.Context, params reconcileOrde
 			return
 		}
 		_, forceFillSync := state.recovery.forceFillSync[order.ID]
-		state.reconcileOrder(ctx, reconcileOrderParams{order: order, focusOrderID: params.focusOrderID, evidence: params.evidence, forceFillSync: forceFillSync})
+		settled := !forceFillSync && order.ID != params.focusOrderID && orderSettledLocally(order, params.evidence)
+		if settled {
+			state.run.Summary["orders_sync_skipped_settled"]++
+		}
+		state.reconcileOrder(ctx, reconcileOrderParams{order: order, focusOrderID: params.focusOrderID, evidence: params.evidence, forceFillSync: forceFillSync, settled: settled})
 	}
 }
 
@@ -65,6 +72,7 @@ func (state *runState) reconcileOrder(ctx context.Context, params reconcileOrder
 		return
 	}
 	_, tradeReferenced := params.evidence.ordersWithTrades[normalizedID(params.order.VenueOrderID)]
+	tradeReferenced = tradeReferenced && !params.settled
 	if !params.forceFillSync && !shouldSyncOrderFills(params.order, params.focusOrderID, tradeReferenced) && !orderNeedsRefresh(params.order) {
 		stepCtx, cancel := context.WithTimeout(ctx, state.service.recovery.Policy().Timeout)
 		defer cancel()
@@ -92,6 +100,36 @@ func (state *runState) reconcileOrder(ctx context.Context, params reconcileOrder
 	}
 }
 
+// orderSettledLocally reports whether a FILLED order needs no per-order trade
+// re-read: the account-level trade scan succeeded, lists at least one trade
+// for it, every listed component is CONFIRMED, and each one is already a
+// CONFIRMED, ledger-applied local fill. Any gap keeps the full synchronization.
+func orderSettledLocally(order domain.Order, evidence venueEvidence) bool {
+	if order.Status != domain.OrderStatusFilled || !evidence.tradesAvailable || evidence.appliedFills == nil {
+		return false
+	}
+	venueOrderID := normalizedID(order.VenueOrderID)
+	if venueOrderID == "" {
+		return false
+	}
+	if _, pending := evidence.ordersWithPendingTrades[venueOrderID]; pending {
+		return false
+	}
+	trades := evidence.orderTrades[venueOrderID]
+	if len(trades) == 0 {
+		return false
+	}
+	for _, trade := range trades {
+		if !trade.confirmed || trade.tradeID == "" {
+			return false
+		}
+		if _, applied := evidence.appliedFills[appliedFillKey(venueOrderID, trade.tradeID)]; !applied {
+			return false
+		}
+	}
+	return true
+}
+
 // kind maps the evidence steps to the recovery outcome the lease persists.
 func (result orderStepResult) kind() domain.OrderRecoveryOutcomeKind {
 	switch {
@@ -108,6 +146,7 @@ func (result orderStepResult) kind() domain.OrderRecoveryOutcomeKind {
 func (state *runState) reconcileOrderSteps(ctx context.Context, params reconcileOrderParams) orderStepResult {
 	result := orderStepResult{refreshed: params.order}
 	_, tradeReferenced := params.evidence.ordersWithTrades[normalizedID(params.order.VenueOrderID)]
+	tradeReferenced = tradeReferenced && !params.settled
 	_, pendingTrade := params.evidence.ordersWithPendingTrades[normalizedID(params.order.VenueOrderID)]
 	fillEvidenceComplete := params.evidence.tradesAvailable && !tradeReferenced
 	if params.forceFillSync || shouldSyncOrderFills(params.order, params.focusOrderID, tradeReferenced) {

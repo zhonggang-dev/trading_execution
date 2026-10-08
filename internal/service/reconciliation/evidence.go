@@ -15,6 +15,21 @@ type venueEvidence struct {
 	tradesAvailable         bool
 	ordersWithTrades        map[string]struct{}
 	ordersWithPendingTrades map[string]struct{}
+	// orderTrades lists every venue trade component per venue order id with
+	// whether the venue reports it CONFIRMED.
+	orderTrades map[string][]venueOrderTrade
+	// appliedFills holds "venueOrderID\x00venueFillID" for local fills that are
+	// CONFIRMED and applied. Nil means it could not be read: nothing is skipped.
+	appliedFills map[string]struct{}
+}
+
+type venueOrderTrade struct {
+	tradeID   string
+	confirmed bool
+}
+
+func appliedFillKey(venueOrderID, venueFillID string) string {
+	return normalizedID(venueOrderID) + "\x00" + strings.TrimSpace(venueFillID)
 }
 
 // dispositionTradeIdentity is deliberately an exact component identity. One
@@ -131,11 +146,56 @@ func (state *runState) collectVenueEvidence(ctx context.Context, scope accountRu
 		}
 		ordersWithTrades, ordersWithPendingTrades = state.recordExternalTrades(ctx, trades, localOrders, dispositionIndex)
 	}
-	return venueEvidence{
+	evidence := venueEvidence{
 		tradesAvailable:         tradesErr == nil,
 		ordersWithTrades:        ordersWithTrades,
 		ordersWithPendingTrades: ordersWithPendingTrades,
-	}, errors.Join(openErr, tradesErr, dispositionErr)
+	}
+	if tradesErr == nil {
+		evidence.orderTrades = indexVenueOrderTrades(trades)
+		evidence.appliedFills = state.loadAppliedFills(ctx, scope)
+	}
+	return evidence, errors.Join(openErr, tradesErr, dispositionErr)
+}
+
+// indexVenueOrderTrades groups the venue trade components by venue order id.
+func indexVenueOrderTrades(trades []domain.VenueTradeSnapshot) map[string][]venueOrderTrade {
+	result := make(map[string][]venueOrderTrade)
+	for _, trade := range trades {
+		confirmed := domain.NormalizeFillStatus(trade.Status) == domain.FillStatusConfirmed
+		for _, venueOrderID := range trade.OrderIDs {
+			key := normalizedID(venueOrderID)
+			result[key] = append(result[key], venueOrderTrade{tradeID: strings.TrimSpace(trade.VenueTradeID), confirmed: confirmed})
+		}
+	}
+	return result
+}
+
+// loadAppliedFills reads the local CONFIRMED, ledger-applied fill components so
+// settled FILLED orders can skip the per-order trade re-read. It returns nil on
+// any failure or when the repository does not support the read; nil disables
+// the skip, so a failure can only make a run slower, never less strict.
+func (state *runState) loadAppliedFills(ctx context.Context, scope accountRunScope) map[string]struct{} {
+	source, ok := state.service.orders.(port.ReconciliationFillRepository)
+	if !ok {
+		return nil
+	}
+	after := scope.scanAfter
+	if !after.IsZero() {
+		// Margin: the venue scan keys on its own timestamps, the ledger on matched_at.
+		after = after.Add(-time.Hour)
+	}
+	refs, err := source.ListAppliedConfirmedFills(ctx, scope.executionAccountID, after)
+	if err != nil {
+		state.service.logger.Warn("applied fill read failed; settled orders will be re-synchronized",
+			"execution_account_id", scope.executionAccountID, "error", err)
+		return nil
+	}
+	result := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		result[appliedFillKey(ref.VenueOrderID, ref.VenueFillID)] = struct{}{}
+	}
+	return result
 }
 
 // recordVenueReadError 把非空的外部读取错误转换为可追踪的基础设施问题。

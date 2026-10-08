@@ -449,6 +449,41 @@ func (repository *OrderRepository) ListForReconciliation(
 	return orders, nil
 }
 
+var _ port.ReconciliationFillRepository = (*OrderRepository)(nil)
+
+// ListAppliedConfirmedFills returns the CONFIRMED, ledger-applied fill
+// components matched at or after matchedAfter (zero means no lower bound).
+func (repository *OrderRepository) ListAppliedConfirmedFills(
+	ctx context.Context,
+	executionAccountID string,
+	matchedAfter time.Time,
+) ([]domain.AppliedFillRef, error) {
+	query := `SELECT venue_order_id, venue_fill_id FROM execution_fills
+		WHERE execution_account_id=$1 AND status='CONFIRMED' AND applied_at IS NOT NULL`
+	args := []any{strings.TrimSpace(executionAccountID)}
+	if !matchedAfter.IsZero() {
+		query += ` AND matched_at >= $2`
+		args = append(args, matchedAfter.UTC())
+	}
+	rows, err := repository.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query applied confirmed fills: %w", err)
+	}
+	defer rows.Close()
+	var refs []domain.AppliedFillRef
+	for rows.Next() {
+		var ref domain.AppliedFillRef
+		if err := rows.Scan(&ref.VenueOrderID, &ref.VenueFillID); err != nil {
+			return nil, fmt.Errorf("scan applied confirmed fill: %w", err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate applied confirmed fills: %w", err)
+	}
+	return refs, nil
+}
+
 var _ port.ReconciliationIssueOrderRepository = (*OrderRepository)(nil)
 
 // ListWithOpenReconciliationIssues selects retryable owned-order problems
