@@ -1706,13 +1706,18 @@ func applyFillFeeEvidence(
 			if err != nil {
 				return domain.Fill{}, err
 			}
-			chainPrice, err := exactRatDecimal(new(big.Rat).Quo(gross, shares), 18)
-			if err != nil {
-				return domain.Fill{}, fmt.Errorf("OrderFilled price from exact amounts: %w", err)
-			}
-			chainFee, err := calculateV2PlatformFee(eventShares, chainPrice, schedule.Rate, schedule.Exponent)
+			exactPrice := new(big.Rat).Quo(gross, shares)
+			chainFee, err := calculateV2PlatformFeeRat(shares, exactPrice, schedule.Rate, schedule.Exponent)
 			if err != nil || !platformFee.Equal(chainFee) {
 				return domain.Fill{}, fmt.Errorf("OrderFilled platform fee %s does not match V2 fee curve %s", platformFee, expectedFee)
+			}
+			// The stored display price is gross/shares truncated to 18 digits
+			// (exact when the quotient is finite). The ledger re-checks the fee
+			// against this decimal, so it must reproduce the exact-price fee.
+			chainPrice := truncatedRatDecimal(exactPrice, 18)
+			roundedFee, err := calculateV2PlatformFee(eventShares, chainPrice, schedule.Rate, schedule.Exponent)
+			if err != nil || !platformFee.Equal(roundedFee) {
+				return domain.Fill{}, fmt.Errorf("OrderFilled settlement price %s cannot reproduce platform fee %s", chainPrice, platformFee)
 			}
 			fill.Price = chainPrice
 		}
@@ -1873,15 +1878,27 @@ func calculateV2PlatformFee(
 	feeRate domain.Decimal,
 	exponent domain.Decimal,
 ) (domain.Decimal, error) {
-	if err := validateFeeExponent(exponent); err != nil {
-		return "", err
-	}
 	sharesRat, err := decimalRat(shares)
 	if err != nil {
 		return "", err
 	}
 	priceRat, err := decimalRat(price)
 	if err != nil {
+		return "", err
+	}
+	return calculateV2PlatformFeeRat(sharesRat, priceRat, feeRate, exponent)
+}
+
+// calculateV2PlatformFeeRat evaluates the fee curve at an exact rational price.
+// A multi-maker settlement price (gross/shares) is generally not a finite
+// decimal, but the exchange computes the fee from the exact amounts.
+func calculateV2PlatformFeeRat(
+	sharesRat *big.Rat,
+	priceRat *big.Rat,
+	feeRate domain.Decimal,
+	exponent domain.Decimal,
+) (domain.Decimal, error) {
+	if err := validateFeeExponent(exponent); err != nil {
 		return "", err
 	}
 	rateRat, err := decimalRat(feeRate)
