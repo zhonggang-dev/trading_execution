@@ -1,11 +1,14 @@
 package polymarket
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
 )
 
 func TestValidateEventGrossAcceptsWallet6PriceBucketDifference(t *testing.T) {
@@ -313,5 +316,72 @@ func TestApplyFillFeeEvidenceMarksShallowReceiptAsFinalityPendingMined(t *testin
 	shallow.Confirmations = 0
 	if _, err := applyFillFeeEvidence(fill, schedule, shallow, "0.01", shallow.ExchangeAddress, shallow.MakerAddress, zeroBytes32); err == nil {
 		t.Fatal("evidence without any confirmation must fail closed")
+	}
+}
+
+type captureLedger struct{ fill domain.Fill }
+
+func (ledger *captureLedger) Record(_ context.Context, _ domain.Order, fill domain.Fill) (domain.FillApplication, error) {
+	ledger.fill = fill
+	return domain.FillApplication{Fill: fill, Applied: true}, nil
+}
+func (*captureLedger) GetFill(context.Context, string) (domain.Fill, error) {
+	return domain.Fill{}, nil
+}
+func (*captureLedger) ListOrderFills(context.Context, string) ([]domain.Fill, error) { return nil, nil }
+
+type noOrderFills struct{}
+
+func (noOrderFills) ListOrderFills(context.Context, domain.Order) ([]domain.Fill, error) {
+	return nil, nil
+}
+
+// TestApplyFillFeeEvidenceAcceptsNonTerminatingSettlementPrice 复现钱包 7 的 56 股成交：均价 9.9315/56 是无限小数，CLOB 给出的取整价对不上手续费，必须用精确分数价格验证链上手续费，并且结果能通过账本边界的手续费曲线复核。
+func TestApplyFillFeeEvidenceAcceptsNonTerminatingSettlementPrice(t *testing.T) {
+	fill := feeEvidenceFill(domain.LiquidityRoleTaker)
+	fill.Shares = "56"
+	fill.Price = "0.18"
+	fill.TransactionHash = "0x" + strings.Repeat("a", 64)
+	fill.VenueOrderID = "0x" + strings.Repeat("b", 64)
+	evidence := feeEvidence()
+	evidence.TransactionHash = fill.TransactionHash
+	evidence.OrderHash = fill.VenueOrderID
+	evidence.MakerAddress = "0x" + strings.Repeat("c", 40)
+	evidence.BlockHash = "0x" + strings.Repeat("d", 64)
+	evidence.MakerAmountBaseUnits = "9931500"
+	evidence.TakerAmountBaseUnits = "56000000"
+	evidence.TotalFeeBaseUnits = "326800"
+	schedule := marketFeeSchedule{Rate: "0.04", Exponent: "1", TakerOnly: true}
+	result, err := applyFillFeeEvidence(fill, schedule, evidence, "0.01", evidence.ExchangeAddress, evidence.MakerAddress, zeroBytes32)
+	if err != nil {
+		t.Fatalf("non-terminating settlement price was rejected: %v", err)
+	}
+	if !result.PlatformFee.Equal("0.3268") || !result.GrossNotional.Equal("9.9315") || !strings.HasPrefix(result.Price.String(), "0.17734821428571428") {
+		t.Fatalf("settlement = price %s gross %s fee %s", result.Price, result.GrossNotional, result.PlatformFee)
+	}
+
+	// The ledger boundary re-derives the fee from the stored price.
+	now := time.Now().UTC()
+	result.OrderID, result.ExecutionAccountID, result.MarketID, result.Status = "order-w7", "wallet-7", "market", domain.FillStatusConfirmed
+	result.MatchedAt, result.ObservedAt, result.ConfirmedAt = now, now, &now
+	ledger := &captureLedger{}
+	processor, err := fillprocessor.New(fillprocessor.Params{Orders: memory.NewOrderRepository(), Source: noOrderFills{}, Ledger: ledger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := domain.Order{ID: "order-w7", VenueOrderID: fill.VenueOrderID, Intent: domain.OrderIntent{
+		ExecutionAccountID: "wallet-7", MarketID: "market", TokenID: "7", Side: domain.SideBuy, Venue: "polymarket",
+	}}
+	if _, err := processor.Process(context.Background(), order, result); err != nil {
+		t.Fatalf("ledger boundary rejected the fill: %v", err)
+	}
+	if !ledger.fill.NetCashDelta.Equal("-10.2583") {
+		t.Fatalf("net cash delta = %s, want -10.2583", ledger.fill.NetCashDelta)
+	}
+
+	// A fee that is not the curve value at the exact price is still rejected.
+	evidence.TotalFeeBaseUnits = "326700"
+	if _, err := applyFillFeeEvidence(fill, schedule, evidence, "0.01", evidence.ExchangeAddress, evidence.MakerAddress, zeroBytes32); err == nil {
+		t.Fatal("incorrect chain fee was accepted for a non-terminating settlement price")
 	}
 }
