@@ -6,12 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	domainorderstate "github.com/UniPat-AI/trading_execution/internal/domain/orderstate"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+)
+
+// The fill transaction is SERIALIZABLE and takes its snapshot before it waits
+// for the account row lock, so it fails with 40001 whenever any reservation
+// commits ahead of it. A batch of reservations committing back to back (parallel
+// intent delivery) would exhaust a few immediate retries, hence more attempts
+// with a short jittered backoff between them.
+const (
+	defaultFillLedgerAttempts = 6
+	fillLedgerRetryBackoff    = 25 * time.Millisecond
 )
 
 // FillLedgerParams 表示后端使用的 FillLedgerParams 类型。
@@ -49,7 +60,7 @@ func NewFillLedger(params FillLedgerParams) (*FillLedger, error) {
 		params.Now = time.Now
 	}
 	if params.MaxAttempts == 0 {
-		params.MaxAttempts = defaultTransactionAttempts
+		params.MaxAttempts = defaultFillLedgerAttempts
 	}
 	if params.MaxAttempts < 1 || params.MaxAttempts > 20 {
 		return nil, fmt.Errorf("fill transaction attempts must be between 1 and 20")
@@ -88,6 +99,16 @@ func (ledger *FillLedger) Record(ctx context.Context, expected domain.Order, fil
 			return domain.FillApplication{}, err
 		}
 		lastErr = err
+		// attempt*25ms plus up to the same again, so concurrent retries spread out.
+		delay := time.Duration(attempt) * fillLedgerRetryBackoff
+		delay += time.Duration(rand.Int63n(int64(delay)))
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return domain.FillApplication{}, errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
 	}
 	return domain.FillApplication{}, lastErr
 }

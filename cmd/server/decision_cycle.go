@@ -114,6 +114,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		Venue:                        params.cfg.Execution.Venue,
 		PredictionLookback:           cycleConfig.PredictionLookback,
 		DeliveryStaleAge:             cycleConfig.Timeout,
+		DeliveryConcurrency:          cycleConfig.DeliveryConcurrency,
 		Logger:                       params.logger,
 	})
 	if err != nil {
