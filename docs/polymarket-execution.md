@@ -69,6 +69,13 @@ placement readiness——都必须透传这个能力接口，否则执行层只�
 
 默认参数：单请求 5 秒超时、8 QPS、burst 4；均可注入配置。适配器没有对 POST/DELETE 自动重试。
 
+本地令牌桶是**进程内、全部 CLOB 请求共用的一个桶**：下单、撤单、读订单与成交、心跳、对账、tick-size/neg-risk 读取都从这里取令牌。
+速率与突发由 `POLYMARKET_REQUESTS_PER_SECOND` / `POLYMARKET_BURST` 配置，未设置时用上面的默认值。生产使用 20 / 10。
+
+官方限额（`docs.polymarket.com/api-reference/trading-rate-limits`，Standard 档，按签名地址）：下单 40 个令牌/秒、突发 60；
+撤单 80 个令牌/秒、突发 120。另有 Cloudflare 的 IP 级限额，例如 `/tick-size` 200 次/10 秒。实盘模式把本地配置上限卡在 40 / 60，
+防止笔误让本地限速失去保护作用；官方档位调整时同步修改 `internal/config` 里的常量。
+
 - `Kind=INVALID/REJECTED`：能够证明没有接受，可进入 `REJECTED`；
 - `Kind=AMBIGUOUS`：请求可能已到达 CLOB，必须进入 `UNKNOWN`；
 - `Kind=UNAVAILABLE`：只读调用暂时不可用；

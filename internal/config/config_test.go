@@ -668,6 +668,86 @@ func TestLoadAcceptsCompleteLoopbackLiveConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadPolymarketRequestLimiter(t *testing.T) {
+	t.Run("unset leaves the adapter defaults in charge", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		config, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if config.Polymarket.RequestsPerSecond != 0 || config.Polymarket.Burst != 0 {
+			t.Fatalf("limiter = %d/%d, want 0/0 (adapter default)", config.Polymarket.RequestsPerSecond, config.Polymarket.Burst)
+		}
+	})
+	t.Run("explicit values pass through", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		t.Setenv("POLYMARKET_REQUESTS_PER_SECOND", "20")
+		t.Setenv("POLYMARKET_BURST", "10")
+		config, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if config.Polymarket.RequestsPerSecond != 20 || config.Polymarket.Burst != 10 {
+			t.Fatalf("limiter = %d/%d, want 20/10", config.Polymarket.RequestsPerSecond, config.Polymarket.Burst)
+		}
+	})
+	for _, test := range []struct{ key, value string }{
+		{"POLYMARKET_REQUESTS_PER_SECOND", "fast"},
+		{"POLYMARKET_REQUESTS_PER_SECOND", "0"},
+		{"POLYMARKET_REQUESTS_PER_SECOND", "-1"},
+		{"POLYMARKET_REQUESTS_PER_SECOND", "1001"},
+		{"POLYMARKET_REQUESTS_PER_SECOND", "2.5"},
+		{"POLYMARKET_BURST", "0"},
+		{"POLYMARKET_BURST", "-3"},
+		{"POLYMARKET_BURST", "1001"},
+		{"POLYMARKET_BURST", "many"},
+	} {
+		t.Run("rejects "+test.key+"="+test.value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv(test.key, test.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.key) {
+				t.Fatalf("Load() error = %v, want %s rejection", err, test.key)
+			}
+		})
+	}
+}
+
+func TestLoadBoundsPolymarketRequestLimiterInLiveMode(t *testing.T) {
+	for _, test := range []struct {
+		name, rate, burst, wantError string
+	}{
+		{"at the venue ceiling", "40", "60", ""},
+		{"production setting", "20", "10", ""},
+		{"rate above ceiling", "41", "10", "POLYMARKET_REQUESTS_PER_SECOND"},
+		{"burst above ceiling", "20", "61", "POLYMARKET_BURST"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			t.Setenv("POLYMARKET_REQUESTS_PER_SECOND", test.rate)
+			t.Setenv("POLYMARKET_BURST", test.burst)
+			_, err := Load()
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("Load() error = %v, want %s rejection", err, test.wantError)
+			}
+		})
+	}
+	t.Run("paper mode is not capped by the venue ceiling", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		t.Setenv("POLYMARKET_REQUESTS_PER_SECOND", "500")
+		t.Setenv("POLYMARKET_BURST", "500")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
+}
+
 func TestLoadRejectsPublicLiveListener(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -802,6 +882,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"RECONCILIATION_POSITION_EPSILON", "RECONCILIATION_BALANCE_EPSILON",
 		"CANCEL_FILL_FINALITY_GRACE", "MAX_ORDER_RECONCILE_ATTEMPTS",
 		"POLYMARKET_MAX_BUY_FEE_RATE_BPS", "POLYGON_ORDER_FILLED_CONFIRMATIONS",
+		"POLYMARKET_REQUESTS_PER_SECOND", "POLYMARKET_BURST",
 		"CHAIN_CASH_REWARD_SENDERS", "CHAIN_CASH_DEPOSIT_SOURCES", "CHAIN_CASH_MAX_BLOCKS_PER_RUN",
 		"CHAIN_CASH_LOG_CHUNK_BLOCKS",
 		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",

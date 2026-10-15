@@ -183,6 +183,9 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		FeeEvidence:    feeEvidence,
 		RequestTimeout: cfg.Polymarket.RequestTimeout,
 		FeeScheduleTTL: cfg.Polymarket.FeeScheduleTTL,
+		// Zero keeps the adapter defaults (8/s, burst 4).
+		RequestsPerSecond: float64(cfg.Polymarket.RequestsPerSecond),
+		Burst:             cfg.Polymarket.Burst,
 	})
 	if err != nil {
 		return nil, err
