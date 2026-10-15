@@ -18,6 +18,16 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 )
 
+// Live ceilings for the local CLOB request token bucket. They follow Polymarket's
+// per-signer order limit for the Standard tier (40 tokens/s, burst 60): the
+// bucket is shared by every request kind, so a typo above these values would
+// silently stop the local limiter from protecting the venue limit. The venue
+// may change tiers; adjust here together with docs/wallet-connection.md.
+const (
+	maxLivePolymarketRequestsPerSecond = 40
+	maxLivePolymarketBurst             = 60
+)
+
 // Config 表示后端使用的 Config 类型。
 type Config struct {
 	App            App
@@ -175,6 +185,12 @@ type Polymarket struct {
 	AutoRedeemRetryInterval      time.Duration
 	AutoRedeemAmbiguityTimeout   time.Duration
 	AutoRedeemBatchSize          int
+	// RequestsPerSecond and Burst size the process-wide CLOB request token
+	// bucket shared by orders, cancels, fill reads, heartbeats and
+	// reconciliation. Zero means unset: the adapter default (8/s, burst 4)
+	// applies, so the default lives in exactly one place.
+	RequestsPerSecond int
+	Burst             int
 	// ChainCash* configure the on-chain pUSD cash ledger. It is active only for
 	// accounts initialized with cmd/chaincashinit; address lists are lowercase.
 	ChainCashRewardSenders   []string
@@ -365,6 +381,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	requestsPerSecond, err := integer("POLYMARKET_REQUESTS_PER_SECOND", 0, 1, 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	polymarketBurst, err := integer("POLYMARKET_BURST", 0, 1, 1000)
+	if err != nil {
+		return Config{}, err
+	}
 	feeScheduleTTL, err := duration("POLYMARKET_FEE_SCHEDULE_TTL", 15*time.Minute)
 	if err != nil {
 		return Config{}, err
@@ -508,6 +532,8 @@ func Load() (Config, error) {
 			MaxBuyFeeRateBPS:             maxBuyFeeRateBPS,
 			LatestBookMaxAge:             latestBookMaxAge,
 			FeeScheduleTTL:               feeScheduleTTL,
+			RequestsPerSecond:            requestsPerSecond,
+			Burst:                        polymarketBurst,
 			OrderFilledConfirmations:     orderFilledConfirmations,
 			FillFinalityMaxAge:           fillFinalityMaxAge,
 			AutoRedeemInterval:           autoRedeemInterval,
@@ -619,6 +645,12 @@ func (config Config) Validate() error {
 		}
 		if comparison, err := config.Polymarket.MaxBuyFeeRateBPS.Compare("10000"); err != nil || comparison > 0 {
 			return fmt.Errorf("POLYMARKET_MAX_BUY_FEE_RATE_BPS must not exceed 10000")
+		}
+		if config.Polymarket.RequestsPerSecond > maxLivePolymarketRequestsPerSecond {
+			return fmt.Errorf("POLYMARKET_REQUESTS_PER_SECOND must not exceed %d in live mode", maxLivePolymarketRequestsPerSecond)
+		}
+		if config.Polymarket.Burst > maxLivePolymarketBurst {
+			return fmt.Errorf("POLYMARKET_BURST must not exceed %d in live mode", maxLivePolymarketBurst)
 		}
 		if config.LiveOperations.Interval < 5*time.Second || config.LiveOperations.Interval > 60*time.Second {
 			return fmt.Errorf("LIVE_OPERATIONS_INTERVAL must be between 5s and 60s in live mode")
