@@ -210,6 +210,15 @@ intent；`exits[]` 的身份/格式错误仍会使整个策略响应被拒绝。
 - 同一 execution account 的一批 durable intent 在提交期间持有账户执行门；定时、即时和手工对账必须
   等待整批提交结束后才能读取该账户。门在成功、拒绝、UNKNOWN、调用错误和 context 取消时都释放，
   不同 execution account 使用独立门，互不阻塞；
+- 同一 execution account 一批 durable intent 的投递并发数由 `DECISION_CYCLE_DELIVERY_CONCURRENCY`
+  （1–8，默认 1 = 严格串行）决定。大于 1 时按领取顺序（`created_at, cycle_id, sequence_no`，即策略响应数组顺序，
+  edge 从大到小）依次启动，风控检查、官方盘口校验、签名和发单并行；**资金/份额预占仍严格按该顺序进行**：
+  第 i 张等第 i-1 张的预占结束（成功或被拒）才预占，预占一结束立刻放行下一张。因此余额不足时拿到钱的
+  仍是策略排在前面的订单。`IntentResult` 与错误聚合保持领取顺序，每张意图的
+  `execute -> CompleteIntent` 恰好各一次，钱包执行门仍覆盖整批。每批投递结束打一条
+  `decision intent batch delivered` 日志（批大小、并发数、耗时、成交/拒绝/UNKNOWN 数）。
+  并发会按比例消耗共享的 CLOB 令牌桶（`POLYMARKET_REQUESTS_PER_SECOND`），一张买单约 5–7 次请求加一次成交读取，
+  带撤单的再加 2 次，并发数应与令牌桶一起评估；
 - 周期重试：账户级 `cycle_id`、策略幂等键和 `client_order_id` 共同避免重复交易；
 - 生产 Runner 只在精确的十分钟 UTC 边界运行，并可在边界后等待配置的启动延迟；进程
   启动过晚、线程暂停超过 `DECISION_CYCLE_MAX_START_LATENESS` 或上一轮运行过长时直接跳过

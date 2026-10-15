@@ -110,6 +110,10 @@ type DecisionCycle struct {
 	PredictionLookback           time.Duration
 	Bindings                     []domain.StrategyExecutionBinding
 	PredictionSourceModes        map[string]domain.PredictionSourceMode
+	// DeliveryConcurrency is how many intents of one wallet's batch are submitted
+	// at once. 1 (the default) is strictly sequential. Asset reservation stays
+	// in strategy order at every value.
+	DeliveryConcurrency int
 }
 
 // Database 表示后端使用的 Database 类型。
@@ -856,6 +860,10 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	deliveryConcurrency, err := integer("DECISION_CYCLE_DELIVERY_CONCURRENCY", 1, 1, 8)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	return DecisionCycle{
 		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
 		SubmissionDisabledAccounts:   submissionDisabledAccounts,
@@ -872,6 +880,7 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		MaxStartLateness: maxStartLateness, Timeout: timeout,
 		PredictionLookback: predictionLookback,
 		Bindings:           bindings, PredictionSourceModes: predictionSourceModes,
+		DeliveryConcurrency: deliveryConcurrency,
 	}, nil
 }
 

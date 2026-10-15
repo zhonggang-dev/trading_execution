@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
@@ -24,6 +25,11 @@ const (
 	defaultDeliveryBatch    = 100
 	defaultDeliveryStaleAge = 9 * time.Minute
 )
+
+// maxDeliveryConcurrency stays well below the database pool (16): every
+// in-flight submission can hold a connection, and reconciliation, the order
+// coordinator and heartbeats share the same pool.
+const maxDeliveryConcurrency = 8
 
 var (
 	ErrInvalidBoundary = errors.New("decision_at is not an exact 10-minute UTC boundary")
@@ -86,6 +92,11 @@ type Params struct {
 	DeliveryStaleAge             time.Duration
 	Now                          func() time.Time
 	Logger                       *slog.Logger
+	// DeliveryConcurrency is how many intents of one wallet's claimed batch are
+	// submitted at once. Zero or one keeps strictly sequential delivery. Whatever
+	// the value, asset reservation stays in batch order (see
+	// port.ReservationSequence).
+	DeliveryConcurrency int
 }
 
 // Service 表示后端使用的 Service 类型。
@@ -124,6 +135,7 @@ type Service struct {
 	venue                            string
 	predictionLookback               time.Duration
 	deliveryStaleAge                 time.Duration
+	deliveryConcurrency              int
 	now                              func() time.Time
 	logger                           *slog.Logger
 }
@@ -238,6 +250,9 @@ func New(params Params) (*Service, error) {
 	if params.DeliveryStaleAge <= 0 || params.DeliveryStaleAge > 24*time.Hour {
 		return nil, fmt.Errorf("decision intent delivery stale age must be positive and at most 24h")
 	}
+	if params.DeliveryConcurrency < 0 || params.DeliveryConcurrency > maxDeliveryConcurrency {
+		return nil, fmt.Errorf("decision intent delivery concurrency must be between 0 and %d", maxDeliveryConcurrency)
+	}
 	if params.Now == nil {
 		params.Now = time.Now
 	}
@@ -276,6 +291,7 @@ func New(params Params) (*Service, error) {
 		venue:                            params.Venue,
 		predictionLookback:               params.PredictionLookback,
 		deliveryStaleAge:                 params.DeliveryStaleAge,
+		deliveryConcurrency:              params.DeliveryConcurrency,
 		now:                              params.Now,
 		logger:                           params.Logger,
 	}, nil
@@ -764,38 +780,10 @@ func (service *Service) deliverPendingForAccount(
 		if len(deliveries) == 0 {
 			break
 		}
-		for _, delivery := range deliveries {
-			intentResult := IntentResult{
-				Intent: delivery.Intent, DeliveryStatus: delivery.Status, DeliveryAttempt: delivery.Attempt,
-			}
-			// A persisted delivery may predate a venue route entering
-			// maintenance-only mode. Keep the lease durable without creating a
-			// new execution order or failing process startup; a later healthy
-			// restart requeues and resumes the exact frozen intent.
-			if service.submissionPolicy != nil && !service.submissionPolicy.Enabled(delivery.Intent) {
-				intentResult.SubmissionDisabled = true
-				result.intents = append(result.intents, intentResult)
-				continue
-			}
-			intentResult.Result, intentResult.Error = service.executor.Submit(ctx, delivery.Intent)
-			completion, complete := decisionIntentCompletion(intentResult.Result, intentResult.Error)
-			if complete {
-				if completeErr := service.recorder.CompleteIntent(ctx, delivery.ClientOrderID, delivery.Attempt, completion); completeErr != nil {
-					intentResult.Error = errors.Join(intentResult.Error, fmt.Errorf("complete durable strategy intent: %w", completeErr))
-				} else {
-					intentResult.DeliveryStatus = completion.Status
-					if completion.Status == domain.DecisionIntentFailed || completion.Status == domain.DecisionIntentUnknown {
-						intentResult.Error = errors.Join(intentResult.Error, fmt.Errorf(
-							"execution order %s completed durable delivery as %s (%s)",
-							completion.OrderID, completion.Status, completion.OrderStatus,
-						))
-					}
-				}
-			} else if intentResult.Error == nil {
-				intentResult.Error = fmt.Errorf("execution did not return a durable order id; delivery remains leased for recovery")
-			}
+		batchResults := service.deliverBatch(ctx, executionAccountID, deliveries)
+		for index, intentResult := range batchResults {
 			if intentResult.Error != nil {
-				result.errors = append(result.errors, fmt.Errorf("submit %s: %w", delivery.ClientOrderID, intentResult.Error))
+				result.errors = append(result.errors, fmt.Errorf("submit %s: %w", deliveries[index].ClientOrderID, intentResult.Error))
 			}
 			result.intents = append(result.intents, intentResult)
 		}
@@ -804,6 +792,102 @@ func (service *Service) deliverPendingForAccount(
 		}
 	}
 	return result, nil
+}
+
+// deliverBatch submits one claimed batch of a single wallet and returns one
+// result per delivery, in claim order. With deliveryConcurrency <= 1 it is the
+// plain sequential loop. Otherwise up to deliveryConcurrency submissions are in
+// flight, started in claim order; their reservation step is serialized in that
+// same order through a port.ReservationSequence, so when the wallet cannot fund
+// the whole batch the orders that win the money are the ones the strategy ranked
+// first.
+func (service *Service) deliverBatch(ctx context.Context, executionAccountID string, deliveries []domain.DecisionIntentDelivery) []IntentResult {
+	startedAt := time.Now()
+	concurrency := service.deliveryConcurrency
+	results := make([]IntentResult, len(deliveries))
+	if concurrency <= 1 || len(deliveries) <= 1 {
+		concurrency = 1
+		for index, delivery := range deliveries {
+			results[index] = service.processDelivery(ctx, delivery)
+		}
+	} else {
+		sequence := port.NewReservationSequence(len(deliveries))
+		slots := make(chan struct{}, concurrency)
+		var wg sync.WaitGroup
+		for index, delivery := range deliveries {
+			// Blocking here, in claim order, guarantees that every lower index has
+			// already started and will release its turn, so a turn never waits
+			// for an order that has not been scheduled.
+			slots <- struct{}{}
+			wg.Add(1)
+			go func(index int, delivery domain.DecisionIntentDelivery) {
+				defer wg.Done()
+				defer func() { <-slots }()
+				turn := sequence.Turn(index)
+				defer turn.Release()
+				results[index] = service.processDelivery(port.WithReservationTurn(ctx, turn), delivery)
+			}(index, delivery)
+		}
+		wg.Wait()
+	}
+	var submitted, rejected, unknown, other int
+	for _, result := range results {
+		switch result.DeliveryStatus {
+		case domain.DecisionIntentSubmitted:
+			submitted++
+		case domain.DecisionIntentFailed:
+			rejected++
+		case domain.DecisionIntentUnknown:
+			unknown++
+		default:
+			other++
+		}
+	}
+	logger := service.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Info("decision intent batch delivered",
+		"execution_account_id", executionAccountID,
+		"batch_size", len(deliveries),
+		"concurrency", concurrency,
+		"elapsed_ms", time.Since(startedAt).Milliseconds(),
+		"submitted", submitted, "rejected", rejected, "unknown", unknown, "other", other,
+	)
+	return results
+}
+
+// processDelivery submits one claimed intent and records the durable outcome.
+func (service *Service) processDelivery(ctx context.Context, delivery domain.DecisionIntentDelivery) IntentResult {
+	intentResult := IntentResult{
+		Intent: delivery.Intent, DeliveryStatus: delivery.Status, DeliveryAttempt: delivery.Attempt,
+	}
+	// A persisted delivery may predate a venue route entering
+	// maintenance-only mode. Keep the lease durable without creating a
+	// new execution order or failing process startup; a later healthy
+	// restart requeues and resumes the exact frozen intent.
+	if service.submissionPolicy != nil && !service.submissionPolicy.Enabled(delivery.Intent) {
+		intentResult.SubmissionDisabled = true
+		return intentResult
+	}
+	intentResult.Result, intentResult.Error = service.executor.Submit(ctx, delivery.Intent)
+	completion, complete := decisionIntentCompletion(intentResult.Result, intentResult.Error)
+	if complete {
+		if completeErr := service.recorder.CompleteIntent(ctx, delivery.ClientOrderID, delivery.Attempt, completion); completeErr != nil {
+			intentResult.Error = errors.Join(intentResult.Error, fmt.Errorf("complete durable strategy intent: %w", completeErr))
+		} else {
+			intentResult.DeliveryStatus = completion.Status
+			if completion.Status == domain.DecisionIntentFailed || completion.Status == domain.DecisionIntentUnknown {
+				intentResult.Error = errors.Join(intentResult.Error, fmt.Errorf(
+					"execution order %s completed durable delivery as %s (%s)",
+					completion.OrderID, completion.Status, completion.OrderStatus,
+				))
+			}
+		}
+	} else if intentResult.Error == nil {
+		intentResult.Error = fmt.Errorf("execution did not return a durable order id; delivery remains leased for recovery")
+	}
+	return intentResult
 }
 
 type deliveryCohort struct {

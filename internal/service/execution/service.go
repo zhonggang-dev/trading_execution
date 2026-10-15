@@ -165,6 +165,13 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 	if err := service.requireActiveAccount(intent.ExecutionAccountID); err != nil {
 		return SubmitResult{}, err
 	}
+	// Batched delivery attaches a reservation turn so that concurrent submissions
+	// still reserve funds in batch order. Every exit path below must release it;
+	// the happy path releases it right after Reserve so the next order can start.
+	reservationTurn, hasReservationTurn := port.ReservationTurnFrom(ctx)
+	if hasReservationTurn {
+		defer reservationTurn.Release()
+	}
 	if existing, err := service.repository.GetByClientOrderID(ctx, intent.ClientOrderID); err == nil {
 		if !executionIntentReplayEquivalent(existing.Intent, intent) {
 			return SubmitResult{}, ErrIdempotencyConflict
@@ -211,7 +218,17 @@ func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (
 		return SubmitResult{Order: stored, Created: true}, errors.Join(err, rejectErr)
 	}
 	stored.MarketValidation = &marketValidation
-	if _, err := service.reservations.Reserve(ctx, stored); err != nil {
+	var reserveErr error
+	if hasReservationTurn {
+		reserveErr = reservationTurn.Wait(ctx)
+	}
+	if reserveErr == nil {
+		_, reserveErr = service.reservations.Reserve(ctx, stored)
+	}
+	if hasReservationTurn {
+		reservationTurn.Release()
+	}
+	if err := reserveErr; err != nil {
 		code := errorCode(err, "ASSET_RESERVATION_FAILED")
 		rejectErr := service.reject(ctx, &stored, code, err)
 		return SubmitResult{Order: stored, Created: true}, errors.Join(fmt.Errorf("reserve order assets: %w", err), rejectErr)

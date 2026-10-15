@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -748,6 +749,41 @@ func TestLoadBoundsPolymarketRequestLimiterInLiveMode(t *testing.T) {
 	})
 }
 
+func TestLoadDecisionCycleDeliveryConcurrency(t *testing.T) {
+	t.Run("defaults to sequential delivery", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		config, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if config.DecisionCycle.DeliveryConcurrency != 1 {
+			t.Fatalf("DeliveryConcurrency = %d, want 1", config.DecisionCycle.DeliveryConcurrency)
+		}
+	})
+	for _, value := range []string{"1", "4", "8"} {
+		t.Run("accepts "+value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("DECISION_CYCLE_DELIVERY_CONCURRENCY", value)
+			config, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if got := strconv.Itoa(config.DecisionCycle.DeliveryConcurrency); got != value {
+				t.Fatalf("DeliveryConcurrency = %s, want %s", got, value)
+			}
+		})
+	}
+	for _, value := range []string{"0", "9", "-1", "many", "2.5"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("DECISION_CYCLE_DELIVERY_CONCURRENCY", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECISION_CYCLE_DELIVERY_CONCURRENCY") {
+				t.Fatalf("Load() error = %v, want DECISION_CYCLE_DELIVERY_CONCURRENCY rejection", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsPublicLiveListener(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -894,7 +930,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"DECISION_CYCLE_PREDICTION_LOOKBACK", "DECISION_CYCLE_MID_PRICE_LOOKBACK",
 		"DECISION_CYCLE_BINDINGS_JSON", "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
 		"DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON",
-		"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON",
+		"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", "DECISION_CYCLE_DELIVERY_CONCURRENCY",
 	} {
 		t.Setenv(key, "")
 	}
