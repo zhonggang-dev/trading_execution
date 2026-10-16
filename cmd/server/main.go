@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/adapter/risk"
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 	"github.com/UniPat-AI/trading_execution/internal/service/edgedistribution"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/executionrouter"
@@ -39,6 +40,7 @@ func main() {
 
 // run 加载配置并装配依赖后运行支持优雅退出的 HTTP 服务。
 func run() error {
+	startedAt := time.Now().UTC()
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -135,6 +137,7 @@ func run() error {
 	if live != nil {
 		httpParams.LiveOperations = live.operations
 	}
+	httpParams.ConsoleV2 = consolev2.New(database, consoleV2RuntimeConfig(cfg, live, startedAt))
 	httpAPI, err := httpapi.New(httpParams)
 	if err != nil {
 		return err
@@ -215,6 +218,51 @@ func run() error {
 		}
 		return err
 	}
+}
+
+// consoleV2RuntimeConfig builds the browser-safe runtime projection. It keeps
+// the real DecisionRunner status and configured binding identities while
+// excluding all upstream/venue credentials and URLs.
+func consoleV2RuntimeConfig(cfg config.Config, live *liveRuntime, startedAt time.Time) consolev2.RuntimeConfig {
+	bindings := make([]consolev2.Binding, 0, len(cfg.DecisionCycle.Bindings))
+	for _, rawBinding := range cfg.DecisionCycle.Bindings {
+		binding := rawBinding.Normalize()
+		mode := ""
+		if configured, ok := cfg.DecisionCycle.PredictionSourceModes[binding.PredictionModelID]; ok {
+			mode = string(configured)
+		}
+		bindings = append(bindings, consolev2.Binding{
+			PredictionModelID: binding.PredictionModelID,
+			ModelID:           binding.ModelID, StrategyID: binding.StrategyID,
+			ExecutionAccountID: binding.ExecutionAccountID, SourceMode: mode,
+		})
+	}
+	config := consolev2.RuntimeConfig{
+		StartedAt:                  startedAt,
+		RunnerEnabled:              cfg.DecisionCycle.Enabled,
+		RunnerInterval:             cfg.DecisionCycle.Interval,
+		Bindings:                   bindings,
+		OrderSubmissionEnabled:     cfg.DecisionCycle.OrderSubmissionEnabled,
+		EntrySubmissionDisabled:    cfg.DecisionCycle.EntrySubmissionDisabled,
+		SubmissionDisabledAccounts: cfg.DecisionCycle.SubmissionDisabledAccounts,
+		EntryDisabledAccounts:      cfg.DecisionCycle.EntryDisabledAccounts,
+		StrategyDisabledAccounts:   cfg.DecisionCycle.StrategyDisabledAccounts,
+		KalshiStrategyInputEnabled: cfg.DecisionCycle.KalshiStrategyInputEnabled,
+	}
+	if live != nil && live.decisionRunner != nil {
+		config.RunnerSnapshot = func() consolev2.RunnerSnapshot {
+			status := live.decisionRunner.Snapshot()
+			return consolev2.RunnerSnapshot{
+				LoopStarted: status.LoopStarted, LoopRunning: status.LoopRunning,
+				InFlight: status.InFlight, LoopStoppedAt: status.LoopStoppedAt,
+				NextBoundary: status.NextBoundary, NextDueAt: status.NextDueAt,
+				LastStartedAt: status.LastStartedAt, LastCompletedAt: status.LastCompletedAt,
+				LastSucceededAt: status.LastSucceededAt, LastError: status.LastError,
+				SkippedBoundaries: status.SkippedBoundaries,
+			}
+		}
+	}
+	return config
 }
 
 type readinessChecker interface {

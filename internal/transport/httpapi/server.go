@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/buildinfo"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 	"github.com/UniPat-AI/trading_execution/internal/service/edgedistribution"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
@@ -77,6 +78,7 @@ type Params struct {
 	TradeHistory     tradeHistoryService
 	LiveOperations   liveOperationsService
 	EdgeDistribution edgeDistributionService
+	ConsoleV2        consolev2.API
 	Readiness        readinessChecker
 	ReadinessTimeout time.Duration
 	// WriteTimeout is the http.Server write deadline. The reconciliation job
@@ -97,6 +99,7 @@ type Server struct {
 	tradeHistory     tradeHistoryService
 	liveOperations   liveOperationsService
 	edgeDistribution edgeDistributionService
+	consoleV2        consolev2.API
 	readinessChecker readinessChecker
 	readinessTimeout time.Duration
 	jobBudget        time.Duration
@@ -139,6 +142,7 @@ func New(params Params) (*Server, error) {
 		tradeHistory:     params.TradeHistory,
 		liveOperations:   params.LiveOperations,
 		edgeDistribution: params.EdgeDistribution,
+		consoleV2:        params.ConsoleV2,
 		readinessChecker: params.Readiness,
 		readinessTimeout: params.ReadinessTimeout,
 		jobBudget:        reconciliationJobBudget(params.WriteTimeout),
@@ -166,6 +170,9 @@ func New(params Params) (*Server, error) {
 	}
 	if server.edgeDistribution != nil {
 		mux.Handle("GET /api/v1/edge-distribution", server.authenticateReadOnly(http.HandlerFunc(server.getEdgeDistribution)))
+	}
+	if server.consoleV2 != nil {
+		server.registerConsoleV2Routes(mux)
 	}
 	if server.positionExitJob != nil {
 		mux.Handle("POST /internal/jobs/position-exit-evaluation/run", server.authenticateToken(server.jobToken, http.HandlerFunc(server.runPositionExitJob)))
