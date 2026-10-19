@@ -208,6 +208,23 @@ func (store *RedemptionStore) BeginRedemptionSubmission(
 	if err := lockExecutionAccount(ctx, tx, redemption.ExecutionAccountID); err != nil {
 		return err
 	}
+	// A Deposit Wallet nonce only advances when a batch executes on-chain, so a
+	// second submission while another one of the same wallet is unconfirmed would
+	// fetch the same nonce and be rejected. The check shares the account lock and
+	// transaction with the status write below, so two submissions can never both
+	// pass it.
+	var busy bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM polymarket_redemptions other
+			WHERE other.execution_account_id=$1 AND other.condition_id<>$2
+			  AND other.status IN ('APPROVAL_SUBMITTING','APPROVAL_SUBMITTED','REDEEM_SUBMITTING','REDEEM_SUBMITTED')
+		)`, redemption.ExecutionAccountID, redemption.ConditionID).Scan(&busy); err != nil {
+		return fmt.Errorf("check in-flight redemptions of the wallet: %w", err)
+	}
+	if busy {
+		return port.ErrRedemptionWalletBusy
+	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE polymarket_redemptions
 		SET status=$3, attempts=attempts+1, last_error='', submitting_at=$4,
@@ -325,6 +342,86 @@ func (store *RedemptionStore) ResetRedemptionReady(
 		    next_attempt_at=$4
 		WHERE execution_account_id=$1 AND condition_id=$2 AND status=$3`,
 		redemption.ExecutionAccountID, redemption.ConditionID, string(redemption.Status), nextAttemptAt.UTC())
+	if err != nil {
+		return err
+	}
+	return requireOneRedemption(result)
+}
+
+// maxSubmitFailureTextLength bounds one stored raw error. It is far above the
+// relayer bodies seen so far; truncation only guards against a hostile or
+// broken response filling the table.
+const maxSubmitFailureTextLength = 8000
+
+func (store *RedemptionStore) RecordRedemptionSubmitFailure(
+	ctx context.Context, redemption domain.Redemption, failure domain.RedemptionSubmitFailure,
+) (domain.RedemptionSubmitFailures, error) {
+	if err := store.requireManaged(redemption); err != nil {
+		return domain.RedemptionSubmitFailures{}, err
+	}
+	text := strings.TrimSpace(failure.ErrorText)
+	if len(text) > maxSubmitFailureTextLength {
+		text = text[:maxSubmitFailureTextLength]
+	}
+	if text == "" || failure.AttemptStartedAt.IsZero() ||
+		(failure.Kind != domain.RedemptionSubmissionApproval && failure.Kind != domain.RedemptionSubmissionRedeem) {
+		return domain.RedemptionSubmitFailures{}, fmt.Errorf("redemption submit failure requires kind, error text, and attempt time")
+	}
+	var status any
+	if failure.HTTPStatus != 0 {
+		status = failure.HTTPStatus
+	}
+	if _, err := store.db.ExecContext(ctx, `
+		INSERT INTO polymarket_redemption_submit_failures (
+			execution_account_id, condition_id, submission_kind, outcome, http_status,
+			error_text, attempt_started_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		redemption.ExecutionAccountID, redemption.ConditionID, string(failure.Kind),
+		string(failure.Outcome), status, text, failure.AttemptStartedAt.UTC()); err != nil {
+		return domain.RedemptionSubmitFailures{}, fmt.Errorf("record redemption submit failure: %w", err)
+	}
+	return store.RedemptionSubmitFailures(ctx, redemption)
+}
+
+func (store *RedemptionStore) RedemptionSubmitFailures(
+	ctx context.Context, redemption domain.Redemption,
+) (domain.RedemptionSubmitFailures, error) {
+	if err := store.requireManaged(redemption); err != nil {
+		return domain.RedemptionSubmitFailures{}, err
+	}
+	var summary domain.RedemptionSubmitFailures
+	err := store.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE((
+			SELECT error_text FROM polymarket_redemption_submit_failures
+			WHERE execution_account_id=$1 AND condition_id=$2 ORDER BY id DESC LIMIT 1
+		), '')
+		FROM polymarket_redemption_submit_failures
+		WHERE execution_account_id=$1 AND condition_id=$2`,
+		redemption.ExecutionAccountID, redemption.ConditionID).Scan(&summary.Count, &summary.LatestText)
+	if err != nil {
+		return domain.RedemptionSubmitFailures{}, fmt.Errorf("read redemption submit failures: %w", err)
+	}
+	return summary, nil
+}
+
+func (store *RedemptionStore) ResetRedemptionForResubmit(
+	ctx context.Context, redemption domain.Redemption, reason string, nextAttemptAt time.Time,
+) error {
+	if err := store.requireManaged(redemption); err != nil {
+		return err
+	}
+	if nextAttemptAt.IsZero() ||
+		(redemption.Status != domain.RedemptionApprovalSubmitting && redemption.Status != domain.RedemptionRedeemSubmitting) {
+		return fmt.Errorf("only a submitting redemption can reset for resubmission")
+	}
+	result, err := store.db.ExecContext(ctx, `
+		UPDATE polymarket_redemptions
+		SET status='READY', submitting_at=NULL, last_error=$5,
+		    updated_at=clock_timestamp(), next_attempt_at=$4
+		WHERE execution_account_id=$1 AND condition_id=$2 AND status=$3
+		  AND submission_provider='' AND submission_reference='' AND transaction_hash=''`,
+		redemption.ExecutionAccountID, redemption.ConditionID, string(redemption.Status), nextAttemptAt.UTC(),
+		boundedRedemptionError(reason))
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // RedemptionStatus is the durable lifecycle of one exact wallet/condition
 // redemption. A submit-intent is persisted before any network mutation so a
@@ -24,6 +27,59 @@ const (
 	RedemptionSubmissionApproval RedemptionSubmissionKind = "APPROVAL"
 	RedemptionSubmissionRedeem   RedemptionSubmissionKind = "REDEEM"
 )
+
+// RedemptionSubmitOutcome classifies a failed submit call by what the venue is
+// known to have done with it. Only the first two are proof that nothing was
+// accepted; everything else, including a timeout after the request left the
+// process, is Ambiguous and must be settled by chain evidence.
+type RedemptionSubmitOutcome string
+
+const (
+	// RedemptionSubmitAmbiguous: the request may have reached the venue.
+	RedemptionSubmitAmbiguous RedemptionSubmitOutcome = "AMBIGUOUS"
+	// RedemptionSubmitNotSubmitted: the call failed before any request that
+	// could mutate the venue was sent.
+	RedemptionSubmitNotSubmitted RedemptionSubmitOutcome = "NOT_SUBMITTED"
+	// RedemptionSubmitRejected: the venue answered with an explicit 4xx and
+	// accepted nothing.
+	RedemptionSubmitRejected RedemptionSubmitOutcome = "REJECTED"
+)
+
+// RedemptionSubmitFailure is the durable, append-only record of one failed
+// submit call, kept so the raw venue error survives later retries and review.
+type RedemptionSubmitFailure struct {
+	Kind             RedemptionSubmissionKind
+	Outcome          RedemptionSubmitOutcome
+	HTTPStatus       int
+	ErrorText        string
+	AttemptStartedAt time.Time
+}
+
+// RedemptionSubmitFailures summarizes the durable failure records of one
+// account/condition: how many submit calls failed and the latest raw error.
+type RedemptionSubmitFailures struct {
+	Count      int
+	LatestText string
+}
+
+// SubmitOutcomeOf reports how a failed submit call should be treated. Errors
+// that do not carry an explicit classification are Ambiguous. The HTTP status
+// is 0 when the error carries none.
+func SubmitOutcomeOf(err error) (RedemptionSubmitOutcome, int) {
+	outcome := RedemptionSubmitAmbiguous
+	var classified interface {
+		SubmitOutcome() RedemptionSubmitOutcome
+	}
+	if errors.As(err, &classified) {
+		outcome = classified.SubmitOutcome()
+	}
+	status := 0
+	var statused interface{ HTTPStatus() int }
+	if errors.As(err, &statused) {
+		status = statused.HTTPStatus()
+	}
+	return outcome, status
+}
 
 type RedemptionSubmissionState string
 

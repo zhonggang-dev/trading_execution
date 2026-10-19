@@ -234,8 +234,29 @@ impact_scoped_tokens` 给出影响范围；`/health/ready` 只在账户级问题
 
 Auto redeem 不使用“持有 48 小时”条件，也不使用 CLOB SELL。一次 condition 赎回会消耗钱包在该
 condition 下的完整 ERC-1155 余额，因此发现任何未消耗 ownership baseline、开放/预占 lot 或不一致的
-adapter identity 时都会进入 `MANUAL_REVIEW`。网络提交前先落 durable intent；若提交响应丢失，只能用
-Data API 找候选交易并用 Polygon 回执验证，禁止盲目重发。
+adapter identity 时都会进入 `MANUAL_REVIEW`。网络提交前先落 durable intent；若提交响应丢失，先用
+Data API 找候选交易并用 Polygon 回执验证，有证据就确认、不重发。
+
+**同钱包串行。** Deposit Wallet 的 nonce 只在批次上链执行后才推进，同一钱包有一笔在途时再取 nonce 会
+拿到同一个值，第二笔被 relayer 拒绝。因此同一 `execution_account_id` 同一时刻最多一笔
+`APPROVAL_SUBMITTING/SUBMITTED`、`REDEEM_SUBMITTING/SUBMITTED`；其它到期行保持 `READY` 等待
+（Info 日志 `redemption deferred`，不改库、不计失败），直到前一笔 `CONFIRMED`（约 3 分钟）。检查在
+`BeginRedemptionSubmission` 的账户锁与 SERIALIZABLE 事务内完成。`MANUAL_REVIEW` 不占位。
+
+**提交失败分类与自动重试。** 每次提交失败的原始报错追加写入 `polymarket_redemption_submit_failures`
+（只追加，触发器拒绝 UPDATE/DELETE/TRUNCATE；含分类、HTTP 状态、完整响应体、尝试开始时间），同时打 ERROR
+日志 `Polymarket redemption submit failed`。一个 (账户, condition) 的失败行数达到
+`POLYMARKET_AUTO_REDEEM_MAX_SUBMIT_ATTEMPTS`（默认 3，范围 1–10）即转 `MANUAL_REVIEW`，原因里带最近一次原始报错。
+
+| 分类 | 判定 | 处理 |
+| --- | --- | --- |
+| `NOT_SUBMITTED` | 取 nonce、签名等发出 `POST /submit` 之前就失败 | 立即复位 `READY`，一个 retry interval 后重提 |
+| `REJECTED` | `POST /submit` 返回 4xx（408 除外） | 同上 |
+| `AMBIGUOUS` | 超时、断连、5xx、408、响应不可解析 | 留在 `*_SUBMITTING`，每轮查 Data API 活动；找到则走回执确认；满 ambiguity timeout 仍无活动则在失败次数内复位 `READY` 重提，否则转人工 |
+
+这放宽了「歧义结果不重发」：只有在满 ambiguity timeout 且链上查不到任何赎回活动之后才重发，重发前账本安全前置条件重新校验，
+同钱包串行保证 nonce 正确，并且总次数封顶。提交成功后 relayer 报 `STATE_FAILED/STATE_INVALID` 仍直接转
+`MANUAL_REVIEW`（可能是真实的链上回滚）。EOA（RPC 直发）账户的提交失败一律按 `AMBIGUOUS` 处理。
 
 赎回状态机的每个等待都有上界，避免一条记录永远占用对账豁免：
 
@@ -252,7 +273,7 @@ Data API 找候选交易并用 Polygon 回执验证，禁止盲目重发。
   当轮未再现时自动关闭。
 - `APPROVAL_SUBMITTED` / `REDEEM_SUBMITTED` 在 relayer 持续返回 pending、没有 tx hash、或回执迟迟不最终化时，
   自 submitted_at 起超过 ambiguity timeout 即转 `MANUAL_REVIEW`。
-- 进入 `MANUAL_REVIEW`（只可能来自永久证据错误，或提交/确认阶段的超时）后该 condition 不再被视为
+- 进入 `MANUAL_REVIEW`（只可能来自永久证据错误、提交失败次数耗尽，或确认阶段的超时）后该 condition 不再被视为
   in-flight，对账会如实报出仓位缺失与余额多出，由人工处理。
 
 ## 必须人工核查
