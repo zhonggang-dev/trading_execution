@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
+
+// defaultMaxSubmitAttempts bounds automatic resubmission of one
+// account/condition when Params leaves it unset.
+const defaultMaxSubmitAttempts = 3
 
 type Params struct {
 	Store            port.RedemptionStore
@@ -20,21 +25,25 @@ type Params struct {
 	RetryInterval    time.Duration
 	AmbiguityTimeout time.Duration
 	BatchSize        int
-	Logger           *slog.Logger
-	Now              func() time.Time
+	// MaxSubmitAttempts is how many failed submit calls one account/condition
+	// may accumulate before it moves to MANUAL_REVIEW. Zero means the default.
+	MaxSubmitAttempts int
+	Logger            *slog.Logger
+	Now               func() time.Time
 }
 
 type Service struct {
-	store            port.RedemptionStore
-	venue            port.RedemptionVenue
-	receipts         port.RedemptionReceiptSource
-	activities       port.RedeemActivitySource
-	pollInterval     time.Duration
-	retryInterval    time.Duration
-	ambiguityTimeout time.Duration
-	batchSize        int
-	logger           *slog.Logger
-	now              func() time.Time
+	store             port.RedemptionStore
+	venue             port.RedemptionVenue
+	receipts          port.RedemptionReceiptSource
+	activities        port.RedeemActivitySource
+	pollInterval      time.Duration
+	retryInterval     time.Duration
+	ambiguityTimeout  time.Duration
+	batchSize         int
+	maxSubmitAttempts int
+	logger            *slog.Logger
+	now               func() time.Time
 }
 
 func New(params Params) (*Service, error) {
@@ -53,6 +62,12 @@ func New(params Params) (*Service, error) {
 	if params.BatchSize <= 0 || params.BatchSize > 100 {
 		return nil, fmt.Errorf("auto redeem batch size must be between 1 and 100")
 	}
+	if params.MaxSubmitAttempts == 0 {
+		params.MaxSubmitAttempts = defaultMaxSubmitAttempts
+	}
+	if params.MaxSubmitAttempts < 1 || params.MaxSubmitAttempts > 10 {
+		return nil, fmt.Errorf("auto redeem max submit attempts must be between 1 and 10")
+	}
 	if params.Logger == nil {
 		params.Logger = slog.Default()
 	}
@@ -63,7 +78,8 @@ func New(params Params) (*Service, error) {
 		store: params.Store, venue: params.Venue, receipts: params.Receipts,
 		activities: params.Activities, pollInterval: params.PollInterval,
 		retryInterval: params.RetryInterval, ambiguityTimeout: params.AmbiguityTimeout,
-		batchSize: params.BatchSize, logger: params.Logger, now: params.Now,
+		batchSize: params.BatchSize, maxSubmitAttempts: params.MaxSubmitAttempts,
+		logger: params.Logger, now: params.Now,
 	}, nil
 }
 
@@ -132,6 +148,13 @@ func (service *Service) processReady(ctx context.Context, redemption domain.Rede
 		kind = domain.RedemptionSubmissionApproval
 	}
 	if err := service.store.BeginRedemptionSubmission(ctx, redemption, kind, now); err != nil {
+		if errors.Is(err, port.ErrRedemptionWalletBusy) {
+			// Not a failure: the wallet nonce only advances once the in-flight
+			// batch executes, so this redemption waits in READY for a later sweep.
+			service.logger.Info("Polymarket redemption deferred while another redemption of the wallet is in flight",
+				"execution_account_id", redemption.ExecutionAccountID, "condition_id", redemption.ConditionID)
+			return nil
+		}
 		return service.review(ctx, redemption, "redemption safety precondition failed: "+err.Error(), now)
 	}
 	submitting := redemption
@@ -148,14 +171,83 @@ func (service *Service) processReady(ctx context.Context, redemption domain.Rede
 		submission, err = service.venue.SubmitRedemption(ctx, redemption.ExecutionAccountID, redemption.ConditionID, redemption.NegRisk)
 	}
 	if err != nil {
-		// The call may have reached an RPC or relayer even when no response was
-		// received. Keep *_SUBMITTING and recover evidence; never resubmit.
-		return service.retry(ctx, submitting, fmt.Errorf("submission outcome is ambiguous: %w", err), now)
+		return service.submitFailed(ctx, submitting, kind, err, now)
 	}
 	if submission.Provider == "" || submission.Reference == "" {
 		return service.review(ctx, submitting, "venue returned an incomplete submission identity", now)
 	}
 	return service.store.RecordRedemptionSubmission(ctx, submitting, submission, now, now.Add(service.retryInterval))
+}
+
+// submitFailed persists the raw error of a failed submit call, then decides by
+// what the venue is known to have done. Only a failure that provably left
+// nothing behind (nothing sent, or an explicit 4xx) is resubmitted at once. The
+// call may otherwise have reached the relayer or RPC even when no response
+// arrived, so the redemption stays *_SUBMITTING and recovery settles it from
+// chain evidence.
+func (service *Service) submitFailed(
+	ctx context.Context, redemption domain.Redemption, kind domain.RedemptionSubmissionKind, cause error, now time.Time,
+) error {
+	outcome, status := domain.SubmitOutcomeOf(cause)
+	failure := domain.RedemptionSubmitFailure{
+		Kind: kind, Outcome: outcome, HTTPStatus: status, ErrorText: cause.Error(), AttemptStartedAt: now,
+	}
+	if redemption.SubmittingAt != nil {
+		failure.AttemptStartedAt = *redemption.SubmittingAt
+	}
+	summary, recordErr := service.store.RecordRedemptionSubmitFailure(ctx, redemption, failure)
+	service.logger.Error("Polymarket redemption submit failed",
+		"execution_account_id", redemption.ExecutionAccountID, "condition_id", redemption.ConditionID,
+		"submission_kind", string(kind), "outcome", string(outcome), "http_status", status,
+		"failures", summary.Count, "error", cause.Error())
+	ambiguous := fmt.Errorf("submission outcome is ambiguous: %w", cause)
+	if recordErr != nil || outcome == domain.RedemptionSubmitAmbiguous {
+		// Without a durable failure count, or without proof that nothing was
+		// accepted, only evidence may move the redemption forward.
+		return service.retry(ctx, redemption, errors.Join(ambiguous, recordErr), now)
+	}
+	if summary.Count >= service.maxSubmitAttempts {
+		return service.review(ctx, redemption, service.exhaustedReason(outcome, summary), now)
+	}
+	reason := fmt.Sprintf("submission %s (failure %d of %d), resubmitting: %s",
+		strings.ToLower(strings.ReplaceAll(string(outcome), "_", " ")), summary.Count, service.maxSubmitAttempts, cause.Error())
+	if err := service.store.ResetRedemptionForResubmit(ctx, redemption, reason, now.Add(service.retryInterval)); err != nil {
+		return errors.Join(cause, err)
+	}
+	return cause
+}
+
+// resubmitOrReview ends a wait that produced no chain evidence within the
+// ambiguity timeout. Within the failure limit the redemption goes back to
+// READY and is submitted again with a fresh wallet nonce; beyond it a person
+// decides. The unresolved wait is the reason, the latest raw error the detail.
+func (service *Service) resubmitOrReview(
+	ctx context.Context, redemption domain.Redemption, waited string, now time.Time,
+) error {
+	summary, err := service.store.RedemptionSubmitFailures(ctx, redemption)
+	if err != nil {
+		return service.retry(ctx, redemption, err, now)
+	}
+	if summary.Count >= service.maxSubmitAttempts {
+		return service.review(ctx, redemption, waited+"; "+service.exhaustedReason(domain.RedemptionSubmitAmbiguous, summary), now)
+	}
+	reason := fmt.Sprintf("%s (failure %d of %d), resubmitting", waited, summary.Count, service.maxSubmitAttempts)
+	if summary.LatestText != "" {
+		reason += ": " + summary.LatestText
+	}
+	if err := service.store.ResetRedemptionForResubmit(ctx, redemption, reason, now.Add(service.retryInterval)); err != nil {
+		return err
+	}
+	return fmt.Errorf("%s", reason)
+}
+
+func (service *Service) exhaustedReason(outcome domain.RedemptionSubmitOutcome, summary domain.RedemptionSubmitFailures) string {
+	reason := fmt.Sprintf("redemption submit failed %d times (limit %d, last %s)",
+		summary.Count, service.maxSubmitAttempts, strings.ToLower(string(outcome)))
+	if summary.LatestText != "" {
+		reason += ": " + summary.LatestText
+	}
+	return reason
 }
 
 func (service *Service) recoverApprovalSubmitting(ctx context.Context, redemption domain.Redemption, now time.Time) error {
@@ -167,7 +259,7 @@ func (service *Service) recoverApprovalSubmitting(ctx context.Context, redemptio
 		return service.store.ResetRedemptionReady(ctx, redemption, now)
 	}
 	if expired(redemption.SubmittingAt, now, service.ambiguityTimeout) {
-		return service.review(ctx, redemption, "approval submit outcome remained ambiguous and adapter approval is still absent", now)
+		return service.resubmitOrReview(ctx, redemption, "approval submit outcome remained ambiguous and adapter approval is still absent", now)
 	}
 	return service.store.RetryRedemption(ctx, redemption, "waiting to recover ambiguous approval submission", now.Add(service.retryInterval))
 }
@@ -212,7 +304,7 @@ func (service *Service) recoverRedeemSubmitting(ctx context.Context, redemption 
 		return service.confirmReceipt(ctx, redemption, activities[0].TransactionHash, redemption.SubmittingAt, now)
 	}
 	if expired(redemption.SubmittingAt, now, service.ambiguityTimeout) {
-		return service.review(ctx, redemption, "redeem submit outcome remained ambiguous and no matching activity was found", now)
+		return service.resubmitOrReview(ctx, redemption, "redeem submit outcome remained ambiguous and no matching activity was found", now)
 	}
 	return service.store.RetryRedemption(ctx, redemption, "waiting to recover ambiguous redeem submission", now.Add(service.retryInterval))
 }

@@ -10,6 +10,10 @@ import (
 )
 
 var (
+	// ErrRedemptionWalletBusy: another redemption or approval of the same
+	// wallet is still in flight, so a new submission would fetch the same
+	// wallet nonce. It is a deferral, not a failure.
+	ErrRedemptionWalletBusy      = errors.New("another redemption of this wallet is in flight")
 	ErrOrderNotFound             = errors.New("order not found")
 	ErrOrderRevisionConflict     = errors.New("order revision conflict")
 	ErrReservationNotFound       = errors.New("asset reservation not found")
@@ -258,6 +262,14 @@ type RedemptionStore interface {
 	BeginRedemptionSubmission(ctx context.Context, redemption domain.Redemption, kind domain.RedemptionSubmissionKind, startedAt time.Time) error
 	RecordRedemptionSubmission(ctx context.Context, redemption domain.Redemption, submission domain.RedemptionSubmission, submittedAt, nextAttemptAt time.Time) error
 	ResetRedemptionReady(ctx context.Context, redemption domain.Redemption, nextAttemptAt time.Time) error
+	// RecordRedemptionSubmitFailure appends the raw error of one failed submit
+	// call and returns the totals including it. Records are never rewritten.
+	RecordRedemptionSubmitFailure(ctx context.Context, redemption domain.Redemption, failure domain.RedemptionSubmitFailure) (domain.RedemptionSubmitFailures, error)
+	RedemptionSubmitFailures(ctx context.Context, redemption domain.Redemption) (domain.RedemptionSubmitFailures, error)
+	// ResetRedemptionForResubmit returns a *_SUBMITTING redemption that never
+	// received a venue identity to READY, recording reason as last_error. It
+	// keeps attempts.
+	ResetRedemptionForResubmit(ctx context.Context, redemption domain.Redemption, reason string, nextAttemptAt time.Time) error
 	RecordRedemptionTransaction(ctx context.Context, redemption domain.Redemption, transactionHash string, nextAttemptAt time.Time) error
 	RecordRedemptionConfirmed(ctx context.Context, redemption domain.Redemption, receipt domain.RedemptionReceipt, confirmedAt time.Time) error
 	ApplyRedemption(ctx context.Context, redemption domain.Redemption, appliedAt time.Time) error

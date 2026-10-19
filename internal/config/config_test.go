@@ -33,6 +33,27 @@ func TestLoadSafeDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadAutoRedeemMaxSubmitAttempts(t *testing.T) {
+	clearConfigEnvironment(t)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.Polymarket.AutoRedeemMaxSubmitAttempts != 3 {
+		t.Fatalf("default max submit attempts = %d, want 3", config.Polymarket.AutoRedeemMaxSubmitAttempts)
+	}
+	t.Setenv("POLYMARKET_AUTO_REDEEM_MAX_SUBMIT_ATTEMPTS", "5")
+	if config, err = Load(); err != nil || config.Polymarket.AutoRedeemMaxSubmitAttempts != 5 {
+		t.Fatalf("configured max submit attempts = %d, %v, want 5", config.Polymarket.AutoRedeemMaxSubmitAttempts, err)
+	}
+	for _, value := range []string{"0", "11", "many"} {
+		t.Setenv("POLYMARKET_AUTO_REDEEM_MAX_SUBMIT_ATTEMPTS", value)
+		if _, err := Load(); err == nil {
+			t.Fatalf("max submit attempts %q was accepted", value)
+		}
+	}
+}
+
 func TestLoadChainCashConfiguration(t *testing.T) {
 	clearConfigEnvironment(t)
 	config, err := Load()

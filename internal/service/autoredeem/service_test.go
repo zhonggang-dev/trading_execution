@@ -10,12 +10,18 @@ import (
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
 type fakeStore struct {
 	events     []string
 	applyErr   error
 	retryTimes []time.Time
+	// beginErr is returned by BeginRedemptionSubmission before any state change.
+	beginErr error
+	// failures is the durable submit-failure history; recordErr makes writing it fail.
+	failures  domain.RedemptionSubmitFailures
+	recordErr error
 }
 
 func (store *fakeStore) SyncPendingRedemptions(context.Context) error { return nil }
@@ -23,7 +29,26 @@ func (store *fakeStore) ListDueRedemptions(context.Context, int, time.Time) ([]d
 	return nil, nil
 }
 func (store *fakeStore) BeginRedemptionSubmission(_ context.Context, _ domain.Redemption, kind domain.RedemptionSubmissionKind, _ time.Time) error {
+	if store.beginErr != nil {
+		return store.beginErr
+	}
 	store.events = append(store.events, "begin:"+string(kind))
+	return nil
+}
+func (store *fakeStore) RecordRedemptionSubmitFailure(_ context.Context, _ domain.Redemption, failure domain.RedemptionSubmitFailure) (domain.RedemptionSubmitFailures, error) {
+	if store.recordErr != nil {
+		return domain.RedemptionSubmitFailures{}, store.recordErr
+	}
+	store.events = append(store.events, "failure:"+string(failure.Outcome))
+	store.failures.Count++
+	store.failures.LatestText = failure.ErrorText
+	return store.failures, nil
+}
+func (store *fakeStore) RedemptionSubmitFailures(context.Context, domain.Redemption) (domain.RedemptionSubmitFailures, error) {
+	return store.failures, nil
+}
+func (store *fakeStore) ResetRedemptionForResubmit(_ context.Context, _ domain.Redemption, reason string, _ time.Time) error {
+	store.events = append(store.events, "resubmit:"+reason)
 	return nil
 }
 func (store *fakeStore) RecordRedemptionSubmission(_ context.Context, _ domain.Redemption, submission domain.RedemptionSubmission, _, _ time.Time) error {
@@ -64,7 +89,22 @@ type fakeVenue struct {
 	submission domain.RedemptionSubmission
 	store      *fakeStore
 	submits    int
+	submitErr  error
 }
+
+// classifiedError is a submit error carrying the venue's classification, like
+// the one the Polymarket client returns.
+type classifiedError struct {
+	outcome domain.RedemptionSubmitOutcome
+	status  int
+	message string
+}
+
+func (failure *classifiedError) Error() string { return failure.message }
+func (failure *classifiedError) SubmitOutcome() domain.RedemptionSubmitOutcome {
+	return failure.outcome
+}
+func (failure *classifiedError) HTTPStatus() int { return failure.status }
 
 func (venue *fakeVenue) RedemptionApproved(context.Context, string, bool) (bool, error) {
 	return venue.approved, nil
@@ -78,6 +118,9 @@ func (venue *fakeVenue) SubmitRedemption(context.Context, string, string, bool) 
 		return domain.RedemptionSubmission{}, fmt.Errorf("venue mutation happened before durable submit intent")
 	}
 	venue.store.events = append(venue.store.events, "submit")
+	if venue.submitErr != nil {
+		return domain.RedemptionSubmission{}, venue.submitErr
+	}
 	return venue.submission, nil
 }
 func (venue *fakeVenue) ResolveRedemptionSubmission(context.Context, string, domain.RedemptionSubmission) (domain.RedemptionSubmission, error) {
@@ -139,16 +182,154 @@ func TestReadyPersistsSubmitIntentBeforeVenueMutation(t *testing.T) {
 	}
 }
 
-func TestAmbiguousRedeemIsNeverBlindlyResubmitted(t *testing.T) {
-	store := &fakeStore{}
-	venue := &fakeVenue{store: store}
-	service := newTestService(t, store, venue, fakeReceipts{}, fakeActivities{})
-	redemption := testRedemption(domain.RedemptionRedeemSubmitting)
+func TestAmbiguousRedeemIsResubmittedOnlyAfterTimeoutWithoutEvidence(t *testing.T) {
 	started := time.Unix(1000, 0).UTC()
+	redemption := testRedemption(domain.RedemptionRedeemSubmitting)
 	redemption.SubmittingAt = &started
-	err := service.process(context.Background(), redemption, started.Add(11*time.Minute))
-	if err == nil || venue.submits != 0 || len(store.events) != 1 || store.events[0][:7] != "review:" {
-		t.Fatalf("ambiguous recovery error/submits/events = %v/%d/%v", err, venue.submits, store.events)
+
+	t.Run("before the timeout it only waits", func(t *testing.T) {
+		store := &fakeStore{}
+		venue := &fakeVenue{store: store}
+		service := newTestService(t, store, venue, fakeReceipts{}, fakeActivities{})
+		if err := service.process(context.Background(), redemption, started.Add(5*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if venue.submits != 0 || len(store.events) != 1 || firstEventKind(store) != "retry" {
+			t.Fatalf("early recovery submits/events = %d/%v, want one retry", venue.submits, store.events)
+		}
+	})
+	t.Run("after the timeout without evidence it resets for resubmission", func(t *testing.T) {
+		store := &fakeStore{failures: domain.RedemptionSubmitFailures{Count: 1, LatestText: "relayer HTTP 502: bad gateway"}}
+		venue := &fakeVenue{store: store}
+		service := newTestService(t, store, venue, fakeReceipts{}, fakeActivities{})
+		err := service.process(context.Background(), redemption, started.Add(11*time.Minute))
+		if err == nil || venue.submits != 0 || len(store.events) != 1 || firstEventKind(store) != "resubmit" {
+			t.Fatalf("timeout recovery error/submits/events = %v/%d/%v, want one resubmit reset", err, venue.submits, store.events)
+		}
+		if !strings.Contains(store.events[0], "relayer HTTP 502: bad gateway") {
+			t.Fatalf("reset reason %q lost the raw error", store.events[0])
+		}
+	})
+	t.Run("after the failure limit it goes to manual review with the raw error", func(t *testing.T) {
+		store := &fakeStore{failures: domain.RedemptionSubmitFailures{Count: 3, LatestText: "relayer HTTP 502: bad gateway"}}
+		service := newTestService(t, store, &fakeVenue{store: store}, fakeReceipts{}, fakeActivities{})
+		err := service.process(context.Background(), redemption, started.Add(11*time.Minute))
+		if err == nil || len(store.events) != 1 || firstEventKind(store) != "review" ||
+			!strings.Contains(store.events[0], "relayer HTTP 502: bad gateway") {
+			t.Fatalf("exhausted recovery error/events = %v/%v, want review with the raw error", err, store.events)
+		}
+	})
+	t.Run("matching chain activity confirms instead of resubmitting", func(t *testing.T) {
+		hash := "0x" + strings.Repeat("44", 32)
+		store := &fakeStore{}
+		venue := &fakeVenue{store: store}
+		service := newTestService(t, store, venue,
+			fakeReceipts{receipt: domain.RedemptionReceipt{TransactionHash: hash}},
+			fakeActivities{activities: []domain.RedeemActivity{{TransactionHash: hash}}})
+		if err := service.process(context.Background(), redemption, started.Add(11*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if venue.submits != 0 || len(store.events) != 1 || store.events[0] != "confirmed:"+hash {
+			t.Fatalf("activity recovery submits/events = %d/%v, want confirmation only", venue.submits, store.events)
+		}
+	})
+}
+
+func TestApprovalSubmitOutcomeUnresolvedResubmitsWithinLimit(t *testing.T) {
+	started := time.Unix(1000, 0).UTC()
+	redemption := testRedemption(domain.RedemptionApprovalSubmitting)
+	redemption.SubmittingAt = &started
+	store := &fakeStore{failures: domain.RedemptionSubmitFailures{Count: 1, LatestText: "timeout"}}
+	service := newTestService(t, store, &fakeVenue{store: store, approved: false}, fakeReceipts{}, fakeActivities{})
+	if err := service.process(context.Background(), redemption, started.Add(11*time.Minute)); err == nil ||
+		len(store.events) != 1 || firstEventKind(store) != "resubmit" {
+		t.Fatalf("approval recovery error/events = %v/%v, want one resubmit reset", err, store.events)
+	}
+}
+
+func TestWalletBusyDefersWithoutAnyWrite(t *testing.T) {
+	store := &fakeStore{beginErr: fmt.Errorf("check: %w", port.ErrRedemptionWalletBusy)}
+	venue := &fakeVenue{approved: true, store: store}
+	service := newTestService(t, store, venue, fakeReceipts{}, fakeActivities{})
+	if err := service.process(context.Background(), testRedemption(domain.RedemptionReady), time.Unix(1000, 0)); err != nil {
+		t.Fatalf("a deferral is not a failure: %v", err)
+	}
+	if venue.submits != 0 || len(store.events) != 0 {
+		t.Fatalf("deferred redemption submits/events = %d/%v, want none", venue.submits, store.events)
+	}
+}
+
+func TestDefinitiveSubmitFailureIsRecordedAndResubmitted(t *testing.T) {
+	for _, outcome := range []domain.RedemptionSubmitOutcome{domain.RedemptionSubmitRejected, domain.RedemptionSubmitNotSubmitted} {
+		t.Run(string(outcome), func(t *testing.T) {
+			store := &fakeStore{}
+			venue := &fakeVenue{approved: true, store: store, submitErr: &classifiedError{
+				outcome: outcome, status: 400, message: `relayer HTTP 400: {"error":"invalid nonce"}`,
+			}}
+			service := newTestService(t, store, venue, fakeReceipts{}, fakeActivities{})
+			err := service.process(context.Background(), testRedemption(domain.RedemptionReady), time.Unix(1000, 0))
+			if err == nil {
+				t.Fatal("a failed submit must still surface as a sweep error")
+			}
+			if len(store.events) != 4 || store.events[2] != "failure:"+string(outcome) || !strings.HasPrefix(store.events[3], "resubmit:") ||
+				!strings.Contains(store.events[3], "invalid nonce") {
+				t.Fatalf("events = %v, want begin, submit, failure, resubmit with the raw error", store.events)
+			}
+		})
+	}
+}
+
+func TestSubmitFailureLimitMovesToManualReviewWithRawError(t *testing.T) {
+	store := &fakeStore{failures: domain.RedemptionSubmitFailures{Count: 2, LatestText: "earlier"}}
+	venue := &fakeVenue{approved: true, store: store, submitErr: &classifiedError{
+		outcome: domain.RedemptionSubmitRejected, status: 400, message: `relayer HTTP 400: {"error":"invalid nonce"}`,
+	}}
+	service := newTestService(t, store, venue, fakeReceipts{}, fakeActivities{})
+	err := service.process(context.Background(), testRedemption(domain.RedemptionReady), time.Unix(1000, 0))
+	last := store.events[len(store.events)-1]
+	if err == nil || !strings.HasPrefix(last, "review:") || !strings.Contains(last, "invalid nonce") {
+		t.Fatalf("limit error/events = %v/%v, want MANUAL_REVIEW carrying the raw error", err, store.events)
+	}
+}
+
+func TestAmbiguousSubmitFailureIsRecordedButNeverResubmittedEarly(t *testing.T) {
+	store := &fakeStore{}
+	venue := &fakeVenue{approved: true, store: store, submitErr: errors.New("context deadline exceeded")}
+	service := newTestService(t, store, venue, fakeReceipts{}, fakeActivities{})
+	if err := service.process(context.Background(), testRedemption(domain.RedemptionReady), time.Unix(1000, 0)); err == nil {
+		t.Fatal("ambiguous submit must surface as a sweep error")
+	}
+	if len(store.events) != 4 || store.events[2] != "failure:AMBIGUOUS" || !strings.HasPrefix(store.events[3], "retry:") {
+		t.Fatalf("events = %v, want begin, submit, failure, retry (stay *_SUBMITTING)", store.events)
+	}
+}
+
+func TestSubmitFailureWithoutDurableRecordNeverResubmits(t *testing.T) {
+	store := &fakeStore{recordErr: errors.New("postgres unavailable")}
+	venue := &fakeVenue{approved: true, store: store, submitErr: &classifiedError{
+		outcome: domain.RedemptionSubmitRejected, status: 400, message: "relayer HTTP 400",
+	}}
+	service := newTestService(t, store, venue, fakeReceipts{}, fakeActivities{})
+	if err := service.process(context.Background(), testRedemption(domain.RedemptionReady), time.Unix(1000, 0)); err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, event := range store.events {
+		if strings.HasPrefix(event, "resubmit:") || strings.HasPrefix(event, "review:") {
+			t.Fatalf("events = %v: without a durable failure count only evidence may move the redemption", store.events)
+		}
+	}
+}
+
+func TestMaxSubmitAttemptsIsValidated(t *testing.T) {
+	for _, attempts := range []int{-1, 11} {
+		_, err := New(Params{
+			Store: &fakeStore{}, Venue: &fakeVenue{}, Receipts: fakeReceipts{}, Activities: fakeActivities{},
+			PollInterval: time.Minute, RetryInterval: 30 * time.Second, AmbiguityTimeout: 10 * time.Minute,
+			BatchSize: 10, MaxSubmitAttempts: attempts,
+		})
+		if err == nil {
+			t.Fatalf("max submit attempts %d was accepted", attempts)
+		}
 	}
 }
 

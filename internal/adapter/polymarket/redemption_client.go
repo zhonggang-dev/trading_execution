@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -151,7 +152,7 @@ func (client *RedemptionClient) SubmitRedemptionApproval(
 ) (domain.RedemptionSubmission, error) {
 	call, err := setApprovalForAllCall(redemptionAdapter(negRisk))
 	if err != nil {
-		return domain.RedemptionSubmission{}, err
+		return domain.RedemptionSubmission{}, notSubmitted(err)
 	}
 	return client.dispatch(ctx, executionAccountID, []redemptionCall{call}, "Approve exact redemption adapter")
 }
@@ -161,7 +162,7 @@ func (client *RedemptionClient) SubmitRedemption(
 ) (domain.RedemptionSubmission, error) {
 	call, err := redeemPositionsCall(redemptionAdapter(negRisk), conditionID)
 	if err != nil {
-		return domain.RedemptionSubmission{}, err
+		return domain.RedemptionSubmission{}, notSubmitted(err)
 	}
 	return client.dispatch(ctx, executionAccountID, []redemptionCall{call}, "Redeem condition "+strings.ToLower(conditionID))
 }
@@ -171,7 +172,7 @@ func (client *RedemptionClient) dispatch(
 ) (domain.RedemptionSubmission, error) {
 	account, err := client.credentials.Account(ctx, strings.TrimSpace(executionAccountID))
 	if err != nil {
-		return domain.RedemptionSubmission{}, fmt.Errorf("select redemption account: %w", err)
+		return domain.RedemptionSubmission{}, notSubmitted(fmt.Errorf("select redemption account: %w", err))
 	}
 	switch account.SignatureType {
 	case SignatureTypeEOA:
@@ -182,7 +183,7 @@ func (client *RedemptionClient) dispatch(
 	case SignatureTypePolyEIP1271:
 		return client.submitDepositWallet(ctx, account, calls, metadata)
 	default:
-		return domain.RedemptionSubmission{}, fmt.Errorf("redemption does not support signature type %d", account.SignatureType)
+		return domain.RedemptionSubmission{}, notSubmitted(fmt.Errorf("redemption does not support signature type %d", account.SignatureType))
 	}
 }
 
@@ -190,7 +191,7 @@ func (client *RedemptionClient) submitDepositWallet(
 	ctx context.Context, account TradingAccount, calls []redemptionCall, metadata string,
 ) (domain.RedemptionSubmission, error) {
 	if strings.TrimSpace(account.Relayer.Key) == "" || strings.TrimSpace(account.Relayer.Address) == "" {
-		return domain.RedemptionSubmission{}, fmt.Errorf("execution account %s requires relayer_api_key and relayer_api_key_address for Deposit Wallet redemption", account.ExecutionAccountID)
+		return domain.RedemptionSubmission{}, notSubmitted(fmt.Errorf("execution account %s requires relayer_api_key and relayer_api_key_address for Deposit Wallet redemption", account.ExecutionAccountID))
 	}
 	query := url.Values{"address": []string{account.Signer.Address()}, "type": []string{"WALLET"}}
 	var params struct {
@@ -198,23 +199,23 @@ func (client *RedemptionClient) submitDepositWallet(
 		Nonce   string `json:"nonce"`
 	}
 	if err := client.relayerJSON(ctx, account, http.MethodGet, "/v1/account/transactions/params", query, nil, &params); err != nil {
-		return domain.RedemptionSubmission{}, fmt.Errorf("fetch Deposit Wallet nonce: %w", err)
+		return domain.RedemptionSubmission{}, notSubmitted(fmt.Errorf("fetch Deposit Wallet nonce: %w", err))
 	}
 	nonce, err := parseUint256(params.Nonce)
 	if err != nil {
-		return domain.RedemptionSubmission{}, fmt.Errorf("relayer nonce: %w", err)
+		return domain.RedemptionSubmission{}, notSubmitted(fmt.Errorf("relayer nonce: %w", err))
 	}
 	deadline := big.NewInt(client.now().UTC().Unix() + 600)
 	digest, err := depositWalletBatchDigest(account.FunderAddress, nonce, deadline, calls)
 	if err != nil {
-		return domain.RedemptionSubmission{}, err
+		return domain.RedemptionSubmission{}, notSubmitted(err)
 	}
 	signature, err := account.Signer.SignDigest(ctx, digest)
 	if err != nil {
-		return domain.RedemptionSubmission{}, fmt.Errorf("sign Deposit Wallet redemption: %w", err)
+		return domain.RedemptionSubmission{}, notSubmitted(fmt.Errorf("sign Deposit Wallet redemption: %w", err))
 	}
 	if len(signature) != 65 || (signature[64] != 27 && signature[64] != 28) {
-		return domain.RedemptionSubmission{}, fmt.Errorf("Deposit Wallet signer returned an invalid Ethereum signature")
+		return domain.RedemptionSubmission{}, notSubmitted(fmt.Errorf("Deposit Wallet signer returned an invalid Ethereum signature"))
 	}
 	payload := map[string]any{
 		"type": "WALLET", "from": account.Signer.Address(), "to": depositWalletFactory,
@@ -229,7 +230,14 @@ func (client *RedemptionClient) submitDepositWallet(
 		TransactionID   string `json:"transactionID"`
 	}
 	if err := client.relayerJSON(ctx, account, http.MethodPost, "/submit", nil, payload, &response); err != nil {
-		return domain.RedemptionSubmission{}, fmt.Errorf("submit Deposit Wallet redemption: %w", err)
+		submitErr := fmt.Errorf("submit Deposit Wallet redemption: %w", err)
+		var rejection *relayerHTTPError
+		if errors.As(err, &rejection) && rejection.rejected() {
+			return domain.RedemptionSubmission{}, &redemptionSubmitError{
+				outcome: domain.RedemptionSubmitRejected, status: rejection.Status, err: submitErr,
+			}
+		}
+		return domain.RedemptionSubmission{}, submitErr
 	}
 	if strings.TrimSpace(response.TransactionID) == "" {
 		return domain.RedemptionSubmission{}, fmt.Errorf("relayer response has no transaction id")
@@ -273,6 +281,52 @@ func (client *RedemptionClient) ResolveRedemptionSubmission(
 	default:
 		return domain.RedemptionSubmission{}, fmt.Errorf("unknown redemption submission provider %q", submission.Provider)
 	}
+}
+
+// relayerHTTPError is a non-2xx relayer answer. Body keeps the response text
+// (bounded) so the exact rejection reason can be stored and searched.
+type relayerHTTPError struct {
+	Status int
+	Body   string
+}
+
+func (failure *relayerHTTPError) Error() string {
+	return fmt.Sprintf("relayer HTTP %d: %s", failure.Status, failure.Body)
+}
+
+func (failure *relayerHTTPError) HTTPStatus() int { return failure.Status }
+
+// rejected reports an explicit client-error answer: the relayer looked at the
+// request and accepted nothing. 408 is a timeout, not a verdict, and 5xx can
+// come from a gateway after the relayer already took the job.
+func (failure *relayerHTTPError) rejected() bool {
+	return failure.Status >= 400 && failure.Status < 500 && failure.Status != http.StatusRequestTimeout
+}
+
+// redemptionSubmitError carries the classification of a failed submit call.
+// Errors without it are ambiguous and are settled by chain evidence.
+type redemptionSubmitError struct {
+	outcome domain.RedemptionSubmitOutcome
+	status  int
+	err     error
+}
+
+func (failure *redemptionSubmitError) Error() string { return failure.err.Error() }
+func (failure *redemptionSubmitError) Unwrap() error { return failure.err }
+func (failure *redemptionSubmitError) SubmitOutcome() domain.RedemptionSubmitOutcome {
+	return failure.outcome
+}
+func (failure *redemptionSubmitError) HTTPStatus() int { return failure.status }
+
+// notSubmitted marks a failure that happened before any request able to mutate
+// the venue was sent, so resubmitting cannot duplicate anything.
+func notSubmitted(err error) error {
+	status := 0
+	var answer *relayerHTTPError
+	if errors.As(err, &answer) {
+		status = answer.Status
+	}
+	return &redemptionSubmitError{outcome: domain.RedemptionSubmitNotSubmitted, status: status, err: err}
 }
 
 func relayerSubmissionState(state string) domain.RedemptionSubmissionState {
@@ -388,7 +442,7 @@ func (client *RedemptionClient) relayerJSON(
 		return fmt.Errorf("relayer response is too large")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("relayer HTTP %d: %s", response.StatusCode, compactError(responseBody))
+		return &relayerHTTPError{Status: response.StatusCode, Body: compactBody(responseBody, relayerErrorBodyLimit)}
 	}
 	if output != nil && json.Unmarshal(responseBody, output) != nil {
 		return fmt.Errorf("relayer response is invalid JSON")
@@ -475,6 +529,18 @@ func normalizeOptionalHash(value string) string {
 		return ""
 	}
 	return "0x" + strings.TrimPrefix(raw, "0x")
+}
+
+// relayerErrorBodyLimit keeps enough of a relayer rejection to read the full
+// reason; compactError's 300 bytes cut it off.
+const relayerErrorBodyLimit = 2000
+
+func compactBody(body []byte, limit int) string {
+	value := strings.Join(strings.Fields(string(body)), " ")
+	if len(value) > limit {
+		value = value[:limit]
+	}
+	return value
 }
 
 func compactError(body []byte) string {

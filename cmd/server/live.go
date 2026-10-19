@@ -517,6 +517,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 			RetryInterval:    cfg.Polymarket.AutoRedeemRetryInterval,
 			AmbiguityTimeout: cfg.Polymarket.AutoRedeemAmbiguityTimeout,
 			BatchSize:        cfg.Polymarket.AutoRedeemBatchSize, Logger: logger,
+			MaxSubmitAttempts: cfg.Polymarket.AutoRedeemMaxSubmitAttempts,
 		})
 		if err != nil {
 			return nil, err

@@ -189,6 +189,7 @@ type Polymarket struct {
 	AutoRedeemRetryInterval      time.Duration
 	AutoRedeemAmbiguityTimeout   time.Duration
 	AutoRedeemBatchSize          int
+	AutoRedeemMaxSubmitAttempts  int
 	// RequestsPerSecond and Burst size the process-wide CLOB request token
 	// bucket shared by orders, cancels, fill reads, heartbeats and
 	// reconciliation. Zero means unset: the adapter default (8/s, burst 4)
@@ -421,6 +422,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	autoRedeemMaxSubmitAttempts, err := integer("POLYMARKET_AUTO_REDEEM_MAX_SUBMIT_ATTEMPTS", 3, 1, 10)
+	if err != nil {
+		return Config{}, err
+	}
 	chainCashRewardSenders, err := chaincash.ParseAddressList(os.Getenv("CHAIN_CASH_REWARD_SENDERS"))
 	if err != nil {
 		return Config{}, fmt.Errorf("CHAIN_CASH_REWARD_SENDERS: %w", err)
@@ -544,6 +549,7 @@ func Load() (Config, error) {
 			AutoRedeemRetryInterval:      autoRedeemRetryInterval,
 			AutoRedeemAmbiguityTimeout:   autoRedeemAmbiguityTimeout,
 			AutoRedeemBatchSize:          autoRedeemBatchSize,
+			AutoRedeemMaxSubmitAttempts:  autoRedeemMaxSubmitAttempts,
 			ChainCashRewardSenders:       chainCashRewardSenders,
 			ChainCashDepositSources:      chainCashDepositSources,
 			ChainCashMaxBlocksPerRun:     chainCashMaxBlocksPerRun,
@@ -681,6 +687,9 @@ func (config Config) Validate() error {
 		}
 		if config.Polymarket.AutoRedeemBatchSize < 1 || config.Polymarket.AutoRedeemBatchSize > 100 {
 			return fmt.Errorf("POLYMARKET_AUTO_REDEEM_BATCH_SIZE must be between 1 and 100")
+		}
+		if config.Polymarket.AutoRedeemMaxSubmitAttempts < 1 || config.Polymarket.AutoRedeemMaxSubmitAttempts > 10 {
+			return fmt.Errorf("POLYMARKET_AUTO_REDEEM_MAX_SUBMIT_ATTEMPTS must be between 1 and 10")
 		}
 	}
 	if config.DecisionCycle.OrderSubmissionEnabled && !config.DecisionCycle.Enabled {
