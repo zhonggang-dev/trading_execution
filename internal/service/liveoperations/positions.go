@@ -102,11 +102,26 @@ func buildPositions(params buildPositionsParams) ([]domain.LivePosition, positio
 				totals.oldestBookAt = earlierTime(totals.oldestBookAt, book.ObservedAt)
 			}
 		}
+		// A baseline-only token (no managed local position) that is gone from the
+		// external snapshot, for example a settled position that was redeemed,
+		// must not stop the service from starting: this view is read-only and
+		// reconciliation already records the EXTERNAL_POSITION_BASELINE_DRIFT
+		// issue that blocks that token. A baseline token that a managed local
+		// position still depends on keeps failing closed.
+		absentBaselineOnly := 0
 		for tokenID := range unseenBaselines {
-			return nil, totals, fmt.Errorf(
-				"external position baseline token %q is absent for account %q",
-				tokenID, observation.account.ExecutionAccountID,
-			)
+			if _, managed := localByKey[livePositionKey(observation.account.ExecutionAccountID, tokenID)]; managed {
+				return nil, totals, fmt.Errorf(
+					"external position baseline token %q is absent for account %q",
+					tokenID, observation.account.ExecutionAccountID,
+				)
+			}
+			absentBaselineOnly++
+		}
+		if absentBaselineOnly > 0 {
+			params.quality.add("positions", "链上持仓", domain.LiveHealthDegraded,
+				fmt.Sprintf("账户 %s 有 %d 个外部持仓基线 token 已不在链上快照中（可能已赎回或卖出），对账已记录 token 级问题",
+					observation.account.ExecutionAccountID, absentBaselineOnly))
 		}
 	}
 	checkMissingExternalPositions(params.local, externalKeys, params.quality)
