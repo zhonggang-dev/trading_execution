@@ -7,36 +7,23 @@ import (
 	"time"
 )
 
-func TestStrategyExecutionContextRejectsUnsafeStrategyID(t *testing.T) {
+func TestStrategyExecutionContextValidatesStrategyIDFormat(t *testing.T) {
 	valid := StrategyExecutionContext{
 		ModelID: "model-1", StrategyID: "strategy-v1", ExecutionAccountID: "account-1",
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("Validate() historical alias error = %v", err)
 	}
-	unknown := valid
-	unknown.StrategyID = "strategy v3"
-	if err := unknown.Validate(); err == nil || !strings.Contains(err.Error(), "invalid format") {
-		t.Fatalf("Validate() error = %v, want unsupported strategy rejection", err)
-	}
-}
-
-func TestStrategyExecutionContextAcceptsConfiguredStrategyID(t *testing.T) {
-	context := StrategyExecutionContext{
-		ModelID: "deepseek_masked", StrategyID: "alpha_new.v2", ExecutionAccountID: "main",
-	}
-	if err := context.Validate(); err != nil {
+	configured := valid
+	configured.StrategyID = "alpha_new.v2"
+	if err := configured.Validate(); err != nil {
 		t.Fatalf("Validate() configured strategy error = %v", err)
 	}
-}
-
-func TestStrategyExecutionContextAcceptsDeepSeekReuseStrategies(t *testing.T) {
-	for _, strategyID := range []string{StrategyIDPendingA, StrategyIDPendingB} {
-		context := StrategyExecutionContext{
-			ModelID: "deepseek_masked", StrategyID: strategyID, ExecutionAccountID: "main",
-		}
-		if err := context.Validate(); err != nil {
-			t.Fatalf("Validate(%q) error = %v", strategyID, err)
+	for _, unsafe := range []string{"strategy v3", "1strategy", "a/b", "名字", strings.Repeat("a", 65)} {
+		invalid := valid
+		invalid.StrategyID = unsafe
+		if err := invalid.Validate(); err == nil || !strings.Contains(err.Error(), "invalid format") {
+			t.Fatalf("Validate(%q) error = %v, want format rejection", unsafe, err)
 		}
 	}
 }

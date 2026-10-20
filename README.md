@@ -37,8 +37,6 @@ prediction_infra PIT 概率快照 + PostgreSQL OPEN lots + venue top-15 订单�
 [`docs/decision-cycle.md`](docs/decision-cycle.md)。
 外部策略团队需要实现的入场与逐笔持仓退出 HTTP 接口、完整请求/响应类型和业务校验见
 [`docs/python-algorithm-http-api.md`](docs/python-algorithm-http-api.md)。
-复用 `main/wallet-1` 切换 DeepSeek 新策略、旧仓退出和审计基线维护见
-[`docs/wallet-reuse-cutover.md`](docs/wallet-reuse-cutover.md)。
 独立十分钟持仓退出任务的运行和持久化说明见
 [`docs/position-exit-job.md`](docs/position-exit-job.md)。
 执行前的市场身份、状态、tick 与最新价格校验见

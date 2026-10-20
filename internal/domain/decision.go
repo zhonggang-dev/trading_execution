@@ -579,20 +579,14 @@ type StrategyExecutionBinding struct {
 const (
 	StrategyIDMultfactorV1 = "multfactor_v1"
 	StrategyIDMultfactorV2 = "multfactor_v2"
-	// StrategyIDPendingA/B are temporary integration identifiers for the
-	// DeepSeek wallet-reuse rollout.  The strategy service owns their trading
-	// logic; Trading only validates the stable wire contract and routes each
-	// identifier to its bound wallet.
-	StrategyIDPendingA = "strategy_pending_a"
-	StrategyIDPendingB = "strategy_pending_b"
 )
 
 var safeStrategyIDPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]{0,63}$`)
 
-// ValidateStrategyID checks the stable wire identifier shared by configuration,
-// strategy responses, orders, and ledger rows. The execution layer does not
-// own the algorithm catalogue; topology validation binds a configured ID to a
-// wallet, while this function only rejects ambiguous or unsafe identifiers.
+// ValidateStrategyID rejects ambiguous or unsafe strategy identifiers. The
+// execution layer does not own the strategy catalogue: which wallet may run
+// which strategy is decided by the bindings configuration and the database
+// authorization rows, so this only checks the wire format.
 func ValidateStrategyID(value string) error {
 	value = CanonicalStrategyID(value)
 	if value == "" {
@@ -733,10 +727,7 @@ func (executionContext StrategyExecutionContext) Validate() error {
 	if executionContext.ModelID == "" || executionContext.StrategyID == "" || executionContext.ExecutionAccountID == "" {
 		return fmt.Errorf("model_id, strategy_id, and execution_account_id are required")
 	}
-	if err := ValidateStrategyID(executionContext.StrategyID); err != nil {
-		return err
-	}
-	return nil
+	return ValidateStrategyID(executionContext.StrategyID)
 }
 
 // Equal 判断两个值在规范化后是否相等。

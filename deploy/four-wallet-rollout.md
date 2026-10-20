@@ -1,15 +1,20 @@
 # Four-wallet decision-cycle rollout
 
-The four routes are one configuration unit: two upstream prediction models,
-two logical strategies for each model, and four distinct execution accounts.
+The four routes are one configuration unit: one upstream prediction model
+(`deepseek_masked`, Sandbox source), four strategies and four distinct execution
+accounts. wallet-6/wallet-7 are fixed to `multfactor_v1/v2`; main/wallet-1 take
+two configurable, distinct strategy IDs (`strategy_pending_a/b` until the formal
+names exist).
 Do not reuse the legacy wallet-2 canary deployment or activation scripts for
 this topology; those scripts intentionally contain a one-binding subset.
 
 Use [`four-wallet-decision-cycle.env.example`](four-wallet-decision-cycle.env.example)
-as the non-secret fragment. Replace every placeholder with the exact
+as the non-secret fragment. Replace the prediction model with the exact
 `model.name` returned by the current Prediction PIT snapshot, install a wallet
 file containing exactly `main`, `wallet-1`, `wallet-6`, and `wallet-7`, and keep
-both durable gates closed:
+both durable gates closed (`ENTRY_DISABLED` may be any subset of
+`["main","wallet-1"]`; start with both listed, then shrink it after the new
+strategies have been observed, re-running the preflight each time):
 
 ```text
 DECISION_CYCLE_ORDER_SUBMISSION_ENABLED=false
@@ -39,7 +44,7 @@ the v2 history window; monetary allocation belongs to the upstream AI strategy:
 EXECUTION_ALLOW_MARKET_ORDERS=false
 POLYMARKET_MAX_BUY_FEE_RATE_BPS=EXACT_REVIEWED_NON_NEGATIVE_DECIMAL
 POLYGON_ORDER_FILLED_CONFIRMATIONS=EXACT_REVIEWED_POSITIVE_INTEGER
-DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON={"EXACT_ECHO_SNAPSHOT_MODEL_NAME":"DIRECT","EXACT_NEW_SNAPSHOT_MODEL_NAME":"SANDBOX"}
+DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON={"EXACT_SNAPSHOT_MODEL_NAME":"SANDBOX"}
 ```
 
 The preflight binds these values into the configuration SHA and verifies the
@@ -47,8 +52,8 @@ running process has the same values. The account entry list is also hashed and
 must be exactly `main,wallet-1`. The Go runtime also enforces the
 source-mode map on every cycle: `DIRECT` accepts only an empty `sandbox_id`,
 while `SANDBOX` requires a non-empty `sandbox_id`. The map must exactly cover
-all configured upstream models; the current release pins echo to `DIRECT` and
-`deepseek_masked` to `SANDBOX`. Market orders must remain disabled for the
+all configured upstream models; the current release pins `deepseek_masked` to
+`SANDBOX`. Market orders must remain disabled for the
 four-wallet activation; changing any other value invalidates disabled-pass
 evidence and requires a new review.
 
@@ -60,9 +65,14 @@ service enforces main/wallet-1 BUY rejection for direct HTTP Submit, reserved
 Resume, decision delivery, and crash recovery.
 
 The `DECISION_CYCLE_BINDINGS_JSON` array must be replaced atomically as one
-environment-file value. The routes are exact: `echo/multfactor_v2 -> main`,
-`echo/multfactor_v1 -> wallet-1`, `deepseek_masked/multfactor_v1 -> wallet-6`,
-and `deepseek_masked/multfactor_v2 -> wallet-7`. The database must contain the
+environment-file value. The routes are `deepseek_masked/<main strategy> -> main`,
+`deepseek_masked/<wallet-1 strategy> -> wallet-1`,
+`deepseek_masked/multfactor_v1 -> wallet-6`, and
+`deepseek_masked/multfactor_v2 -> wallet-7`. Binding the formal strategy names
+later is a configuration change only: edit the two IDs in this array and run
+[`rebind_main_wallet1.sql`](rebind_main_wallet1.sql) with the same names while
+`ENTRY_DISABLED` still lists the account, because lots are owned by the exact
+`model_id + strategy_id`. The database must contain the
 same four `(model_id, strategy_id, execution_account_id)` authorization rows.
 All four authorization rows are enabled in shadow. main/wallet-1 remain active
 so their existing OPEN lots can be reconciled and exited; new BUY entries are
@@ -106,38 +116,29 @@ main/wallet-1: both have managed OPEN lots and must remain eligible for
 reconciliation and SELL exits. wallet-6/wallet-7 activation is a reviewed
 stopped-service CAS change while the global kill switch stays closed.
 
-Prediction must publish the same source-model set, not the logical aliases.
-The following values are mandatory in `/etc/prediction-infra/env` and must be
-loaded by the actual `prediction-infra.service` process:
+Prediction must publish the Sandbox source model named in the bindings, not the
+logical alias. The following values are mandatory in `/etc/prediction-infra/env`
+and must be loaded by the actual `prediction-infra.service` process:
 
 ```text
-REDIS_ENABLED=true
-REDIS_ADDRESS=APPROVED_REDIS_HOST:6379
-REDIS_DATABASE=APPROVED_REDIS_DATABASE
-DIRECT_PREDICTION_ENABLED=true
-REDIS_DIRECT_PREDICTION_STREAM_KEY=prediction_pm_directprediction
-DIRECT_PREDICTION_MODEL_IDS_JSON=["EXACT_ECHO_SNAPSHOT_MODEL_NAME"]
 PREDICTION_RESULT_ENABLED=true
 TRADING_INPUT_ENABLED=true
 DATABASE_URL=postgresql://...
-REDIS_PASSWORD=...
 TRADING_INPUT_TOKEN=...
 PREDICTION_RESULT_TOKEN=...
 ```
 
-`DIRECT_PREDICTION_MODEL_IDS_JSON` must equal the `DIRECT` subset in Trading's
-source-mode map, so it contains the echo source model and must not contain the
-new Sandbox model source. Unknown, blank, duplicated, missing, or extra models
-fail preflight. Prediction result callbacks and Trading input must both be
+All four wallets consume the Sandbox source only, so there is no Direct Redis
+model: the preflight uses an empty Direct group mapping, performs no Redis
+`XINFO`, and requires zero Direct manifest markets. Prediction may keep
+producing Echo through `DIRECT_PREDICTION_MODEL_IDS_JSON` for other consumers;
+that inventory is not part of this contract. (If a Direct source model is ever
+added back to the source-mode map, the preflight again requires the Redis
+settings, an exact `DIRECT_PREDICTION_MODEL_IDS_JSON`, and a consumer group per
+Direct model.) Prediction result callbacks and Trading input must both be
 enabled. `TRADING_INPUT_TOKEN` must equal Trading's
 `DECISION_CYCLE_PREDICTION_INFRA_TOKEN`; both Prediction tokens and Trading's
 strategy token must be non-empty, and the result/input tokens must be distinct.
-
-Direct model identity remains statically pinned in Prediction configuration,
-but the entry-enabled cohort is wallet-6/wallet-7 and is Sandbox-only.
-Therefore shadow preflight uses an empty Direct group mapping, performs no
-Redis `XINFO`, and requires zero Direct manifest markets. main/wallet-1 do not
-receive Echo entry predictions while their account BUY gate is active.
 
 Run the read-only preflight while submission is still disabled:
 

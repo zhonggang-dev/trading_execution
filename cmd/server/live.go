@@ -106,8 +106,8 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	for _, account := range accounts {
 		accountIDs = append(accountIDs, account.ExecutionAccountID)
 	}
-	if err := validateLiveWalletRelease(
-		accountIDs, cfg.DecisionCycle.SubmissionDisabledAccounts, cfg.DecisionCycle.Topology,
+	if err := validateCurrentLiveWallet67Release(
+		accountIDs, cfg.DecisionCycle.SubmissionDisabledAccounts,
 	); err != nil {
 		return nil, err
 	}
@@ -149,9 +149,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure live execution account scope: %w", err)
 	}
-	activeAuthorizations, err := currentLiveAuthorizations(
-		reconciliationAccountIDs, cfg.DecisionCycle.Bindings, cfg.DecisionCycle.Topology,
-	)
+	activeAuthorizations, err := currentLiveWallet67Authorizations(reconciliationAccountIDs, cfg.DecisionCycle.Bindings)
 	if err != nil {
 		return nil, err
 	}
@@ -610,10 +608,6 @@ func optionalQuarantineReadiness(
 }
 
 func validateCurrentLiveWallet67Release(configured, quarantined []string) error {
-	return validateLiveWalletRelease(configured, quarantined, config.DecisionCycleTopologyFourWallet)
-}
-
-func validateLiveWalletRelease(configured, quarantined []string, topology string) error {
 	if err := requireExactLiveAccountSet(
 		"wallet file", configured, []string{"main", "wallet-1", "wallet-6", "wallet-7"},
 	); err != nil {
@@ -622,24 +616,12 @@ func validateLiveWalletRelease(configured, quarantined []string, topology string
 	if len(quarantined) != 0 {
 		return fmt.Errorf("this release requires an empty submission-disabled account list")
 	}
-	if topology != config.DecisionCycleTopologyFourWallet &&
-		topology != config.DecisionCycleTopologyDeepSeekReuseFourWallet {
-		return fmt.Errorf("unsupported decision-cycle topology %q", topology)
-	}
 	return nil
 }
 
 func currentLiveWallet67Authorizations(
 	activeAccountIDs []string,
 	bindings []domain.StrategyExecutionBinding,
-) ([]postgresadapter.ExpectedActiveExecutionAccount, error) {
-	return currentLiveAuthorizations(activeAccountIDs, bindings, config.DecisionCycleTopologyFourWallet)
-}
-
-func currentLiveAuthorizations(
-	activeAccountIDs []string,
-	bindings []domain.StrategyExecutionBinding,
-	topology string,
 ) ([]postgresadapter.ExpectedActiveExecutionAccount, error) {
 	maskedModelID := ""
 	for _, rawBinding := range bindings {
@@ -658,35 +640,9 @@ func currentLiveAuthorizations(
 	if maskedModelID == "" {
 		return nil, fmt.Errorf("wallet-6/wallet-7 masked model route is required")
 	}
-	modelForRetained := "echo"
-	mainStrategy, wallet1Strategy := domain.StrategyIDMultfactorV2, domain.StrategyIDMultfactorV1
-	if topology == config.DecisionCycleTopologyDeepSeekReuseFourWallet {
-		if err := config.ValidateDecisionCycleTopology(topology, bindings); err != nil {
-			return nil, err
-		}
-		modelForRetained = "deepseek_masked"
-		maskedModelID = modelForRetained
-		for _, rawBinding := range bindings {
-			binding := rawBinding.Normalize()
-			switch binding.ExecutionAccountID {
-			case "main":
-				mainStrategy = binding.StrategyID
-			case "wallet-1":
-				wallet1Strategy = binding.StrategyID
-			}
-		}
-	}
+	// main/wallet-1 take their strategy IDs from the bindings (already shape-
+	// validated at config load); wallet-6/wallet-7 stay on the fixed IDs.
 	routes := map[string]postgresadapter.ExpectedActiveExecutionAccount{
-		"main": {
-			ExecutionAccountID: "main",
-			ModelID:            modelForRetained,
-			StrategyID:         mainStrategy,
-		},
-		"wallet-1": {
-			ExecutionAccountID: "wallet-1",
-			ModelID:            modelForRetained,
-			StrategyID:         wallet1Strategy,
-		},
 		"wallet-6": {
 			ExecutionAccountID: "wallet-6",
 			ModelID:            maskedModelID,
@@ -698,8 +654,15 @@ func currentLiveAuthorizations(
 			StrategyID:         domain.StrategyIDMultfactorV2,
 		},
 	}
-	if topology != config.DecisionCycleTopologyFourWallet && topology != config.DecisionCycleTopologyDeepSeekReuseFourWallet {
-		return nil, fmt.Errorf("unsupported decision-cycle topology %q", topology)
+	for _, rawBinding := range bindings {
+		binding := rawBinding.Normalize()
+		if binding.ExecutionAccountID == "main" || binding.ExecutionAccountID == "wallet-1" {
+			routes[binding.ExecutionAccountID] = postgresadapter.ExpectedActiveExecutionAccount{
+				ExecutionAccountID: binding.ExecutionAccountID,
+				ModelID:            maskedModelID,
+				StrategyID:         binding.StrategyID,
+			}
+		}
 	}
 	result := make([]postgresadapter.ExpectedActiveExecutionAccount, 0, len(activeAccountIDs))
 	seen := make(map[string]struct{}, len(activeAccountIDs))
