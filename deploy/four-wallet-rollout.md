@@ -69,10 +69,30 @@ environment-file value. The routes are `deepseek_masked/<main strategy> -> main`
 `deepseek_masked/<wallet-1 strategy> -> wallet-1`,
 `deepseek_masked/multfactor_v1 -> wallet-6`, and
 `deepseek_masked/multfactor_v2 -> wallet-7`. Binding the formal strategy names
-later is a configuration change only: edit the two IDs in this array and run
-[`rebind_main_wallet1.sql`](rebind_main_wallet1.sql) with the same names while
+later is a configuration change only (no code change). Do it while
 `ENTRY_DISABLED` still lists the account, because lots are owned by the exact
-`model_id + strategy_id`. The database must contain the
+`model_id + strategy_id`:
+
+1. Edit the main/wallet-1 `strategy_id` values in `DECISION_CYCLE_BINDINGS_JSON`.
+2. In `/etc/trading-execution/kalshi-live.env`, change the `main` entry of
+   `KALSHI_LIVE_BINDINGS_JSON` to the same `model_id`/`strategy_id` (only those
+   two fields; leave the key id and key path alone). Startup fails with
+   `Kalshi live route is not an exact decision binding` otherwise.
+3. Run [`rebind_main_wallet1.sql`](rebind_main_wallet1.sql) with the same two
+   names (`-v main_strategy=... -v wallet1_strategy=...`).
+4. Restart the service. Make sure the release directory is readable by the
+   `trading-execution` user (mode 755), otherwise systemd fails with
+   `status=200/CHDIR`.
+5. Enable in two steps: first remove the account from
+   `DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON` (strategy is called, BUY is
+   still blocked by `ENTRY_DISABLED`), check a cycle, then remove it from
+   `DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON`. The global
+   `DECISION_CYCLE_ORDER_SUBMISSION_ENABLED` stays `true` and is not changed.
+
+Out-of-band exits and redemptions change the chain balance and holdings; record
+the cash with a ledger rebase before the next reconciliation (an unexplained
+difference is an account-wide `BALANCE_DRIFT` that blocks every order for the
+account). The database must contain the
 same four `(model_id, strategy_id, execution_account_id)` authorization rows.
 All four authorization rows are enabled in shadow. main/wallet-1 remain active
 so their existing OPEN lots can be reconciled and exited; new BUY entries are
