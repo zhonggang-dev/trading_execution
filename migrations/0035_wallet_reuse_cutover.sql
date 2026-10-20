@@ -589,7 +589,7 @@ $$;
 DO $$
 BEGIN
     EXECUTE format(
-        'ALTER FUNCTION %I.execution_apply_wallet_reuse_cutover(JSONB,TEXT,TEXT,TEXT,TEXT) SET search_path = pg_catalog, %I',
+        'ALTER FUNCTION %I.execution_apply_wallet_reuse_cutover(JSONB,TEXT,TEXT,TEXT,TEXT) SET search_path = pg_catalog, %I, pg_temp',
         current_schema(), current_schema()
     );
 END;

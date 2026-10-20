@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/walletcutover"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 type cutoverTestChain struct{ report walletcutover.ChainReport }
@@ -136,6 +139,162 @@ func TestWalletCutoverDryRunAndApplyAreAtomic(t *testing.T) {
 	}
 	if _, err := service.Apply(context.Background(), params); err != nil {
 		t.Fatalf("idempotent replay: %v", err)
+	}
+}
+
+func TestWalletCutoverSecurityDefinerIgnoresTemporaryRelations(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not configured")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "0035_wallet_reuse_cutover.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(migration)); err != nil {
+		t.Fatalf("apply 0035: %v", err)
+	}
+
+	for _, account := range []struct{ id, wallet, total string }{
+		{"main", "0x1111111111111111111111111111111111111111", "10"},
+		{"wallet-1", "0x2222222222222222222222222222222222222222", "20"},
+	} {
+		if _, err := db.Exec(`
+			INSERT INTO execution_accounts(execution_account_id,wallet_address,collateral_asset,total_balance,available_balance,reserved_balance)
+			VALUES ($1,$2,'pUSD',$3::numeric,$3::numeric,0)`, account.id, account.wallet, account.total); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`
+			INSERT INTO execution_risk_controls(execution_account_id,control_scope,control_key,paused,reason)
+			VALUES ($1,'ACCOUNT','',true,'cutover')`, account.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	adminConfig, err := pgx.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema string
+	if err := db.QueryRow(`SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	const controlledRole = "trading_execution_cutover_operator"
+	var controlledRoleExists bool
+	if err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname=$1)`, controlledRole).Scan(&controlledRoleExists); err != nil {
+		t.Fatal(err)
+	}
+	createdControlledRole := false
+	if !controlledRoleExists {
+		if _, err := db.Exec(`CREATE ROLE ` + pgx.Identifier{controlledRole}.Sanitize() + ` NOLOGIN`); err != nil {
+			t.Fatalf("create controlled role: %v", err)
+		}
+		createdControlledRole = true
+	}
+	operatorRole := fmt.Sprintf("walletcutover_operator_%d", time.Now().UnixNano())
+	quotedOperatorRole := pgx.Identifier{operatorRole}.Sanitize()
+	if _, err := db.Exec(`CREATE ROLE ` + quotedOperatorRole + ` LOGIN PASSWORD 'operator-password'`); err != nil {
+		t.Fatalf("create operator role: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(`DROP ROLE ` + quotedOperatorRole)
+		if createdControlledRole {
+			_, _ = db.Exec(`DROP ROLE ` + pgx.Identifier{controlledRole}.Sanitize())
+		}
+	})
+	for _, grant := range []string{
+		`GRANT ` + pgx.Identifier{controlledRole}.Sanitize() + ` TO ` + quotedOperatorRole,
+		`GRANT USAGE ON SCHEMA ` + pgx.Identifier{schema}.Sanitize() + ` TO ` + quotedOperatorRole,
+		`GRANT SELECT ON ` + pgx.Identifier{schema, "execution_accounts"}.Sanitize() + ` TO ` + quotedOperatorRole,
+		`GRANT EXECUTE ON FUNCTION ` + pgx.Identifier{schema}.Sanitize() + `.execution_apply_wallet_reuse_cutover(jsonb,text,text,text,text) TO ` + quotedOperatorRole,
+	} {
+		if _, err := db.Exec(grant); err != nil {
+			t.Fatalf("grant operator privilege (%s): %v", grant, err)
+		}
+	}
+
+	operatorConfig := adminConfig.Copy()
+	operatorConfig.User = operatorRole
+	operatorConfig.Password = "operator-password"
+	operatorConfig.RuntimeParams["search_path"] = schema
+	operatorDB := stdlib.OpenDB(*operatorConfig)
+	operatorDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = operatorDB.Close() })
+	if err := operatorDB.PingContext(context.Background()); err != nil {
+		t.Fatalf("connect operator role: %v", err)
+	}
+	accountsTable := pgx.Identifier{schema, "execution_accounts"}.Sanitize()
+	if _, err := operatorDB.Exec(`CREATE TEMP TABLE execution_accounts AS SELECT * FROM ` + accountsTable + ` WITH NO DATA`); err != nil {
+		t.Fatalf("create shadow execution_accounts temp table: %v", err)
+	}
+	if _, err := operatorDB.Exec(`
+		INSERT INTO execution_accounts(execution_account_id,wallet_address,collateral_asset,total_balance,available_balance,reserved_balance,version)
+		VALUES
+		 ('main','0x1111111111111111111111111111111111111111','pUSD',10,10,0,1),
+		 ('wallet-1','0x2222222222222222222222222222222222222222','pUSD',20,20,0,1)`); err != nil {
+		t.Fatalf("seed shadow execution_accounts temp table: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	manifest := walletcutover.Manifest{
+		SchemaVersion: walletcutover.ManifestSchemaVersion, BatchID: "search-path-cutover",
+		ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour), Actor: "operator", Reason: "search path regression",
+		EvidenceBlock: walletcutover.EvidenceBlock{ChainID: 137, Number: 100, Hash: "0x" + repeatedHex("ab", 32), Confirmations: 128},
+		Accounts: []walletcutover.AccountManifest{
+			cutoverAccount("main", "0x1111111111111111111111111111111111111111", "10", "8"),
+			cutoverAccount("wallet-1", "0x2222222222222222222222222222222222222222", "20", "19"),
+		},
+	}
+	chainReport := walletcutover.ChainReport{
+		ChainID: 137, BlockNumber: 100, BlockHash: manifest.EvidenceBlock.Hash,
+		BlockTime: manifest.ObservedAt, LatestBlock: 300, Confirmations: 128,
+		Accounts: []walletcutover.ChainAccountReport{
+			{ExecutionAccountID: "main", WalletAddress: manifest.Accounts[0].WalletAddress, CashBalance: "8"},
+			{ExecutionAccountID: "wallet-1", WalletAddress: manifest.Accounts[1].WalletAddress, CashBalance: "19"},
+		},
+	}
+	manifestRaw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainRaw, err := json.Marshal(chainReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(struct {
+		Manifest    json.RawMessage `json:"manifest"`
+		ChainReport json.RawMessage `json:"chain_report"`
+	}{Manifest: manifestRaw, ChainReport: chainRaw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(manifestRaw)
+	var result []byte
+	if err := operatorDB.QueryRow(
+		`SELECT execution_apply_wallet_reuse_cutover($1::jsonb,$2,$3,$4,$5)`,
+		payload, manifest.BatchID, hex.EncodeToString(digest[:]), manifest.Actor, manifest.Reason,
+	).Scan(&result); err != nil {
+		t.Fatalf("apply wallet cutover as controlled operator with temp shadow: %v", err)
+	}
+	if len(result) == 0 {
+		t.Fatal("wallet cutover returned an empty result")
+	}
+
+	for _, account := range []struct{ id, wantReal, wantTemp string }{
+		{"main", "8", "10"},
+		{"wallet-1", "19", "20"},
+	} {
+		var realBalance, tempBalance string
+		if err := db.QueryRow(`SELECT total_balance::text FROM execution_accounts WHERE execution_account_id=$1`, account.id).Scan(&realBalance); err != nil {
+			t.Fatal(err)
+		}
+		if err := operatorDB.QueryRow(`SELECT total_balance::text FROM execution_accounts WHERE execution_account_id=$1`, account.id).Scan(&tempBalance); err != nil {
+			t.Fatal(err)
+		}
+		if !sameNumeric(realBalance, account.wantReal) || !sameNumeric(tempBalance, account.wantTemp) {
+			t.Fatalf("account %s balances = real %s/temp %s, want real %s/temp %s", account.id, realBalance, tempBalance, account.wantReal, account.wantTemp)
+		}
 	}
 }
 
