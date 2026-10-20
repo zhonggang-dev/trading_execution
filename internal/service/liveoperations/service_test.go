@@ -294,6 +294,26 @@ func TestExternalPositionBaselineDriftFailsClosed(t *testing.T) {
 	}
 }
 
+func TestAbsentBaselineOnlyTokenDegradesInsteadOfFailing(t *testing.T) {
+	now := time.Date(2026, 8, 19, 8, 0, 10, 0, time.UTC)
+	service, _, _ := newTestService(t, &now)
+	baseline := testLivePositionBaseline(&now, "5")
+	baseline.TokenID = "token-redeemed-baseline-only"
+	baseline.ConditionID = "condition-redeemed"
+	service.positionBaselines.(*fakePositionBaselineSource).baselines = []domain.ExternalPositionBaseline{baseline}
+
+	if err := service.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v, want a degraded snapshot for a baseline-only token that left the wallet", err)
+	}
+	snapshot, err := service.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dataQualityStatus(snapshot.DataQuality, "positions") != domain.LiveHealthDegraded {
+		t.Fatalf("absent baseline-only token did not degrade position quality: %#v", snapshot.DataQuality)
+	}
+}
+
 // newTestService 创建包含一个账户、一个仓位和完整健康状态的聚合服务。
 func newTestService(t *testing.T, now *time.Time) (*Service, *fakeBalanceSource, *fakeRepository) {
 	t.Helper()
