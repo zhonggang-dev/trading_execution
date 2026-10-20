@@ -13,15 +13,15 @@ import four_wallet_preflight as preflight
 
 VALID_BINDINGS = [
     {
-        "prediction_model_id": "echo-producer-v7",
-        "model_id": "echo",
-        "strategy_id": "multfactor_v2",
+        "prediction_model_id": "qwen",
+        "model_id": "deepseek_masked",
+        "strategy_id": "strategy_pending_a",
         "execution_account_id": "main",
     },
     {
-        "prediction_model_id": "echo-producer-v7",
-        "model_id": "echo",
-        "strategy_id": "multfactor_v1",
+        "prediction_model_id": "qwen",
+        "model_id": "deepseek_masked",
+        "strategy_id": "strategy_pending_b",
         "execution_account_id": "wallet-1",
     },
     {
@@ -38,10 +38,29 @@ VALID_BINDINGS = [
     },
 ]
 SOURCE_MODES = {
+    "qwen": "SANDBOX",
+}
+MODEL_GROUPS: dict[str, str] = {}
+# The production topology is SANDBOX-only, but the preflight still carries the
+# generic DIRECT-source checks. These fixtures exercise those paths directly;
+# they intentionally bypass validate_topology (an echo route is not deployable).
+DIRECT_SOURCE_MODES = {
     "echo-producer-v7": "DIRECT",
     "qwen": "SANDBOX",
 }
-MODEL_GROUPS = {"echo-producer-v7": "predict-echo-v1"}
+DIRECT_MODEL_GROUPS = {"echo-producer-v7": "predict-echo-v1"}
+
+
+def legacy_direct_bindings() -> tuple[preflight.Binding, ...]:
+    rows = [
+        ("echo-producer-v7", "echo", "multfactor_v2", "main"),
+        ("echo-producer-v7", "echo", "multfactor_v1", "wallet-1"),
+        ("qwen", "deepseek_masked", "multfactor_v1", "wallet-6"),
+        ("qwen", "deepseek_masked", "multfactor_v2", "wallet-7"),
+    ]
+    return tuple(sorted(preflight.Binding(*row) for row in rows))
+
+
 TRADING_COMMIT = "a" * 40
 PREDICTION_COMMIT = "b" * 40
 STATIC_TRADING_ENVIRONMENT = {
@@ -58,7 +77,7 @@ STATIC_TRADING_DRIFT = {
     "POLYMARKET_MAX_BUY_FEE_RATE_BPS": "9999",
     "POLYGON_ORDER_FILLED_CONFIRMATIONS": "65",
     "DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON": (
-        '{"echo-producer-v7":"SANDBOX","qwen":"DIRECT"}'
+        '{"qwen":"DIRECT"}'
     ),
     "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON": '["main","wallet-6"]',
 }
@@ -286,11 +305,14 @@ def activation_risk_approval(
     }
 
 
-def consumer_state(now: dt.datetime) -> dict[str, object]:
+def consumer_state(
+    now: dt.datetime, model_groups: dict[str, str] | None = None
+) -> dict[str, object]:
+    model_groups = MODEL_GROUPS if model_groups is None else model_groups
     return {
         "observed_at": iso(now),
         "stream_key": "prediction_pm_directprediction",
-        "model_groups": MODEL_GROUPS,
+        "model_groups": model_groups,
         "groups": [
             {
                 "model_id": model_id,
@@ -306,7 +328,7 @@ def consumer_state(now: dt.datetime) -> dict[str, object]:
                     }
                 ],
             }
-            for index, (model_id, group) in enumerate(MODEL_GROUPS.items(), start=1)
+            for index, (model_id, group) in enumerate(model_groups.items(), start=1)
         ],
     }
 
@@ -335,60 +357,83 @@ def delivery_watermark() -> dict[str, object]:
 
 
 class BindingTopologyTests(unittest.TestCase):
-    def test_accepts_complete_two_by_two_matrix(self) -> None:
-        bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+    def decode(self, bindings: list[dict[str, object]]) -> tuple[preflight.Binding, ...]:
+        return preflight.decode_bindings(json.dumps(bindings))
+
+    def test_accepts_the_four_wallet_matrix(self) -> None:
+        bindings = self.decode(VALID_BINDINGS)
         self.assertEqual(len(bindings), 4)
         self.assertEqual(
             {binding.execution_account_id for binding in bindings},
             preflight.EXPECTED_ACCOUNTS,
         )
 
-    def test_accepts_current_prediction_source_names_without_hardcoding(self) -> None:
+    def test_accepts_configured_main_wallet1_strategy_ids(self) -> None:
+        configured = [dict(item) for item in VALID_BINDINGS]
+        configured[0]["strategy_id"] = "alpha_new.v2"
+        configured[1]["strategy_id"] = "beta-new"
+        bindings = self.decode(configured)
+        self.assertEqual(
+            {binding.strategy_id for binding in bindings},
+            {"alpha_new.v2", "beta-new", "multfactor_v1", "multfactor_v2"},
+        )
+
+    def test_accepts_current_prediction_source_name_without_hardcoding(self) -> None:
         current = [dict(item) for item in VALID_BINDINGS]
-        current[0]["prediction_model_id"] = "echo-producer-current"
-        current[1]["prediction_model_id"] = "echo-producer-current"
-        current[2]["prediction_model_id"] = "masked-producer-current"
-        current[3]["prediction_model_id"] = "masked-producer-current"
-        self.assertEqual(len(preflight.decode_bindings(json.dumps(current))), 4)
+        for item in current:
+            item["prediction_model_id"] = "v4.1 flash"
+        self.assertEqual(len(self.decode(current)), 4)
 
     def test_rejects_missing_wallet(self) -> None:
         broken = [dict(item) for item in VALID_BINDINGS]
         broken[-1]["execution_account_id"] = "wallet-6"
         with self.assertRaisesRegex(preflight.PreflightError, "binding accounts must be exactly"):
-            preflight.decode_bindings(json.dumps(broken))
+            self.decode(broken)
 
-    def test_rejects_incomplete_cartesian_product(self) -> None:
+    def test_rejects_echo_route_for_main(self) -> None:
         broken = [dict(item) for item in VALID_BINDINGS]
-        broken[-1]["strategy_id"] = "multfactor_v1"
-        with self.assertRaisesRegex(preflight.PreflightError, "duplicate logical model/strategy"):
-            preflight.decode_bindings(json.dumps(broken))
+        broken[0]["model_id"] = "echo"
+        with self.assertRaisesRegex(preflight.PreflightError, "one logical model"):
+            self.decode(broken)
 
-    def test_rejects_swapped_execution_account_routes(self) -> None:
+    def test_rejects_two_prediction_models(self) -> None:
         broken = [dict(item) for item in VALID_BINDINGS]
-        broken[2]["execution_account_id"] = "wallet-7"
-        broken[3]["execution_account_id"] = "wallet-6"
-        with self.assertRaisesRegex(preflight.PreflightError, "must use execution account"):
-            preflight.decode_bindings(json.dumps(broken))
+        broken[0]["prediction_model_id"] = "other"
+        with self.assertRaisesRegex(preflight.PreflightError, "one prediction model"):
+            self.decode(broken)
 
-    def test_rejects_swapped_retained_account_routes(self) -> None:
+    def test_rejects_wrong_wallet6_wallet7_strategies(self) -> None:
         broken = [dict(item) for item in VALID_BINDINGS]
-        broken[0]["execution_account_id"] = "wallet-1"
-        broken[1]["execution_account_id"] = "main"
-        with self.assertRaisesRegex(preflight.PreflightError, "must use execution account"):
-            preflight.decode_bindings(json.dumps(broken))
+        broken[2]["strategy_id"] = "multfactor_v2"
+        broken[3]["strategy_id"] = "multfactor_v1"
+        with self.assertRaisesRegex(preflight.PreflightError, "must use strategy"):
+            self.decode(broken)
 
-    def test_rejects_prediction_model_alias_collision(self) -> None:
+    def test_rejects_duplicate_main_wallet1_strategy(self) -> None:
         broken = [dict(item) for item in VALID_BINDINGS]
-        broken[2]["prediction_model_id"] = "echo-producer-v7"
-        broken[3]["prediction_model_id"] = "echo-producer-v7"
-        with self.assertRaisesRegex(preflight.PreflightError, "exactly 2 logical and 2 prediction"):
-            preflight.decode_bindings(json.dumps(broken))
+        broken[1]["strategy_id"] = broken[0]["strategy_id"]
+        with self.assertRaisesRegex(preflight.PreflightError, "distinct"):
+            self.decode(broken)
+
+    def test_rejects_main_wallet1_claiming_fixed_strategies_including_aliases(self) -> None:
+        for claimed in ("multfactor_v1", "strategy-v2", "MULTFACTOR_V1"):
+            broken = [dict(item) for item in VALID_BINDINGS]
+            broken[0]["strategy_id"] = claimed
+            with self.assertRaisesRegex(preflight.PreflightError, "cannot reuse"):
+                self.decode(broken)
+
+    def test_rejects_unsafe_strategy_id(self) -> None:
+        for unsafe in ("alpha new", "1alpha", "a/b", "x" * 65):
+            broken = [dict(item) for item in VALID_BINDINGS]
+            broken[0]["strategy_id"] = unsafe
+            with self.assertRaisesRegex(preflight.PreflightError, "invalid strategy_id"):
+                self.decode(broken)
 
     def test_rejects_unresolved_source_model_placeholder(self) -> None:
         broken = [dict(item) for item in VALID_BINDINGS]
         broken[0]["prediction_model_id"] = "EXACT_ECHO_SNAPSHOT_MODEL_NAME"
         with self.assertRaisesRegex(preflight.PreflightError, "unresolved"):
-            preflight.decode_bindings(json.dumps(broken))
+            self.decode(broken)
 
 
 class DatabaseStateTests(unittest.TestCase):
@@ -667,7 +712,7 @@ class EnvironmentTests(unittest.TestCase):
             SOURCE_MODES,
         )
         for payload, message in (
-            ({"echo-producer-v7": "DIRECT"}, "qwen"),
+            ({}, "qwen"),
             (
                 {
                     **SOURCE_MODES,
@@ -675,27 +720,9 @@ class EnvironmentTests(unittest.TestCase):
                 },
                 "unconfigured-model",
             ),
-            (
-                {
-                    "echo-producer-v7": "SANDBOX",
-                    "qwen": "DIRECT",
-                },
-                "echo source model",
-            ),
-            (
-                {
-                    "echo-producer-v7": "direct",
-                    "qwen": "SANDBOX",
-                },
-                "exactly DIRECT or SANDBOX",
-            ),
-            (
-                {
-                    "echo-producer-v7": {"mode": "DIRECT"},
-                    "qwen": "SANDBOX",
-                },
-                "exactly DIRECT or SANDBOX",
-            ),
+            ({"qwen": "DIRECT"}, "deepseek_masked source model to be SANDBOX"),
+            ({"qwen": "sandbox"}, "exactly DIRECT or SANDBOX"),
+            ({"qwen": {"mode": "SANDBOX"}}, "exactly DIRECT or SANDBOX"),
         ):
             with self.subTest(payload=payload), self.assertRaisesRegex(
                 preflight.PreflightError, message
@@ -705,9 +732,7 @@ class EnvironmentTests(unittest.TestCase):
                 )
         with self.assertRaisesRegex(preflight.PreflightError, "duplicate model"):
             preflight.decode_prediction_model_source_modes(
-                '{"echo-producer-v7":"DIRECT","echo-producer-v7":"DIRECT",'
-                '"qwen":"SANDBOX"}',
-                bindings,
+                '{"qwen":"SANDBOX","qwen":"SANDBOX"}', bindings
             )
 
     def test_accepts_only_empty_submission_quarantine(self) -> None:
@@ -806,17 +831,22 @@ class EnvironmentTests(unittest.TestCase):
                     submission_state="disabled",
                 )
 
-    def test_requires_exact_main_wallet1_entry_gate(self) -> None:
+    def test_entry_gate_is_any_subset_of_main_and_wallet1(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             wallet_path = self.write_wallet_file(
                 pathlib.Path(temporary), sorted(preflight.EXPECTED_ACCOUNTS)
             )
-            for value in ('[]', '["main"]', '["wallet-6","wallet-7"]'):
+            for value in ('[]', '["main"]', '["wallet-1"]', '["main","wallet-1"]'):
                 environment = self.environment(wallet_path)
                 environment["DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON"] = value
-                with self.subTest(value=value), self.assertRaisesRegex(
-                    preflight.PreflightError, "exactly main and wallet-1"
-                ):
+                with self.subTest(value=value):
+                    preflight.validate_environment(
+                        environment, submission_state="disabled"
+                    )
+            for value in ('["wallet-6"]', '["wallet-6","wallet-7"]', '["main","main"]'):
+                environment = self.environment(wallet_path)
+                environment["DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON"] = value
+                with self.subTest(value=value), self.assertRaises(preflight.PreflightError):
                     preflight.validate_environment(
                         environment, submission_state="disabled"
                     )
@@ -961,7 +991,7 @@ class ActivationRiskApprovalTests(unittest.TestCase):
 
 class PredictionEnvironmentTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        self.bindings = legacy_direct_bindings()
         self.environment = {
             "REDIS_ENABLED": "true",
             "REDIS_ADDRESS": "127.0.0.1:6379",
@@ -977,10 +1007,10 @@ class PredictionEnvironmentTests(unittest.TestCase):
 
     def validate(self) -> None:
         preflight.validate_prediction_environment(
-            self.environment, self.bindings, SOURCE_MODES
+            self.environment, self.bindings, DIRECT_SOURCE_MODES
         )
         preflight.validate_configured_direct_prediction_models(
-            self.environment, SOURCE_MODES
+            self.environment, DIRECT_SOURCE_MODES
         )
 
     def test_accepts_exact_direct_source_mode_subset(self) -> None:
@@ -1027,8 +1057,20 @@ class PredictionEnvironmentTests(unittest.TestCase):
             sandbox_environment, entry_bindings, entry_modes
         )
         preflight.validate_configured_direct_prediction_models(
-            sandbox_environment, SOURCE_MODES
+            sandbox_environment, DIRECT_SOURCE_MODES
         )
+
+    def test_sandbox_only_topology_ignores_the_echo_producer_inventory(self) -> None:
+        bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        environment = {
+            "DATABASE_URL": "postgres://prediction:secret@db/prediction",
+            "PREDICTION_RESULT_ENABLED": "true",
+            "TRADING_INPUT_ENABLED": "true",
+            # Prediction may keep producing Echo for other consumers.
+            "DIRECT_PREDICTION_MODEL_IDS_JSON": '["echoz"]',
+        }
+        preflight.validate_prediction_environment(environment, bindings, SOURCE_MODES)
+        preflight.validate_configured_direct_prediction_models(environment, SOURCE_MODES)
 
 
 class RuntimeEvidenceTests(unittest.TestCase):
@@ -1308,7 +1350,7 @@ class DryRunEvidenceTests(unittest.TestCase):
 class SnapshotManifestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.decision_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
-        self.bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        self.bindings = legacy_direct_bindings()
         self.active_bindings = preflight.active_rollout_bindings(
             self.bindings, ("wallet-6", "wallet-7")
         )
@@ -1328,7 +1370,7 @@ class SnapshotManifestTests(unittest.TestCase):
             self.snapshot,
             self.dry_run,
             self.bindings if bindings is None else bindings,
-            SOURCE_MODES,
+            DIRECT_SOURCE_MODES,
             dt.timedelta(hours=3),
         )
 
@@ -1626,13 +1668,13 @@ class ConsumerEvidenceTests(unittest.TestCase):
         self.environment = {
             "REDIS_DIRECT_PREDICTION_STREAM_KEY": "prediction_pm_directprediction"
         }
-        self.state = consumer_state(self.now)
+        self.state = consumer_state(self.now, DIRECT_MODEL_GROUPS)
 
     def validate(self) -> None:
         preflight.validate_consumer_state(
             self.state,
             self.environment,
-            model_groups=MODEL_GROUPS,
+            model_groups=DIRECT_MODEL_GROUPS,
             now=self.now,
             max_age=dt.timedelta(minutes=2),
             max_idle=dt.timedelta(minutes=15),
@@ -1666,7 +1708,7 @@ class ConsumerEvidenceTests(unittest.TestCase):
         )
 
     def test_decodes_empty_groups_for_sandbox_only_entry(self) -> None:
-        bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        bindings = legacy_direct_bindings()
         entry_bindings = preflight.entry_enabled_rollout_bindings(
             bindings, ("main", "wallet-1")
         )
@@ -1683,46 +1725,46 @@ class ConsumerEvidenceTests(unittest.TestCase):
             self.validate()
 
     def test_rejects_sandbox_model_group(self) -> None:
-        bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        bindings = legacy_direct_bindings()
         with self.assertRaisesRegex(preflight.PreflightError, "qwen"):
             preflight.decode_model_groups(
                 json.dumps(
                     {
-                        **MODEL_GROUPS,
+                        **DIRECT_MODEL_GROUPS,
                         "qwen": "predict-gemini-v1",
                     }
                 ),
                 bindings,
-                SOURCE_MODES,
+                DIRECT_SOURCE_MODES,
             )
 
     def test_rejects_duplicate_direct_model_group_key(self) -> None:
-        bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        bindings = legacy_direct_bindings()
         with self.assertRaisesRegex(preflight.PreflightError, "duplicates model"):
             preflight.decode_model_groups(
                 '{"echo-producer-v7":"predict-echo-a",'
                 '"echo-producer-v7":"predict-echo-b"}',
                 bindings,
-                SOURCE_MODES,
+                DIRECT_SOURCE_MODES,
             )
 
     def test_rejects_mapping_missing_a_source_model(self) -> None:
-        bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        bindings = legacy_direct_bindings()
         with self.assertRaisesRegex(preflight.PreflightError, "echo-producer-v7"):
             preflight.decode_model_groups(
-                json.dumps({}), bindings, SOURCE_MODES
+                json.dumps({}), bindings, DIRECT_SOURCE_MODES
             )
 
     def test_current_rollout_checks_only_direct_echo_consumer(self) -> None:
-        bindings = preflight.decode_bindings(json.dumps(VALID_BINDINGS))
+        bindings = legacy_direct_bindings()
         model_groups = preflight.decode_model_groups(
-            json.dumps(MODEL_GROUPS),
+            json.dumps(DIRECT_MODEL_GROUPS),
             bindings,
-            SOURCE_MODES,
+            DIRECT_SOURCE_MODES,
         )
         self.assertEqual(model_groups, {"echo-producer-v7": "predict-echo-v1"})
 
-        state = consumer_state(self.now)
+        state = consumer_state(self.now, DIRECT_MODEL_GROUPS)
         state["model_groups"] = model_groups
         state["groups"] = [
             group
@@ -1742,7 +1784,7 @@ class ConsumerEvidenceTests(unittest.TestCase):
             preflight.decode_model_groups(
                 json.dumps({"qwen": "predict-gemini-v1"}),
                 bindings,
-                SOURCE_MODES,
+                DIRECT_SOURCE_MODES,
             )
 
 
@@ -2300,7 +2342,7 @@ class DisabledPhaseEvidenceTests(unittest.TestCase):
             model_groups=MODEL_GROUPS,
             configuration_sha="c" * 64,
             dry_run=self.dry_run,
-            manifest_markets=1,
+            manifest_markets=0,
             delivery_watermark=delivery_watermark(),
             database_account_identity_sha256="e" * 64,
             runtime_state={

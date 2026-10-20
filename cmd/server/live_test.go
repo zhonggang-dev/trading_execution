@@ -207,6 +207,8 @@ func TestCurrentLiveReleaseAcceptsOnlyEmptyQuarantine(t *testing.T) {
 
 func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
 	bindings := []domain.StrategyExecutionBinding{
+		{ModelID: "deepseek_masked", StrategyID: "strategy_pending_a", ExecutionAccountID: "main"},
+		{ModelID: "deepseek_masked", StrategyID: "strategy_pending_b", ExecutionAccountID: "wallet-1"},
 		{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
 		{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
 	}
@@ -218,6 +220,11 @@ func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(authorizations) != 4 ||
+		authorizations[0].ExecutionAccountID != "main" ||
+		authorizations[0].ModelID != "deepseek_masked" ||
+		authorizations[0].StrategyID != "strategy_pending_a" ||
+		authorizations[1].ExecutionAccountID != "wallet-1" ||
+		authorizations[1].StrategyID != "strategy_pending_b" ||
 		authorizations[2].ExecutionAccountID != "wallet-6" ||
 		authorizations[2].ModelID != "deepseek_masked" ||
 		authorizations[2].StrategyID != domain.StrategyIDMultfactorV1 ||
@@ -229,19 +236,21 @@ func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
 		!strings.Contains(err.Error(), "no current live route") {
 		t.Fatalf("retired authorization error = %v", err)
 	}
-	bindings[0].ModelID = "gemini_masked"
-	bindings[1].ModelID = "gemini_masked"
+	for i := range bindings {
+		bindings[i].ModelID = "gemini_masked"
+	}
 	legacy, err := currentLiveWallet67Authorizations([]string{"main", "wallet-1", "wallet-6", "wallet-7"}, bindings)
 	if err != nil || len(legacy) != 4 || legacy[2].ModelID != "gemini_masked" || legacy[3].ModelID != "gemini_masked" {
 		t.Fatalf("legacy authorizations = %#v, error = %v", legacy, err)
 	}
-	bindings[0].ModelID = "qwen_masked"
-	bindings[1].ModelID = "qwen_masked"
+	for i := range bindings {
+		bindings[i].ModelID = "qwen_masked"
+	}
 	if _, err := currentLiveWallet67Authorizations([]string{"wallet-6", "wallet-7"}, bindings); err != nil {
 		t.Fatalf("temporary Qwen route is needed for disabled deployment: %v", err)
 	}
-	bindings[0].ModelID = "gemini_masked"
-	bindings[1].ModelID = "qwen_masked"
+	bindings[2].ModelID = "gemini_masked"
+	bindings[3].ModelID = "qwen_masked"
 	if _, err := currentLiveWallet67Authorizations([]string{"wallet-6", "wallet-7"}, bindings); err == nil {
 		t.Fatal("mixed Gemini/Qwen wallet routes were accepted")
 	}

@@ -29,14 +29,21 @@ import urllib.request
 from decimal import Decimal, InvalidOperation
 
 
-EXPECTED_STRATEGIES = frozenset({"multfactor_v1", "multfactor_v2"})
-EXPECTED_ROUTES = {
-    ("echo", "multfactor_v2"): "main",
-    ("echo", "multfactor_v1"): "wallet-1",
-    ("deepseek_masked", "multfactor_v1"): "wallet-6",
-    ("deepseek_masked", "multfactor_v2"): "wallet-7",
+# wallet-6/wallet-7 keep their fixed strategies. main/wallet-1 take any safe,
+# distinct strategy_id from DECISION_CYCLE_BINDINGS_JSON (the formal strategy
+# names are plain configuration, not code), but cannot claim a fixed one.
+MASKED_MODEL_ID = "deepseek_masked"
+FIXED_STRATEGIES = {"wallet-6": "multfactor_v1", "wallet-7": "multfactor_v2"}
+EXPECTED_ACCOUNTS = frozenset({"main", "wallet-1", "wallet-6", "wallet-7"})
+SAFE_STRATEGY_ID = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+STRATEGY_ID_ALIASES = {
+    "strategy-v1": "multfactor_v1",
+    "mult-factor-v1": "multfactor_v1",
+    "strategy-v2": "multfactor_v2",
+    "mult-factor-v2": "multfactor_v2",
+    "multfactor_v1": "multfactor_v1",
+    "multfactor_v2": "multfactor_v2",
 }
-EXPECTED_ACCOUNTS = frozenset(EXPECTED_ROUTES.values())
 CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS = frozenset()
 ACTIVATABLE_ACCOUNTS = frozenset({"wallet-6", "wallet-7"})
 POLICY_FRESHNESS_FIELDS = (
@@ -332,6 +339,13 @@ def _nonempty_string(value: object, field: str, index: int) -> str:
     return value.strip()
 
 
+def _strategy_id(value: object, index: int) -> str:
+    strategy_id = _nonempty_string(value, "strategy_id", index)
+    if not SAFE_STRATEGY_ID.fullmatch(strategy_id):
+        raise PreflightError(f"binding {index} has an invalid strategy_id format")
+    return STRATEGY_ID_ALIASES.get(strategy_id.lower(), strategy_id)
+
+
 def decode_bindings(payload: str) -> tuple[Binding, ...]:
     try:
         raw = json.loads(payload)
@@ -367,7 +381,7 @@ def decode_bindings(payload: str) -> tuple[Binding, ...]:
             Binding(
                 prediction_model_id=prediction_model_id,
                 model_id=model_id,
-                strategy_id=_nonempty_string(item.get("strategy_id"), "strategy_id", index),
+                strategy_id=_strategy_id(item.get("strategy_id"), index),
                 execution_account_id=_nonempty_string(
                     item.get("execution_account_id"), "execution_account_id", index
                 ),
@@ -481,9 +495,7 @@ def decode_prediction_model_source_modes(
         logical_modes.setdefault(binding.model_id, set()).add(
             result[binding.prediction_model_id]
         )
-    if logical_modes.get("echo") != {PREDICTION_SOURCE_DIRECT}:
-        raise PreflightError("current rollout requires the echo source model to be DIRECT")
-    if logical_modes.get("deepseek_masked") != {PREDICTION_SOURCE_SANDBOX}:
+    if logical_modes.get(MASKED_MODEL_ID) != {PREDICTION_SOURCE_SANDBOX}:
         raise PreflightError(
             "current rollout requires the deepseek_masked source model to be SANDBOX"
         )
@@ -529,10 +541,9 @@ def decode_entry_disabled_accounts(
             "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON contains unbound accounts: "
             f"{sorted(unknown)}"
         )
-    expected = {"main", "wallet-1"}
-    if set(accounts) != expected:
+    if not set(accounts) <= {"main", "wallet-1"}:
         raise PreflightError(
-            "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1"
+            "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON may contain only main and wallet-1"
         )
     return tuple(sorted(accounts))
 
@@ -566,7 +577,17 @@ def active_rollout_bindings(
 
 
 def validate_topology(bindings: list[Binding] | tuple[Binding, ...]) -> tuple[Binding, ...]:
-    normalized = tuple(sorted(bindings))
+    normalized_bindings: list[Binding] = []
+    for index, binding in enumerate(bindings):
+        strategy_id = binding.strategy_id.strip() if isinstance(binding.strategy_id, str) else ""
+        if not SAFE_STRATEGY_ID.fullmatch(strategy_id):
+            raise PreflightError(f"binding {index} has an invalid strategy_id format")
+        normalized_bindings.append(
+            dataclasses.replace(
+                binding, strategy_id=STRATEGY_ID_ALIASES.get(strategy_id.lower(), strategy_id)
+            )
+        )
+    normalized = tuple(sorted(normalized_bindings))
     accounts = {binding.execution_account_id for binding in normalized}
     if accounts != EXPECTED_ACCOUNTS:
         raise PreflightError(
@@ -575,47 +596,34 @@ def validate_topology(bindings: list[Binding] | tuple[Binding, ...]) -> tuple[Bi
     if len(accounts) != len(normalized):
         raise PreflightError("each execution account must appear in exactly one binding")
 
-    strategies = {binding.strategy_id for binding in normalized}
-    if strategies != EXPECTED_STRATEGIES:
-        raise PreflightError(
-            f"strategies must be exactly {sorted(EXPECTED_STRATEGIES)}, got {sorted(strategies)}"
-        )
     logical_models = {binding.model_id for binding in normalized}
     prediction_models = {binding.prediction_model_id for binding in normalized}
-    if len(logical_models) != 2 or len(prediction_models) != 2:
-        raise PreflightError("four-wallet topology requires exactly 2 logical and 2 prediction models")
+    if logical_models != {MASKED_MODEL_ID} or len(prediction_models) != 1:
+        raise PreflightError(
+            f"four-wallet topology requires one logical model {MASKED_MODEL_ID!r} "
+            "and one prediction model"
+        )
 
-    source_for_logical: dict[str, str] = {}
-    logical_for_source: dict[str, str] = {}
-    pairs: set[tuple[str, str]] = set()
+    by_account = {binding.execution_account_id: binding for binding in normalized}
+    for account_id, expected_strategy in FIXED_STRATEGIES.items():
+        if by_account[account_id].strategy_id != expected_strategy:
+            raise PreflightError(
+                f"route for {account_id!r} must use strategy {expected_strategy!r}"
+            )
+    main_strategy = by_account["main"].strategy_id
+    wallet1_strategy = by_account["wallet-1"].strategy_id
+    if main_strategy == wallet1_strategy:
+        raise PreflightError("main and wallet-1 must use distinct strategy IDs")
+    if {main_strategy, wallet1_strategy} & set(FIXED_STRATEGIES.values()):
+        raise PreflightError(
+            "main and wallet-1 cannot reuse the wallet-6/wallet-7 strategy IDs"
+        )
+
     authorizations: set[tuple[str, str, str]] = set()
     for binding in normalized:
-        previous_source = source_for_logical.setdefault(binding.model_id, binding.prediction_model_id)
-        if previous_source != binding.prediction_model_id:
-            raise PreflightError(f"logical model {binding.model_id!r} maps to multiple prediction models")
-        previous_logical = logical_for_source.setdefault(binding.prediction_model_id, binding.model_id)
-        if previous_logical != binding.model_id:
-            raise PreflightError(
-                f"prediction model {binding.prediction_model_id!r} maps to multiple logical models"
-            )
-        pair = (binding.model_id, binding.strategy_id)
-        if pair in pairs:
-            raise PreflightError(f"duplicate logical model/strategy binding: {pair}")
-        pairs.add(pair)
         if binding.authorization in authorizations:
             raise PreflightError(f"duplicate database authorization: {binding.authorization}")
         authorizations.add(binding.authorization)
-
-    expected_pairs = set(EXPECTED_ROUTES)
-    if pairs != expected_pairs:
-        raise PreflightError("bindings must contain the exact echo/deepseek_masked route matrix")
-    for binding in normalized:
-        expected_account = EXPECTED_ROUTES[(binding.model_id, binding.strategy_id)]
-        if binding.execution_account_id != expected_account:
-            raise PreflightError(
-                f"route {binding.model_id!r}/{binding.strategy_id!r} must use "
-                f"execution account {expected_account!r}"
-            )
     return normalized
 
 
@@ -850,12 +858,16 @@ def decode_configured_direct_prediction_models(
 def validate_configured_direct_prediction_models(
     environment: dict[str, str], source_modes: dict[str, str]
 ) -> None:
-    configured = set(decode_configured_direct_prediction_models(environment))
     expected = {
         model_id
         for model_id, mode in source_modes.items()
         if mode == PREDICTION_SOURCE_DIRECT
     }
+    if not expected:
+        # A SANDBOX-only Trading topology does not consume any Direct Redis
+        # model, so Prediction may keep producing Echo for other consumers.
+        return
+    configured = set(decode_configured_direct_prediction_models(environment))
     unexpected = configured - expected
     missing = expected - configured
     if unexpected or missing:

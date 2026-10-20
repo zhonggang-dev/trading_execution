@@ -1564,9 +1564,8 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		return domain.OrderIntent{}, fmt.Errorf("SUBMIT requires order parameters")
 	}
 	order := *evaluation.Order
-	strategyID := request.Context.Normalize().StrategyID
-	if strategyID != domain.StrategyIDMultfactorV1 && strategyID != domain.StrategyIDMultfactorV2 {
-		return domain.OrderIntent{}, fmt.Errorf("unsupported strategy_id %q", strategyID)
+	if err := request.Context.Validate(); err != nil {
+		return domain.OrderIntent{}, err
 	}
 	prediction, found := strategyPrediction(request.Predictions, evaluation.PredictionID)
 	if !found || evaluation.OutcomeIndex < 0 || evaluation.OutcomeIndex >= len(prediction.Outcomes) {

@@ -640,17 +640,9 @@ func currentLiveWallet67Authorizations(
 	if maskedModelID == "" {
 		return nil, fmt.Errorf("wallet-6/wallet-7 masked model route is required")
 	}
+	// main/wallet-1 take their strategy IDs from the bindings (already shape-
+	// validated at config load); wallet-6/wallet-7 stay on the fixed IDs.
 	routes := map[string]postgresadapter.ExpectedActiveExecutionAccount{
-		"main": {
-			ExecutionAccountID: "main",
-			ModelID:            "echo",
-			StrategyID:         domain.StrategyIDMultfactorV2,
-		},
-		"wallet-1": {
-			ExecutionAccountID: "wallet-1",
-			ModelID:            "echo",
-			StrategyID:         domain.StrategyIDMultfactorV1,
-		},
 		"wallet-6": {
 			ExecutionAccountID: "wallet-6",
 			ModelID:            maskedModelID,
@@ -661,6 +653,16 @@ func currentLiveWallet67Authorizations(
 			ModelID:            maskedModelID,
 			StrategyID:         domain.StrategyIDMultfactorV2,
 		},
+	}
+	for _, rawBinding := range bindings {
+		binding := rawBinding.Normalize()
+		if binding.ExecutionAccountID == "main" || binding.ExecutionAccountID == "wallet-1" {
+			routes[binding.ExecutionAccountID] = postgresadapter.ExpectedActiveExecutionAccount{
+				ExecutionAccountID: binding.ExecutionAccountID,
+				ModelID:            maskedModelID,
+				StrategyID:         binding.StrategyID,
+			}
+		}
 	}
 	result := make([]postgresadapter.ExpectedActiveExecutionAccount, 0, len(activeAccountIDs))
 	seen := make(map[string]struct{}, len(activeAccountIDs))

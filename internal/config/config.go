@@ -1081,10 +1081,6 @@ func validateDecisionPredictionSourceModes(
 			)
 		}
 		switch logicalModelID {
-		case "echo":
-			if mode != domain.PredictionSourceModeDirect {
-				return fmt.Errorf("this release requires logical model echo to use DIRECT prediction source mode")
-			}
 		case "gemini_masked", "qwen_masked", "deepseek_masked":
 			if mode != domain.PredictionSourceModeSandbox {
 				return fmt.Errorf("this release requires logical model %s to use SANDBOX prediction source mode", logicalModelID)
@@ -1168,22 +1164,21 @@ func validateCurrentWallet67Quarantine(accounts []string) error {
 	return nil
 }
 
-// validateCurrentWallet67EntryDisabledAccounts pins this release to the
-// reviewed wallet-6/wallet-7 shadow cohort. Retained main/wallet-1 stay active
-// for exits and reconciliation, but cannot create a new BUY.
+// validateCurrentWallet67EntryDisabledAccounts allows only main/wallet-1 in the
+// account BUY gate (any subset, including empty). wallet-6/wallet-7 can never
+// be gated off by this list. Gated accounts stay active for exits and
+// reconciliation but cannot create a new BUY.
 func validateCurrentWallet67EntryDisabledAccounts(accounts []string) error {
-	if len(accounts) != 2 {
-		return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1")
-	}
 	seen := make(map[string]struct{}, len(accounts))
-	for _, accountID := range accounts {
-		seen[strings.TrimSpace(accountID)] = struct{}{}
-	}
-	if _, exists := seen["main"]; !exists {
-		return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1")
-	}
-	if _, exists := seen["wallet-1"]; !exists {
-		return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1")
+	for _, raw := range accounts {
+		accountID := strings.TrimSpace(raw)
+		if accountID != "main" && accountID != "wallet-1" {
+			return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON may contain only main and wallet-1")
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON contains duplicate account %q", accountID)
+		}
+		seen[accountID] = struct{}{}
 	}
 	return nil
 }
@@ -1193,65 +1188,57 @@ func validateCurrentWallet67EntryDisabledAccounts(accounts []string) error {
 // Changing the live topology is a deliberate code/config contract change.
 func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBinding) error {
 	if len(bindings) != 4 {
-		return fmt.Errorf("live decision submission requires the exact 2 models x 2 strategies x 4 accounts topology")
+		return fmt.Errorf("live decision submission requires exactly 4 bindings: main, wallet-1, wallet-6, wallet-7")
 	}
-	expectedAccounts := map[string]struct{}{
-		"main": {}, "wallet-1": {}, "wallet-6": {}, "wallet-7": {},
+	// wallet-6/wallet-7 keep their fixed strategies. main/wallet-1 take the
+	// strategy identifiers from this configuration (any safe, distinct ID);
+	// they may not claim a fixed one.
+	fixedStrategies := map[string]string{
+		"wallet-6": domain.StrategyIDMultfactorV1,
+		"wallet-7": domain.StrategyIDMultfactorV2,
 	}
+	routes := make(map[string]domain.StrategyExecutionBinding, len(bindings))
+	predictionModels := make(map[string]struct{}, 1)
 	maskedModelID := ""
 	for _, rawBinding := range bindings {
 		binding := rawBinding.Normalize()
-		if binding.ModelID == "echo" {
-			continue
+		if _, duplicate := routes[binding.ExecutionAccountID]; duplicate {
+			return fmt.Errorf("live decision submission contains duplicate execution account %q", binding.ExecutionAccountID)
 		}
+		routes[binding.ExecutionAccountID] = binding
+		predictionModels[binding.PredictionModelID] = struct{}{}
 		if maskedModelID == "" {
 			maskedModelID = binding.ModelID
 		} else if maskedModelID != binding.ModelID {
-			return fmt.Errorf("live decision submission cannot mix masked wallet routes")
+			return fmt.Errorf("live decision submission requires one logical model for all four wallets")
 		}
 	}
 	if maskedModelID != "gemini_masked" && maskedModelID != "qwen_masked" && maskedModelID != "deepseek_masked" {
-		return fmt.Errorf("live decision submission requires a supported masked wallet route")
+		return fmt.Errorf("live decision submission requires a supported masked model route")
 	}
-	expectedRoutes := map[string]string{
-		"echo\x00" + domain.StrategyIDMultfactorV2:             "main",
-		"echo\x00" + domain.StrategyIDMultfactorV1:             "wallet-1",
-		maskedModelID + "\x00" + domain.StrategyIDMultfactorV1: "wallet-6",
-		maskedModelID + "\x00" + domain.StrategyIDMultfactorV2: "wallet-7",
+	if len(predictionModels) != 1 {
+		return fmt.Errorf("live decision submission requires one prediction model for all four wallets")
 	}
-	accounts := make(map[string]struct{}, len(bindings))
-	logicalModels := make(map[string]struct{}, 2)
-	predictionModels := make(map[string]struct{}, 2)
-	pairs := make(map[string]struct{}, len(bindings))
-	for _, binding := range bindings {
-		binding = binding.Normalize()
-		accounts[binding.ExecutionAccountID] = struct{}{}
-		logicalModels[binding.ModelID] = struct{}{}
-		predictionModels[binding.PredictionModelID] = struct{}{}
-		pair := binding.ModelID + "\x00" + binding.StrategyID
-		expectedAccountID, expected := expectedRoutes[pair]
-		if !expected {
-			return fmt.Errorf("live decision submission contains unsupported model/strategy route %q/%q", binding.ModelID, binding.StrategyID)
-		}
-		if binding.ExecutionAccountID != expectedAccountID {
-			return fmt.Errorf(
-				"live decision submission route %q/%q must use execution account %q",
-				binding.ModelID, binding.StrategyID, expectedAccountID,
-			)
-		}
-		pairs[pair] = struct{}{}
-	}
-	if len(logicalModels) != 2 || len(predictionModels) != 2 || len(pairs) != 4 {
-		return fmt.Errorf("live decision submission requires the exact 2 models x 2 strategies x 4 accounts topology")
-	}
-	for accountID := range expectedAccounts {
-		if _, exists := accounts[accountID]; !exists {
+	for _, accountID := range []string{"main", "wallet-1", "wallet-6", "wallet-7"} {
+		if _, exists := routes[accountID]; !exists {
 			return fmt.Errorf("live decision submission requires execution accounts main, wallet-1, wallet-6, and wallet-7")
 		}
 	}
-	for pair := range expectedRoutes {
-		if _, exists := pairs[pair]; !exists {
-			return fmt.Errorf("live decision submission requires the exact echo/%s route matrix", maskedModelID)
+	for accountID, strategyID := range fixedStrategies {
+		if routes[accountID].StrategyID != strategyID {
+			return fmt.Errorf("live decision submission route for %q must use strategy %q", accountID, strategyID)
+		}
+	}
+	mainStrategy, wallet1Strategy := routes["main"].StrategyID, routes["wallet-1"].StrategyID
+	if mainStrategy == wallet1Strategy {
+		return fmt.Errorf("main and wallet-1 must use distinct strategy IDs")
+	}
+	for accountID, strategyID := range map[string]string{"main": mainStrategy, "wallet-1": wallet1Strategy} {
+		if strategyID == domain.StrategyIDMultfactorV1 || strategyID == domain.StrategyIDMultfactorV2 {
+			return fmt.Errorf("%s cannot reuse the wallet-6/wallet-7 strategy %q", accountID, strategyID)
+		}
+		if err := domain.ValidateStrategyID(strategyID); err != nil {
+			return fmt.Errorf("%s: %w", accountID, err)
 		}
 	}
 	return nil

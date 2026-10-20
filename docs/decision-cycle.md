@@ -10,8 +10,8 @@
 Go 启动时注入绑定表，例如：
 
 ```text
-echo / multfactor_v2 / main
-echo / multfactor_v1 / wallet-1
+deepseek_masked / <main 策略标识> / main
+deepseek_masked / <wallet-1 策略标识> / wallet-1
 deepseek_masked / multfactor_v1 / wallet-6
 deepseek_masked / multfactor_v2 / wallet-7
 ```
@@ -65,8 +65,8 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
   "cycle_id": "main:20260818T042000Z",
   "input_id": "strategy-input-...",
   "context": {
-    "model_id": "echo",
-    "strategy_id": "multfactor_v1",
+    "model_id": "deepseek_masked",
+    "strategy_id": "strategy_pending_a",
     "execution_account_id": "main"
   },
   "decision_at": "2026-08-18T04:20:00Z",
@@ -120,9 +120,9 @@ revision 不会覆盖正确来源。候选结果要求 `prediction_as_of` 和 `c
 `available_at`、`completed_at` 选择每个 `(market_id, prediction_model_id)` 的最新结果；三类时间戳
 完全相同但 payload 不同的 revision 会因歧义直接失败，等价 delivery duplicate 才按 prediction ID
 确定性择一。不同模型对同一 Market 的 Condition、Outcome 顺序和 token 必须完全一致。
-四钱包部署 preflight 另外对当前 dry-run snapshot 做更严格的来源证据检查：Direct echo 必须有最新
-`COMPLETED` manifest task 及其精确、非 Sandbox 结果；每个 active Sandbox 模型必须至少有一条 fresh、
-PIT-visible 且 `sandbox_id` 非空的 effective 结果，Sandbox 模型不得伪装成 Direct expectation。
+四钱包部署 preflight 另外对当前 dry-run snapshot 做更严格的来源证据检查：四个钱包共用一个
+Sandbox 模型，它必须至少有一条 fresh、PIT-visible 且 `sandbox_id` 非空的 effective 结果，
+Sandbox 模型不得伪装成 Direct expectation。
 `DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true` 时，每个 active binding 的上游模型至少要有一条
 符合来源与 freshness 契约的结果；缺失模型只关闭该 binding 的 BUY entry，并继续允许其 OPEN lots 走合法
 SELL exit。该门禁不要求不同模型覆盖完全相同的 Market 集合。
@@ -260,18 +260,22 @@ recorders 持久化共享盘口、完整 binding 输入、输出与订单意图�
 受限钱包文件。只有 live 模式且两个显式开关都打开，OrderIntent 才会进入执行层；之后仍受
 数据库 Kill Switch、账户/策略暂停、binding、余额和 reconciliation freshness 等硬风控阻断。
 
-四钱包示例配置（`echo` 的上游精确名需在部署前核对）：
+四钱包示例配置。四个钱包共用同一个 `deepseek_masked` 与同一个上游模型；wallet-6/wallet-7
+固定为 `multfactor_v1/v2`，main/wallet-1 的 `strategy_id` 由配置决定，只要求格式安全
+（字母开头，只含字母数字 `._-`，最长 64）、两者互不相同、且不占用 `multfactor_v1/v2`。
+拿到正式策略标识后，按 [`deploy/rebind_main_wallet1.sql`](../deploy/rebind_main_wallet1.sql)
+切换数据库绑定，并同步修改下面两个 `strategy_id`，重启即可，不需要改代码：
 
 ```json
 [
-  {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"},
-  {"prediction_model_id":"echo","model_id":"echo","strategy_id":"multfactor_v1","execution_account_id":"wallet-1"},
+  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
+  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
   {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
   {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
 ]
 ```
 
-`execution_strategy_bindings.model_id` 必须使用逻辑名 `echo` / `deepseek_masked`，并与
+`execution_strategy_bindings.model_id` 必须使用逻辑名 `deepseek_masked`，并与
 `strategy_id + execution_account_id` 组成相同的四条绑定；上游真实名只存在运行配置中。
 OPEN lot 保留开仓时的 `model_id` 和 `strategy_id`。每个策略周期只查询与当前
 `model_id + strategy_id + execution_account_id` 完全匹配且至少 0.01 shares 的 lot；
