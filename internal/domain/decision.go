@@ -578,6 +578,12 @@ type StrategyExecutionBinding struct {
 const (
 	StrategyIDMultfactorV1 = "multfactor_v1"
 	StrategyIDMultfactorV2 = "multfactor_v2"
+	// StrategyIDPendingA/B are temporary integration identifiers for the
+	// DeepSeek wallet-reuse rollout.  The strategy service owns their trading
+	// logic; Trading only validates the stable wire contract and routes each
+	// identifier to its bound wallet.
+	StrategyIDPendingA = "strategy_pending_a"
+	StrategyIDPendingB = "strategy_pending_b"
 )
 
 // Normalize 规范化当前模型的文本、时间和可变字段。
@@ -710,7 +716,7 @@ func (executionContext StrategyExecutionContext) Validate() error {
 		return fmt.Errorf("model_id, strategy_id, and execution_account_id are required")
 	}
 	switch executionContext.StrategyID {
-	case StrategyIDMultfactorV1, StrategyIDMultfactorV2:
+	case StrategyIDMultfactorV1, StrategyIDMultfactorV2, StrategyIDPendingA, StrategyIDPendingB:
 		return nil
 	default:
 		return fmt.Errorf("strategy_id %q is not supported", executionContext.StrategyID)

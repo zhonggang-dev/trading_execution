@@ -72,6 +72,10 @@ type LiveOperations struct {
 // workflow. OrderSubmissionEnabled is deliberately independent from Enabled so
 // production can run the complete decision path without creating orders.
 type DecisionCycle struct {
+	// Topology selects the explicit four-wallet routing contract. The default
+	// keeps the legacy Echo/main+wallet-1 routes; the DeepSeek reuse profile
+	// rebinds those same physical wallets to the temporary pending strategies.
+	Topology               string
 	Enabled                bool
 	OrderSubmissionEnabled bool
 	// SubmissionDisabledAccounts keeps a configured binding in the four-wallet
@@ -115,6 +119,11 @@ type DecisionCycle struct {
 	// in strategy order at every value.
 	DeliveryConcurrency int
 }
+
+const (
+	DecisionCycleTopologyFourWallet              = "four-wallet"
+	DecisionCycleTopologyDeepSeekReuseFourWallet = "deepseek-reuse-four-wallet"
+)
 
 // Database 表示后端使用的 Database 类型。
 type Database struct {
@@ -754,7 +763,9 @@ func (config Config) Validate() error {
 		if err := validateDecisionBindings(config.DecisionCycle.Bindings); err != nil {
 			return err
 		}
-		if err := validateFourWalletSubmissionTopology(config.DecisionCycle.Bindings); err != nil {
+		if err := validateDecisionSubmissionTopology(
+			config.DecisionCycle.Topology, config.DecisionCycle.Bindings,
+		); err != nil {
 			return err
 		}
 		if err := validateDecisionSubmissionDisabledAccounts(
@@ -768,6 +779,12 @@ func (config Config) Validate() error {
 			config.DecisionCycle.EntryDisabledAccounts,
 		); err != nil {
 			return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON: %w", err)
+		}
+		if err := validateDecisionEntryDisabledAccountsForTopology(
+			config.DecisionCycle.Topology,
+			config.DecisionCycle.EntryDisabledAccounts,
+		); err != nil {
+			return err
 		}
 		if err := validateDecisionStrategyDisabledAccounts(
 			config.DecisionCycle.Bindings,
@@ -783,6 +800,31 @@ func (config Config) Validate() error {
 		}
 	}
 	if config.Execution.Mode == "live" {
+		// Validate the selected routing contract even when the scheduler is
+		// disabled.  Direct Submit/Resume and startup authorization must not be
+		// bypassed by changing the process profile while the cycle is closed.
+		if len(config.DecisionCycle.Bindings) > 0 {
+			if err := validateDecisionBindings(config.DecisionCycle.Bindings); err != nil {
+				return err
+			}
+			if err := validateDecisionSubmissionTopology(
+				config.DecisionCycle.Topology, config.DecisionCycle.Bindings,
+			); err != nil {
+				return err
+			}
+			if err := validateDecisionPredictionSourceModes(
+				config.DecisionCycle.Bindings,
+				config.DecisionCycle.PredictionSourceModes,
+			); err != nil {
+				return err
+			}
+			if err := validateDecisionEntryDisabledAccountsForTopology(
+				config.DecisionCycle.Topology,
+				config.DecisionCycle.EntryDisabledAccounts,
+			); err != nil {
+				return err
+			}
+		}
 		// These release pins protect the live execution API independently of the
 		// scheduler. Disabling the decision cycle must never remove the
 		// account-scoped BUY gate from direct Submit/Resume paths.
@@ -792,7 +834,11 @@ func (config Config) Validate() error {
 		if config.DecisionCycle.EntrySubmissionDisabled {
 			return fmt.Errorf("this release requires DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false and uses the exact account entry gate")
 		}
-		if err := validateCurrentWallet67EntryDisabledAccounts(config.DecisionCycle.EntryDisabledAccounts); err != nil {
+		if config.DecisionCycle.Topology == DecisionCycleTopologyDeepSeekReuseFourWallet {
+			if err := validateDeepSeekReuseEntryDisabledAccounts(config.DecisionCycle.EntryDisabledAccounts); err != nil {
+				return err
+			}
+		} else if err := validateCurrentWallet67EntryDisabledAccounts(config.DecisionCycle.EntryDisabledAccounts); err != nil {
 			return err
 		}
 	}
@@ -800,6 +846,16 @@ func (config Config) Validate() error {
 }
 
 func loadDecisionCycle() (DecisionCycle, error) {
+	topology := strings.TrimSpace(os.Getenv("DECISION_CYCLE_TOPOLOGY"))
+	if topology == "" {
+		topology = DecisionCycleTopologyFourWallet
+	}
+	if topology != DecisionCycleTopologyFourWallet && topology != DecisionCycleTopologyDeepSeekReuseFourWallet {
+		return DecisionCycle{}, fmt.Errorf(
+			"DECISION_CYCLE_TOPOLOGY must be exactly %q or %q",
+			DecisionCycleTopologyFourWallet, DecisionCycleTopologyDeepSeekReuseFourWallet,
+		)
+	}
 	enabled, err := boolean("DECISION_CYCLE_ENABLED", false)
 	if err != nil {
 		return DecisionCycle{}, err
@@ -874,7 +930,8 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		return DecisionCycle{}, err
 	}
 	return DecisionCycle{
-		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
+		Topology: topology,
+		Enabled:  enabled, OrderSubmissionEnabled: submitEnabled,
 		SubmissionDisabledAccounts:   submissionDisabledAccounts,
 		EntrySubmissionDisabled:      entrySubmissionDisabled,
 		EntryDisabledAccounts:        entryDisabledAccounts,
@@ -1158,6 +1215,27 @@ func validateDecisionStrategyDisabledAccounts(
 	return nil
 }
 
+func validateDecisionEntryDisabledAccountsForTopology(topology string, accounts []string) error {
+	if topology != DecisionCycleTopologyDeepSeekReuseFourWallet {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(accounts))
+	for _, raw := range accounts {
+		accountID := strings.TrimSpace(raw)
+		if accountID != "main" && accountID != "wallet-1" {
+			return fmt.Errorf(
+				"DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON may contain only main and wallet-1 in %s",
+				DecisionCycleTopologyDeepSeekReuseFourWallet,
+			)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON contains duplicate account %q", accountID)
+		}
+		seen[accountID] = struct{}{}
+	}
+	return nil
+}
+
 // validateCurrentWallet67Quarantine pins this shadow release to all four
 // active accounts. Account-level BUY gating preserves main/wallet-1 exits and
 // reconciliation without using the broader quarantine mechanism.
@@ -1184,6 +1262,15 @@ func validateCurrentWallet67EntryDisabledAccounts(accounts []string) error {
 	}
 	if _, exists := seen["wallet-1"]; !exists {
 		return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1")
+	}
+	return nil
+}
+
+func validateDeepSeekReuseEntryDisabledAccounts(accounts []string) error {
+	if err := validateDecisionEntryDisabledAccountsForTopology(
+		DecisionCycleTopologyDeepSeekReuseFourWallet, accounts,
+	); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1255,6 +1342,74 @@ func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBin
 		}
 	}
 	return nil
+}
+
+// validateDeepSeekReuseFourWalletTopology binds the existing four physical
+// wallets to one SANDBOX DeepSeek source.  The two temporary strategy IDs are
+// intentionally explicit so a generic strategy name cannot silently claim a
+// production wallet.
+func validateDeepSeekReuseFourWalletTopology(bindings []domain.StrategyExecutionBinding) error {
+	if len(bindings) != 4 {
+		return fmt.Errorf("deepseek-reuse-four-wallet requires exactly 4 bindings")
+	}
+	expectedRoutes := map[string]string{
+		"deepseek_masked\x00" + domain.StrategyIDPendingA:     "main",
+		"deepseek_masked\x00" + domain.StrategyIDPendingB:     "wallet-1",
+		"deepseek_masked\x00" + domain.StrategyIDMultfactorV1: "wallet-6",
+		"deepseek_masked\x00" + domain.StrategyIDMultfactorV2: "wallet-7",
+	}
+	accounts := make(map[string]struct{}, len(bindings))
+	predictionModels := make(map[string]struct{}, len(bindings))
+	pairs := make(map[string]struct{}, len(bindings))
+	for _, rawBinding := range bindings {
+		binding := rawBinding.Normalize()
+		if binding.ModelID != "deepseek_masked" {
+			return fmt.Errorf("deepseek-reuse-four-wallet requires logical model deepseek_masked")
+		}
+		pair := binding.ModelID + "\x00" + binding.StrategyID
+		expectedAccountID, exists := expectedRoutes[pair]
+		if !exists {
+			return fmt.Errorf(
+				"deepseek-reuse-four-wallet contains unsupported model/strategy route %q/%q",
+				binding.ModelID, binding.StrategyID,
+			)
+		}
+		if binding.ExecutionAccountID != expectedAccountID {
+			return fmt.Errorf(
+				"deepseek-reuse-four-wallet route %q/%q must use execution account %q",
+				binding.ModelID, binding.StrategyID, expectedAccountID,
+			)
+		}
+		accounts[binding.ExecutionAccountID] = struct{}{}
+		predictionModels[binding.PredictionModelID] = struct{}{}
+		pairs[pair] = struct{}{}
+	}
+	expectedAccounts := map[string]struct{}{"main": {}, "wallet-1": {}, "wallet-6": {}, "wallet-7": {}}
+	if len(predictionModels) != 1 || len(pairs) != len(expectedRoutes) || len(accounts) != len(expectedAccounts) {
+		return fmt.Errorf("deepseek-reuse-four-wallet requires one prediction model and the exact four-wallet route matrix")
+	}
+	for accountID := range expectedAccounts {
+		if _, exists := accounts[accountID]; !exists {
+			return fmt.Errorf("deepseek-reuse-four-wallet requires execution account %q", accountID)
+		}
+	}
+	for pair := range expectedRoutes {
+		if _, exists := pairs[pair]; !exists {
+			return fmt.Errorf("deepseek-reuse-four-wallet is missing route %q", pair)
+		}
+	}
+	return nil
+}
+
+func validateDecisionSubmissionTopology(topology string, bindings []domain.StrategyExecutionBinding) error {
+	switch topology {
+	case DecisionCycleTopologyFourWallet:
+		return validateFourWalletSubmissionTopology(bindings)
+	case DecisionCycleTopologyDeepSeekReuseFourWallet:
+		return validateDeepSeekReuseFourWalletTopology(bindings)
+	default:
+		return fmt.Errorf("unsupported DECISION_CYCLE_TOPOLOGY %q", topology)
+	}
 }
 
 func secureServiceURL(value string) bool {
