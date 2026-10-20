@@ -9,6 +9,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarket"
 	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
+	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 )
@@ -244,6 +245,28 @@ func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
 	bindings[1].ModelID = "qwen_masked"
 	if _, err := currentLiveWallet67Authorizations([]string{"wallet-6", "wallet-7"}, bindings); err == nil {
 		t.Fatal("mixed Gemini/Qwen wallet routes were accepted")
+	}
+}
+
+func TestDeepSeekReuseLiveAuthorizationsRoutePendingStrategies(t *testing.T) {
+	bindings := []domain.StrategyExecutionBinding{
+		{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDPendingA, ExecutionAccountID: "main"},
+		{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDPendingB, ExecutionAccountID: "wallet-1"},
+		{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
+		{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+	}
+	authorizations, err := currentLiveAuthorizations(
+		[]string{"main", "wallet-1", "wallet-6", "wallet-7"},
+		bindings,
+		config.DecisionCycleTopologyDeepSeekReuseFourWallet,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authorizations) != 4 || authorizations[0].ModelID != "deepseek_masked" ||
+		authorizations[0].StrategyID != domain.StrategyIDPendingA ||
+		authorizations[1].StrategyID != domain.StrategyIDPendingB {
+		t.Fatalf("deepseek reuse authorizations = %#v", authorizations)
 	}
 }
 

@@ -1565,7 +1565,12 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 	}
 	order := *evaluation.Order
 	strategyID := request.Context.Normalize().StrategyID
-	if strategyID != domain.StrategyIDMultfactorV1 && strategyID != domain.StrategyIDMultfactorV2 {
+	switch strategyID {
+	case domain.StrategyIDMultfactorV1, domain.StrategyIDMultfactorV2,
+		domain.StrategyIDPendingA, domain.StrategyIDPendingB:
+		// Supported strategy identities are validated by the domain context as
+		// well.  The temporary DeepSeek routes use the same v4 order contract.
+	default:
 		return domain.OrderIntent{}, fmt.Errorf("unsupported strategy_id %q", strategyID)
 	}
 	prediction, found := strategyPrediction(request.Predictions, evaluation.PredictionID)

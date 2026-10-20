@@ -276,6 +276,48 @@ func TestLoadAcceptsV41FlashWallet67Route(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsDeepSeekReuseFourWalletTopology(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_TOPOLOGY", DecisionCycleTopologyDeepSeekReuseFourWallet)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+	]`)
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"v4.1 flash":"SANDBOX"}`)
+	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `[]`)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.DecisionCycle.Topology != DecisionCycleTopologyDeepSeekReuseFourWallet ||
+		len(config.DecisionCycle.Bindings) != 4 ||
+		config.DecisionCycle.Bindings[0].ModelID != "deepseek_masked" {
+		t.Fatalf("deepseek reuse config = %#v", config.DecisionCycle)
+	}
+}
+
+func TestLoadRejectsDeepSeekReuseEntryGateOnWallet67(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_TOPOLOGY", DecisionCycleTopologyDeepSeekReuseFourWallet)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+	]`)
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"v4.1 flash":"SANDBOX"}`)
+	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `["wallet-6"]`)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "may contain only main and wallet-1") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
 func TestLoadRejectsMixedGeminiQwenWalletRoutes(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -944,6 +986,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"CHAIN_CASH_LOG_CHUNK_BLOCKS",
 		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",
 		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
+		"DECISION_CYCLE_TOPOLOGY",
 		"DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED",
 		"DECISION_CYCLE_PREDICTION_INFRA_URL", "DECISION_CYCLE_PREDICTION_INFRA_TOKEN",
 		"DECISION_CYCLE_STRATEGY_URL", "DECISION_CYCLE_STRATEGY_TOKEN",

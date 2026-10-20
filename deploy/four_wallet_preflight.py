@@ -29,6 +29,9 @@ import urllib.request
 from decimal import Decimal, InvalidOperation
 
 
+TOPOLOGY_FOUR_WALLET = "four-wallet"
+TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET = "deepseek-reuse-four-wallet"
+
 EXPECTED_STRATEGIES = frozenset({"multfactor_v1", "multfactor_v2"})
 EXPECTED_ROUTES = {
     ("echo", "multfactor_v2"): "main",
@@ -37,6 +40,15 @@ EXPECTED_ROUTES = {
     ("deepseek_masked", "multfactor_v2"): "wallet-7",
 }
 EXPECTED_ACCOUNTS = frozenset(EXPECTED_ROUTES.values())
+DEEPSEEK_REUSE_EXPECTED_STRATEGIES = frozenset(
+    {"strategy_pending_a", "strategy_pending_b", "multfactor_v1", "multfactor_v2"}
+)
+DEEPSEEK_REUSE_EXPECTED_ROUTES = {
+    ("deepseek_masked", "strategy_pending_a"): "main",
+    ("deepseek_masked", "strategy_pending_b"): "wallet-1",
+    ("deepseek_masked", "multfactor_v1"): "wallet-6",
+    ("deepseek_masked", "multfactor_v2"): "wallet-7",
+}
 CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS = frozenset()
 ACTIVATABLE_ACCOUNTS = frozenset({"wallet-6", "wallet-7"})
 POLICY_FRESHNESS_FIELDS = (
@@ -76,6 +88,9 @@ CURRENT_ROLLOUT_RISK_CONTRACT_BY_ACCOUNT = {
 MAX_CONFIG_BYTES = 4 << 20
 DISABLED_EVIDENCE_SCHEMA = "four_wallet.disabled_preflight.v1"
 ACTIVATION_RISK_APPROVAL_SCHEMA = "four_wallet.activation_risk_approval.v1"
+DEEPSEEK_REUSE_DISABLED_EVIDENCE_SCHEMA = "deepseek_reuse_four_wallet.disabled_preflight.v1"
+DEEPSEEK_REUSE_ACTIVATION_RISK_APPROVAL_SCHEMA = "deepseek_reuse_four_wallet.activation_risk_approval.v1"
+CUTOVER_BASELINE_EVIDENCE_SCHEMA = "trading.wallet_reuse_cutover.applied.v1"
 ACTIVATION_RISK_DECISION = "APPROVED_FOR_LIVE_ACTIVATION"
 IMMUTABLE_RELEASE_IDENTITY = re.compile(r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})")
 PREDICTION_SOURCE_DIRECT = "DIRECT"
@@ -94,6 +109,7 @@ TRADING_RUNTIME_KEYS = frozenset(
         "POLYGON_ORDER_FILLED_CONFIRMATIONS",
         "DECISION_CYCLE_ENABLED",
         "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED",
+        "DECISION_CYCLE_TOPOLOGY",
         "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
         "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON",
         "DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",
@@ -309,6 +325,26 @@ SELECT json_build_object(
 )::text;
 """
 
+# This query is intentionally separate from DATABASE_STATE_SQL.  Legacy
+# deployments predate migration 0035 and must not parse a reference to the new
+# cutover tables; the reuse topology opts into this query explicitly.
+CUTOVER_BASELINE_SQL = r"""
+SELECT COALESCE((
+  SELECT json_build_object(
+    'batch_id', b.batch_id,
+    'manifest_sha256', b.manifest_sha256,
+    'accounts', COALESCE((
+      SELECT json_agg(a.execution_account_id ORDER BY a.execution_account_id)
+        FROM execution_wallet_cutover_accounts a
+       WHERE a.batch_id=b.batch_id
+    ), '[]'::json)
+  )
+  FROM execution_wallet_cutover_batches b
+  ORDER BY b.created_at DESC, b.batch_id DESC
+  LIMIT 1
+), '{}'::json)::text;
+"""
+
 
 class PreflightError(RuntimeError):
     """A safe-to-report deployment invariant violation."""
@@ -326,13 +362,39 @@ class Binding:
         return (self.model_id, self.strategy_id, self.execution_account_id)
 
 
+def _topology_schema(topology: str, *, activation: bool = False) -> str:
+    if topology == TOPOLOGY_FOUR_WALLET:
+        return ACTIVATION_RISK_APPROVAL_SCHEMA if activation else DISABLED_EVIDENCE_SCHEMA
+    if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+        return (
+            DEEPSEEK_REUSE_ACTIVATION_RISK_APPROVAL_SCHEMA
+            if activation
+            else DEEPSEEK_REUSE_DISABLED_EVIDENCE_SCHEMA
+        )
+    raise PreflightError(f"unsupported topology {topology!r}")
+
+
+def _topology_routes(topology: str) -> tuple[dict[tuple[str, str], str], frozenset[str], frozenset[str]]:
+    if topology == TOPOLOGY_FOUR_WALLET:
+        return EXPECTED_ROUTES, EXPECTED_STRATEGIES, frozenset({"echo", "deepseek_masked"})
+    if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+        return (
+            DEEPSEEK_REUSE_EXPECTED_ROUTES,
+            DEEPSEEK_REUSE_EXPECTED_STRATEGIES,
+            frozenset({"deepseek_masked"}),
+        )
+    raise PreflightError(f"unsupported topology {topology!r}")
+
+
 def _nonempty_string(value: object, field: str, index: int) -> str:
     if not isinstance(value, str) or not value.strip():
         raise PreflightError(f"binding {index} has an empty or non-string {field}")
     return value.strip()
 
 
-def decode_bindings(payload: str) -> tuple[Binding, ...]:
+def decode_bindings(
+    payload: str, *, topology: str = TOPOLOGY_FOUR_WALLET
+) -> tuple[Binding, ...]:
     try:
         raw = json.loads(payload)
     except json.JSONDecodeError as error:
@@ -340,7 +402,7 @@ def decode_bindings(payload: str) -> tuple[Binding, ...]:
     if not isinstance(raw, list):
         raise PreflightError("DECISION_CYCLE_BINDINGS_JSON must be one JSON array")
     if len(raw) != 4:
-        raise PreflightError(f"four-wallet topology requires exactly 4 bindings, got {len(raw)}")
+        raise PreflightError(f"{topology} requires exactly 4 bindings, got {len(raw)}")
 
     allowed_fields = {
         "prediction_model_id",
@@ -373,7 +435,7 @@ def decode_bindings(payload: str) -> tuple[Binding, ...]:
                 ),
             )
         )
-    return validate_topology(bindings)
+    return validate_topology(bindings, topology=topology)
 
 
 def _decode_bound_account_list(
@@ -432,7 +494,10 @@ def decode_strategy_disabled_accounts(
 
 
 def decode_prediction_model_source_modes(
-    payload: str, bindings: tuple[Binding, ...]
+    payload: str,
+    bindings: tuple[Binding, ...],
+    *,
+    topology: str = TOPOLOGY_FOUR_WALLET,
 ) -> dict[str, str]:
     def reject_duplicate_keys(
         pairs: list[tuple[str, object]],
@@ -481,12 +546,20 @@ def decode_prediction_model_source_modes(
         logical_modes.setdefault(binding.model_id, set()).add(
             result[binding.prediction_model_id]
         )
-    if logical_modes.get("echo") != {PREDICTION_SOURCE_DIRECT}:
-        raise PreflightError("current rollout requires the echo source model to be DIRECT")
-    if logical_modes.get("deepseek_masked") != {PREDICTION_SOURCE_SANDBOX}:
-        raise PreflightError(
-            "current rollout requires the deepseek_masked source model to be SANDBOX"
-        )
+    if topology == TOPOLOGY_FOUR_WALLET:
+        if logical_modes.get("echo") != {PREDICTION_SOURCE_DIRECT}:
+            raise PreflightError("current rollout requires the echo source model to be DIRECT")
+        if logical_modes.get("deepseek_masked") != {PREDICTION_SOURCE_SANDBOX}:
+            raise PreflightError(
+                "current rollout requires the deepseek_masked source model to be SANDBOX"
+            )
+    elif topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+        if logical_modes != {"deepseek_masked": {PREDICTION_SOURCE_SANDBOX}}:
+            raise PreflightError(
+                "deepseek-reuse-four-wallet requires one deepseek_masked SANDBOX source model"
+            )
+    else:
+        raise PreflightError(f"unsupported topology {topology!r}")
     return dict(sorted(result.items()))
 
 
@@ -498,7 +571,10 @@ def validate_rollout_quarantine(accounts: tuple[str, ...]) -> None:
 
 
 def decode_entry_disabled_accounts(
-    payload: str, bindings: tuple[Binding, ...]
+    payload: str,
+    bindings: tuple[Binding, ...],
+    *,
+    topology: str = TOPOLOGY_FOUR_WALLET,
 ) -> tuple[str, ...]:
     try:
         raw = json.loads(payload)
@@ -529,11 +605,19 @@ def decode_entry_disabled_accounts(
             "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON contains unbound accounts: "
             f"{sorted(unknown)}"
         )
-    expected = {"main", "wallet-1"}
-    if set(accounts) != expected:
-        raise PreflightError(
-            "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1"
-        )
+    if topology == TOPOLOGY_FOUR_WALLET:
+        expected = {"main", "wallet-1"}
+        if set(accounts) != expected:
+            raise PreflightError(
+                "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON must contain exactly main and wallet-1"
+            )
+    elif topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+        if not set(accounts) <= {"main", "wallet-1"}:
+            raise PreflightError(
+                "deepseek-reuse-four-wallet entry-disabled accounts may only contain main and wallet-1"
+            )
+    else:
+        raise PreflightError(f"unsupported topology {topology!r}")
     return tuple(sorted(accounts))
 
 
@@ -565,7 +649,12 @@ def active_rollout_bindings(
     return result
 
 
-def validate_topology(bindings: list[Binding] | tuple[Binding, ...]) -> tuple[Binding, ...]:
+def validate_topology(
+    bindings: list[Binding] | tuple[Binding, ...],
+    *,
+    topology: str = TOPOLOGY_FOUR_WALLET,
+) -> tuple[Binding, ...]:
+    expected_routes, expected_strategies, expected_logical_models = _topology_routes(topology)
     normalized = tuple(sorted(bindings))
     accounts = {binding.execution_account_id for binding in normalized}
     if accounts != EXPECTED_ACCOUNTS:
@@ -576,14 +665,22 @@ def validate_topology(bindings: list[Binding] | tuple[Binding, ...]) -> tuple[Bi
         raise PreflightError("each execution account must appear in exactly one binding")
 
     strategies = {binding.strategy_id for binding in normalized}
-    if strategies != EXPECTED_STRATEGIES:
+    if strategies != expected_strategies:
         raise PreflightError(
-            f"strategies must be exactly {sorted(EXPECTED_STRATEGIES)}, got {sorted(strategies)}"
+            f"strategies must be exactly {sorted(expected_strategies)}, got {sorted(strategies)}"
         )
     logical_models = {binding.model_id for binding in normalized}
     prediction_models = {binding.prediction_model_id for binding in normalized}
-    if len(logical_models) != 2 or len(prediction_models) != 2:
-        raise PreflightError("four-wallet topology requires exactly 2 logical and 2 prediction models")
+    expected_prediction_model_count = 1 if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET else 2
+    if logical_models != expected_logical_models or len(prediction_models) != expected_prediction_model_count:
+        if topology == TOPOLOGY_FOUR_WALLET:
+            raise PreflightError(
+                "four-wallet topology requires exactly 2 logical and 2 prediction models"
+            )
+        raise PreflightError(
+            f"{topology} requires logical models {sorted(expected_logical_models)} and "
+            f"{expected_prediction_model_count} prediction model(s)"
+        )
 
     source_for_logical: dict[str, str] = {}
     logical_for_source: dict[str, str] = {}
@@ -606,11 +703,11 @@ def validate_topology(bindings: list[Binding] | tuple[Binding, ...]) -> tuple[Bi
             raise PreflightError(f"duplicate database authorization: {binding.authorization}")
         authorizations.add(binding.authorization)
 
-    expected_pairs = set(EXPECTED_ROUTES)
+    expected_pairs = set(expected_routes)
     if pairs != expected_pairs:
-        raise PreflightError("bindings must contain the exact echo/deepseek_masked route matrix")
+        raise PreflightError(f"bindings must contain the exact {topology} route matrix")
     for binding in normalized:
-        expected_account = EXPECTED_ROUTES[(binding.model_id, binding.strategy_id)]
+        expected_account = expected_routes[(binding.model_id, binding.strategy_id)]
         if binding.execution_account_id != expected_account:
             raise PreflightError(
                 f"route {binding.model_id!r}/{binding.strategy_id!r} must use "
@@ -656,7 +753,85 @@ def _read_bounded_regular_file(path: pathlib.Path, label: str) -> bytes:
         raise PreflightError(f"cannot read {label} file {path}: {error}") from error
 
 
-def wallet_accounts(path: pathlib.Path) -> frozenset[str]:
+def validate_cutover_baseline_evidence(
+    path: pathlib.Path | None,
+    *,
+    topology: str,
+) -> str | None:
+    """Require an applied main/wallet-1 cutover before the reuse profile.
+
+    The legacy profile deliberately does not touch the new migration tables or
+    require a new artifact.  The reuse profile must carry an operator-produced
+    mode-0600 result from the walletcutover apply boundary so changing only the
+    strategy bindings cannot reopen an unreconciled old ledger.
+    """
+    if topology == TOPOLOGY_FOUR_WALLET:
+        if path is not None:
+            raise PreflightError(
+                "cutover baseline evidence is only valid with the deepseek-reuse-four-wallet topology"
+            )
+        return None
+    if topology != TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+        raise PreflightError(f"unsupported topology {topology!r}")
+    if path is None:
+        raise PreflightError(
+            "deepseek-reuse-four-wallet requires --cutover-baseline-evidence-json"
+        )
+    payload = _read_bounded_regular_file(path, "cutover baseline evidence")
+    info = path.stat()
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise PreflightError("cutover baseline evidence must not be accessible to group or other users")
+    if info.st_uid != os.geteuid():
+        raise PreflightError("cutover baseline evidence must be owned by the preflight user")
+    try:
+        evidence = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise PreflightError("cutover baseline evidence is invalid JSON") from error
+    if not isinstance(evidence, dict):
+        raise PreflightError("cutover baseline evidence must be a JSON object")
+    if evidence.get("schema_version") != CUTOVER_BASELINE_EVIDENCE_SCHEMA:
+        raise PreflightError("cutover baseline evidence schema is unsupported")
+    mode = evidence.get("mode")
+    if mode not in {"apply-baseline", "apply-baseline-replay"}:
+        raise PreflightError("cutover baseline command evidence must be an apply result")
+    if not isinstance(evidence.get("result"), dict):
+        raise PreflightError("cutover baseline command evidence result is invalid")
+    result = evidence["result"]
+    if result.get("schema_version") != CUTOVER_BASELINE_EVIDENCE_SCHEMA:
+        raise PreflightError("cutover baseline command result schema is unsupported")
+    if result.get("applied") is not True and result.get("already_applied") is not True:
+        raise PreflightError("cutover baseline evidence must prove an applied baseline")
+    batch_id = evidence.get("batch_id", result.get("batch_id"))
+    manifest_sha = evidence.get("manifest_sha256", result.get("manifest_sha256"))
+    if not isinstance(batch_id, str) or not batch_id.strip():
+        raise PreflightError("cutover baseline evidence batch_id is required")
+    if not isinstance(manifest_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha):
+        raise PreflightError("cutover baseline evidence manifest_sha256 is invalid")
+    for field, expected in (("batch_id", batch_id), ("manifest_sha256", manifest_sha)):
+        nested = result.get(field)
+        if nested is not None and nested != expected:
+            raise PreflightError(
+                f"cutover baseline command result {field} differs from its envelope"
+            )
+    accounts = result.get("accounts")
+    if not isinstance(accounts, list):
+        raise PreflightError("cutover baseline evidence must cover main and wallet-1 exactly")
+    account_ids = []
+    for account in accounts:
+        if isinstance(account, str):
+            account_ids.append(account)
+        elif isinstance(account, dict) and isinstance(account.get("execution_account_id"), str):
+            account_ids.append(account["execution_account_id"])
+        else:
+            raise PreflightError("cutover baseline evidence account identity is invalid")
+    if set(account_ids) != {"main", "wallet-1"} or len(account_ids) != 2:
+        raise PreflightError("cutover baseline evidence must cover main and wallet-1 exactly")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def wallet_accounts(
+    path: pathlib.Path, *, topology: str = TOPOLOGY_FOUR_WALLET
+) -> frozenset[str]:
     payload = _read_bounded_regular_file(path, "wallet")
     mode = path.stat().st_mode
     if stat.S_IMODE(mode) & 0o077:
@@ -687,7 +862,7 @@ def wallet_accounts(path: pathlib.Path) -> frozenset[str]:
     accounts = frozenset(account_ids)
     if accounts != EXPECTED_ACCOUNTS:
         raise PreflightError(
-            f"wallet accounts must be exactly {sorted(EXPECTED_ACCOUNTS)}, got {sorted(accounts)}"
+            f"{topology} wallet accounts must be exactly {sorted(EXPECTED_ACCOUNTS)}, got {sorted(accounts)}"
         )
     return accounts
 
@@ -722,8 +897,17 @@ def _required_static_decimal(
 
 
 def validate_environment(
-    environment: dict[str, str], *, submission_state: str, entry_submission_state: str = "allowed"
+    environment: dict[str, str],
+    *,
+    submission_state: str,
+    entry_submission_state: str = "allowed",
+    topology: str = TOPOLOGY_FOUR_WALLET,
 ) -> tuple[Binding, ...]:
+    configured_topology = environment.get("DECISION_CYCLE_TOPOLOGY", TOPOLOGY_FOUR_WALLET).strip() or TOPOLOGY_FOUR_WALLET
+    if configured_topology != topology:
+        raise PreflightError(
+            f"DECISION_CYCLE_TOPOLOGY must be {topology!r} for this preflight, got {configured_topology!r}"
+        )
     _required_boolean(environment, "EXECUTION_ALLOW_MARKET_ORDERS", False)
     max_buy_fee_rate_bps = _required_static_decimal(
         environment, "POLYMARKET_MAX_BUY_FEE_RATE_BPS", allow_zero=True
@@ -760,9 +944,13 @@ def validate_environment(
             "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED",
             submission_state == "enabled",
         )
-    bindings = decode_bindings(environment.get("DECISION_CYCLE_BINDINGS_JSON", ""))
+    bindings = decode_bindings(
+        environment.get("DECISION_CYCLE_BINDINGS_JSON", ""), topology=topology
+    )
     decode_prediction_model_source_modes(
-        environment.get("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", ""), bindings
+        environment.get("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", ""),
+        bindings,
+        topology=topology,
     )
     quarantined_accounts = decode_submission_disabled_accounts(
         environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
@@ -772,6 +960,7 @@ def validate_environment(
     decode_entry_disabled_accounts(
         environment.get("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", ""),
         bindings,
+        topology=topology,
     )
     decode_strategy_disabled_accounts(
         environment.get("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON", "[]"),
@@ -780,7 +969,7 @@ def validate_environment(
     wallet_path = environment.get("POLYMARKET_ACCOUNTS_FILE", "").strip()
     if not wallet_path:
         raise PreflightError("POLYMARKET_ACCOUNTS_FILE is required")
-    wallet_accounts(pathlib.Path(wallet_path))
+    wallet_accounts(pathlib.Path(wallet_path), topology=topology)
     if not environment.get("TRADING_EXECUTION_DATABASE_URL", "").strip():
         raise PreflightError("TRADING_EXECUTION_DATABASE_URL is required")
     lookback = environment.get("DECISION_CYCLE_PREDICTION_LOOKBACK", "").strip()
@@ -827,17 +1016,18 @@ def validate_prediction_environment(
     if redis_database < 0 or redis_database > 15:
         raise PreflightError("REDIS_DATABASE must be between 0 and 15")
 def decode_configured_direct_prediction_models(
-    environment: dict[str, str]
+    environment: dict[str, str], *, allow_empty: bool = False
 ) -> tuple[str, ...]:
+    raw_payload = environment.get("DIRECT_PREDICTION_MODEL_IDS_JSON", "").strip()
+    if allow_empty and not raw_payload:
+        return tuple()
     try:
-        configured_models = json.loads(
-            environment.get("DIRECT_PREDICTION_MODEL_IDS_JSON", "")
-        )
+        configured_models = json.loads(raw_payload)
     except json.JSONDecodeError as error:
         raise PreflightError(
             f"DIRECT_PREDICTION_MODEL_IDS_JSON is invalid JSON: {error.msg}"
         ) from error
-    if not isinstance(configured_models, list) or not configured_models or any(
+    if not isinstance(configured_models, list) or (not configured_models and not allow_empty) or any(
         not isinstance(value, str) or not value.strip() for value in configured_models
     ):
         raise PreflightError("DIRECT_PREDICTION_MODEL_IDS_JSON must be a non-empty string array")
@@ -856,6 +1046,12 @@ def validate_configured_direct_prediction_models(
         for model_id, mode in source_modes.items()
         if mode == PREDICTION_SOURCE_DIRECT
     }
+    if not expected:
+        # A SANDBOX-only Trading topology may coexist with an Echo producer in
+        # Prediction.  It does not consume a Direct Redis model/group, so the
+        # upstream Direct model inventory is deliberately not part of this
+        # preflight contract.
+        return
     unexpected = configured - expected
     missing = expected - configured
     if unexpected or missing:
@@ -975,9 +1171,25 @@ def validate_database_state(
         sorted(CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS)
     ),
     approved_risk_contracts: dict[str, dict[str, object]] | None = None,
+    topology: str = TOPOLOGY_FOUR_WALLET,
+    cutover_baseline_identity: dict[str, object] | None = None,
 ) -> str:
     if not isinstance(state, dict):
         raise PreflightError("database preflight result must be a JSON object")
+    if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+        if not isinstance(cutover_baseline_identity, dict):
+            raise PreflightError("deepseek-reuse-four-wallet requires applied cutover baseline identity")
+        observed_baseline = state.get("cutover_baseline")
+        if not isinstance(observed_baseline, dict) or observed_baseline.get("batch_id") != cutover_baseline_identity.get("batch_id") or observed_baseline.get("manifest_sha256") != cutover_baseline_identity.get("manifest_sha256"):
+            raise PreflightError("database cutover baseline does not match the reviewed applied evidence")
+        baseline_accounts = observed_baseline.get("accounts")
+        if (
+            not isinstance(baseline_accounts, list)
+            or len(baseline_accounts) != 2
+            or not all(isinstance(account, str) for account in baseline_accounts)
+            or set(baseline_accounts) != {"main", "wallet-1"}
+        ):
+            raise PreflightError("database cutover baseline must cover main and wallet-1 exactly")
     if submission_state not in {"disabled", "enabled"}:
         raise PreflightError("database submission state must be disabled or enabled")
     if state.get("global_kill_switch") is not True:
@@ -2283,6 +2495,7 @@ def configuration_sha256(
     approved_prediction_version: str,
     wallet_file_sha256: str,
     activation_risk_approval_sha256: str | None = None,
+    cutover_baseline_evidence_sha256: str | None = None,
     approved_prediction_health_version: str | None = None,
     approved_prediction_executable_sha256: str | None = None,
 ) -> str:
@@ -2302,11 +2515,14 @@ def configuration_sha256(
         "bindings": [dataclasses.asdict(binding) for binding in bindings],
         "direct_prediction_models": sorted(model_groups),
         "configured_direct_prediction_models": list(
-            decode_configured_direct_prediction_models(prediction_environment)
+            decode_configured_direct_prediction_models(
+                prediction_environment, allow_empty=not model_groups
+            )
         ),
         "direct_model_groups": model_groups,
         "wallet_file_sha256": wallet_file_sha256,
         "activation_risk_approval_sha256": activation_risk_approval_sha256,
+        "cutover_baseline_evidence_sha256": cutover_baseline_evidence_sha256,
         "approved_release_identity": {
             "trading_commit": approved_trading_commit,
             "prediction_version": approved_prediction_version,
@@ -2344,12 +2560,13 @@ def build_disabled_evidence(
     delivery_watermark: dict[str, object],
     database_account_identity_sha256: str,
     runtime_state: object,
+    topology: str = TOPOLOGY_FOUR_WALLET,
 ) -> dict[str, object]:
     if not isinstance(runtime_state, dict) or not isinstance(runtime_state.get("trading"), dict):
         raise PreflightError("cannot build disabled evidence without Trading runtime identity")
     trading_runtime = runtime_state["trading"]
     evidence: dict[str, object] = {
-        "schema_version": DISABLED_EVIDENCE_SCHEMA,
+        "schema_version": _topology_schema(topology),
         "issued_at": now.isoformat().replace("+00:00", "Z"),
         "submission_state": "disabled",
         "approved_trading_commit": expected_trading_commit,
@@ -2380,6 +2597,7 @@ def validate_disabled_evidence(
     configuration_sha: str,
     delivery_watermark: dict[str, object],
     database_account_identity_sha256: str,
+    topology: str = TOPOLOGY_FOUR_WALLET,
 ) -> dict[str, object]:
     if not isinstance(evidence, dict):
         raise PreflightError("disabled-phase evidence must be a JSON object")
@@ -2388,7 +2606,7 @@ def validate_disabled_evidence(
     unsigned.pop("evidence_sha256", None)
     if not isinstance(supplied_digest, str) or supplied_digest != _canonical_sha256(unsigned):
         raise PreflightError("disabled-phase evidence checksum is invalid")
-    if evidence.get("schema_version") != DISABLED_EVIDENCE_SCHEMA:
+    if evidence.get("schema_version") != _topology_schema(topology):
         raise PreflightError("disabled-phase evidence schema is unsupported")
     _fresh_observation(
         evidence.get("issued_at"), "disabled evidence issued_at", now=now, max_age=max_age
@@ -2515,6 +2733,7 @@ def validate_activation_risk_approval(
     expected_trading_commit: str,
     now: dt.datetime,
     max_age: dt.timedelta,
+    topology: str = TOPOLOGY_FOUR_WALLET,
 ) -> dict[str, dict[str, object]]:
     if not isinstance(approval, dict):
         raise PreflightError("activation-risk approval must be a JSON object")
@@ -2532,7 +2751,7 @@ def validate_activation_risk_approval(
         raise PreflightError(
             "activation-risk approval must contain the exact reviewed schema fields"
         )
-    if approval.get("schema_version") != ACTIVATION_RISK_APPROVAL_SCHEMA:
+    if approval.get("schema_version") != _topology_schema(topology, activation=True):
         raise PreflightError(
             "activation-risk approval schema is unsupported; disabled-phase evidence "
             "cannot authorize wallet activation"
@@ -2674,7 +2893,9 @@ def _pg_environment(database_url: str) -> tuple[dict[str, str], pathlib.Path | N
     return child, pgpass_path
 
 
-def query_database_state(database_url: str) -> object:
+def query_database_state(
+    database_url: str, *, topology: str = TOPOLOGY_FOUR_WALLET
+) -> object:
     if not shutil.which("psql"):
         raise PreflightError("psql is required for the database authorization preflight")
     child, pgpass_path = _pg_environment(database_url)
@@ -2687,6 +2908,16 @@ def query_database_state(database_url: str) -> object:
             timeout=30,
             check=False,
         )
+        baseline_result = None
+        if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET and result.returncode == 0:
+            baseline_result = subprocess.run(
+                ["psql", "-X", "-Atq", "-v", "ON_ERROR_STOP=1", "-c", CUTOVER_BASELINE_SQL],
+                env=child,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise PreflightError(f"database preflight command failed: {type(error).__name__}") from error
     finally:
@@ -2699,9 +2930,24 @@ def query_database_state(database_url: str) -> object:
     if len(lines) != 1:
         raise PreflightError("database preflight returned an unexpected result shape")
     try:
-        return json.loads(lines[0])
+        state = json.loads(lines[0])
     except json.JSONDecodeError as error:
         raise PreflightError("database preflight returned invalid JSON") from error
+    if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+        if baseline_result is None or baseline_result.returncode != 0:
+            detail = "" if baseline_result is None else baseline_result.stderr.strip().replace("\n", " ")[-1000:]
+            raise PreflightError(f"cutover baseline database query failed: {detail}")
+        baseline_lines = [line for line in baseline_result.stdout.splitlines() if line.strip()]
+        if len(baseline_lines) != 1:
+            raise PreflightError("cutover baseline query returned an unexpected result shape")
+        try:
+            baseline = json.loads(baseline_lines[0])
+        except json.JSONDecodeError as error:
+            raise PreflightError("cutover baseline query returned invalid JSON") from error
+        if not isinstance(state, dict):
+            raise PreflightError("database preflight returned an unexpected result shape")
+        state["cutover_baseline"] = baseline
+    return state
 
 
 def _get_json(url: str, headers: dict[str, str] | None = None) -> object:
@@ -3123,6 +3369,12 @@ def collect_consumer_state(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--topology",
+        choices=(TOPOLOGY_FOUR_WALLET, TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET),
+        default=TOPOLOGY_FOUR_WALLET,
+        help="explicit Trading wallet/strategy topology; default preserves the legacy four-wallet routes",
+    )
+    parser.add_argument(
         "--env-file",
         type=pathlib.Path,
         default=pathlib.Path("/etc/trading-execution/env"),
@@ -3153,6 +3405,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--disabled-evidence-json",
         type=pathlib.Path,
         help="disabled-phase artifact; required after restarting with submission enabled",
+    )
+    parser.add_argument(
+        "--cutover-baseline-evidence-json",
+        type=pathlib.Path,
+        help=(
+            "mode-0600 applied main/wallet-1 walletcutover result; required by "
+            "--topology deepseek-reuse-four-wallet"
+        ),
     )
     parser.add_argument(
         "--activation-risk-approval-json",
@@ -3352,13 +3612,34 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
         prediction_environment = read_environment_file(args.prediction_env_file)
+        cutover_baseline_evidence_sha = validate_cutover_baseline_evidence(
+            args.cutover_baseline_evidence_json,
+            topology=args.topology,
+        )
+        cutover_baseline_identity: dict[str, object] | None = None
+        if args.topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+            evidence_payload = json.loads(
+                _read_bounded_regular_file(
+                    args.cutover_baseline_evidence_json, "cutover baseline evidence"
+                )
+            )
+            result_payload = evidence_payload.get("result", evidence_payload)
+            cutover_baseline_identity = {
+                "batch_id": evidence_payload.get("batch_id", result_payload.get("batch_id")),
+                "manifest_sha256": evidence_payload.get(
+                    "manifest_sha256", result_payload.get("manifest_sha256")
+                ),
+            }
         bindings = validate_environment(
             environment,
             submission_state=args.submission_state,
             entry_submission_state=args.entry_submission_state,
+            topology=args.topology,
         )
         source_modes = decode_prediction_model_source_modes(
-            environment["DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON"], bindings
+            environment["DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON"],
+            bindings,
+            topology=args.topology,
         )
         submission_disabled_accounts = decode_submission_disabled_accounts(
             environment.get("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", "[]"),
@@ -3368,6 +3649,7 @@ def main(argv: list[str] | None = None) -> int:
         entry_disabled_accounts = decode_entry_disabled_accounts(
             environment["DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON"],
             bindings,
+            topology=args.topology,
         )
         active_wallet67 = ACTIVATABLE_ACCOUNTS
         activation_risk_approval_sha = (
@@ -3392,6 +3674,7 @@ def main(argv: list[str] | None = None) -> int:
                 expected_trading_commit=expected_trading_commit,
                 now=dt.datetime.now(dt.timezone.utc),
                 max_age=dt.timedelta(seconds=args.max_risk_approval_age_seconds),
+                topology=args.topology,
             )
         else:
             if (
@@ -3442,6 +3725,7 @@ def main(argv: list[str] | None = None) -> int:
             activation_risk_approval_sha256=(
                 activation_risk_approval_sha or None
             ),
+            cutover_baseline_evidence_sha256=cutover_baseline_evidence_sha,
             approved_prediction_health_version=expected_prediction_health_version,
             approved_prediction_executable_sha256=(
                 expected_prediction_executable_sha256 or None
@@ -3480,7 +3764,9 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.database_state_json is None:
-            state = query_database_state(environment["TRADING_EXECUTION_DATABASE_URL"])
+            state = query_database_state(
+                environment["TRADING_EXECUTION_DATABASE_URL"], topology=args.topology
+            )
         else:
             state = json.loads(_read_bounded_regular_file(args.database_state_json, "database state"))
         database_now = dt.datetime.now(dt.timezone.utc)
@@ -3491,6 +3777,8 @@ def main(argv: list[str] | None = None) -> int:
             submission_state=args.submission_state,
             submission_disabled_accounts=submission_disabled_accounts,
             approved_risk_contracts=approved_risk_contracts,
+            topology=args.topology,
+            cutover_baseline_identity=cutover_baseline_identity,
         )
         delivery_watermark = validate_delivery_state(
             state, entry_submission_state=args.entry_submission_state
@@ -3508,6 +3796,7 @@ def main(argv: list[str] | None = None) -> int:
                 configuration_sha=configuration_sha,
                 delivery_watermark=delivery_watermark,
                 database_account_identity_sha256=database_account_identity_sha,
+                topology=args.topology,
             )
             reject_enabled_cycles_after_evidence(state, disabled_dry_run)
         dry_run_now = dt.datetime.now(dt.timezone.utc)
@@ -3620,7 +3909,7 @@ def main(argv: list[str] | None = None) -> int:
             # mutate deliveries while the PIT/Redis evidence is being inspected.
             if args.database_state_json is None:
                 final_state = query_database_state(
-                    environment["TRADING_EXECUTION_DATABASE_URL"]
+                    environment["TRADING_EXECUTION_DATABASE_URL"], topology=args.topology
                 )
             else:
                 try:
@@ -3664,6 +3953,8 @@ def main(argv: list[str] | None = None) -> int:
                 submission_state=args.submission_state,
                 submission_disabled_accounts=submission_disabled_accounts,
                 approved_risk_contracts=approved_risk_contracts,
+                topology=args.topology,
+                cutover_baseline_identity=cutover_baseline_identity,
             )
             if final_account_identity_sha != database_account_identity_sha:
                 raise PreflightError(
@@ -3717,6 +4008,7 @@ def main(argv: list[str] | None = None) -> int:
                 delivery_watermark=delivery_watermark,
                 database_account_identity_sha256=database_account_identity_sha,
                 runtime_state=runtime_state,
+                topology=args.topology,
             )
             write_disabled_evidence(args.write_disabled_evidence, disabled_evidence)
             evidence_path = str(args.write_disabled_evidence)
@@ -3731,7 +4023,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(
         "FOUR_WALLET_PREFLIGHT=PASS "
-        f"bindings={len(bindings)} accounts={len(EXPECTED_ACCOUNTS)} "
+        f"topology={args.topology} bindings={len(bindings)} accounts={len(EXPECTED_ACCOUNTS)} "
         f"manifest_markets={manifest_markets} dry_run={dry_run['decision_at']} "
         f"submission_state={args.submission_state} consumer_groups={len(model_groups)} "
         f"disabled_evidence={evidence_path or args.disabled_evidence_json} "

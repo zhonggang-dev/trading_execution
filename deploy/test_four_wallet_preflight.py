@@ -41,6 +41,33 @@ SOURCE_MODES = {
     "echo-producer-v7": "DIRECT",
     "qwen": "SANDBOX",
 }
+DEEPSEEK_REUSE_BINDINGS = [
+    {
+        "prediction_model_id": "v4.1 flash",
+        "model_id": "deepseek_masked",
+        "strategy_id": "strategy_pending_a",
+        "execution_account_id": "main",
+    },
+    {
+        "prediction_model_id": "v4.1 flash",
+        "model_id": "deepseek_masked",
+        "strategy_id": "strategy_pending_b",
+        "execution_account_id": "wallet-1",
+    },
+    {
+        "prediction_model_id": "v4.1 flash",
+        "model_id": "deepseek_masked",
+        "strategy_id": "multfactor_v1",
+        "execution_account_id": "wallet-6",
+    },
+    {
+        "prediction_model_id": "v4.1 flash",
+        "model_id": "deepseek_masked",
+        "strategy_id": "multfactor_v2",
+        "execution_account_id": "wallet-7",
+    },
+]
+DEEPSEEK_REUSE_SOURCE_MODES = {"v4.1 flash": "SANDBOX"}
 MODEL_GROUPS = {"echo-producer-v7": "predict-echo-v1"}
 TRADING_COMMIT = "a" * 40
 PREDICTION_COMMIT = "b" * 40
@@ -389,6 +416,152 @@ class BindingTopologyTests(unittest.TestCase):
         broken[0]["prediction_model_id"] = "EXACT_ECHO_SNAPSHOT_MODEL_NAME"
         with self.assertRaisesRegex(preflight.PreflightError, "unresolved"):
             preflight.decode_bindings(json.dumps(broken))
+
+    def test_accepts_explicit_deepseek_reuse_routes(self) -> None:
+        bindings = preflight.decode_bindings(
+            json.dumps(DEEPSEEK_REUSE_BINDINGS),
+            topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+        )
+        self.assertEqual(
+            {binding.strategy_id for binding in bindings},
+            preflight.DEEPSEEK_REUSE_EXPECTED_STRATEGIES,
+        )
+        self.assertEqual(
+            preflight.decode_prediction_model_source_modes(
+                json.dumps(DEEPSEEK_REUSE_SOURCE_MODES),
+                bindings,
+                topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+            ),
+            DEEPSEEK_REUSE_SOURCE_MODES,
+        )
+
+    def test_reuse_entry_gate_only_allows_main_and_wallet1_subset(self) -> None:
+        bindings = preflight.decode_bindings(
+            json.dumps(DEEPSEEK_REUSE_BINDINGS),
+            topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+        )
+        self.assertEqual(
+            preflight.decode_entry_disabled_accounts(
+                '["main"]',
+                bindings,
+                topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+            ),
+            ("main",),
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "may only contain main"):
+            preflight.decode_entry_disabled_accounts(
+                '["wallet-6"]',
+                bindings,
+                topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+            )
+
+    def test_reuse_requires_applied_walletcutover_command_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "cutover-result.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": preflight.CUTOVER_BASELINE_EVIDENCE_SCHEMA,
+                        "mode": "apply-baseline",
+                        "batch_id": "cutover-1",
+                        "manifest_sha256": "a" * 64,
+                        "result": {
+                            "schema_version": preflight.CUTOVER_BASELINE_EVIDENCE_SCHEMA,
+                            "applied": True,
+                            "batch_id": "cutover-1",
+                            "manifest_sha256": "a" * 64,
+                            "accounts": ["main", "wallet-1"],
+                        },
+                    }
+                )
+            )
+            path.chmod(0o600)
+            self.assertEqual(
+                preflight.validate_cutover_baseline_evidence(
+                    path,
+                    topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+                ),
+                preflight.hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+
+    def test_reuse_rejects_applied_result_without_account_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "cutover-result.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": preflight.CUTOVER_BASELINE_EVIDENCE_SCHEMA,
+                        "mode": "apply-baseline",
+                        "batch_id": "cutover-1",
+                        "manifest_sha256": "a" * 64,
+                        "result": {
+                            "schema_version": preflight.CUTOVER_BASELINE_EVIDENCE_SCHEMA,
+                            "applied": True,
+                            "batch_id": "cutover-1",
+                            "manifest_sha256": "a" * 64,
+                        },
+                    }
+                )
+            )
+            path.chmod(0o600)
+            with self.assertRaisesRegex(
+                preflight.PreflightError,
+                "must cover main and wallet-1 exactly",
+            ):
+                preflight.validate_cutover_baseline_evidence(
+                    path,
+                    topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+                )
+
+    def test_reuse_rejects_handwritten_apply_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "cutover-result.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "mode": "apply",
+                        "batch_id": "cutover-1",
+                        "manifest_sha256": "a" * 64,
+                        "result": {
+                            "applied": True,
+                            "accounts": ["main", "wallet-1"],
+                        },
+                    }
+                )
+            )
+            path.chmod(0o600)
+            with self.assertRaisesRegex(
+                preflight.PreflightError,
+                "schema is unsupported",
+            ):
+                preflight.validate_cutover_baseline_evidence(
+                    path,
+                    topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+                )
+
+    def test_reuse_rejects_direct_applied_payload_without_command_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "cutover-result.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": preflight.CUTOVER_BASELINE_EVIDENCE_SCHEMA,
+                        "batch_id": "cutover-1",
+                        "manifest_sha256": "a" * 64,
+                        "applied": True,
+                        "accounts": ["main", "wallet-1"],
+                    }
+                )
+            )
+            path.chmod(0o600)
+            with self.assertRaisesRegex(
+                preflight.PreflightError,
+                "must be an apply result",
+            ):
+                preflight.validate_cutover_baseline_evidence(
+                    path,
+                    topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+                )
 
 
 class DatabaseStateTests(unittest.TestCase):

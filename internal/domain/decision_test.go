@@ -21,6 +21,17 @@ func TestStrategyExecutionContextRejectsUnknownStrategy(t *testing.T) {
 	}
 }
 
+func TestStrategyExecutionContextAcceptsDeepSeekReuseStrategies(t *testing.T) {
+	for _, strategyID := range []string{StrategyIDPendingA, StrategyIDPendingB} {
+		context := StrategyExecutionContext{
+			ModelID: "deepseek_masked", StrategyID: strategyID, ExecutionAccountID: "main",
+		}
+		if err := context.Validate(); err != nil {
+			t.Fatalf("Validate(%q) error = %v", strategyID, err)
+		}
+	}
+}
+
 func TestStrategyExecutionBindingSeparatesPredictionAndLogicalModels(t *testing.T) {
 	binding := StrategyExecutionBinding{
 		PredictionModelID:  " gemini-3.6-flash ",

@@ -1131,6 +1131,78 @@ func TestAccountEntryGateRoutesOnlyV41FlashPredictionsToWallet6AndWallet7(t *tes
 	}
 }
 
+func TestDeepSeekReuseFourWalletRunsSingleSandboxSourceWithMainWallet1BuyBlocked(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	prediction := validPrediction(decisionAt)
+	prediction.PredictionID = "pred-deepseek-reuse"
+	prediction.SourceJobID = "job-deepseek-reuse"
+	prediction.SandboxID = "sandbox-v41-flash"
+	prediction.Model.Name = "v4.1 flash"
+	bindings := []domain.StrategyExecutionBinding{
+		{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", StrategyID: domain.StrategyIDPendingA, ExecutionAccountID: "main"},
+		{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", StrategyID: domain.StrategyIDPendingB, ExecutionAccountID: "wallet-1"},
+		{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
+		{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+	}
+	strategy := &matrixStrategy{}
+	executor := &fakeExecutor{}
+	recorder := &fakeRecorder{}
+	service, err := newTestService(Params{
+		PredictionSource: fakePredictionSource{snapshot: domain.PredictionSnapshot{
+			SchemaVersion: domain.PredictionSnapshotSchemaVersion,
+			SnapshotID:    "predsnap-deepseek-reuse",
+			DecisionAt:    decisionAt,
+			Predictions:   []domain.Prediction{prediction},
+		}},
+		PositionSource: fakePositionSource{}, OrderBookSource: &fakeOrderBookSource{},
+		Strategy: strategy, Recorder: recorder, Executor: executor,
+		SubmitEnabled: true, EntryDisabledAccounts: []string{"main", "wallet-1"},
+		RequireCompleteModelCoverage: true, Bindings: bindings,
+		PredictionSourceModes: map[string]domain.PredictionSourceMode{
+			"v4.1 flash": domain.PredictionSourceModeSandbox,
+		},
+		Venue: "polymarket-paper", Now: func() time.Time { return decisionAt.Add(2 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, runErr := service.Run(context.Background(), decisionAt)
+	if runErr != nil {
+		t.Fatalf("Run() error = %v", runErr)
+	}
+	if len(result.Runs) != 4 || len(strategy.requests) != 4 {
+		t.Fatalf("runs/requests = %d/%d", len(result.Runs), len(strategy.requests))
+	}
+	for index, request := range strategy.requests {
+		run := result.Runs[index]
+		if request.Context.ModelID != "deepseek_masked" || len(request.Predictions) != 1 &&
+			(request.Context.ExecutionAccountID != "main" && request.Context.ExecutionAccountID != "wallet-1") {
+			t.Fatalf("unexpected DeepSeek request = %#v", request)
+		}
+		switch request.Context.ExecutionAccountID {
+		case "main":
+			if request.Context.StrategyID != domain.StrategyIDPendingA || len(request.Predictions) != 0 ||
+				run.EntrySubmissionEnabled || run.EntryBlockReason != domain.StrategyEntryBlockSubmissionDisabled {
+				t.Fatalf("main reuse gate = %#v / %#v", request, run)
+			}
+		case "wallet-1":
+			if request.Context.StrategyID != domain.StrategyIDPendingB || len(request.Predictions) != 0 ||
+				run.EntrySubmissionEnabled || run.EntryBlockReason != domain.StrategyEntryBlockSubmissionDisabled {
+				t.Fatalf("wallet-1 reuse gate = %#v / %#v", request, run)
+			}
+		case "wallet-6", "wallet-7":
+			if len(request.Predictions) != 1 || request.Predictions[0].Model.Name != "deepseek_masked" || !run.EntrySubmissionEnabled {
+				t.Fatalf("wallet67 DeepSeek request/run = %#v / %#v", request, run)
+			}
+		default:
+			t.Fatalf("unexpected execution account %q", request.Context.ExecutionAccountID)
+		}
+	}
+	if len(executor.intents) != 0 || len(recorder.claimedIntents) != 0 {
+		t.Fatalf("matrix strategy generated unexpected BUY intents: executor=%#v recorder=%#v", executor.intents, recorder.claimedIntents)
+	}
+}
+
 func TestRunSelectsLatestPITProbabilityForSameMarketAndModel(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	first := validPrediction(decisionAt)
@@ -2045,6 +2117,13 @@ func TestStrategySpecificEvidenceMetricsAndUniverseReason(t *testing.T) {
 	}}
 	if err := validateEvidenceMetrics(evidence, request, "token", true); err != nil {
 		t.Fatalf("v1 evidence error = %v", err)
+	}
+	for _, strategyID := range []string{domain.StrategyIDPendingA, domain.StrategyIDPendingB} {
+		pendingRequest := request
+		pendingRequest.Context.StrategyID = strategyID
+		if err := validateEvidenceMetrics(evidence, pendingRequest, "token", true); err != nil {
+			t.Fatalf("%s evidence error = %v", strategyID, err)
+		}
 	}
 	evidence.Metrics["MOM"] = "-0.01"
 	evidence.Metrics["best_bid"] = "0.49"
