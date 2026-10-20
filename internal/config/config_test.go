@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -297,6 +298,59 @@ func TestLoadAcceptsDeepSeekReuseFourWalletTopology(t *testing.T) {
 		len(config.DecisionCycle.Bindings) != 4 ||
 		config.DecisionCycle.Bindings[0].ModelID != "deepseek_masked" {
 		t.Fatalf("deepseek reuse config = %#v", config.DecisionCycle)
+	}
+}
+
+func TestLoadAcceptsConfiguredDeepSeekReuseStrategyIDs(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_TOPOLOGY", DecisionCycleTopologyDeepSeekReuseFourWallet)
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"alpha_new.v2","execution_account_id":"main"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"beta-new","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+	]`)
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"v4.1 flash":"SANDBOX"}`)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.DecisionCycle.Bindings[0].StrategyID != "alpha_new.v2" ||
+		config.DecisionCycle.Bindings[1].StrategyID != "beta-new" {
+		t.Fatalf("configured strategies = %#v", config.DecisionCycle.Bindings)
+	}
+}
+
+func TestLoadRejectsUnsafeOrConflictingDeepSeekReuseStrategyIDs(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		mainID    string
+		wallet1ID string
+		want      string
+	}{
+		{name: "unsafe", mainID: "alpha new", wallet1ID: "beta_new", want: "invalid format"},
+		{name: "duplicate", mainID: "alpha_new", wallet1ID: "alpha_new", want: "duplicate model/strategy"},
+		{name: "fixed wallet strategy", mainID: domain.StrategyIDMultfactorV1, wallet1ID: "beta_new", want: "duplicate model/strategy"},
+		{name: "uppercase fixed wallet strategy", mainID: "MULTFACTOR_V1", wallet1ID: "beta_new", want: "duplicate model/strategy"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			t.Setenv("DECISION_CYCLE_TOPOLOGY", DecisionCycleTopologyDeepSeekReuseFourWallet)
+			t.Setenv("DECISION_CYCLE_BINDINGS_JSON", fmt.Sprintf(`[
+				{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":%q,"execution_account_id":"main"},
+				{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":%q,"execution_account_id":"wallet-1"},
+				{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+				{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+			]`, test.mainID, test.wallet1ID))
+			t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"v4.1 flash":"SANDBOX"}`)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

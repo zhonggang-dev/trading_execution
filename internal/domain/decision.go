@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -586,6 +587,23 @@ const (
 	StrategyIDPendingB = "strategy_pending_b"
 )
 
+var safeStrategyIDPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]{0,63}$`)
+
+// ValidateStrategyID checks the stable wire identifier shared by configuration,
+// strategy responses, orders, and ledger rows. The execution layer does not
+// own the algorithm catalogue; topology validation binds a configured ID to a
+// wallet, while this function only rejects ambiguous or unsafe identifiers.
+func ValidateStrategyID(value string) error {
+	value = CanonicalStrategyID(value)
+	if value == "" {
+		return fmt.Errorf("strategy_id is required")
+	}
+	if !safeStrategyIDPattern.MatchString(value) {
+		return fmt.Errorf("strategy_id %q has invalid format", value)
+	}
+	return nil
+}
+
 // Normalize 规范化当前模型的文本、时间和可变字段。
 func (executionContext StrategyExecutionContext) Normalize() StrategyExecutionContext {
 	executionContext.ModelID = strings.TrimSpace(executionContext.ModelID)
@@ -715,12 +733,10 @@ func (executionContext StrategyExecutionContext) Validate() error {
 	if executionContext.ModelID == "" || executionContext.StrategyID == "" || executionContext.ExecutionAccountID == "" {
 		return fmt.Errorf("model_id, strategy_id, and execution_account_id are required")
 	}
-	switch executionContext.StrategyID {
-	case StrategyIDMultfactorV1, StrategyIDMultfactorV2, StrategyIDPendingA, StrategyIDPendingB:
-		return nil
-	default:
-		return fmt.Errorf("strategy_id %q is not supported", executionContext.StrategyID)
+	if err := ValidateStrategyID(executionContext.StrategyID); err != nil {
+		return err
 	}
+	return nil
 }
 
 // Equal 判断两个值在规范化后是否相等。

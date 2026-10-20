@@ -1345,47 +1345,30 @@ func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBin
 }
 
 // validateDeepSeekReuseFourWalletTopology binds the existing four physical
-// wallets to one SANDBOX DeepSeek source.  The two temporary strategy IDs are
-// intentionally explicit so a generic strategy name cannot silently claim a
-// production wallet.
+// wallets to one SANDBOX DeepSeek source. The main and wallet-1 strategy IDs
+// are supplied by the trusted binding configuration; wallet-6/7 retain their
+// fixed strategy identities and cannot be claimed by the new routes.
 func validateDeepSeekReuseFourWalletTopology(bindings []domain.StrategyExecutionBinding) error {
 	if len(bindings) != 4 {
 		return fmt.Errorf("deepseek-reuse-four-wallet requires exactly 4 bindings")
 	}
-	expectedRoutes := map[string]string{
-		"deepseek_masked\x00" + domain.StrategyIDPendingA:     "main",
-		"deepseek_masked\x00" + domain.StrategyIDPendingB:     "wallet-1",
-		"deepseek_masked\x00" + domain.StrategyIDMultfactorV1: "wallet-6",
-		"deepseek_masked\x00" + domain.StrategyIDMultfactorV2: "wallet-7",
-	}
 	accounts := make(map[string]struct{}, len(bindings))
 	predictionModels := make(map[string]struct{}, len(bindings))
-	pairs := make(map[string]struct{}, len(bindings))
+	routes := make(map[string]domain.StrategyExecutionBinding, len(bindings))
 	for _, rawBinding := range bindings {
 		binding := rawBinding.Normalize()
 		if binding.ModelID != "deepseek_masked" {
 			return fmt.Errorf("deepseek-reuse-four-wallet requires logical model deepseek_masked")
 		}
-		pair := binding.ModelID + "\x00" + binding.StrategyID
-		expectedAccountID, exists := expectedRoutes[pair]
-		if !exists {
-			return fmt.Errorf(
-				"deepseek-reuse-four-wallet contains unsupported model/strategy route %q/%q",
-				binding.ModelID, binding.StrategyID,
-			)
-		}
-		if binding.ExecutionAccountID != expectedAccountID {
-			return fmt.Errorf(
-				"deepseek-reuse-four-wallet route %q/%q must use execution account %q",
-				binding.ModelID, binding.StrategyID, expectedAccountID,
-			)
+		if _, duplicate := routes[binding.ExecutionAccountID]; duplicate {
+			return fmt.Errorf("deepseek-reuse-four-wallet contains duplicate execution account %q", binding.ExecutionAccountID)
 		}
 		accounts[binding.ExecutionAccountID] = struct{}{}
 		predictionModels[binding.PredictionModelID] = struct{}{}
-		pairs[pair] = struct{}{}
+		routes[binding.ExecutionAccountID] = binding
 	}
 	expectedAccounts := map[string]struct{}{"main": {}, "wallet-1": {}, "wallet-6": {}, "wallet-7": {}}
-	if len(predictionModels) != 1 || len(pairs) != len(expectedRoutes) || len(accounts) != len(expectedAccounts) {
+	if len(predictionModels) != 1 || len(accounts) != len(expectedAccounts) {
 		return fmt.Errorf("deepseek-reuse-four-wallet requires one prediction model and the exact four-wallet route matrix")
 	}
 	for accountID := range expectedAccounts {
@@ -1393,12 +1376,41 @@ func validateDeepSeekReuseFourWalletTopology(bindings []domain.StrategyExecution
 			return fmt.Errorf("deepseek-reuse-four-wallet requires execution account %q", accountID)
 		}
 	}
-	for pair := range expectedRoutes {
-		if _, exists := pairs[pair]; !exists {
-			return fmt.Errorf("deepseek-reuse-four-wallet is missing route %q", pair)
+	for accountID, expectedStrategyID := range map[string]string{
+		"wallet-6": domain.StrategyIDMultfactorV1,
+		"wallet-7": domain.StrategyIDMultfactorV2,
+	} {
+		binding := routes[accountID]
+		if binding.StrategyID != expectedStrategyID {
+			return fmt.Errorf(
+				"deepseek-reuse-four-wallet route for %q must use strategy %q",
+				accountID, expectedStrategyID,
+			)
+		}
+	}
+	mainStrategy := routes["main"].StrategyID
+	wallet1Strategy := routes["wallet-1"].StrategyID
+	if mainStrategy == wallet1Strategy {
+		return fmt.Errorf("deepseek-reuse-four-wallet main and wallet-1 strategy IDs must be distinct")
+	}
+	for accountID, strategyID := range map[string]string{"main": mainStrategy, "wallet-1": wallet1Strategy} {
+		if strategyID == domain.StrategyIDMultfactorV1 || strategyID == domain.StrategyIDMultfactorV2 {
+			return fmt.Errorf(
+				"deepseek-reuse-four-wallet route for %q cannot reuse wallet-6/wallet-7 strategy %q",
+				accountID, strategyID,
+			)
+		}
+		if err := domain.ValidateStrategyID(strategyID); err != nil {
+			return fmt.Errorf("deepseek-reuse-four-wallet route for %q: %w", accountID, err)
 		}
 	}
 	return nil
+}
+
+// ValidateDecisionCycleTopology exposes the topology contract to startup
+// composition code without duplicating route rules in another package.
+func ValidateDecisionCycleTopology(topology string, bindings []domain.StrategyExecutionBinding) error {
+	return validateDecisionSubmissionTopology(topology, bindings)
 }
 
 func validateDecisionSubmissionTopology(topology string, bindings []domain.StrategyExecutionBinding) error {

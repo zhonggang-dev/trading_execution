@@ -2013,6 +2013,10 @@ func TestMultfactorV1EntryDoesNotRequireMidPriceHistory(t *testing.T) {
 	if _, err := buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket"); err != nil {
 		t.Fatalf("buildEntryIntent() error = %v, want v1 to ignore hourly history", err)
 	}
+	request.Context.StrategyID = "alpha_new"
+	if _, err := buildEntryIntent(request, decisionAt.Add(time.Second), evaluation, "polymarket"); err != nil {
+		t.Fatalf("buildEntryIntent() configured strategy error = %v", err)
+	}
 	if reason := inputFailureReason(request, prediction.Outcomes[0].TokenID); reason != "" {
 		t.Fatalf("inputFailureReason() = %q, want no v1 history failure", reason)
 	}
@@ -2080,14 +2084,14 @@ func TestMixedCycleCallsV1AndV2WithoutMidPriceHistoryDependency(t *testing.T) {
 	}
 }
 
-func TestUnknownStrategyFailsClosedBeforeStrategyOutputCanCreateAnIntent(t *testing.T) {
+func TestUnsafeStrategyIDFailsClosedBeforeStrategyOutputCanCreateAnIntent(t *testing.T) {
 	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
 	request := domain.StrategyDecisionRequest{
 		SchemaVersion: domain.StrategyInputSchemaVersion,
 		CycleID:       "cycle-unknown",
 		InputID:       "input-unknown",
 		Context: domain.StrategyExecutionContext{
-			ModelID: "test", StrategyID: "multfactor_v3", ExecutionAccountID: "account-1",
+			ModelID: "test", StrategyID: "strategy v3", ExecutionAccountID: "account-1",
 		},
 		DecisionAt: decisionAt,
 	}
@@ -2102,6 +2106,31 @@ func TestUnknownStrategyFailsClosedBeforeStrategyOutputCanCreateAnIntent(t *test
 	}
 	if _, err := validateResponse(request, response, "polymarket"); err == nil || !errors.Is(err, ErrInvalidStrategy) {
 		t.Fatalf("validateResponse() error = %v, want unsupported strategy rejection", err)
+	}
+}
+
+func TestConfiguredStrategyResponseContextCannotClaimAnotherRoute(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 18, 4, 20, 0, 0, time.UTC)
+	request := domain.StrategyDecisionRequest{
+		SchemaVersion: domain.StrategyInputSchemaVersion,
+		CycleID:       "cycle-alpha",
+		InputID:       "input-alpha",
+		Context: domain.StrategyExecutionContext{
+			ModelID: "deepseek_masked", StrategyID: "alpha_new", ExecutionAccountID: "main",
+		},
+		DecisionAt: decisionAt,
+	}
+	response := domain.StrategyDecisionResponse{
+		SchemaVersion: domain.StrategyOutputSchemaVersion,
+		CycleID:       request.CycleID,
+		InputID:       request.InputID,
+		Context: domain.StrategyExecutionContext{
+			ModelID: "deepseek_masked", StrategyID: "beta_new", ExecutionAccountID: "wallet-1",
+		},
+		DecidedAt: decisionAt.Add(time.Second),
+	}
+	if _, err := validateResponse(request, response, "polymarket"); err == nil || !errors.Is(err, ErrInvalidStrategy) {
+		t.Fatalf("validateResponse() error = %v, want exact configured-route context rejection", err)
 	}
 }
 
