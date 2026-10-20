@@ -424,7 +424,7 @@ class BindingTopologyTests(unittest.TestCase):
         )
         self.assertEqual(
             {binding.strategy_id for binding in bindings},
-            preflight.DEEPSEEK_REUSE_EXPECTED_STRATEGIES,
+            {"strategy_pending_a", "strategy_pending_b", "multfactor_v1", "multfactor_v2"},
         )
         self.assertEqual(
             preflight.decode_prediction_model_source_modes(
@@ -434,6 +434,34 @@ class BindingTopologyTests(unittest.TestCase):
             ),
             DEEPSEEK_REUSE_SOURCE_MODES,
         )
+
+    def test_accepts_configured_deepseek_reuse_strategy_ids(self) -> None:
+        configured = [dict(item) for item in DEEPSEEK_REUSE_BINDINGS]
+        configured[0]["strategy_id"] = "alpha_new"
+        configured[1]["strategy_id"] = "beta-new"
+        bindings = preflight.decode_bindings(
+            json.dumps(configured),
+            topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+        )
+        self.assertEqual(
+            {binding.strategy_id for binding in bindings},
+            {"alpha_new", "beta-new", "multfactor_v1", "multfactor_v2"},
+        )
+
+    def test_reuse_strategy_aliases_cannot_claim_wallet6_or_wallet7(self) -> None:
+        configured = [dict(item) for item in DEEPSEEK_REUSE_BINDINGS]
+        configured[0]["strategy_id"] = "strategy-v1"
+        with self.assertRaisesRegex(preflight.PreflightError, "cannot reuse"):
+            preflight.decode_bindings(
+                json.dumps(configured),
+                topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+            )
+        configured[0]["strategy_id"] = "MULTFACTOR_V1"
+        with self.assertRaisesRegex(preflight.PreflightError, "cannot reuse"):
+            preflight.decode_bindings(
+                json.dumps(configured),
+                topology=preflight.TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET,
+            )
 
     def test_reuse_entry_gate_only_allows_main_and_wallet1_subset(self) -> None:
         bindings = preflight.decode_bindings(

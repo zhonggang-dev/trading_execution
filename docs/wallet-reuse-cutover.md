@@ -17,7 +17,12 @@ deepseek_masked / multfactor_v2 / wallet-7
 
 默认 `four-wallet` 保持旧 Echo + masked 四钱包合同，不会因为部署新二进制就解锁 `main/wallet-1`。新模式初次验收仍保留 `DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON=["main","wallet-1"]`；策略调用使用新绑定，但 BUY 被账户门禁阻止。后续可以逐个移出这两个账户，不能意外把 wallet-6/7 加入该列表。
 
-`strategy_pending_a/b` 是临时已知标识，算法侧、代码白名单、预检、配置和数据库必须一致。正式名称确定后同步替换并测试。旧 Echo 授权行以 `enabled=false` 保留；历史订单、成交、财务事件、lot 的原 `model_id/strategy_id` 不改，新策略不能接管旧 lot。
+`strategy_pending_a/b` 是可直接替换的临时示例标识。正式名称确定后，只需在同一份
+`DECISION_CYCLE_BINDINGS_JSON` 中替换 main 和 wallet-1 的 `strategy_id`，然后重新执行
+启动/预检；名称必须以字母开头、只含 ASCII 字母数字、`.`、`_`、`-` 且不超过 64 个字符，两个
+ID 必须互不相同，也不能占用 wallet-6/7 的 `multfactor_v1/v2`。不需要替换源码或新增算法
+白名单。旧 Echo 授权行以 `enabled=false` 保留；历史订单、成交、财务事件、lot 的原
+`model_id/strategy_id` 不改，新策略不能接管旧 lot。
 
 ## 旧仓处置原则
 
@@ -59,9 +64,17 @@ deepseek_masked / multfactor_v2 / wallet-7
 
 正常服务数据库身份不能执行受控基线函数。真实部署时按 migration 和运行角色安装所需的只读权限，不能把操作角色凭据写入普通服务环境。
 
-迁移不会猜测服务器上的运行角色。部署完成后由数据库管理员按实际 schema 和角色显式授予读取权限；示例中的 `trading_execution` schema、`trading_execution_app` 角色必须按实际值替换，已有权限无需重复授予。以下是运行对账/控制台读取路径所需的表清单：
+迁移不会猜测服务器上的运行角色。部署完成后由数据库管理员按实际 schema 和角色显式收窄并授予读取权限；示例中的 `trading_execution` schema、`trading_execution_app` 角色必须按实际值替换。生产 owner 可能通过默认权限自动给新表写权限，因此必须在同一事务先对四张切换审计表 `REVOKE ALL`，再授予应用 `SELECT`；不能只追加 `GRANT SELECT`，也不要修改全库默认权限或其他表。以下是运行对账/控制台读取路径所需的权限清单：
 
 ```sql
+BEGIN;
+REVOKE ALL ON
+  trading_execution.execution_wallet_cutover_batches,
+  trading_execution.execution_wallet_cutover_accounts,
+  trading_execution.execution_wallet_cutover_assets,
+  trading_execution.execution_wallet_cutover_lot_adjustments
+FROM trading_execution_app;
+
 GRANT USAGE ON SCHEMA trading_execution TO trading_execution_app;
 GRANT SELECT ON
   trading_execution.execution_wallet_cutover_batches,
@@ -75,12 +88,14 @@ GRANT SELECT ON
   trading_execution.execution_wallet_migrations
 TO trading_execution_app;
 
+COMMIT;
+
 GRANT USAGE ON SCHEMA trading_execution TO trading_execution_cutover_operator;
 GRANT EXECUTE ON FUNCTION trading_execution.execution_apply_wallet_reuse_cutover(JSONB,TEXT,TEXT,TEXT,TEXT)
 TO trading_execution_cutover_operator;
 ```
 
-`trading_execution_app` 不获得 audit 表写权限，也不获得受控 apply 函数的 `EXECUTE`。`0035` 必须由独立的迁移/数据库所有者安装，不能让普通服务角色成为函数所有者；撤销 PUBLIC 权限不会隔离所有者。
+复核时应逐表确认 `trading_execution_app` 只有 `SELECT`（`INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER` 均为 false），且它没有受控 apply 函数的 `EXECUTE`。`0035` 必须由独立的迁移/数据库所有者安装，不能让普通服务角色成为函数所有者；撤销 PUBLIC 权限不会隔离所有者。
 
 `trading_execution_cutover_operator` 权限组由管理员预先创建，只允许专用维护登录身份加入，不能加入普通服务角色；维护凭据不进入正常服务环境。若权限组在迁移后创建，管理员仍须执行上例的 `GRANT EXECUTE`。
 

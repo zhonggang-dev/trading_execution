@@ -661,9 +661,20 @@ func currentLiveAuthorizations(
 	modelForRetained := "echo"
 	mainStrategy, wallet1Strategy := domain.StrategyIDMultfactorV2, domain.StrategyIDMultfactorV1
 	if topology == config.DecisionCycleTopologyDeepSeekReuseFourWallet {
+		if err := config.ValidateDecisionCycleTopology(topology, bindings); err != nil {
+			return nil, err
+		}
 		modelForRetained = "deepseek_masked"
 		maskedModelID = modelForRetained
-		mainStrategy, wallet1Strategy = domain.StrategyIDPendingA, domain.StrategyIDPendingB
+		for _, rawBinding := range bindings {
+			binding := rawBinding.Normalize()
+			switch binding.ExecutionAccountID {
+			case "main":
+				mainStrategy = binding.StrategyID
+			case "wallet-1":
+				wallet1Strategy = binding.StrategyID
+			}
+		}
 	}
 	routes := map[string]postgresadapter.ExpectedActiveExecutionAccount{
 		"main": {
@@ -687,26 +698,7 @@ func currentLiveAuthorizations(
 			StrategyID:         domain.StrategyIDMultfactorV2,
 		},
 	}
-	if topology == config.DecisionCycleTopologyDeepSeekReuseFourWallet {
-		seenRoutes := make(map[string]string, len(bindings))
-		for _, rawBinding := range bindings {
-			binding := rawBinding.Normalize()
-			if binding.ModelID != "deepseek_masked" {
-				return nil, fmt.Errorf("deepseek-reuse-four-wallet requires all routes to use deepseek_masked")
-			}
-			key := binding.ModelID + "\x00" + binding.StrategyID
-			if previous, duplicate := seenRoutes[key]; duplicate {
-				return nil, fmt.Errorf("deepseek-reuse-four-wallet repeats route %q for %q and %q", key, previous, binding.ExecutionAccountID)
-			}
-			seenRoutes[key] = binding.ExecutionAccountID
-		}
-		if len(seenRoutes) != 4 || seenRoutes["deepseek_masked\x00"+domain.StrategyIDPendingA] != "main" ||
-			seenRoutes["deepseek_masked\x00"+domain.StrategyIDPendingB] != "wallet-1" ||
-			seenRoutes["deepseek_masked\x00"+domain.StrategyIDMultfactorV1] != "wallet-6" ||
-			seenRoutes["deepseek_masked\x00"+domain.StrategyIDMultfactorV2] != "wallet-7" {
-			return nil, fmt.Errorf("deepseek-reuse-four-wallet requires the exact four strategy routes")
-		}
-	} else if topology != config.DecisionCycleTopologyFourWallet {
+	if topology != config.DecisionCycleTopologyFourWallet && topology != config.DecisionCycleTopologyDeepSeekReuseFourWallet {
 		return nil, fmt.Errorf("unsupported decision-cycle topology %q", topology)
 	}
 	result := make([]postgresadapter.ExpectedActiveExecutionAccount, 0, len(activeAccountIDs))

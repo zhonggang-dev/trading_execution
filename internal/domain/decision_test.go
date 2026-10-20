@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func TestStrategyExecutionContextRejectsUnknownStrategy(t *testing.T) {
+func TestStrategyExecutionContextRejectsUnsafeStrategyID(t *testing.T) {
 	valid := StrategyExecutionContext{
 		ModelID: "model-1", StrategyID: "strategy-v1", ExecutionAccountID: "account-1",
 	}
@@ -15,9 +15,18 @@ func TestStrategyExecutionContextRejectsUnknownStrategy(t *testing.T) {
 		t.Fatalf("Validate() historical alias error = %v", err)
 	}
 	unknown := valid
-	unknown.StrategyID = "multfactor_v3"
-	if err := unknown.Validate(); err == nil || !strings.Contains(err.Error(), "not supported") {
+	unknown.StrategyID = "strategy v3"
+	if err := unknown.Validate(); err == nil || !strings.Contains(err.Error(), "invalid format") {
 		t.Fatalf("Validate() error = %v, want unsupported strategy rejection", err)
+	}
+}
+
+func TestStrategyExecutionContextAcceptsConfiguredStrategyID(t *testing.T) {
+	context := StrategyExecutionContext{
+		ModelID: "deepseek_masked", StrategyID: "alpha_new.v2", ExecutionAccountID: "main",
+	}
+	if err := context.Validate(); err != nil {
+		t.Fatalf("Validate() configured strategy error = %v", err)
 	}
 }
 

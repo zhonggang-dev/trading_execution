@@ -40,15 +40,6 @@ EXPECTED_ROUTES = {
     ("deepseek_masked", "multfactor_v2"): "wallet-7",
 }
 EXPECTED_ACCOUNTS = frozenset(EXPECTED_ROUTES.values())
-DEEPSEEK_REUSE_EXPECTED_STRATEGIES = frozenset(
-    {"strategy_pending_a", "strategy_pending_b", "multfactor_v1", "multfactor_v2"}
-)
-DEEPSEEK_REUSE_EXPECTED_ROUTES = {
-    ("deepseek_masked", "strategy_pending_a"): "main",
-    ("deepseek_masked", "strategy_pending_b"): "wallet-1",
-    ("deepseek_masked", "multfactor_v1"): "wallet-6",
-    ("deepseek_masked", "multfactor_v2"): "wallet-7",
-}
 CURRENT_ROLLOUT_QUARANTINED_ACCOUNTS = frozenset()
 ACTIVATABLE_ACCOUNTS = frozenset({"wallet-6", "wallet-7"})
 POLICY_FRESHNESS_FIELDS = (
@@ -98,6 +89,15 @@ PREDICTION_SOURCE_SANDBOX = "SANDBOX"
 PREDICTION_SOURCE_MODES = frozenset(
     {PREDICTION_SOURCE_DIRECT, PREDICTION_SOURCE_SANDBOX}
 )
+SAFE_STRATEGY_ID = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+STRATEGY_ID_ALIASES = {
+    "strategy-v1": "multfactor_v1",
+    "mult-factor-v1": "multfactor_v1",
+    "strategy-v2": "multfactor_v2",
+    "mult-factor-v2": "multfactor_v2",
+    "multfactor_v1": "multfactor_v1",
+    "multfactor_v2": "multfactor_v2",
+}
 
 TRADING_RUNTIME_KEYS = frozenset(
     {
@@ -379,8 +379,8 @@ def _topology_routes(topology: str) -> tuple[dict[tuple[str, str], str], frozens
         return EXPECTED_ROUTES, EXPECTED_STRATEGIES, frozenset({"echo", "deepseek_masked"})
     if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
         return (
-            DEEPSEEK_REUSE_EXPECTED_ROUTES,
-            DEEPSEEK_REUSE_EXPECTED_STRATEGIES,
+            {},
+            frozenset(),
             frozenset({"deepseek_masked"}),
         )
     raise PreflightError(f"unsupported topology {topology!r}")
@@ -390,6 +390,15 @@ def _nonempty_string(value: object, field: str, index: int) -> str:
     if not isinstance(value, str) or not value.strip():
         raise PreflightError(f"binding {index} has an empty or non-string {field}")
     return value.strip()
+
+
+def _strategy_id(value: object, index: int) -> str:
+    strategy_id = _nonempty_string(value, "strategy_id", index)
+    if not SAFE_STRATEGY_ID.fullmatch(strategy_id):
+        raise PreflightError(
+            f"binding {index} has an invalid strategy_id format"
+        )
+    return STRATEGY_ID_ALIASES.get(strategy_id.lower(), strategy_id)
 
 
 def decode_bindings(
@@ -429,7 +438,7 @@ def decode_bindings(
             Binding(
                 prediction_model_id=prediction_model_id,
                 model_id=model_id,
-                strategy_id=_nonempty_string(item.get("strategy_id"), "strategy_id", index),
+                strategy_id=_strategy_id(item.get("strategy_id"), index),
                 execution_account_id=_nonempty_string(
                     item.get("execution_account_id"), "execution_account_id", index
                 ),
@@ -655,7 +664,20 @@ def validate_topology(
     topology: str = TOPOLOGY_FOUR_WALLET,
 ) -> tuple[Binding, ...]:
     expected_routes, expected_strategies, expected_logical_models = _topology_routes(topology)
-    normalized = tuple(sorted(bindings))
+    normalized_bindings: list[Binding] = []
+    for index, binding in enumerate(bindings):
+        if not isinstance(binding.strategy_id, str):
+            raise PreflightError(f"binding {index} has an empty or non-string strategy_id")
+        strategy_id = binding.strategy_id.strip()
+        if not SAFE_STRATEGY_ID.fullmatch(strategy_id):
+            raise PreflightError(f"binding {index} has an invalid strategy_id format")
+        normalized_bindings.append(
+            dataclasses.replace(
+                binding,
+                strategy_id=STRATEGY_ID_ALIASES.get(strategy_id.lower(), strategy_id),
+            )
+        )
+    normalized = tuple(sorted(normalized_bindings))
     accounts = {binding.execution_account_id for binding in normalized}
     if accounts != EXPECTED_ACCOUNTS:
         raise PreflightError(
@@ -664,11 +686,6 @@ def validate_topology(
     if len(accounts) != len(normalized):
         raise PreflightError("each execution account must appear in exactly one binding")
 
-    strategies = {binding.strategy_id for binding in normalized}
-    if strategies != expected_strategies:
-        raise PreflightError(
-            f"strategies must be exactly {sorted(expected_strategies)}, got {sorted(strategies)}"
-        )
     logical_models = {binding.model_id for binding in normalized}
     prediction_models = {binding.prediction_model_id for binding in normalized}
     expected_prediction_model_count = 1 if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET else 2
@@ -681,6 +698,35 @@ def validate_topology(
             f"{topology} requires logical models {sorted(expected_logical_models)} and "
             f"{expected_prediction_model_count} prediction model(s)"
         )
+
+    if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+        by_account = {binding.execution_account_id: binding for binding in normalized}
+        for account_id, expected_strategy in (
+            ("wallet-6", "multfactor_v1"),
+            ("wallet-7", "multfactor_v2"),
+        ):
+            binding = by_account[account_id]
+            if binding.model_id != "deepseek_masked" or binding.strategy_id != expected_strategy:
+                raise PreflightError(
+                    f"deepseek-reuse-four-wallet route for {account_id!r} must use "
+                    f"deepseek_masked/{expected_strategy}"
+                )
+        main_strategy = by_account["main"].strategy_id
+        wallet1_strategy = by_account["wallet-1"].strategy_id
+        if main_strategy == wallet1_strategy:
+            raise PreflightError(
+                "deepseek-reuse-four-wallet main and wallet-1 strategy IDs must be distinct"
+            )
+        if {main_strategy, wallet1_strategy} & {"multfactor_v1", "multfactor_v2"}:
+            raise PreflightError(
+                "deepseek-reuse-four-wallet main and wallet-1 cannot reuse wallet-6/wallet-7 strategy IDs"
+            )
+    else:
+        strategies = {binding.strategy_id for binding in normalized}
+        if strategies != expected_strategies:
+            raise PreflightError(
+                f"strategies must be exactly {sorted(expected_strategies)}, got {sorted(strategies)}"
+            )
 
     source_for_logical: dict[str, str] = {}
     logical_for_source: dict[str, str] = {}
@@ -703,16 +749,20 @@ def validate_topology(
             raise PreflightError(f"duplicate database authorization: {binding.authorization}")
         authorizations.add(binding.authorization)
 
-    expected_pairs = set(expected_routes)
-    if pairs != expected_pairs:
-        raise PreflightError(f"bindings must contain the exact {topology} route matrix")
-    for binding in normalized:
-        expected_account = expected_routes[(binding.model_id, binding.strategy_id)]
-        if binding.execution_account_id != expected_account:
-            raise PreflightError(
-                f"route {binding.model_id!r}/{binding.strategy_id!r} must use "
-                f"execution account {expected_account!r}"
-            )
+    if topology == TOPOLOGY_DEEPSEEK_REUSE_FOUR_WALLET:
+        if len(pairs) != 4:
+            raise PreflightError("deepseek-reuse-four-wallet requires four unique strategy routes")
+    else:
+        expected_pairs = set(expected_routes)
+        if pairs != expected_pairs:
+            raise PreflightError(f"bindings must contain the exact {topology} route matrix")
+        for binding in normalized:
+            expected_account = expected_routes[(binding.model_id, binding.strategy_id)]
+            if binding.execution_account_id != expected_account:
+                raise PreflightError(
+                    f"route {binding.model_id!r}/{binding.strategy_id!r} must use "
+                    f"execution account {expected_account!r}"
+                )
     return normalized
 
 
