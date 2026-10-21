@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -94,7 +95,11 @@ func (reader *Reader) Runtime(ctx context.Context) (Runtime, error) {
 	}
 	accounts, accountDataState, accountErr := reader.runtimeAccounts(ctx)
 	if accountErr != nil {
-		if errorsIsContext(accountErr) {
+		// An explicitly cancelled request keeps the existing cancellation
+		// contract. A database deadline, including the HTTP five-second read
+		// deadline, only makes the account projection unavailable; runner and
+		// configured bindings remain useful and must not be erased.
+		if errors.Is(accountErr, context.Canceled) {
 			return Runtime{}, accountErr
 		}
 		// Runner/config state is still useful when the database projection is

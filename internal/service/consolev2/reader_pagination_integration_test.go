@@ -151,6 +151,30 @@ func TestReaderPaginationSnapshotAndCancellation(t *testing.T) {
 	close(stopWriter)
 	writer.Wait()
 
+	runtimeReader := New(db, RuntimeConfig{
+		RunnerEnabled: true,
+		Bindings:      []Binding{{ModelID: "matrix", StrategyID: "matrix", ExecutionAccountID: matrixAccount}},
+		RunnerSnapshot: func() RunnerSnapshot {
+			return RunnerSnapshot{LoopStarted: true, LoopRunning: true}
+		},
+		Now: func() time.Time { return time.Now().UTC() },
+	})
+	runtimeLockTx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtimeLockTx.ExecContext(ctx, `LOCK TABLE execution_orders IN ACCESS EXCLUSIVE MODE`); err != nil {
+		_ = runtimeLockTx.Rollback()
+		t.Fatal(err)
+	}
+	runtimeCtx, runtimeCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	runtime, runtimeErr := runtimeReader.Runtime(runtimeCtx)
+	runtimeCancel()
+	_ = runtimeLockTx.Rollback()
+	if runtimeErr != nil || runtime.AccountDataState != "unavailable" || len(runtime.Bindings) != 1 || !runtime.Runner.Running {
+		t.Fatalf("runtime timeout err=%v state=%#v", runtimeErr, runtime)
+	}
+
 	lockTx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
