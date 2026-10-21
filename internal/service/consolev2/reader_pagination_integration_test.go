@@ -38,7 +38,10 @@ func TestReaderPaginationSnapshotAndCancellation(t *testing.T) {
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	matrixAccount := "console-v2-page-matrix-" + suffix
 	concurrentAccount := "console-v2-page-concurrent-" + suffix
+	cyclePrefix := "console-v2-page-cycle-" + suffix + "-"
 	cleanup := func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM strategy_order_intent_deliveries WHERE cycle_id LIKE $1`, cyclePrefix+"%")
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM strategy_decision_runs WHERE cycle_id LIKE $1`, cyclePrefix+"%")
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM execution_orders WHERE execution_account_id IN ($1,$2)`, matrixAccount, concurrentAccount)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM execution_accounts WHERE execution_account_id IN ($1,$2)`, matrixAccount, concurrentAccount)
 	}
@@ -81,6 +84,65 @@ func TestReaderPaginationSnapshotAndCancellation(t *testing.T) {
 	}
 	seedOrder(matrixAccount, "page-one-"+suffix, "RECEIVED")
 
+	seedCycle := func(index int, status string) string {
+		t.Helper()
+		cycleID := fmt.Sprintf("%s%02d", cyclePrefix, index)
+		inputID := cycleID + "-input"
+		decisionAt := time.Now().UTC().Add(-time.Duration(index) * time.Second)
+		var outputPayload any
+		var submissionEnabled any
+		if status != "INPUT_RECORDED" {
+			outputPayload = `{}`
+			submissionEnabled = false
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO strategy_decision_runs (
+				cycle_id, input_id, decision_at, model_id, strategy_id, execution_account_id,
+				input_payload, output_payload, order_submission_enabled, created_at, updated_at, decided_at
+			) VALUES ($1,$2,$3,'cycle-model','cycle-strategy',$4,'{}'::jsonb,$5::jsonb,$6,$3,$3,$7)`,
+			cycleID, inputID, decisionAt, matrixAccount, outputPayload, submissionEnabled,
+			func() any {
+				if status == "INPUT_RECORDED" {
+					return nil
+				}
+				return decisionAt
+			}()); err != nil {
+			t.Fatal(err)
+		}
+		if status == "INPUT_RECORDED" {
+			return cycleID
+		}
+		deliveryStatus := "SUBMITTED"
+		if status == "DELIVERY_PENDING" {
+			deliveryStatus = "PENDING"
+		} else if status == "DELIVERY_ATTENTION" {
+			deliveryStatus = "FAILED"
+		}
+		claimedAt, completedAt, orderID, orderStatus := any(decisionAt), any(decisionAt), any(cycleID+"-order"), any("UNKNOWN")
+		if deliveryStatus == "PENDING" {
+			claimedAt, completedAt, orderID, orderStatus = nil, nil, nil, nil
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO strategy_order_intent_deliveries (
+				client_order_id, cycle_id, sequence_no, intent_payload, status,
+				attempt_count, claimed_at, completed_at, order_id, order_status, created_at, updated_at
+			) VALUES ($1,$2,0,'{}'::jsonb,$3,1,$4,$5,$6,$7,$8,$8)`,
+			cycleID+"-delivery", cycleID, deliveryStatus, claimedAt, completedAt, orderID, orderStatus, decisionAt); err != nil {
+			t.Fatal(err)
+		}
+		return cycleID
+	}
+	cycleIDs := map[string]string{
+		"INPUT_RECORDED":     seedCycle(0, "INPUT_RECORDED"),
+		"DELIVERY_PENDING":   seedCycle(1, "DELIVERY_PENDING"),
+		"DELIVERY_ATTENTION": seedCycle(2, "DELIVERY_ATTENTION"),
+		"OUTPUT_RECORDED":    seedCycle(3, "OUTPUT_RECORDED"),
+	}
+	_ = seedCycle(4, "INPUT_RECORDED")
+	_ = seedCycle(5, "DELIVERY_PENDING")
+	_ = seedCycle(6, "DELIVERY_ATTENTION")
+	_ = seedCycle(7, "OUTPUT_RECORDED")
+
 	reader := New(db, RuntimeConfig{Now: func() time.Time { return time.Now().UTC() }})
 	checks := []struct {
 		name   string
@@ -116,6 +178,28 @@ func TestReaderPaginationSnapshotAndCancellation(t *testing.T) {
 				}
 			}
 		})
+	}
+	for _, status := range []string{"INPUT_RECORDED", "DELIVERY_PENDING", "DELIVERY_ATTENTION", "OUTPUT_RECORDED"} {
+		page, err := reader.DecisionCycles(ctx, ListFilter{Limit: 1, Status: status, ExecutionAccountID: matrixAccount})
+		if err != nil {
+			t.Fatalf("cycle status %s: %v", status, err)
+		}
+		if page.Total != 2 || len(page.Items) != 1 || !page.HasMore {
+			t.Fatalf("cycle status %s total=%d items=%d has_more=%v", status, page.Total, len(page.Items), page.HasMore)
+		}
+	}
+	filteredCycles, err := reader.DecisionCycles(ctx, ListFilter{
+		Limit: 1, Query: cycleIDs["DELIVERY_PENDING"], ModelID: "cycle-model",
+		ExecutionAccountID: matrixAccount,
+		From:               func() *time.Time { value := time.Now().UTC().Add(-2 * time.Minute); return &value }(),
+		To:                 func() *time.Time { value := time.Now().UTC().Add(2 * time.Minute); return &value }(),
+	})
+	if err != nil || filteredCycles.Total != 1 || len(filteredCycles.Items) != 1 || filteredCycles.Items[0].Status != "DELIVERY_PENDING" {
+		t.Fatalf("filtered cycles=%#v err=%v", filteredCycles, err)
+	}
+	emptyCycles, err := reader.DecisionCycles(ctx, ListFilter{Limit: 1, Query: "cycle-does-not-exist", ExecutionAccountID: matrixAccount})
+	if err != nil || emptyCycles.Total != 0 || len(emptyCycles.Items) != 0 || emptyCycles.HasMore {
+		t.Fatalf("empty cycles=%#v err=%v", emptyCycles, err)
 	}
 
 	stopWriter := make(chan struct{})

@@ -53,35 +53,84 @@ WITH cycle_rows AS (
 )
 `
 
-const cycleProjection = cycleRowsProjection + `
-SELECT cycle_id, input_id, decision_at, model_id, prediction_model_id, strategy_id,
-       execution_account_id, prediction_snapshot_id, orderbook_snapshot_set_id,
-       created_at, decided_at, order_submission_enabled, entry_submission_enabled, entry_block_reason,
-       prediction_count, position_lot_count, intent_count,
-       delivery_pending_count, delivery_failed_count, status
-FROM cycle_rows
+// The list path applies identity/time filters before aggregating deliveries.
+// This keeps account/model/q-filtered status reads from scanning delivery
+// history belonging to unrelated cycles.
+const cycleListRowsSelect = `
+SELECT fr.cycle_id, fr.input_id, fr.decision_at, fr.model_id, NULL::text AS prediction_model_id,
+       fr.strategy_id, fr.execution_account_id,
+       COALESCE(fr.input_payload->>'prediction_snapshot_id', '') AS prediction_snapshot_id,
+       COALESCE(batch.snapshot_set_id, '') AS orderbook_snapshot_set_id,
+       fr.created_at, fr.decided_at, fr.order_submission_enabled,
+       CASE
+         WHEN fr.output_payload IS NULL THEN NULL
+         WHEN fr.output_payload->'entry_policy' ? 'enabled' THEN fr.output_payload->'entry_policy'->>'enabled'
+         ELSE NULL
+       END AS entry_submission_enabled,
+       CASE
+         WHEN fr.output_payload IS NULL THEN NULL
+         ELSE NULLIF(fr.output_payload->'entry_policy'->>'block_reason', '')
+       END AS entry_block_reason,
+       COALESCE(jsonb_array_length(COALESCE(fr.input_payload->'predictions','[]'::jsonb)), 0) AS prediction_count,
+       COALESCE(jsonb_array_length(COALESCE(fr.input_payload->'positions','[]'::jsonb)), 0) AS position_lot_count,
+       COALESCE(delivery.intent_count, 0) AS intent_count,
+       COALESCE(delivery.delivery_pending_count, 0) AS delivery_pending_count,
+       COALESCE(delivery.delivery_failed_count, 0) AS delivery_failed_count,
+       CASE
+         WHEN fr.output_payload IS NULL THEN 'INPUT_RECORDED'
+         WHEN COALESCE(delivery.has_attention, FALSE) THEN 'DELIVERY_ATTENTION'
+         WHEN COALESCE(delivery.has_pending, FALSE) THEN 'DELIVERY_PENDING'
+         ELSE 'OUTPUT_RECORDED'
+       END AS status
+FROM filtered_runs fr
+LEFT JOIN strategy_orderbook_snapshot_batches batch ON batch.decision_at=fr.decision_at
+LEFT JOIN delivery_status delivery ON delivery.cycle_id=fr.cycle_id
 `
 
-// Filtering a cycle only needs its durable identity and delivery-derived
-// status. Keep COUNT away from the JSON array lengths, snapshot join and
-// per-cycle delivery counts used by the display projection.
-const cycleCountProjection = `
-WITH cycle_rows AS (
-    SELECT r.cycle_id, r.input_id, r.decision_at, r.model_id, r.strategy_id,
-           r.execution_account_id,
+func cycleListPrefix(baseWhere string) string {
+	return `WITH filtered_runs AS (
+    SELECT r.*
+    FROM strategy_decision_runs r
+    WHERE ` + baseWhere + `
+), delivery_status AS (
+    SELECT d.cycle_id,
+           count(*)::int AS intent_count,
+           count(*) FILTER (WHERE d.status IN ('PENDING','SUBMITTING'))::int AS delivery_pending_count,
+           count(*) FILTER (WHERE d.status IN ('FAILED','UNKNOWN'))::int AS delivery_failed_count,
+           bool_or(d.status IN ('FAILED','UNKNOWN')) AS has_attention,
+           bool_or(d.status IN ('PENDING','SUBMITTING')) AS has_pending
+    FROM strategy_order_intent_deliveries d
+    JOIN filtered_runs fr ON fr.cycle_id=d.cycle_id
+    GROUP BY d.cycle_id
+), cycle_rows AS (` + cycleListRowsSelect + `)
+`
+}
+
+func cycleCountStatusPrefix(baseWhere string) string {
+	return `WITH filtered_runs AS (
+    SELECT r.*
+    FROM strategy_decision_runs r
+    WHERE ` + baseWhere + `
+), delivery_status AS (
+    SELECT d.cycle_id,
+           bool_or(d.status IN ('FAILED','UNKNOWN')) AS has_attention,
+           bool_or(d.status IN ('PENDING','SUBMITTING')) AS has_pending
+    FROM strategy_order_intent_deliveries d
+    JOIN filtered_runs fr ON fr.cycle_id=d.cycle_id
+    GROUP BY d.cycle_id
+), cycle_rows AS (
+    SELECT fr.cycle_id, fr.output_payload,
            CASE
-             WHEN r.output_payload IS NULL THEN 'INPUT_RECORDED'
-             WHEN EXISTS (SELECT 1 FROM strategy_order_intent_deliveries d
-                          WHERE d.cycle_id=r.cycle_id AND d.status IN ('FAILED','UNKNOWN')) THEN 'DELIVERY_ATTENTION'
-             WHEN EXISTS (SELECT 1 FROM strategy_order_intent_deliveries d
-                          WHERE d.cycle_id=r.cycle_id AND d.status IN ('PENDING','SUBMITTING')) THEN 'DELIVERY_PENDING'
+             WHEN fr.output_payload IS NULL THEN 'INPUT_RECORDED'
+             WHEN COALESCE(delivery.has_attention, FALSE) THEN 'DELIVERY_ATTENTION'
+             WHEN COALESCE(delivery.has_pending, FALSE) THEN 'DELIVERY_PENDING'
              ELSE 'OUTPUT_RECORDED'
            END AS status
-    FROM strategy_decision_runs r
+    FROM filtered_runs fr
+    LEFT JOIN delivery_status delivery ON delivery.cycle_id=fr.cycle_id
 )
-SELECT cycle_id, input_id, decision_at, model_id, strategy_id, execution_account_id, status
-FROM cycle_rows
 `
+}
 
 const cycleDetailProjection = cycleRowsProjection + `
 SELECT cycle_id, input_id, decision_at, model_id, prediction_model_id, strategy_id,
@@ -102,6 +151,38 @@ SELECT cycle_id, input_id, decision_at, model_id, prediction_model_id, strategy_
 FROM cycle_rows
 `
 
+func buildCycleBaseFilter(filter ListFilter, now time.Time) (string, []any) {
+	args := make([]any, 0, 10)
+	conditions := []string{"TRUE"}
+	add := func(value any) string {
+		args = append(args, value)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	if filter.ModelID != "" {
+		conditions = append(conditions, "r.model_id = "+add(filter.ModelID))
+	}
+	if filter.StrategyID != "" {
+		conditions = append(conditions, "r.strategy_id = "+add(filter.StrategyID))
+	}
+	if filter.ExecutionAccountID != "" {
+		conditions = append(conditions, "r.execution_account_id = "+add(filter.ExecutionAccountID))
+	}
+	if filter.Query != "" {
+		placeholder := add("%" + filter.Query + "%")
+		conditions = append(conditions, "(r.cycle_id ILIKE "+placeholder+" OR r.input_id ILIKE "+placeholder+
+			" OR r.model_id ILIKE "+placeholder+" OR r.strategy_id ILIKE "+placeholder+")")
+	}
+	if filter.From != nil {
+		conditions = append(conditions, "r.decision_at >= "+add(filter.From.UTC()))
+	} else {
+		conditions = append(conditions, "r.decision_at >= "+add(boundedSince(filter, now)))
+	}
+	if filter.To != nil {
+		conditions = append(conditions, "r.decision_at <= "+add(filter.To.UTC()))
+	}
+	return strings.Join(conditions, " AND "), args
+}
+
 func (reader *Reader) DecisionCycles(ctx context.Context, filter ListFilter) (Page[DecisionCycle], error) {
 	filter, err := normalizeFilter(filter)
 	if err != nil {
@@ -111,50 +192,45 @@ func (reader *Reader) DecisionCycles(ctx context.Context, filter ListFilter) (Pa
 		return Page[DecisionCycle]{}, err
 	}
 	now := reader.now().UTC()
-	args := make([]any, 0, 12)
-	conditions := []string{"1=1"}
-	add := func(expression string, value any) string {
-		args = append(args, value)
-		return fmt.Sprintf("$%d", len(args))
-	}
-	if filter.ModelID != "" {
-		conditions = append(conditions, "model_id = "+add("", filter.ModelID))
-	}
-	if filter.StrategyID != "" {
-		conditions = append(conditions, "strategy_id = "+add("", filter.StrategyID))
-	}
-	if filter.ExecutionAccountID != "" {
-		conditions = append(conditions, "execution_account_id = "+add("", filter.ExecutionAccountID))
-	}
-	if filter.Status != "" {
-		conditions = append(conditions, "status = "+add("", filter.Status))
-	}
-	if filter.Query != "" {
-		placeholder := add("", "%"+filter.Query+"%")
-		conditions = append(conditions, "(cycle_id ILIKE "+placeholder+" OR input_id ILIKE "+placeholder+
-			" OR model_id ILIKE "+placeholder+" OR strategy_id ILIKE "+placeholder+")")
-	}
-	if filter.From != nil {
-		conditions = append(conditions, "decision_at >= "+add("", filter.From.UTC()))
-	} else {
-		conditions = append(conditions, "decision_at >= "+add("", boundedSince(filter, now)))
-	}
-	if filter.To != nil {
-		conditions = append(conditions, "decision_at <= "+add("", filter.To.UTC()))
-	}
-	where := strings.Join(conditions, " AND ")
+	baseWhere, baseArgs := buildCycleBaseFilter(filter, now)
 	tx, err := reader.beginReadTx(ctx, "decision cycles")
 	if err != nil {
 		return Page[DecisionCycle]{}, err
 	}
 	defer tx.Rollback()
-	total, err := countProjection(ctx, tx, cycleCountProjection, where, args, "decision cycles")
+
+	countArgs := append([]any(nil), baseArgs...)
+	var countQuerySQL string
+	if filter.Status == "" {
+		countQuerySQL = "SELECT COUNT(*) FROM strategy_decision_runs r WHERE " + baseWhere
+	} else if filter.Status == "INPUT_RECORDED" {
+		countQuerySQL = "SELECT COUNT(*) FROM strategy_decision_runs r WHERE " + baseWhere + " AND r.output_payload IS NULL"
+	} else {
+		statusArg := fmt.Sprintf("$%d", len(countArgs)+1)
+		countArgs = append(countArgs, filter.Status)
+		countQuerySQL = cycleCountStatusPrefix(baseWhere) + "SELECT COUNT(*) FROM cycle_rows WHERE status = " + statusArg
+	}
+	total, err := countQuery(ctx, tx, countQuerySQL, countArgs, "decision cycles")
 	if err != nil {
 		return Page[DecisionCycle]{}, err
 	}
-	listArgs := append([]any(nil), args...)
+
+	listArgs := append([]any(nil), baseArgs...)
+	statusWhere := "TRUE"
+	if filter.Status != "" {
+		statusArg := fmt.Sprintf("$%d", len(listArgs)+1)
+		listArgs = append(listArgs, filter.Status)
+		statusWhere = "status = " + statusArg
+	}
 	limit, offset := pageLimitOffset(filter, &listArgs)
-	query := cycleProjection + " WHERE " + where +
+	query := cycleListPrefix(baseWhere) + `
+SELECT cycle_id, input_id, decision_at, model_id, prediction_model_id, strategy_id,
+       execution_account_id, prediction_snapshot_id, orderbook_snapshot_set_id,
+       created_at, decided_at, order_submission_enabled, entry_submission_enabled, entry_block_reason,
+       prediction_count, position_lot_count, intent_count,
+       delivery_pending_count, delivery_failed_count, status
+FROM cycle_rows
+WHERE ` + statusWhere +
 		" ORDER BY decision_at DESC, cycle_id DESC LIMIT " + limit + " OFFSET " + offset
 	rows, err := tx.QueryContext(ctx, query, listArgs...)
 	if err != nil {
