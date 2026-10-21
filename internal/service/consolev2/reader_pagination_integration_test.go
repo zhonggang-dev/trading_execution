@@ -2,7 +2,9 @@ package consolev2
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -83,6 +85,12 @@ func TestReaderPaginationSnapshotAndCancellation(t *testing.T) {
 		seedOrder(matrixAccount, fmt.Sprintf("page-unknown-%03d-%s", i, suffix), "UNKNOWN")
 	}
 	seedOrder(matrixAccount, "page-one-"+suffix, "RECEIVED")
+	largeSeed := make([]byte, 128*1024)
+	if _, err := rand.Read(largeSeed); err != nil {
+		t.Fatal(err)
+	}
+	largeBlob := hex.EncodeToString(largeSeed)
+	largePayload := `{"blob":"` + largeBlob + `"}`
 
 	seedCycle := func(index int, status string) string {
 		t.Helper()
@@ -92,15 +100,15 @@ func TestReaderPaginationSnapshotAndCancellation(t *testing.T) {
 		var outputPayload any
 		var submissionEnabled any
 		if status != "INPUT_RECORDED" {
-			outputPayload = `{}`
+			outputPayload = largePayload
 			submissionEnabled = false
 		}
 		if _, err := db.ExecContext(ctx, `
 			INSERT INTO strategy_decision_runs (
 				cycle_id, input_id, decision_at, model_id, strategy_id, execution_account_id,
 				input_payload, output_payload, order_submission_enabled, created_at, updated_at, decided_at
-			) VALUES ($1,$2,$3,'cycle-model','cycle-strategy',$4,'{}'::jsonb,$5::jsonb,$6,$3,$3,$7)`,
-			cycleID, inputID, decisionAt, matrixAccount, outputPayload, submissionEnabled,
+			) VALUES ($1,$2,$3,'cycle-model','cycle-strategy',$4,$5::jsonb,$6::jsonb,$7,$3,$3,$8)`,
+			cycleID, inputID, decisionAt, matrixAccount, largePayload, outputPayload, submissionEnabled,
 			func() any {
 				if status == "INPUT_RECORDED" {
 					return nil
@@ -142,6 +150,18 @@ func TestReaderPaginationSnapshotAndCancellation(t *testing.T) {
 	_ = seedCycle(5, "DELIVERY_PENDING")
 	_ = seedCycle(6, "DELIVERY_ATTENTION")
 	_ = seedCycle(7, "OUTPUT_RECORDED")
+	var largePayloadRows int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM strategy_decision_runs
+		WHERE cycle_id LIKE $1
+		  AND pg_column_size(input_payload) > 100000
+		  AND (output_payload IS NULL OR pg_column_size(output_payload) > 100000)`, cyclePrefix+"%").Scan(&largePayloadRows); err != nil {
+		t.Fatal(err)
+	}
+	if largePayloadRows != 8 {
+		t.Fatalf("large cycle payload rows=%d, want 8", largePayloadRows)
+	}
 
 	reader := New(db, RuntimeConfig{Now: func() time.Time { return time.Now().UTC() }})
 	checks := []struct {
