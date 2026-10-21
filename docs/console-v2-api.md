@@ -17,6 +17,7 @@ All list routes return:
     "items": [],
     "limit": 20,
     "offset": 0,
+    "total": 0,
     "has_more": false,
     "observed_at": "2026-10-16T08:00:00Z",
     "summary": {}
@@ -25,8 +26,11 @@ All list routes return:
 ```
 
 `limit` defaults to 20 and is bounded to 1–100. `offset` is bounded to
-0–10000. The reader fetches one extra row to compute `has_more`; it never runs
-a full-table `COUNT`. `q`, identity filters, and status values are single
+0–9007199254740891. `total` is the exact number of rows matching the applied filters
+and default time window. The count and page query run in one read-only
+repeatable-read transaction, and `has_more` is derived from `total` and the
+returned page. Empty and out-of-range pages still return the exact `total`.
+`q`, identity filters, and status values are single
 values no longer than 128 characters and reject NUL, CR, and LF. Optional
 `from`/`to` values are RFC3339 and `from` must be within one year of the
 server clock. The default list view is recent (30 days) plus current attention
@@ -65,6 +69,16 @@ is invoked.
   `last_error_code` is one of `CYCLE_FAILED`, `STARTUP_RECOVERY_FAILED`, or
   `BOUNDARY_SKIPPED` when `has_last_error` is true.
   Raw runner error text is retained in server logs and is never returned to the browser.
+  `account_data_state` is `available` or `unavailable`; when available,
+  `accounts[]` keeps configured binding identity beside nullable database
+  binding/policy/control facts, latest durable cycle/reconciliation status,
+  and bounded open issue/order counts. Database failure preserves runner and
+  config fields while marking this account projection unavailable. The
+  `entry_gate_state` values are `enabled`, `sell_only`, or `unknown`; a
+  historical cycle without a Go-owned entry policy remains `unknown` even if
+  the current process configuration has changed, and an account with no
+  persisted cycle remains `unknown`. Current configuration switches stay in
+  `submission` and are not folded into historical gate state.
 - `GET /api/v1/console/v2/service-metrics` returns real Go runtime and memory
   measurements, uptime, and `observed_at`. CPU, request rate, and container
   limits are unavailable in this process and are represented in
@@ -112,6 +126,11 @@ is invoked.
   (`UNKNOWN`, `RECONCILING`, and `MANUAL_REVIEW` remain visible when present).
   Filters are `q`, `model_id`, `strategy_id`, `execution_account_id`,
   `market_source`, `side`, `status`, `from`, `to`, `limit`, and `offset`.
+  Each order also contains an `evidence_summary` computed from all durable
+  fills, reservations, and open reconciliation issues for that order. It
+  separates `none`/`observed`/`finality_pending`/`confirmed` fill evidence
+  from `not_applied`/`partially_applied`/`applied` accounting and never uses
+  the finite trace array length as a global count.
 - `GET /api/v1/console/v2/orders/{order_id}/trace` returns one safe order and
   finite `deliveries`, `events`, `attempts`, confirmed/observed `fills`,
   related `position_lots`, and related reconciliation issues. Attempt error
@@ -133,9 +152,10 @@ is invoked.
 - `GET /api/v1/console/v2/reconciliation-issues` returns issue/run/account,
   issue and a nullable reason code (the current table has no dedicated reason
   code column), resolution/status, stable order/venue/market
-  identities, safe local/remote numeric values, source, and observed/resolved
-  times. Open issues are always included regardless of age; resolved issues
-  are bounded to the recent window. Raw `details` are never returned.
+  identities, safe local/remote numeric values, source, observed time,
+  immutable first-observed time, and persisted impact scope. Open issues are
+  always included regardless of age; resolved issues are bounded to the recent
+  window. Raw `details` are never returned.
 - `GET /api/v1/console/v2/redemptions` returns the natural composite
   `redemption_id` (`execution_account_id:condition_id`), account/condition,
   status, transaction hash, payout base units, receipt block, confirmations,

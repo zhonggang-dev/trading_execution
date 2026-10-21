@@ -126,6 +126,7 @@ func TestConsoleV2RejectsWritesAndInvalidFilters(t *testing.T) {
 	}
 	for _, path := range []string{
 		"/api/v1/console/v2/orders?limit=101",
+		"/api/v1/console/v2/orders?offset=9007199254740892",
 		"/api/v1/console/v2/orders?status=NOT_A_STATUS",
 		"/api/v1/console/v2/orders?market_source=UNKNOWN",
 		"/api/v1/console/v2/orders?model=echo&model_id=echo",
@@ -145,6 +146,21 @@ func TestConsoleV2RejectsWritesAndInvalidFilters(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Fatalf("short aliases path=%s status=%d body=%s", path, response.Code, response.Body.String())
 		}
+	}
+	page := performRequest(t, server, http.MethodGet, "/api/v1/console/v2/orders", "", "readonly-secret")
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), `"total":0`) {
+		t.Fatalf("page total status=%d body=%s", page.Code, page.Body.String())
+	}
+}
+
+func TestConsoleV2AcceptsBrowserSafeDeepOffset(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/console/v2/orders?offset=9007199254740891", nil)
+	filter, err := parseConsoleV2Filter(request, consoleV2FilterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filter.Offset != consolev2.MaxOffset {
+		t.Fatalf("offset=%d, want %d", filter.Offset, consolev2.MaxOffset)
 	}
 }
 

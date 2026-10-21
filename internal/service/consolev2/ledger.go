@@ -62,12 +62,20 @@ func (reader *Reader) PositionLots(ctx context.Context, filter ListFilter) (Page
 	if filter.To != nil {
 		conditions = append(conditions, "l.opened_at <= "+arg(filter.To.UTC()))
 	}
-	args = append(args, filter.Limit+1)
-	limit := fmt.Sprintf("$%d", len(args))
-	args = append(args, filter.Offset)
-	offset := fmt.Sprintf("$%d", len(args))
-	rows, err := reader.db.QueryContext(ctx, positionLotProjection+" WHERE "+strings.Join(conditions, " AND ")+
-		" ORDER BY l.opened_at DESC, l.lot_id DESC LIMIT "+limit+" OFFSET "+offset, args...)
+	where := strings.Join(conditions, " AND ")
+	tx, err := reader.beginReadTx(ctx, "position lots")
+	if err != nil {
+		return Page[PositionLot]{}, err
+	}
+	defer tx.Rollback()
+	total, err := countProjection(ctx, tx, positionLotProjection, where, args, "position lots")
+	if err != nil {
+		return Page[PositionLot]{}, err
+	}
+	listArgs := append([]any(nil), args...)
+	limit, offset := pageLimitOffset(filter, &listArgs)
+	rows, err := tx.QueryContext(ctx, positionLotProjection+" WHERE "+where+
+		" ORDER BY l.opened_at DESC, l.lot_id DESC LIMIT "+limit+" OFFSET "+offset, listArgs...)
 	if err != nil {
 		return Page[PositionLot]{}, dbUnavailable("list position lots", err)
 	}
@@ -83,7 +91,11 @@ func (reader *Reader) PositionLots(ctx context.Context, filter ListFilter) (Page
 	if err := queryRowsError(rows, "iterate position lots"); err != nil {
 		return Page[PositionLot]{}, dbUnavailable("iterate position lots", err)
 	}
-	return finishPage(items, filter, now, map[string]any{"basis": "bounded_recent_or_open_lots"}), nil
+	page := finishPage(items, filter, total, now, map[string]any{"basis": "bounded_recent_or_open_lots"})
+	if err := tx.Commit(); err != nil {
+		return Page[PositionLot]{}, dbUnavailable("commit position lots", err)
+	}
+	return page, nil
 }
 
 func scanPositionLot(row rowScanner) (PositionLot, error) {
@@ -144,12 +156,20 @@ func (reader *Reader) ReconciliationRuns(ctx context.Context, filter ListFilter)
 	if filter.To != nil {
 		conditions = append(conditions, "started_at <= "+arg(filter.To.UTC()))
 	}
-	args = append(args, filter.Limit+1)
-	limit := fmt.Sprintf("$%d", len(args))
-	args = append(args, filter.Offset)
-	offset := fmt.Sprintf("$%d", len(args))
-	rows, err := reader.db.QueryContext(ctx, reconciliationRunProjection+" WHERE "+strings.Join(conditions, " AND ")+
-		" ORDER BY started_at DESC, run_id DESC LIMIT "+limit+" OFFSET "+offset, args...)
+	where := strings.Join(conditions, " AND ")
+	tx, err := reader.beginReadTx(ctx, "reconciliation runs")
+	if err != nil {
+		return Page[ReconciliationRun]{}, err
+	}
+	defer tx.Rollback()
+	total, err := countProjection(ctx, tx, reconciliationRunProjection, where, args, "reconciliation runs")
+	if err != nil {
+		return Page[ReconciliationRun]{}, err
+	}
+	listArgs := append([]any(nil), args...)
+	limit, offset := pageLimitOffset(filter, &listArgs)
+	rows, err := tx.QueryContext(ctx, reconciliationRunProjection+" WHERE "+where+
+		" ORDER BY started_at DESC, run_id DESC LIMIT "+limit+" OFFSET "+offset, listArgs...)
 	if err != nil {
 		return Page[ReconciliationRun]{}, dbUnavailable("list reconciliation runs", err)
 	}
@@ -171,7 +191,11 @@ func (reader *Reader) ReconciliationRuns(ctx context.Context, filter ListFilter)
 	if err := queryRowsError(rows, "iterate reconciliation runs"); err != nil {
 		return Page[ReconciliationRun]{}, dbUnavailable("iterate reconciliation runs", err)
 	}
-	return finishPage(items, filter, now, map[string]any{"basis": "bounded_recent_or_attention_runs"}), nil
+	page := finishPage(items, filter, total, now, map[string]any{"basis": "bounded_recent_or_attention_runs"})
+	if err := tx.Commit(); err != nil {
+		return Page[ReconciliationRun]{}, dbUnavailable("commit reconciliation runs", err)
+	}
+	return page, nil
 }
 
 const reconciliationIssueProjection = `
@@ -179,7 +203,7 @@ SELECT issue.issue_id, issue.run_id, issue.execution_account_id, issue.issue_typ
        NULL::text, issue.resolution, issue.status, issue.order_id,
        issue.venue_order_id, issue.venue_trade_id, issue.market_id, issue.condition_id,
        issue.token_id, issue.local_value::text, issue.remote_value::text, issue.source,
-       issue.observed_at, issue.resolved_at
+       issue.observed_at, issue.first_observed_at, issue.impact_scope, issue.resolved_at
 FROM reconciliation_issues issue
 `
 
@@ -220,12 +244,20 @@ func (reader *Reader) ReconciliationIssues(ctx context.Context, filter ListFilte
 	if filter.To != nil {
 		conditions = append(conditions, "issue.observed_at <= "+arg(filter.To.UTC()))
 	}
-	args = append(args, filter.Limit+1)
-	limit := fmt.Sprintf("$%d", len(args))
-	args = append(args, filter.Offset)
-	offset := fmt.Sprintf("$%d", len(args))
-	rows, err := reader.db.QueryContext(ctx, reconciliationIssueProjection+" WHERE "+strings.Join(conditions, " AND ")+
-		" ORDER BY CASE WHEN issue.status='OPEN' THEN 0 ELSE 1 END, issue.observed_at DESC, issue.issue_id DESC LIMIT "+limit+" OFFSET "+offset, args...)
+	where := strings.Join(conditions, " AND ")
+	tx, err := reader.beginReadTx(ctx, "reconciliation issues")
+	if err != nil {
+		return Page[ReconciliationIssue]{}, err
+	}
+	defer tx.Rollback()
+	total, err := countProjection(ctx, tx, reconciliationIssueProjection, where, args, "reconciliation issues")
+	if err != nil {
+		return Page[ReconciliationIssue]{}, err
+	}
+	listArgs := append([]any(nil), args...)
+	limit, offset := pageLimitOffset(filter, &listArgs)
+	rows, err := tx.QueryContext(ctx, reconciliationIssueProjection+" WHERE "+where+
+		" ORDER BY CASE WHEN issue.status='OPEN' THEN 0 ELSE 1 END, issue.observed_at DESC, issue.issue_id DESC LIMIT "+limit+" OFFSET "+offset, listArgs...)
 	if err != nil {
 		return Page[ReconciliationIssue]{}, dbUnavailable("list reconciliation issues", err)
 	}
@@ -241,22 +273,33 @@ func (reader *Reader) ReconciliationIssues(ctx context.Context, filter ListFilte
 	if err := queryRowsError(rows, "iterate reconciliation issues"); err != nil {
 		return Page[ReconciliationIssue]{}, dbUnavailable("iterate reconciliation issues", err)
 	}
-	return finishPage(items, filter, now, map[string]any{"basis": "all_open_or_recent", "open_issues_unbounded_by_age": true}), nil
+	page := finishPage(items, filter, total, now, map[string]any{"basis": "all_open_or_recent", "open_issues_unbounded_by_age": true})
+	if err := tx.Commit(); err != nil {
+		return Page[ReconciliationIssue]{}, dbUnavailable("commit reconciliation issues", err)
+	}
+	return page, nil
 }
 
 func scanReconciliationIssue(row rowScanner) (ReconciliationIssue, error) {
 	var item ReconciliationIssue
 	var reasonCode, localValue, remoteValue sql.NullString
-	var resolved sql.NullTime
+	var firstObserved, resolved sql.NullTime
+	var impactScope sql.NullString
 	if err := row.Scan(&item.IssueID, &item.RunID, &item.ExecutionAccountID, &item.IssueType,
 		&reasonCode, &item.Resolution, &item.Status, &item.OrderID, &item.VenueOrderID,
 		&item.VenueTradeID, &item.MarketID, &item.ConditionID, &item.TokenID,
-		&localValue, &remoteValue, &item.Source, &item.ObservedAt, &resolved); err != nil {
+		&localValue, &remoteValue, &item.Source, &item.ObservedAt, &firstObserved, &impactScope, &resolved); err != nil {
 		return ReconciliationIssue{}, err
 	}
 	item.ReasonCode = scanNullableString(reasonCode)
 	item.LocalValue, item.RemoteValue = scanNullableString(localValue), scanNullableString(remoteValue)
 	item.ObservedAt = item.ObservedAt.UTC()
+	if firstObserved.Valid {
+		item.FirstObservedAt = firstObserved.Time.UTC()
+	} else {
+		item.FirstObservedAt = item.ObservedAt
+	}
+	item.ImpactScope = impactScope.String
 	item.ResolvedAt = scanNullableTime(resolved)
 	return item, nil
 }
@@ -304,12 +347,20 @@ func (reader *Reader) Redemptions(ctx context.Context, filter ListFilter) (Page[
 	if filter.To != nil {
 		conditions = append(conditions, "created_at <= "+arg(filter.To.UTC()))
 	}
-	args = append(args, filter.Limit+1)
-	limit := fmt.Sprintf("$%d", len(args))
-	args = append(args, filter.Offset)
-	offset := fmt.Sprintf("$%d", len(args))
-	rows, err := reader.db.QueryContext(ctx, redemptionProjection+" WHERE "+strings.Join(conditions, " AND ")+
-		" ORDER BY CASE WHEN status <> 'APPLIED' THEN 0 ELSE 1 END, updated_at DESC, redemption_id DESC LIMIT "+limit+" OFFSET "+offset, args...)
+	where := strings.Join(conditions, " AND ")
+	tx, err := reader.beginReadTx(ctx, "redemptions")
+	if err != nil {
+		return Page[Redemption]{}, err
+	}
+	defer tx.Rollback()
+	total, err := countProjection(ctx, tx, redemptionProjection, where, args, "redemptions")
+	if err != nil {
+		return Page[Redemption]{}, err
+	}
+	listArgs := append([]any(nil), args...)
+	limit, offset := pageLimitOffset(filter, &listArgs)
+	rows, err := tx.QueryContext(ctx, redemptionProjection+" WHERE "+where+
+		" ORDER BY CASE WHEN status <> 'APPLIED' THEN 0 ELSE 1 END, updated_at DESC, redemption_id DESC LIMIT "+limit+" OFFSET "+offset, listArgs...)
 	if err != nil {
 		return Page[Redemption]{}, dbUnavailable("list redemptions", err)
 	}
@@ -334,5 +385,9 @@ func (reader *Reader) Redemptions(ctx context.Context, filter ListFilter) (Page[
 	if err := queryRowsError(rows, "iterate redemptions"); err != nil {
 		return Page[Redemption]{}, dbUnavailable("iterate redemptions", err)
 	}
-	return finishPage(items, filter, now, map[string]any{"basis": "bounded_recent_or_pending_or_manual_review_redemptions", "redemption_id": "execution_account_id:condition_id"}), nil
+	page := finishPage(items, filter, total, now, map[string]any{"basis": "bounded_recent_or_pending_or_manual_review_redemptions", "redemption_id": "execution_account_id:condition_id"})
+	if err := tx.Commit(); err != nil {
+		return Page[Redemption]{}, dbUnavailable("commit redemptions", err)
+	}
+	return page, nil
 }

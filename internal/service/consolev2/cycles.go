@@ -62,6 +62,27 @@ SELECT cycle_id, input_id, decision_at, model_id, prediction_model_id, strategy_
 FROM cycle_rows
 `
 
+// Filtering a cycle only needs its durable identity and delivery-derived
+// status. Keep COUNT away from the JSON array lengths, snapshot join and
+// per-cycle delivery counts used by the display projection.
+const cycleCountProjection = `
+WITH cycle_rows AS (
+    SELECT r.cycle_id, r.input_id, r.decision_at, r.model_id, r.strategy_id,
+           r.execution_account_id,
+           CASE
+             WHEN r.output_payload IS NULL THEN 'INPUT_RECORDED'
+             WHEN EXISTS (SELECT 1 FROM strategy_order_intent_deliveries d
+                          WHERE d.cycle_id=r.cycle_id AND d.status IN ('FAILED','UNKNOWN')) THEN 'DELIVERY_ATTENTION'
+             WHEN EXISTS (SELECT 1 FROM strategy_order_intent_deliveries d
+                          WHERE d.cycle_id=r.cycle_id AND d.status IN ('PENDING','SUBMITTING')) THEN 'DELIVERY_PENDING'
+             ELSE 'OUTPUT_RECORDED'
+           END AS status
+    FROM strategy_decision_runs r
+)
+SELECT cycle_id, input_id, decision_at, model_id, strategy_id, execution_account_id, status
+FROM cycle_rows
+`
+
 const cycleDetailProjection = cycleRowsProjection + `
 SELECT cycle_id, input_id, decision_at, model_id, prediction_model_id, strategy_id,
        execution_account_id, prediction_snapshot_id, orderbook_snapshot_set_id,
@@ -121,10 +142,21 @@ func (reader *Reader) DecisionCycles(ctx context.Context, filter ListFilter) (Pa
 	if filter.To != nil {
 		conditions = append(conditions, "decision_at <= "+add("", filter.To.UTC()))
 	}
-	limit, offset := pageLimitOffset(filter, &args)
-	query := cycleProjection + " WHERE " + strings.Join(conditions, " AND ") +
+	where := strings.Join(conditions, " AND ")
+	tx, err := reader.beginReadTx(ctx, "decision cycles")
+	if err != nil {
+		return Page[DecisionCycle]{}, err
+	}
+	defer tx.Rollback()
+	total, err := countProjection(ctx, tx, cycleCountProjection, where, args, "decision cycles")
+	if err != nil {
+		return Page[DecisionCycle]{}, err
+	}
+	listArgs := append([]any(nil), args...)
+	limit, offset := pageLimitOffset(filter, &listArgs)
+	query := cycleProjection + " WHERE " + where +
 		" ORDER BY decision_at DESC, cycle_id DESC LIMIT " + limit + " OFFSET " + offset
-	rows, err := reader.db.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, listArgs...)
 	if err != nil {
 		return Page[DecisionCycle]{}, dbUnavailable("list decision cycles", err)
 	}
@@ -140,7 +172,11 @@ func (reader *Reader) DecisionCycles(ctx context.Context, filter ListFilter) (Pa
 	if err := queryRowsError(rows, "iterate decision cycles"); err != nil {
 		return Page[DecisionCycle]{}, dbUnavailable("iterate decision cycles", err)
 	}
-	return finishPage(items, filter, now, map[string]any{"basis": "bounded_recent_cycles"}), nil
+	page := finishPage(items, filter, total, now, map[string]any{"basis": "bounded_recent_cycles"})
+	if err := tx.Commit(); err != nil {
+		return Page[DecisionCycle]{}, dbUnavailable("commit decision cycles", err)
+	}
+	return page, nil
 }
 
 func (reader *Reader) DecisionCycle(ctx context.Context, cycleID string) (DecisionCycleDetail, error) {
