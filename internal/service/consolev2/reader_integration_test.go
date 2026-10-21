@@ -43,6 +43,9 @@ func TestReaderAgainstMigratedTradingSchema(t *testing.T) {
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM strategy_decision_runs WHERE cycle_id=$1`, cycleID)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM execution_orders WHERE order_id=$1`, orderID)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM polymarket_redemptions WHERE execution_account_id=$1 AND condition_id=$2`, accountID, condition)
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM execution_strategy_bindings WHERE execution_account_id=$1`, accountID)
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM execution_risk_policies WHERE execution_account_id=$1`, accountID)
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM execution_risk_controls WHERE execution_account_id=$1`, accountID)
 		_, _ = db.ExecContext(context.Background(), `DELETE FROM execution_accounts WHERE execution_account_id=$1`, accountID)
 	}
 	cleanup()
@@ -53,6 +56,25 @@ func TestReaderAgainstMigratedTradingSchema(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO execution_accounts (execution_account_id, wallet_address, collateral_asset)
 		VALUES ($1, '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'pUSD')`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO execution_strategy_bindings (model_id, strategy_id, execution_account_id, enabled)
+		VALUES ('echo', 'multfactor_v2', $1, FALSE)`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO execution_risk_policies (
+			execution_account_id, policy_id, version, enabled,
+			max_order_notional, max_market_exposure, max_strategy_exposure,
+			max_wallet_exposure, max_daily_traded_notional,
+			max_price_age_ms, max_signal_age_ms, max_state_age_ms
+		) VALUES ($1, 'console-v2-policy', 1, FALSE, 100, 100, 100, 100, 100, 1000, 1000, 1000)`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO execution_risk_controls (execution_account_id, control_scope, control_key, paused)
+		VALUES ($1, 'ACCOUNT', '', TRUE)`, accountID); err != nil {
 		t.Fatal(err)
 	}
 	intent := `{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"console-v2-test-account","client_order_id":"console-v2-client","market_source":"POLYMARKET","condition_id":"` + condition + `","side":"BUY","price":"0.4","size":"2"}`
@@ -110,41 +132,60 @@ func TestReaderAgainstMigratedTradingSchema(t *testing.T) {
 	}
 
 	now := decisionAt.Add(1 * time.Hour)
-	reader := New(db, RuntimeConfig{StartedAt: decisionAt, Now: func() time.Time { return now }})
+	reader := New(db, RuntimeConfig{
+		StartedAt: decisionAt, Now: func() time.Time { return now },
+		Bindings: []Binding{{ModelID: "echo", StrategyID: "multfactor_v2", ExecutionAccountID: accountID, SourceMode: "DIRECT"}},
+	})
+	runtime, err := reader.Runtime(ctx)
+	if err != nil || runtime.AccountDataState != "available" || len(runtime.Accounts) != 1 ||
+		runtime.Accounts[0].DatabaseBindingEnabled == nil || *runtime.Accounts[0].DatabaseBindingEnabled ||
+		runtime.Accounts[0].RiskPolicyEnabled == nil || *runtime.Accounts[0].RiskPolicyEnabled ||
+		runtime.Accounts[0].AccountPaused == nil || !*runtime.Accounts[0].AccountPaused ||
+		runtime.Accounts[0].OpenIssueCount != 1 || runtime.Accounts[0].OpenOrderCount != 1 {
+		t.Fatalf("runtime accounts=%#v err=%v", runtime, err)
+	}
 	cycles, err := reader.DecisionCycles(ctx, ListFilter{Limit: 5})
-	if err != nil || len(cycles.Items) != 1 || cycles.Items[0].PredictionSnapshotID != "snapshot-1" ||
+	if err != nil || cycles.Total != 1 || len(cycles.Items) != 1 || cycles.Items[0].PredictionSnapshotID != "snapshot-1" ||
 		cycles.Items[0].PredictionModelID != nil || cycles.Items[0].OrderSubmissionEnabled == nil ||
 		*cycles.Items[0].OrderSubmissionEnabled || cycles.Items[0].EntrySubmissionEnabled != nil ||
 		cycles.Items[0].EntryBlockReason != nil ||
 		cycles.Items[0].IntentCount != 1 || cycles.Items[0].Status != "OUTPUT_RECORDED" {
 		t.Fatalf("cycles=%#v err=%v", cycles, err)
 	}
+	cycleOutOfRange, err := reader.DecisionCycles(ctx, ListFilter{Limit: 5, Offset: 5})
+	if err != nil || len(cycleOutOfRange.Items) != 0 || cycleOutOfRange.Total != 1 || cycleOutOfRange.HasMore {
+		t.Fatalf("cycle out-of-range page=%#v err=%v", cycleOutOfRange, err)
+	}
 	detail, err := reader.DecisionCycle(ctx, cycleID)
 	if err != nil || len(detail.Predictions) != 1 || detail.Predictions[0].PredictionID != "prediction-1" {
 		t.Fatalf("cycle detail=%#v err=%v", detail, err)
 	}
 	orders, err := reader.Orders(ctx, ListFilter{Limit: 5})
-	if err != nil || len(orders.Items) != 1 || orders.Items[0].OrderID != orderID || orders.Items[0].Shares != "2" {
+	if err != nil || orders.Total != 1 || len(orders.Items) != 1 || orders.Items[0].OrderID != orderID || orders.Items[0].Shares != "2" {
 		t.Fatalf("orders=%#v err=%v", orders, err)
+	}
+	filteredOrders, err := reader.Orders(ctx, ListFilter{Limit: 5, Query: "does-not-exist"})
+	if err != nil || len(filteredOrders.Items) != 0 || filteredOrders.Total != 0 || filteredOrders.HasMore {
+		t.Fatalf("filtered empty orders=%#v err=%v", filteredOrders, err)
 	}
 	trace, err := reader.OrderTrace(ctx, orderID)
 	if err != nil || trace.Order.OrderID != orderID || len(trace.Events) != 0 {
 		t.Fatalf("trace=%#v err=%v", trace, err)
 	}
 	lots, err := reader.PositionLots(ctx, ListFilter{Limit: 5})
-	if err != nil || len(lots.Items) != 0 {
+	if err != nil || lots.Total != 0 || len(lots.Items) != 0 {
 		t.Fatalf("lots=%#v err=%v", lots, err)
 	}
 	runs, err := reader.ReconciliationRuns(ctx, ListFilter{Limit: 5})
-	if err != nil || len(runs.Items) != 1 || runs.Items[0].RunID != runID {
+	if err != nil || runs.Total != 1 || len(runs.Items) != 1 || runs.Items[0].RunID != runID {
 		t.Fatalf("runs=%#v err=%v", runs, err)
 	}
 	issues, err := reader.ReconciliationIssues(ctx, ListFilter{Limit: 5})
-	if err != nil || len(issues.Items) != 1 || issues.Items[0].IssueID != issueID || issues.Items[0].ReasonCode != nil {
+	if err != nil || issues.Total != 1 || len(issues.Items) != 1 || issues.Items[0].IssueID != issueID || issues.Items[0].ReasonCode != nil || issues.Items[0].ImpactScope != "ACCOUNT" {
 		t.Fatalf("issues=%#v err=%v", issues, err)
 	}
 	redemptions, err := reader.Redemptions(ctx, ListFilter{Limit: 5})
-	if err != nil || len(redemptions.Items) != 1 || redemptions.Items[0].Status != "READY" {
+	if err != nil || redemptions.Total != 1 || len(redemptions.Items) != 1 || redemptions.Items[0].Status != "READY" {
 		t.Fatalf("redemptions=%#v err=%v", redemptions, err)
 	}
 	metrics, err := reader.ServiceMetrics(ctx)

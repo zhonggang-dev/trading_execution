@@ -13,10 +13,21 @@ import (
 const (
 	defaultLimit = 20
 	maxLimit     = 100
-	maxOffset    = 10000
-	defaultAge   = 30 * 24 * time.Hour
-	maxQueryLen  = 128
+	// MaxOffset follows the browser's Number.MAX_SAFE_INTEGER boundary (leaving
+	// room for the largest supported page). The old 10,000/1,000,000 caps could
+	// make a real last page unreachable when an exact total exceeded the cap.
+	// Queries remain protected by the HTTP five-second deadline and the value is
+	// always passed to PostgreSQL as a parameter.
+	MaxOffset   = 9_007_199_254_740_891
+	defaultAge  = 30 * 24 * time.Hour
+	maxQueryLen = 128
 )
+
+const maxOffset = MaxOffset
+
+func maxInt() int {
+	return int(^uint(0) >> 1)
+}
 
 // Reader reads only durable, explicitly projected trading facts. It never
 // invokes a venue, starts a job, or writes a database row.
@@ -81,6 +92,16 @@ func (reader *Reader) Runtime(ctx context.Context) (Runtime, error) {
 		LastErrorCode:     runnerErrorCode(snapshot.LastError),
 		SkippedBoundaries: snapshot.SkippedBoundaries,
 	}
+	accounts, accountDataState, accountErr := reader.runtimeAccounts(ctx)
+	if accountErr != nil {
+		if errorsIsContext(accountErr) {
+			return Runtime{}, accountErr
+		}
+		// Runner/config state is still useful when the database projection is
+		// unavailable. Keep the failure explicit instead of returning an empty
+		// account list that looks like there are no configured accounts.
+		accounts, accountDataState = nil, "unavailable"
+	}
 	return Runtime{
 		ObservedAt: now,
 		Runner:     runner,
@@ -93,7 +114,191 @@ func (reader *Reader) Runtime(ctx context.Context) (Runtime, error) {
 			StrategyDisabledAccounts:   append([]string(nil), reader.config.StrategyDisabledAccounts...),
 			KalshiStrategyInputEnabled: reader.config.KalshiStrategyInputEnabled,
 		},
+		AccountDataState: accountDataState,
+		Accounts:         accounts,
 	}, nil
+}
+
+// runtimeAccounts reads the configured bindings and their independent
+// database facts in one bounded repeatable-read snapshot. It is a projection,
+// not a new execution-authorization algorithm; nil database values remain
+// unknown and the caller reports an unavailable projection on query failure.
+func (reader *Reader) runtimeAccounts(ctx context.Context) ([]RuntimeAccount, string, error) {
+	if len(reader.config.Bindings) == 0 {
+		return []RuntimeAccount{}, "available", nil
+	}
+	if reader.db == nil {
+		return nil, "unavailable", nil
+	}
+	tx, err := reader.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, "unavailable", dbUnavailable("begin runtime accounts", err)
+	}
+	defer tx.Rollback()
+
+	values := make([]string, 0, len(reader.config.Bindings))
+	args := make([]any, 0, len(reader.config.Bindings)*3)
+	for index, binding := range reader.config.Bindings {
+		base := index*3 + 1
+		values = append(values, fmt.Sprintf("($%d::text,$%d::text,$%d::text)", base, base+1, base+2))
+		args = append(args, binding.ModelID, binding.StrategyID, binding.ExecutionAccountID)
+	}
+	query := `
+WITH configured(model_id, strategy_id, execution_account_id) AS (VALUES ` + strings.Join(values, ",") + `)
+SELECT configured.model_id, configured.strategy_id, configured.execution_account_id,
+       binding.enabled, policy.enabled, control.paused,
+		cycle.decision_at, cycle.status, cycle.entry_enabled, cycle.entry_block_reason,
+       reconciliation.started_at, reconciliation.status,
+       COALESCE(issues.open_issue_count, 0), COALESCE(orders.open_order_count, 0)
+FROM configured
+LEFT JOIN execution_strategy_bindings binding
+  ON binding.model_id=configured.model_id
+ AND binding.strategy_id=configured.strategy_id
+ AND binding.execution_account_id=configured.execution_account_id
+LEFT JOIN execution_risk_policies policy
+  ON policy.execution_account_id=configured.execution_account_id
+LEFT JOIN execution_risk_controls control
+  ON control.execution_account_id=configured.execution_account_id
+ AND control.control_scope='ACCOUNT' AND control.control_key=''
+LEFT JOIN LATERAL (
+    SELECT r.decision_at,
+	           CASE
+	             WHEN r.output_payload IS NULL THEN 'INPUT_RECORDED'
+	             WHEN EXISTS (SELECT 1 FROM strategy_order_intent_deliveries d
+	                          WHERE d.cycle_id=r.cycle_id AND d.status IN ('FAILED','UNKNOWN')) THEN 'DELIVERY_ATTENTION'
+	             WHEN EXISTS (SELECT 1 FROM strategy_order_intent_deliveries d
+	                          WHERE d.cycle_id=r.cycle_id AND d.status IN ('PENDING','SUBMITTING')) THEN 'DELIVERY_PENDING'
+	             ELSE 'OUTPUT_RECORDED'
+	           END AS status,
+	           CASE
+	             WHEN jsonb_typeof(r.output_payload->'entry_policy'->'enabled') = 'boolean'
+	               THEN (r.output_payload->'entry_policy'->>'enabled')::boolean
+	             ELSE NULL
+	           END AS entry_enabled,
+           NULLIF(r.output_payload->'entry_policy'->>'block_reason', '') AS entry_block_reason
+    FROM strategy_decision_runs r
+    WHERE r.model_id=configured.model_id
+      AND r.strategy_id=configured.strategy_id
+      AND r.execution_account_id=configured.execution_account_id
+    ORDER BY r.decision_at DESC, r.cycle_id DESC
+    LIMIT 1
+) cycle ON TRUE
+LEFT JOIN LATERAL (
+    SELECT r.started_at, r.status
+    FROM reconciliation_runs r
+    WHERE r.execution_account_id=configured.execution_account_id
+    ORDER BY r.started_at DESC, r.run_id DESC
+    LIMIT 1
+) reconciliation ON TRUE
+LEFT JOIN LATERAL (
+    SELECT count(*)::bigint AS open_issue_count
+    FROM reconciliation_issues i
+    WHERE i.execution_account_id=configured.execution_account_id AND i.status='OPEN'
+) issues ON TRUE
+LEFT JOIN LATERAL (
+    SELECT count(*)::bigint AS open_order_count
+    FROM execution_orders o
+    WHERE o.execution_account_id=configured.execution_account_id
+      AND o.status NOT IN ('FILLED','REJECTED','CANCELLED')
+) orders ON TRUE
+ORDER BY configured.execution_account_id, configured.model_id, configured.strategy_id`
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, "unavailable", dbUnavailable("read runtime accounts", err)
+	}
+	defer rows.Close()
+	accounts := make([]RuntimeAccount, 0, len(reader.config.Bindings))
+	for rows.Next() {
+		var account RuntimeAccount
+		var bindingEnabled, policyEnabled, accountPaused sql.NullBool
+		var cycleAt, reconciliationAt sql.NullTime
+		var cycleStatus, entryBlockReason, reconciliationStatus sql.NullString
+		var cycleEntryEnabled sql.NullBool
+		var openIssues, openOrders int64
+		if err := rows.Scan(&account.ModelID, &account.StrategyID, &account.ExecutionAccountID,
+			&bindingEnabled, &policyEnabled, &accountPaused,
+			&cycleAt, &cycleStatus, &cycleEntryEnabled, &entryBlockReason,
+			&reconciliationAt, &reconciliationStatus, &openIssues, &openOrders); err != nil {
+			return nil, "unavailable", dbUnavailable("scan runtime accounts", err)
+		}
+		account.ConfiguredBinding = true
+		account.DatabaseBindingEnabled = scanNullableBool(bindingEnabled)
+		account.RiskPolicyEnabled = scanNullableBool(policyEnabled)
+		account.AccountPaused = scanNullableBool(accountPaused)
+		account.LastCycleAt = scanNullableTime(cycleAt)
+		account.LastCycleStatus = cycleStatus.String
+		account.LastCycleEntryBlockReason = scanNullableString(entryBlockReason)
+		account.LastReconciliationAt = scanNullableTime(reconciliationAt)
+		account.LastReconciliationStatus = reconciliationStatus.String
+		if openIssues < 0 || openOrders < 0 || openIssues > int64(^uint(0)>>1) || openOrders > int64(^uint(0)>>1) {
+			return nil, "unavailable", dbUnavailable("scan runtime accounts", fmt.Errorf("count outside supported range"))
+		}
+		account.OpenIssueCount, account.OpenOrderCount = int(openIssues), int(openOrders)
+		account.StrategyInputState = runtimeAccountState(account.ExecutionAccountID, reader.config.SubmissionDisabledAccounts, reader.config.StrategyDisabledAccounts, false)
+		account.EntryGateState = runtimeEntryGateState(
+			cycleAt,
+			cycleEntryEnabled,
+			entryBlockReason,
+		)
+		account.OrderSubmissionState = runtimeAccountState(account.ExecutionAccountID, reader.config.SubmissionDisabledAccounts, nil, !reader.config.OrderSubmissionEnabled)
+		if mode := runtimeBindingMode(reader.config.Bindings, account.ModelID, account.StrategyID, account.ExecutionAccountID); mode != "" {
+			account.SourceMode = mode
+		}
+		accounts = append(accounts, account)
+	}
+	if err := queryRowsError(rows, "iterate runtime accounts"); err != nil {
+		return nil, "unavailable", dbUnavailable("iterate runtime accounts", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, "unavailable", dbUnavailable("commit runtime accounts", err)
+	}
+	return accounts, "available", nil
+}
+
+func runtimeBindingMode(bindings []Binding, modelID, strategyID, accountID string) string {
+	for _, binding := range bindings {
+		if binding.ModelID == modelID && binding.StrategyID == strategyID && binding.ExecutionAccountID == accountID {
+			return binding.SourceMode
+		}
+	}
+	return ""
+}
+
+func runtimeAccountState(accountID string, disabledAccounts, strategyDisabled []string, globallyDisabled bool) string {
+	if globallyDisabled || containsString(disabledAccounts, accountID) || containsString(strategyDisabled, accountID) {
+		return "disabled"
+	}
+	return "enabled"
+}
+
+// runtimeEntryGateState keeps the current config and the latest durable cycle
+// evidence separate. A persisted cycle with no Go-owned entry policy remains
+// unknown; a later config change must not rewrite that historical fact. When
+// no cycle exists yet there is no durable gate observation, so the state also
+// remains unknown; current config switches are exposed in RuntimeSubmission.
+func runtimeEntryGateState(cycleAt sql.NullTime, entryEnabled sql.NullBool, blockReason sql.NullString) string {
+	if cycleAt.Valid {
+		if blockReason.Valid && strings.TrimSpace(blockReason.String) != "" {
+			return "sell_only"
+		}
+		if entryEnabled.Valid {
+			if entryEnabled.Bool {
+				return "enabled"
+			}
+			return "sell_only"
+		}
+		return "unknown"
+	}
+	return "unknown"
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // runnerErrorCode deliberately exposes only a stable operational category.
@@ -179,6 +384,44 @@ func (reader *Reader) requireDB(ctx context.Context) error {
 	return nil
 }
 
+// beginReadTx gives a list request one consistent snapshot for both its exact
+// count and page rows. A read-only repeatable-read transaction avoids a row
+// being inserted or deleted between the two queries and keeps an empty or
+// out-of-range page countable.
+func (reader *Reader) beginReadTx(ctx context.Context, operation string) (*sql.Tx, error) {
+	if err := reader.requireDB(ctx); err != nil {
+		return nil, err
+	}
+	tx, err := reader.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, dbUnavailable("begin "+operation, err)
+	}
+	return tx, nil
+}
+
+func countProjection(ctx context.Context, tx *sql.Tx, projection, where string, args []any, operation string) (int, error) {
+	query := "SELECT COUNT(*) FROM (" + projection + " WHERE " + where + ") AS filtered_rows"
+	return countQuery(ctx, tx, query, args, operation)
+}
+
+// countFrom counts the same base row identity as a list query without running
+// expensive display-only lateral projections. Callers must pass a fixed,
+// internal FROM clause and a predicate built from the same query arguments.
+func countFrom(ctx context.Context, tx *sql.Tx, from, where string, args []any, operation string) (int, error) {
+	return countQuery(ctx, tx, "SELECT COUNT(*) FROM "+from+" WHERE "+where, args, operation)
+}
+
+func countQuery(ctx context.Context, tx *sql.Tx, query string, args []any, operation string) (int, error) {
+	var total int64
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
+		return 0, dbUnavailable("count "+operation, err)
+	}
+	if total < 0 || total > int64(^uint(0)>>1) {
+		return 0, dbUnavailable("count "+operation, fmt.Errorf("total is outside the supported integer range"))
+	}
+	return int(total), nil
+}
+
 func normalizeFilter(filter ListFilter) (ListFilter, error) {
 	if filter.Limit == 0 {
 		filter.Limit = defaultLimit
@@ -227,7 +470,7 @@ func pageLimitOffset(filter ListFilter, args *[]any) (string, string) {
 	return limit, offset
 }
 
-func finishPage[T any](items []T, filter ListFilter, now time.Time, summary map[string]any) Page[T] {
+func finishPage[T any](items []T, filter ListFilter, total int, now time.Time, summary map[string]any) Page[T] {
 	hasMore := len(items) > filter.Limit
 	if hasMore {
 		items = items[:filter.Limit]
@@ -235,7 +478,11 @@ func finishPage[T any](items []T, filter ListFilter, now time.Time, summary map[
 	if items == nil {
 		items = make([]T, 0)
 	}
-	return Page[T]{Items: items, Limit: filter.Limit, Offset: filter.Offset, HasMore: hasMore, ObservedAt: now.UTC(), Summary: summary}
+	// The exact count is authoritative for navigation, including a short page
+	// returned after a concurrent change (which cannot happen inside the
+	// repeatable-read transaction, but is cheap to make explicit here).
+	hasMore = filter.Offset+len(items) < total
+	return Page[T]{Items: items, Limit: filter.Limit, Offset: filter.Offset, Total: total, HasMore: hasMore, ObservedAt: now.UTC(), Summary: summary}
 }
 
 func scanNullableString(value sql.NullString) *string {

@@ -279,8 +279,8 @@ func parseConsoleV2Filter(request *http.Request, options consoleV2FilterOptions)
 	if filter.Limit < 1 || filter.Limit > 100 {
 		return consolev2.ListFilter{}, fmt.Errorf("limit must be between 1 and 100")
 	}
-	if filter.Offset < 0 || filter.Offset > 10000 {
-		return consolev2.ListFilter{}, fmt.Errorf("offset must be between 0 and 10000")
+	if filter.Offset < 0 || filter.Offset > consolev2.MaxOffset {
+		return consolev2.ListFilter{}, fmt.Errorf("offset must be between 0 and %d", consolev2.MaxOffset)
 	}
 	for key, value := range map[string]string{
 		"q": filter.Query, "model_id": filter.ModelID, "strategy_id": filter.StrategyID,

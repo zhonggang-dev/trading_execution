@@ -50,12 +50,14 @@ type ListFilter struct {
 	To                 *time.Time
 }
 
-// Page is the common finite list envelope. There is intentionally no total:
-// the reader uses LIMIT+1 and never performs an unbounded COUNT.
+// Page is the common finite list envelope. Total is the exact number of rows
+// matching the applied filter in the same read snapshot as Items. It is kept
+// beside HasMore for clients that still use cursor-like next-page controls.
 type Page[T any] struct {
 	Items      []T            `json:"items"`
 	Limit      int            `json:"limit"`
 	Offset     int            `json:"offset"`
+	Total      int            `json:"total"`
 	HasMore    bool           `json:"has_more"`
 	ObservedAt time.Time      `json:"observed_at"`
 	Summary    map[string]any `json:"summary,omitempty"`
@@ -103,10 +105,37 @@ type Binding struct {
 }
 
 type Runtime struct {
-	ObservedAt time.Time         `json:"observed_at"`
-	Runner     RuntimeRunner     `json:"runner"`
-	Bindings   []Binding         `json:"bindings"`
-	Submission RuntimeSubmission `json:"submission"`
+	ObservedAt       time.Time         `json:"observed_at"`
+	Runner           RuntimeRunner     `json:"runner"`
+	Bindings         []Binding         `json:"bindings"`
+	Submission       RuntimeSubmission `json:"submission"`
+	AccountDataState string            `json:"account_data_state"`
+	Accounts         []RuntimeAccount  `json:"accounts,omitempty"`
+}
+
+// RuntimeAccount keeps current configuration, database authorization, and
+// the latest durable observations side by side. Nullable database fields are
+// deliberately pointers: an unavailable read is different from a disabled
+// account and must not be rendered as a fabricated false/zero.
+type RuntimeAccount struct {
+	ExecutionAccountID        string     `json:"execution_account_id"`
+	ModelID                   string     `json:"model_id"`
+	StrategyID                string     `json:"strategy_id"`
+	SourceMode                string     `json:"source_mode,omitempty"`
+	ConfiguredBinding         bool       `json:"configured_binding"`
+	DatabaseBindingEnabled    *bool      `json:"database_binding_enabled"`
+	RiskPolicyEnabled         *bool      `json:"risk_policy_enabled"`
+	AccountPaused             *bool      `json:"account_paused"`
+	StrategyInputState        string     `json:"strategy_input_state"`
+	EntryGateState            string     `json:"entry_gate_state"`
+	OrderSubmissionState      string     `json:"order_submission_state"`
+	LastCycleAt               *time.Time `json:"last_cycle_at,omitempty"`
+	LastCycleStatus           string     `json:"last_cycle_status,omitempty"`
+	LastCycleEntryBlockReason *string    `json:"last_cycle_entry_block_reason,omitempty"`
+	LastReconciliationAt      *time.Time `json:"last_reconciliation_at,omitempty"`
+	LastReconciliationStatus  string     `json:"last_reconciliation_status,omitempty"`
+	OpenIssueCount            int        `json:"open_issue_count"`
+	OpenOrderCount            int        `json:"open_order_count"`
 }
 
 type RuntimeRunner struct {
@@ -200,25 +229,38 @@ type DecisionCycleDetail struct {
 }
 
 type Order struct {
-	OrderID            string    `json:"order_id"`
-	ClientOrderID      string    `json:"client_order_id"`
-	VenueOrderID       string    `json:"venue_order_id,omitempty"`
-	Status             string    `json:"status"`
-	ExecutionAccountID string    `json:"execution_account_id"`
-	ModelID            string    `json:"model_id,omitempty"`
-	StrategyID         string    `json:"strategy_id,omitempty"`
-	Venue              string    `json:"venue"`
-	MarketSource       string    `json:"market_source,omitempty"`
-	MarketID           string    `json:"market_id"`
-	ConditionID        string    `json:"condition_id,omitempty"`
-	TokenID            string    `json:"token_id"`
-	Side               string    `json:"side,omitempty"`
-	Price              string    `json:"price,omitempty"`
-	Shares             string    `json:"shares,omitempty"`
-	FilledShares       string    `json:"filled_shares"`
-	AverageFillPrice   string    `json:"average_fill_price,omitempty"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	OrderID            string               `json:"order_id"`
+	ClientOrderID      string               `json:"client_order_id"`
+	VenueOrderID       string               `json:"venue_order_id,omitempty"`
+	Status             string               `json:"status"`
+	ExecutionAccountID string               `json:"execution_account_id"`
+	ModelID            string               `json:"model_id,omitempty"`
+	StrategyID         string               `json:"strategy_id,omitempty"`
+	Venue              string               `json:"venue"`
+	MarketSource       string               `json:"market_source,omitempty"`
+	MarketID           string               `json:"market_id"`
+	ConditionID        string               `json:"condition_id,omitempty"`
+	TokenID            string               `json:"token_id"`
+	Side               string               `json:"side,omitempty"`
+	Price              string               `json:"price,omitempty"`
+	Shares             string               `json:"shares,omitempty"`
+	FilledShares       string               `json:"filled_shares"`
+	AverageFillPrice   string               `json:"average_fill_price,omitempty"`
+	CreatedAt          time.Time            `json:"created_at"`
+	UpdatedAt          time.Time            `json:"updated_at"`
+	EvidenceSummary    OrderEvidenceSummary `json:"evidence_summary"`
+}
+
+// OrderEvidenceSummary is computed from durable fill/reservation/issue rows
+// for the order. It is never inferred from a truncated trace array.
+type OrderEvidenceSummary struct {
+	FillEvidenceState  string `json:"fill_evidence_state"`
+	AccountingState    string `json:"accounting_state"`
+	ConfirmedFillCount int    `json:"confirmed_fill_count"`
+	AppliedFillCount   int    `json:"applied_fill_count"`
+	PendingFillCount   int    `json:"pending_fill_count"`
+	OpenIssueCount     int    `json:"open_issue_count"`
+	ReservationState   string `json:"reservation_state,omitempty"`
 }
 
 type OrderEvent struct {
@@ -325,6 +367,8 @@ type ReconciliationIssue struct {
 	RemoteValue        *string    `json:"remote_value,omitempty"`
 	Source             string     `json:"source,omitempty"`
 	ObservedAt         time.Time  `json:"observed_at"`
+	FirstObservedAt    time.Time  `json:"first_observed_at"`
+	ImpactScope        string     `json:"impact_scope"`
 	ResolvedAt         *time.Time `json:"resolved_at,omitempty"`
 }
 
