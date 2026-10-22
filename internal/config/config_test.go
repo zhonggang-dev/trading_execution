@@ -235,6 +235,32 @@ func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsMainBrierMidEdgeOnceWithWallet1Held(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"brier_mid_edge_once","execution_account_id":"main"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
+		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+	]`)
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"v4.1 flash":"SANDBOX"}`)
+	t.Setenv("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON", `["wallet-1"]`)
+	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `["wallet-1"]`)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.DecisionCycle.Bindings[0].ExecutionAccountID != "main" ||
+		config.DecisionCycle.Bindings[0].StrategyID != "brier_mid_edge_once" ||
+		config.DecisionCycle.Bindings[1].StrategyID != "strategy_pending_b" {
+		t.Fatalf("decision routes = %#v", config.DecisionCycle.Bindings)
+	}
+}
+
 func TestLoadAcceptsLegacyGeminiWallet67Route(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)

@@ -15,9 +15,11 @@ func TestStrategyExecutionContextValidatesStrategyIDFormat(t *testing.T) {
 		t.Fatalf("Validate() historical alias error = %v", err)
 	}
 	configured := valid
-	configured.StrategyID = "alpha_new.v2"
-	if err := configured.Validate(); err != nil {
-		t.Fatalf("Validate() configured strategy error = %v", err)
+	for _, id := range []string{"alpha_new.v2", "brier_mid_edge_once"} {
+		configured.StrategyID = id
+		if err := configured.Validate(); err != nil {
+			t.Fatalf("Validate(%q) configured strategy error = %v", id, err)
+		}
 	}
 	for _, unsafe := range []string{"strategy v3", "1strategy", "a/b", "名字", strings.Repeat("a", 65)} {
 		invalid := valid

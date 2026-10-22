@@ -89,6 +89,14 @@ later is a configuration change only (no code change). Do it while
    `DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON`. The global
    `DECISION_CYCLE_ORDER_SUBMISSION_ENABLED` stays `true` and is not changed.
 
+Current state: main is bound to `brier_mid_edge_once` (strategy_version `1.0.0`,
+display name "Brier 概率差单次建仓策略"), with main removed from both
+`STRATEGY_DISABLED` and `ENTRY_DISABLED`; wallet-1 stays on `strategy_pending_b`
+and is still listed in both. The algorithm service must accept the new ID on
+`/api/v4/decisions` and `/api/v2/position-exits/evaluate`; a SUBMIT response
+must carry `evidence.metrics` `best_ask`, `near_logdiff_usd` and `rel_spread`
+(only `multfactor_v2` additionally needs `MOM`/`MACD_SIGNAL`).
+
 Out-of-band exits and redemptions change the chain balance and holdings; record
 the cash with a ledger rebase before the next reconciliation (an unexplained
 difference is an account-wide `BALANCE_DRIFT` that blocks every order for the
