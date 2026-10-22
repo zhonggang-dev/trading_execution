@@ -2099,6 +2099,38 @@ func TestStrategySpecificEvidenceMetricsAndUniverseReason(t *testing.T) {
 	}
 }
 
+func TestConfiguredStrategyOnlyNeedsBestAskMetric(t *testing.T) {
+	book := []domain.OrderBookSnapshot{{
+		TokenID: "token", Status: domain.OrderBookStatusOK,
+		Asks: []domain.PriceLevel{{Price: "0.50", Size: "10"}},
+	}}
+	request := func(strategyID string) domain.StrategyDecisionRequest {
+		return domain.StrategyDecisionRequest{Context: domain.StrategyExecutionContext{
+			ModelID: "test", StrategyID: strategyID, ExecutionAccountID: "account-x",
+		}, OrderBooks: book}
+	}
+	bestAskOnly := domain.StrategyEvidence{Metrics: map[string]string{"best_ask": "0.50", "mid_edge": "0.12"}}
+	if err := validateEvidenceMetrics(bestAskOnly, request("brier_mid_edge_once"), "token", true); err != nil {
+		t.Fatalf("configured strategy with best_ask only error = %v", err)
+	}
+	for _, strategyID := range []string{domain.StrategyIDMultfactorV1, domain.StrategyIDMultfactorV2} {
+		if err := validateEvidenceMetrics(bestAskOnly, request(strategyID), "token", true); err == nil ||
+			!strings.Contains(err.Error(), "near_logdiff_usd") {
+			t.Fatalf("%s without factor metrics error = %v, want rejection", strategyID, err)
+		}
+	}
+	wrongAsk := domain.StrategyEvidence{Metrics: map[string]string{"best_ask": "0.51"}}
+	if err := validateEvidenceMetrics(wrongAsk, request("brier_mid_edge_once"), "token", true); err == nil ||
+		!strings.Contains(err.Error(), "must equal the input best ask") {
+		t.Fatalf("configured strategy with wrong best_ask error = %v", err)
+	}
+	missingAsk := domain.StrategyEvidence{Metrics: map[string]string{"mid_edge": "0.12"}}
+	if err := validateEvidenceMetrics(missingAsk, request("brier_mid_edge_once"), "token", true); err == nil ||
+		!strings.Contains(err.Error(), "best_ask") {
+		t.Fatalf("configured strategy without best_ask error = %v", err)
+	}
+}
+
 func TestDecisionIntentCompletionRequiresDurableExecutionOwnership(t *testing.T) {
 	if _, complete := decisionIntentCompletion(port.OrderSubmitResult{}, errors.New("database unavailable")); complete {
 		t.Fatal("delivery without a durable execution order was marked terminal")

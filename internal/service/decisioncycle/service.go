@@ -2003,7 +2003,13 @@ func validateEvidenceMetrics(evidence domain.StrategyEvidence, request domain.St
 	if !requireAll {
 		return nil
 	}
-	required := []string{"best_ask", "near_logdiff_usd", "rel_spread"}
+	// The factor metrics are multfactor evidence. A strategy that does not use
+	// them (configured strategies such as brier_mid_edge_once) only has to echo
+	// the executable ask; any other metric it sends must still be a decimal.
+	required := []string{"best_ask"}
+	if strategyID == domain.StrategyIDMultfactorV1 || strategyID == domain.StrategyIDMultfactorV2 {
+		required = append(required, "near_logdiff_usd", "rel_spread")
+	}
 	if strategyID == domain.StrategyIDMultfactorV2 {
 		required = append(required, "MOM", "MACD_SIGNAL")
 	}

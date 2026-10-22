@@ -66,7 +66,7 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
   "input_id": "strategy-input-...",
   "context": {
     "model_id": "deepseek_masked",
-    "strategy_id": "strategy_pending_a",
+    "strategy_id": "brier_mid_edge_once",
     "execution_account_id": "main"
   },
   "decision_at": "2026-08-18T04:20:00Z",
@@ -268,7 +268,7 @@ recorders 持久化共享盘口、完整 binding 输入、输出与订单意图�
 
 ```json
 [
-  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
+  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"brier_mid_edge_once","execution_account_id":"main"},
   {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
   {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
   {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
