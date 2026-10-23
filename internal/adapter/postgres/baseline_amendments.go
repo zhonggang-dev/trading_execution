@@ -89,7 +89,7 @@ func (store *BaselineAmendmentStore) Facts(ctx context.Context, accountID, token
 		if err := store.db.QueryRowContext(ctx, `
 			SELECT neg_risk FROM position_lots
 			WHERE execution_account_id=$1 AND token_id=$2 AND neg_risk IS NOT NULL
-			ORDER BY created_at DESC LIMIT 1`, accountID, tokenID).Scan(&negRisk); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			ORDER BY opened_at DESC LIMIT 1`, accountID, tokenID).Scan(&negRisk); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return facts, fmt.Errorf("read position lot neg_risk: %w", err)
 		}
 		if negRisk.Valid {
