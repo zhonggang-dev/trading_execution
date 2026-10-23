@@ -172,7 +172,7 @@ func (recorder *ReconciliationRecorder) CompleteWithState(ctx context.Context, r
 			resolveFillLagDriftIssues, resolvePolymarketPositionPrecisionIssues,
 			resolveRecoveredSellPositionDriftIssues, resolveVerifiedTransientIssues,
 			resolveRecoveredSellPositionTrajectoryIssues,
-			resolveAppliedRedemptionStalledIssues,
+			resolveAppliedRedemptionStalledIssues, resolveAmendedBaselineIssues,
 		}
 		// Wallet migration crosses scopes and retains its original full-scan guard.
 		if run.Status == domain.ReconciliationRunCompleted {
@@ -519,6 +519,58 @@ func resolveWalletMigrationIssues(ctx context.Context, tx *sql.Tx, run domain.Re
 	resolved, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("count resolved wallet-migration reconciliation issues: %w", err)
+	}
+	return int(resolved), nil
+}
+
+// resolveAmendedBaselineIssues closes a stale manual POSITION_DRIFT or
+// EXTERNAL_POSITION_BASELINE_DRIFT of a token whose ownership equation was
+// made consistent by an audited baseline amendment. It never trusts the
+// amendment alone: the token must be independently verified by this run
+// (shares equal baseline + managed ledger), or its unmanaged baseline must be
+// fully retired while the external position source was verified and the token
+// raised nothing in this run.
+func resolveAmendedBaselineIssues(ctx context.Context, tx *sql.Tx, run domain.ReconciliationRun) (int, error) {
+	const resolvedDetails = "; automatically resolved after an audited baseline amendment and a clean reconciliation of the token"
+	result, err := tx.ExecContext(ctx, `
+		UPDATE reconciliation_issues issue
+		SET status='RESOLVED', resolution='AUTOMATIC', resolved_at=$3,
+		    details=issue.details || $4
+		WHERE issue.execution_account_id=$1
+		  AND issue.status='OPEN'
+		  AND issue.resolution='MANUAL_REVIEW'
+		  AND issue.run_id<>$2
+		  AND issue.token_id<>''
+		  AND issue.issue_type IN ('POSITION_DRIFT','EXTERNAL_POSITION_BASELINE_DRIFT')
+		  AND EXISTS (
+		    SELECT 1 FROM execution_external_position_baseline_amendments amendment
+		    WHERE amendment.execution_account_id=issue.execution_account_id
+		      AND amendment.token_id=issue.token_id
+		  )
+		  AND (
+		    $5::jsonb->>('verified_position:' || issue.token_id)='1'
+		    OR (
+		      $5::jsonb->>'verified_source:EXTERNAL_POSITIONS'='1'
+		      AND NOT EXISTS (
+		        SELECT 1 FROM execution_external_position_baseline_remaining remaining
+		        WHERE remaining.execution_account_id=issue.execution_account_id
+		          AND remaining.token_id=issue.token_id
+		      )
+		    )
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM reconciliation_issues active
+		    WHERE active.execution_account_id=issue.execution_account_id
+		      AND active.run_id=$2
+		      AND active.status='OPEN'
+		      AND active.token_id=issue.token_id
+		  )`, run.ExecutionAccountID, run.RunID, run.CompletedAt.UTC(), resolvedDetails, verificationJSON(run))
+	if err != nil {
+		return 0, fmt.Errorf("resolve amended baseline issues: %w", err)
+	}
+	resolved, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count resolved amended baseline issues: %w", err)
 	}
 	return int(resolved), nil
 }

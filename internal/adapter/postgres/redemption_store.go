@@ -57,17 +57,10 @@ func (store *RedemptionStore) requireManaged(redemption domain.Redemption) error
 func (store *RedemptionStore) SyncPendingRedemptions(ctx context.Context) error {
 	_, err := store.db.ExecContext(ctx, `
 		WITH baseline_remaining AS (
-			SELECT item.execution_account_id, LOWER(item.condition_id) AS condition_id,
-			       SUM(COALESCE((
-				   SELECT disposition.shares_after
-				   FROM execution_external_position_dispositions disposition
-				   WHERE disposition.baseline_id=item.baseline_id
-				     AND disposition.token_id=item.token_id
-				     AND disposition.disposition_kind IN ('EXTERNAL_SELL','ADOPTION')
-				   ORDER BY disposition.transition_sequence DESC LIMIT 1
-			   ), item.shares)) AS shares
-			FROM execution_external_position_baseline_items item
-			GROUP BY item.execution_account_id, LOWER(item.condition_id)
+			SELECT remaining.execution_account_id, LOWER(remaining.condition_id) AS condition_id,
+			       SUM(remaining.shares) AS shares
+			FROM execution_external_position_baseline_remaining remaining
+			GROUP BY remaining.execution_account_id, LOWER(remaining.condition_id)
 		), candidates AS (
 			SELECT position.execution_account_id, LOWER(position.condition_id) AS condition_id,
 			       LOWER(account.wallet_address) AS wallet_address,
@@ -274,15 +267,9 @@ func (store *RedemptionStore) BeginRedemptionSubmission(
 			  AND (lot.status<>'SETTLED_PENDING_REDEEM' OR lot.neg_risk IS DISTINCT FROM $6)
 		  )
 		  AND NOT EXISTS (
-			SELECT 1 FROM execution_external_position_baseline_items item
-			WHERE item.execution_account_id=$1 AND LOWER(item.condition_id)=$2
-			  AND COALESCE((
-				SELECT disposition.shares_after
-				FROM execution_external_position_dispositions disposition
-				WHERE disposition.baseline_id=item.baseline_id AND disposition.token_id=item.token_id
-				  AND disposition.disposition_kind IN ('EXTERNAL_SELL','ADOPTION')
-				ORDER BY disposition.transition_sequence DESC LIMIT 1
-			  ), item.shares)>0
+			SELECT 1 FROM execution_external_position_baseline_remaining remaining
+			WHERE remaining.execution_account_id=$1 AND LOWER(remaining.condition_id)=$2
+			  AND remaining.shares>0
 		  )`,
 		redemption.ExecutionAccountID, redemption.ConditionID, string(status), startedAt.UTC(),
 		strings.ToLower(redemption.WalletAddress), redemption.NegRisk)
@@ -581,18 +568,9 @@ func (store *RedemptionStore) ApplyRedemption(
 	}
 
 	baseline, err := numeric(ctx, tx, `
-		WITH remaining AS (
-			SELECT COALESCE((
-				SELECT disposition.shares_after
-				FROM execution_external_position_dispositions disposition
-				WHERE disposition.baseline_id=item.baseline_id AND disposition.token_id=item.token_id
-				  AND disposition.disposition_kind IN ('EXTERNAL_SELL','ADOPTION')
-				ORDER BY disposition.transition_sequence DESC LIMIT 1
-			), item.shares) AS shares
-			FROM execution_external_position_baseline_items item
-			WHERE item.execution_account_id=$1 AND LOWER(item.condition_id)=$2
-		)
-		SELECT COALESCE(SUM(shares),0)::text FROM remaining`, redemption.ExecutionAccountID, redemption.ConditionID)
+		SELECT COALESCE(SUM(remaining.shares),0)::text
+		FROM execution_external_position_baseline_remaining remaining
+		WHERE remaining.execution_account_id=$1 AND LOWER(remaining.condition_id)=$2`, redemption.ExecutionAccountID, redemption.ConditionID)
 	if err != nil {
 		return err
 	}
