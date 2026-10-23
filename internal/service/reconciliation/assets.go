@@ -379,11 +379,13 @@ func (state *runState) compareBaselinedPosition(ctx context.Context, params comp
 	// comparison, no epsilon may absorb a change to an unmanaged cutover amount.
 	// A finality-pending managed fill on the same token changes only the
 	// managed part, so its exact signed delta is added before the comparison.
-	if identityMatches && !expected.Equal(params.external.Shares) &&
+	sharesMatch := expected.Equal(params.external.Shares) ||
+		within(expected, params.external.Shares, domain.BaselineSharesTolerance(params.baseline, params.external.Source))
+	if identityMatches && !sharesMatch &&
 		state.baselinedPositionExplainedByFinalityPendingFills(params.tokenID, expected, params.external.Shares) {
 		return
 	}
-	if !identityMatches || !expected.Equal(params.external.Shares) {
+	if !identityMatches || !sharesMatch {
 		details := "remote position does not equal the immutable unmanaged baseline plus the managed ledger; do not adjust the baseline or invent a managed position"
 		if !identityMatches {
 			details = "remote, unmanaged baseline, and managed ledger position identities do not match exactly; do not merge or relabel the token"

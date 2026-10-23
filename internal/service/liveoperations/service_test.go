@@ -404,3 +404,28 @@ func dataQualityStatus(values []domain.LiveDataQuality, id string) domain.LiveHe
 	}
 	return ""
 }
+
+func TestLiveBaselineQuantityToleratesOnlyAmendmentDataAPIQuantum(t *testing.T) {
+	now := time.Date(2026, 8, 19, 8, 0, 10, 0, time.UTC)
+	for _, test := range []struct {
+		name    string
+		source  string
+		remote  domain.Decimal
+		wantErr bool
+	}{
+		{name: "amendment within the quantum", source: domain.ExternalPositionBaselineSourceAmendment, remote: "0.0251"},
+		{name: "amendment beyond the quantum", source: domain.ExternalPositionBaselineSourceAmendment, remote: "0.0271", wantErr: true},
+		{name: "sealed baseline stays exact", source: "POLYMARKET_DATA_API", remote: "0.0251", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			baseline := testLivePositionBaseline(&now, "0.025174")
+			baseline.Source = test.source
+			external := testLiveExternalPosition(&now, test.remote)
+			external.Source = "POLYMARKET_DATA_API"
+			_, _, err := managedExternalPosition("account-1", external, baseline, nil)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("managedExternalPosition() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}

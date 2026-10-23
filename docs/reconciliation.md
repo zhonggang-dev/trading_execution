@@ -232,6 +232,10 @@ impact_scoped_tokens` 给出影响范围；`/health/ready` 只在账户级问题
 - 已有的人工 issue 由 `resolveAmendedBaselineIssues` 自动关闭，条件是：该 token 有增补；本轮独立核验了该 token
   （`verified_position:<token>`），或其未托管基线已被完全退役且 `verified_source:EXTERNAL_POSITIONS`；并且本轮该 token 没有新问题。
 
+比较容差：封存基线仍按精确相等比较；只有 `BASELINE_AMENDMENT` 来源的残余（链上精确值）在与 Data API 比较时，
+容许一个 Data API 显示单位（0.001 份）的差，因为 Data API 把份额四舍五入到 3～4 位（例如链上 5.025174 显示为 5.0251）。
+对账与运维视图（`liveoperations`）使用同一规则（`domain.BaselineSharesTolerance`）。
+
 运维命令 `cmd/baselineamend` 只推导、不猜测：从链上读取钱包 ERC-1155 余额（已确认区块），从账本读取托管份额与基线剩余，
 身份取自托管持仓（ADD）或封存基线项（RETIRE），`neg_risk` 未知即拒绝。残余默认不得超过 `--max-add-shares 0.1`。
 

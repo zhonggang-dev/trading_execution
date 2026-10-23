@@ -210,7 +210,7 @@ func (repository *ExternalPositionBaselineRepository) appendAmendmentOnlyBaselin
 		}
 		baseline.BaselineID = "baseline-amendment:" + strings.TrimSpace(amendmentID)
 		baseline.ExecutionAccountID = executionAccountID
-		baseline.Source = "BASELINE_AMENDMENT"
+		baseline.Source = domain.ExternalPositionBaselineSourceAmendment
 		baseline.ConditionID = strings.TrimSpace(baseline.ConditionID)
 		baseline.TokenID = strings.TrimSpace(baseline.TokenID)
 		baseline.OutcomeName = strings.TrimSpace(baseline.OutcomeName)

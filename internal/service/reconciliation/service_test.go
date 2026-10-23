@@ -1434,3 +1434,39 @@ func assertIssue(t *testing.T, issues []domain.ReconciliationIssue, issueType do
 	}
 	t.Fatalf("issue %s/%s missing from %#v", issueType, status, issues)
 }
+
+// TestAmendmentResidualToleratesOnlyOneDataAPIQuantum pins the narrow rule: an
+// amendment residual is a chain-exact amount, so the Data API's display
+// precision may differ from the ownership equation by one quantum, while a
+// sealed baseline stays exact and a material difference is still reported.
+func TestAmendmentResidualToleratesOnlyOneDataAPIQuantum(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		source     string
+		remote     domain.Decimal
+		wantStatus domain.ReconciliationRunStatus
+	}{
+		{name: "amendment within the quantum", source: domain.ExternalPositionBaselineSourceAmendment, remote: "0.0251", wantStatus: domain.ReconciliationRunCompleted},
+		{name: "amendment beyond the quantum", source: domain.ExternalPositionBaselineSourceAmendment, remote: "0.0271", wantStatus: domain.ReconciliationRunAttentionRequired},
+		{name: "sealed baseline stays exact", source: "POLYMARKET_DATA_API", remote: "0.0251", wantStatus: domain.ReconciliationRunAttentionRequired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			baseline := testExternalPositionBaseline("0.025174")
+			baseline.Source = test.source
+			external := testExternalPosition(test.remote)
+			external.Source = "POLYMARKET_DATA_API"
+			ledger := &fakeLedger{balance: testBalance("100")}
+			service := newPositionBaselineTestService(t, ledger,
+				[]domain.ExternalPositionBaseline{baseline}, []domain.ExternalPosition{external})
+			result, err := service.RunAccount(context.Background(), RunAccountParams{
+				ExecutionAccountID: "account-1", Trigger: domain.ReconciliationTriggerScheduled,
+			})
+			if err != nil || result.Run.Status != test.wantStatus {
+				t.Fatalf("RunAccount() status/error = %v/%v issues=%#v", result.Run.Status, err, result.Issues)
+			}
+			if test.wantStatus == domain.ReconciliationRunAttentionRequired {
+				assertIssue(t, result.Issues, domain.ReconciliationIssueExternalPositionBaselineDrift, domain.ReconciliationIssueOpen)
+			}
+		})
+	}
+}
