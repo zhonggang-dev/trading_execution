@@ -216,11 +216,16 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, err
 	}
 
+	entryDisabledSet := make(map[string]struct{}, len(cfg.DecisionCycle.EntryDisabledAccounts))
+	for _, accountID := range cfg.DecisionCycle.EntryDisabledAccounts {
+		entryDisabledSet[accountID] = struct{}{}
+	}
 	expectedBindings := make([]postgresadapter.ExpectedExecutionAccount, 0, len(accounts))
 	for _, account := range accounts {
 		_, quarantined := quarantinedAccountSet[account.ExecutionAccountID]
+		_, buyDisabled := entryDisabledSet[account.ExecutionAccountID]
 		preflight, preflightErr := preflightLiveAccount(
-			ctx, account.ExecutionAccountID, quarantined, tradingClient, eligibility,
+			ctx, account.ExecutionAccountID, quarantined, buyDisabled, tradingClient, eligibility,
 		)
 		if preflightErr != nil {
 			return nil, preflightErr
@@ -715,6 +720,7 @@ func preflightLiveAccount(
 	ctx context.Context,
 	executionAccountID string,
 	quarantined bool,
+	buyDisabled bool,
 	client liveAccountProbeClient,
 	eligibility polymarket.GeographicEligibilityChecker,
 ) (liveAccountPreflightResult, error) {
@@ -742,7 +748,10 @@ func preflightLiveAccount(
 		)
 	}
 	result.funding = &funding
-	if !funding.CollateralBalancePositive {
+	// An account behind the BUY gate can never spend collateral, so an empty
+	// balance (funds moved out on purpose) must not stop the whole service.
+	// Allowances and placement eligibility are still required.
+	if !funding.CollateralBalancePositive && !buyDisabled {
 		return liveAccountPreflightResult{}, fmt.Errorf(
 			"execution account %q has no positive CLOB pUSD collateral balance", executionAccountID,
 		)
