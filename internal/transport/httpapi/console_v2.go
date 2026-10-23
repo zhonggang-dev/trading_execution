@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,12 +14,13 @@ import (
 )
 
 type consoleV2FilterOptions struct {
-	Model        bool
-	Strategy     bool
-	Account      bool
-	MarketSource map[string]struct{}
-	Status       map[string]struct{}
-	Side         bool
+	Model           bool
+	Strategy        bool
+	Account         bool
+	MarketSource    map[string]struct{}
+	Status          map[string]struct{}
+	Side            bool
+	RejectTimeRange bool
 }
 
 const consoleV2ReadTimeout = 5 * time.Second
@@ -32,6 +34,8 @@ func (server *Server) registerConsoleV2Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/v1/console/v2/decision-cycles/{cycle_id}", readOnly(server.consoleV2DecisionCycle))
 	mux.Handle("GET /api/v1/console/v2/orders", readOnly(server.consoleV2Orders))
 	mux.Handle("GET /api/v1/console/v2/orders/{order_id}/trace", readOnly(server.consoleV2OrderTrace))
+	mux.Handle("GET /api/v1/console/v2/holdings", readOnly(server.consoleV2Holdings))
+	mux.Handle("GET /api/v1/console/v2/holdings/lots", readOnly(server.consoleV2HoldingLots))
 	mux.Handle("GET /api/v1/console/v2/position-lots", readOnly(server.consoleV2PositionLots))
 	mux.Handle("GET /api/v1/console/v2/reconciliation-runs", readOnly(server.consoleV2ReconciliationRuns))
 	mux.Handle("GET /api/v1/console/v2/reconciliation-issues", readOnly(server.consoleV2ReconciliationIssues))
@@ -106,6 +110,31 @@ func (server *Server) consoleV2OrderTrace(writer http.ResponseWriter, request *h
 		return
 	}
 	value, err := server.consoleV2.OrderTrace(request.Context(), request.PathValue("order_id"))
+	server.writeConsoleV2Result(writer, value, err)
+}
+
+func (server *Server) consoleV2Holdings(writer http.ResponseWriter, request *http.Request) {
+	filter, err := parseConsoleV2Filter(request, consoleV2FilterOptions{
+		Model: true, Strategy: true, Account: true,
+		MarketSource:    map[string]struct{}{"POLYMARKET": {}, "KALSHI": {}},
+		Status:          map[string]struct{}{"OPEN": {}, "SETTLED_PENDING_REDEEM": {}, "MIXED": {}},
+		RejectTimeRange: true,
+	})
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_CONSOLE_V2_FILTER", err.Error())
+		return
+	}
+	value, err := server.consoleV2.Holdings(request.Context(), filter)
+	server.writeConsoleV2Result(writer, value, err)
+}
+
+func (server *Server) consoleV2HoldingLots(writer http.ResponseWriter, request *http.Request) {
+	identity, filter, err := parseConsoleV2HoldingLotsQuery(request)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_CONSOLE_V2_FILTER", err.Error())
+		return
+	}
+	value, err := server.consoleV2.HoldingLots(request.Context(), identity, filter)
 	server.writeConsoleV2Result(writer, value, err)
 }
 
@@ -238,6 +267,9 @@ func parseConsoleV2Filter(request *http.Request, options consoleV2FilterOptions)
 			return consolev2.ListFilter{}, fmt.Errorf("query parameter %q must be provided once", key)
 		}
 	}
+	if options.RejectTimeRange && (query.Has("from") || query.Has("to")) {
+		return consolev2.ListFilter{}, fmt.Errorf("from and to are not supported for this resource")
+	}
 	modelID, err := consoleV2FilterAlias(query, "model_id", "model")
 	if err != nil {
 		return consolev2.ListFilter{}, err
@@ -310,6 +342,123 @@ func parseConsoleV2Filter(request *http.Request, options consoleV2FilterOptions)
 		return consolev2.ListFilter{}, fmt.Errorf("from must be within the bounded one-year query window")
 	}
 	return filter, nil
+}
+
+const maxHoldingIdentityJSONLength = 2048
+
+func parseConsoleV2HoldingLotsQuery(request *http.Request) (consolev2.HoldingIdentity, consolev2.ListFilter, error) {
+	query := request.URL.Query()
+	allowed := map[string]struct{}{"holding_identity": {}, "limit": {}, "offset": {}}
+	for key, values := range query {
+		if _, ok := allowed[key]; !ok {
+			return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("unsupported query parameter %q", key)
+		}
+		if len(values) != 1 {
+			return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("query parameter %q must be provided once", key)
+		}
+	}
+	identityValues, ok := query["holding_identity"]
+	if !ok || len(identityValues) != 1 || strings.TrimSpace(identityValues[0]) == "" {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("holding_identity must be provided once")
+	}
+	rawIdentity := identityValues[0]
+	if len(rawIdentity) > maxHoldingIdentityJSONLength {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("holding_identity is too long")
+	}
+	var tuple []json.RawMessage
+	if err := json.Unmarshal([]byte(rawIdentity), &tuple); err != nil || len(tuple) != 9 {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("holding_identity must be a JSON array of exactly 9 values")
+	}
+	readText := func(index int, name string, nullable bool) (string, error) {
+		var value *string
+		if err := json.Unmarshal(tuple[index], &value); err != nil {
+			return "", fmt.Errorf("holding_identity[%d] %s must be a string", index, name)
+		}
+		if value == nil {
+			if nullable {
+				return "", nil
+			}
+			return "", fmt.Errorf("holding_identity[%d] %s must be a string", index, name)
+		}
+		if len(*value) > 128 || strings.ContainsAny(*value, "\x00\r\n") {
+			return "", fmt.Errorf("holding_identity[%d] %s is invalid", index, name)
+		}
+		return *value, nil
+	}
+	accountID, err := readText(0, "execution_account_id", false)
+	if err != nil {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, err
+	}
+	modelID, err := readText(1, "model_id", false)
+	if err != nil {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, err
+	}
+	strategyID, err := readText(2, "strategy_id", false)
+	if err != nil {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, err
+	}
+	marketSource, err := readText(3, "market_source", true)
+	if err != nil {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, err
+	}
+	marketID, err := readText(4, "market_id", false)
+	if err != nil {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, err
+	}
+	conditionID, err := readText(5, "condition_id", false)
+	if err != nil {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, err
+	}
+	tokenID, err := readText(6, "token_id", false)
+	if err != nil {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, err
+	}
+	var outcomeIndex *int
+	if string(tuple[7]) != "null" {
+		var value int
+		if err := json.Unmarshal(tuple[7], &value); err != nil || (value != 0 && value != 1) {
+			return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("holding_identity[7] outcome_index must be null, 0, or 1")
+		}
+		outcomeIndex = &value
+	}
+	outcomeName, err := readText(8, "outcome_name", true)
+	if err != nil {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, err
+	}
+	var outcomeNamePtr *string
+	if outcomeName != "" {
+		outcomeNamePtr = &outcomeName
+	}
+	filter := consolev2.ListFilter{Limit: 20}
+	if raw := query.Get("limit"); raw != "" {
+		filter.Limit, err = strconv.Atoi(raw)
+		if err != nil {
+			return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("limit must be an integer")
+		}
+	}
+	if raw := query.Get("offset"); raw != "" {
+		filter.Offset, err = strconv.Atoi(raw)
+		if err != nil {
+			return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("offset must be an integer")
+		}
+	}
+	if filter.Limit < 1 || filter.Limit > 100 {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("limit must be between 1 and 100")
+	}
+	if filter.Offset < 0 || filter.Offset > consolev2.MaxOffset {
+		return consolev2.HoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("offset must be between 0 and %d", consolev2.MaxOffset)
+	}
+	return consolev2.HoldingIdentity{
+		ExecutionAccountID: accountID,
+		ModelID:            modelID,
+		StrategyID:         strategyID,
+		MarketSource:       marketSource,
+		MarketID:           marketID,
+		ConditionID:        conditionID,
+		TokenID:            tokenID,
+		OutcomeIndex:       outcomeIndex,
+		OutcomeName:        outcomeNamePtr,
+	}, filter, nil
 }
 
 func consoleV2FilterAlias(query map[string][]string, longName, shortName string) (string, error) {

@@ -13,6 +13,8 @@ SELECT o.order_id, o.client_order_id, NULLIF(o.venue_order_id,''), o.status,
        COALESCE(o.intent->>'strategy_id',''), o.venue,
        COALESCE(o.intent->>'market_source',''), o.market_id,
        COALESCE(o.intent->>'condition_id',''), o.token_id,
+       NULLIF(o.intent->'metadata'->>'market_question',''),
+       NULLIF(o.intent->>'outcome_name',''),
        COALESCE(o.intent->>'side',''),
 	       COALESCE(NULLIF(o.intent->>'price',''), NULLIF(o.intent->>'worst_price',''), ''),
        COALESCE(o.intent->>'size',''), o.filled_size::text,
@@ -182,31 +184,31 @@ func (reader *Reader) loadOrder(ctx context.Context, orderID string) (Order, err
 
 func scanOrderBase(row rowScanner) (Order, error) {
 	var item Order
-	var venueOrderID, modelID, strategyID, marketSource, conditionID, side, price, shares, averageFillPrice sql.NullString
+	var venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice sql.NullString
 	if err := row.Scan(&item.OrderID, &item.ClientOrderID, &venueOrderID, &item.Status,
 		&item.ExecutionAccountID, &modelID, &strategyID, &item.Venue, &marketSource,
-		&item.MarketID, &conditionID, &item.TokenID, &side, &price, &shares,
+		&item.MarketID, &conditionID, &item.TokenID, &marketQuestion, &outcomeName, &side, &price, &shares,
 		&item.FilledShares, &averageFillPrice, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return Order{}, err
 	}
-	populateOrderBase(&item, venueOrderID, modelID, strategyID, marketSource, conditionID, side, price, shares, averageFillPrice)
+	populateOrderBase(&item, venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice)
 	return item, nil
 }
 
 func scanOrder(row rowScanner) (Order, error) {
 	var item Order
-	var venueOrderID, modelID, strategyID, marketSource, conditionID, side, price, shares, averageFillPrice sql.NullString
+	var venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice sql.NullString
 	var fillEvidenceState, accountingState, reservationState sql.NullString
 	var totalFills, confirmedFills, appliedFills, pendingFills, openIssues int64
 	if err := row.Scan(&item.OrderID, &item.ClientOrderID, &venueOrderID, &item.Status,
 		&item.ExecutionAccountID, &modelID, &strategyID, &item.Venue, &marketSource,
-		&item.MarketID, &conditionID, &item.TokenID, &side, &price, &shares,
+		&item.MarketID, &conditionID, &item.TokenID, &marketQuestion, &outcomeName, &side, &price, &shares,
 		&item.FilledShares, &averageFillPrice, &item.CreatedAt, &item.UpdatedAt,
 		&totalFills, &confirmedFills, &appliedFills, &pendingFills,
 		&fillEvidenceState, &accountingState, &openIssues, &reservationState); err != nil {
 		return Order{}, err
 	}
-	populateOrderBase(&item, venueOrderID, modelID, strategyID, marketSource, conditionID, side, price, shares, averageFillPrice)
+	populateOrderBase(&item, venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice)
 	if totalFills < 0 || confirmedFills < 0 || appliedFills < 0 || pendingFills < 0 || openIssues < 0 ||
 		totalFills > int64(maxInt()) || confirmedFills > int64(maxInt()) || appliedFills > int64(maxInt()) ||
 		pendingFills > int64(maxInt()) || openIssues > int64(maxInt()) {
@@ -224,12 +226,14 @@ func scanOrder(row rowScanner) (Order, error) {
 	return item, nil
 }
 
-func populateOrderBase(item *Order, venueOrderID, modelID, strategyID, marketSource, conditionID, side, price, shares, averageFillPrice sql.NullString) {
+func populateOrderBase(item *Order, venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice sql.NullString) {
 	item.VenueOrderID = venueOrderID.String
 	item.ModelID = modelID.String
 	item.StrategyID = strategyID.String
 	item.MarketSource = marketSource.String
 	item.ConditionID = conditionID.String
+	item.MarketQuestion = scanNullableString(marketQuestion)
+	item.OutcomeName = scanNullableString(outcomeName)
 	item.Side = side.String
 	item.Price = price.String
 	item.Shares = shares.String
