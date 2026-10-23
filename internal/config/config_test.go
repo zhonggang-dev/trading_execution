@@ -859,6 +859,46 @@ func TestLoadDecisionCycleDeliveryConcurrency(t *testing.T) {
 	}
 }
 
+func TestLoadDecisionCycleOrderReport(t *testing.T) {
+	t.Run("defaults to disabled with a 24h lookback", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		config, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if len(config.DecisionCycle.OrderReportStrategyIDs) != 0 || config.DecisionCycle.OrderReportLookback != 24*time.Hour {
+			t.Fatalf("order report = %#v / %s", config.DecisionCycle.OrderReportStrategyIDs, config.DecisionCycle.OrderReportLookback)
+		}
+	})
+	t.Run("reads strategy IDs and lookback", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		t.Setenv("DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON", `["brier_mid_edge_once"]`)
+		t.Setenv("DECISION_CYCLE_ORDER_REPORT_LOOKBACK", "72h")
+		config, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if got := config.DecisionCycle.OrderReportStrategyIDs; len(got) != 1 || got[0] != "brier_mid_edge_once" ||
+			config.DecisionCycle.OrderReportLookback != 72*time.Hour {
+			t.Fatalf("order report = %#v / %s", got, config.DecisionCycle.OrderReportLookback)
+		}
+	})
+	t.Run("rejects a non-array strategy list", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		t.Setenv("DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON", `"brier_mid_edge_once"`)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON") {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
+	t.Run("rejects a malformed lookback", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		t.Setenv("DECISION_CYCLE_ORDER_REPORT_LOOKBACK", "soon")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECISION_CYCLE_ORDER_REPORT_LOOKBACK") {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
+}
+
 func TestLoadRejectsPublicLiveListener(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -998,6 +1038,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"CHAIN_CASH_LOG_CHUNK_BLOCKS",
 		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",
 		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
+		"DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON", "DECISION_CYCLE_ORDER_REPORT_LOOKBACK",
 		"DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED",
 		"DECISION_CYCLE_PREDICTION_INFRA_URL", "DECISION_CYCLE_PREDICTION_INFRA_TOKEN",
 		"DECISION_CYCLE_STRATEGY_URL", "DECISION_CYCLE_STRATEGY_TOKEN",

@@ -383,6 +383,44 @@ func (repository *OrderRepository) listPending(
 	return orders, nil
 }
 
+// ListUpdatedSince returns the orders of the given accounts that changed at or
+// after since, oldest change first. It serves read-only reporting and uses the
+// (execution_account_id, updated_at) index.
+func (repository *OrderRepository) ListUpdatedSince(
+	ctx context.Context,
+	executionAccountIDs []string,
+	since time.Time,
+	limit int,
+) ([]domain.Order, error) {
+	executionAccountIDs, err := normalizePendingOrderAccounts(executionAccountIDs)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 10000 {
+		return nil, fmt.Errorf("updated-order limit must be between 1 and 10000")
+	}
+	rows, err := repository.db.QueryContext(ctx, selectOrderColumns+`
+		WHERE execution_account_id = ANY($1::text[]) AND updated_at >= $2
+		ORDER BY updated_at, order_id
+		LIMIT $3`, executionAccountIDs, since.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("query updated orders: %w", err)
+	}
+	defer rows.Close()
+	orders := make([]domain.Order, 0)
+	for rows.Next() {
+		order, err := scanOrder(rows)
+		if err != nil {
+			return nil, err
+		}
+		orders = append(orders, order)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate updated orders: %w", err)
+	}
+	return orders, nil
+}
+
 func normalizePendingOrderAccounts(accountIDs []string) ([]string, error) {
 	if len(accountIDs) == 0 {
 		return nil, fmt.Errorf("active execution accounts are required for pending-order selection")

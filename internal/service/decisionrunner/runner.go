@@ -45,7 +45,15 @@ type Params struct {
 	Now              func() time.Time
 	Wait             WaitFunc
 	Logger           *slog.Logger
+	// AfterCycle runs once after every decision cycle, whether it succeeded or
+	// failed, with its own bounded context. Its error is only logged: it must
+	// never affect the cycle result or readiness. Optional.
+	AfterCycle func(context.Context) error
 }
+
+// afterCycleTimeout bounds the AfterCycle hook so a slow dependency cannot eat
+// into the next boundary.
+const afterCycleTimeout = 30 * time.Second
 
 type Runner struct {
 	cycle            Cycle
@@ -56,6 +64,7 @@ type Runner struct {
 	now              func() time.Time
 	wait             WaitFunc
 	logger           *slog.Logger
+	afterCycle       func(context.Context) error
 
 	mu                    sync.Mutex
 	loopStarted           bool
@@ -122,6 +131,7 @@ func New(params Params) (*Runner, error) {
 		cycle: params.Cycle, interval: params.Interval, startupDelay: params.StartupDelay,
 		maxStartLateness: params.MaxStartLateness,
 		timeout:          params.Timeout, now: params.Now, wait: params.Wait, logger: params.Logger,
+		afterCycle: params.AfterCycle,
 	}, nil
 }
 
@@ -226,7 +236,26 @@ func (runner *Runner) runBoundary(ctx context.Context, boundary time.Time) (deci
 	completedAt := runner.now().UTC()
 	runner.completeCycle(completedAt, err)
 	runner.logResult(boundary.UTC(), result, err)
+	runner.runAfterCycle(ctx)
 	return result, err
+}
+
+// runAfterCycle runs the optional post-cycle hook on a fresh deadline: the
+// cycle's own context is already cancelled and may have expired.
+func (runner *Runner) runAfterCycle(ctx context.Context) {
+	if runner.afterCycle == nil {
+		return
+	}
+	hookContext, cancel := context.WithTimeout(ctx, afterCycleTimeout)
+	defer cancel()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			runner.logger.Error("decision cycle post-hook panicked", "panic", recovered)
+		}
+	}()
+	if err := runner.afterCycle(hookContext); err != nil {
+		runner.logger.Warn("decision cycle post-hook failed", "error", err)
+	}
 }
 
 func (runner *Runner) logResult(boundary time.Time, result decisioncycle.RunResult, runErr error) {

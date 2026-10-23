@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisioncycle"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
+	"github.com/UniPat-AI/trading_execution/internal/service/strategyreport"
 )
 
 type buildDecisionRunnerParams struct {
@@ -92,6 +94,21 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 	if err != nil {
 		return nil, fmt.Errorf("build orderbook snapshot recorder: %w", err)
 	}
+	var orderReporter *strategyreport.Reporter
+	if len(cycleConfig.OrderReportStrategyIDs) > 0 {
+		orderRepository, repositoryErr := postgresadapter.NewOrderRepository(params.database)
+		if repositoryErr != nil {
+			return nil, fmt.Errorf("build order repository for strategy order reports: %w", repositoryErr)
+		}
+		orderReporter, err = buildOrderReporter(cycleConfig, orderRepository, strategyClient, params.logger)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var notSubmittedReporter decisioncycle.NotSubmittedReporter
+	if orderReporter != nil {
+		notSubmittedReporter = orderReporter
+	}
 	cycle, err := decisioncycle.New(decisioncycle.Params{
 		PredictionSource:             predictionClient,
 		PositionSource:               params.positionSource,
@@ -115,6 +132,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		PredictionLookback:           cycleConfig.PredictionLookback,
 		DeliveryStaleAge:             cycleConfig.Timeout,
 		DeliveryConcurrency:          cycleConfig.DeliveryConcurrency,
+		NotSubmittedReporter:         notSubmittedReporter,
 		Logger:                       params.logger,
 	})
 	if err != nil {
@@ -124,11 +142,61 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		Cycle: cycle, Interval: cycleConfig.Interval, StartupDelay: cycleConfig.StartupDelay,
 		MaxStartLateness: cycleConfig.MaxStartLateness,
 		Timeout:          cycleConfig.Timeout, Logger: params.logger,
+		AfterCycle: orderReportHook(orderReporter),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build decision cycle runner: %w", err)
 	}
 	return runner, nil
+}
+
+// buildOrderReporter wires strategy order reporting to the accounts bound to
+// the configured strategies. A configured strategy with no binding is a typo.
+func buildOrderReporter(
+	cycleConfig config.DecisionCycle,
+	orders strategyreport.OrderSource,
+	sink strategyreport.Sink,
+	logger *slog.Logger,
+) (*strategyreport.Reporter, error) {
+	configured := make(map[string]struct{}, len(cycleConfig.OrderReportStrategyIDs))
+	for _, id := range cycleConfig.OrderReportStrategyIDs {
+		configured[id] = struct{}{}
+	}
+	bound := make(map[string]struct{}, len(configured))
+	accounts := make([]string, 0)
+	seenAccounts := make(map[string]struct{})
+	for _, binding := range cycleConfig.Bindings {
+		if _, reported := configured[binding.StrategyID]; !reported {
+			continue
+		}
+		bound[binding.StrategyID] = struct{}{}
+		if _, seen := seenAccounts[binding.ExecutionAccountID]; !seen {
+			seenAccounts[binding.ExecutionAccountID] = struct{}{}
+			accounts = append(accounts, binding.ExecutionAccountID)
+		}
+	}
+	for id := range configured {
+		if _, ok := bound[id]; !ok {
+			return nil, fmt.Errorf("DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON strategy %q has no decision binding", id)
+		}
+	}
+	reporter, err := strategyreport.New(strategyreport.Params{
+		Orders: orders, Sink: sink, StrategyIDs: cycleConfig.OrderReportStrategyIDs, AccountIDs: accounts,
+		Lookback: cycleConfig.OrderReportLookback, Logger: logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build strategy order reporter: %w", err)
+	}
+	return reporter, nil
+}
+
+// orderReportHook returns the post-cycle hook, or nil when reporting is off
+// (a nil func keeps the runner free of any reporting path).
+func orderReportHook(reporter *strategyreport.Reporter) func(context.Context) error {
+	if reporter == nil {
+		return nil
+	}
+	return reporter.Sync
 }
 
 func validateDecisionAccounts(cycleConfig config.DecisionCycle, accountIDs []string) error {

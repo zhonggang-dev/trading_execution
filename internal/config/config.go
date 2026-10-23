@@ -114,6 +114,12 @@ type DecisionCycle struct {
 	// at once. 1 (the default) is strictly sequential. Asset reservation stays
 	// in strategy order at every value.
 	DeliveryConcurrency int
+	// OrderReportStrategyIDs lists the strategies whose order outcomes are
+	// reported back to the strategy service (POST /api/v1/strategy-order-reports).
+	// Empty (the default) disables reporting entirely.
+	OrderReportStrategyIDs []string
+	// OrderReportLookback bounds how far back each report pass re-reads orders.
+	OrderReportLookback time.Duration
 }
 
 // Database 表示后端使用的 Database 类型。
@@ -873,6 +879,17 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	orderReportStrategyIDs, err := decodeDecisionAccountList(
+		"DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON",
+		os.Getenv("DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON"),
+	)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	orderReportLookback, err := duration("DECISION_CYCLE_ORDER_REPORT_LOOKBACK", 24*time.Hour)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	return DecisionCycle{
 		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
 		SubmissionDisabledAccounts:   submissionDisabledAccounts,
@@ -889,7 +906,9 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		MaxStartLateness: maxStartLateness, Timeout: timeout,
 		PredictionLookback: predictionLookback,
 		Bindings:           bindings, PredictionSourceModes: predictionSourceModes,
-		DeliveryConcurrency: deliveryConcurrency,
+		DeliveryConcurrency:    deliveryConcurrency,
+		OrderReportStrategyIDs: orderReportStrategyIDs,
+		OrderReportLookback:    orderReportLookback,
 	}, nil
 }
 
