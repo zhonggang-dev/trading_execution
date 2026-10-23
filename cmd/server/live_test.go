@@ -300,7 +300,7 @@ func TestPreflightLiveAccountAllowsUnfundedQuarantine(t *testing.T) {
 	eligibility := &livePreflightEligibility{err: errors.New("eligibility probe must be skipped")}
 
 	result, err := preflightLiveAccount(
-		context.Background(), "wallet-6", true, client, eligibility,
+		context.Background(), "wallet-6", true, false, client, eligibility,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -325,13 +325,33 @@ func TestPreflightLiveAccountRejectsQuarantinedOpenOrder(t *testing.T) {
 	eligibility := &livePreflightEligibility{}
 
 	_, err := preflightLiveAccount(
-		context.Background(), "wallet-6", true, client, eligibility,
+		context.Background(), "wallet-6", true, false, client, eligibility,
 	)
 	if err == nil || !strings.Contains(err.Error(), "has 1 open CLOB order") {
 		t.Fatalf("preflightLiveAccount() error = %v, want quarantined open-order rejection", err)
 	}
 	if len(client.fundingCalls) != 0 || len(eligibility.calls) != 0 {
 		t.Fatalf("rejected quarantine ran trading-capability probes: funding=%#v eligibility=%#v", client.fundingCalls, eligibility.calls)
+	}
+}
+
+func TestPreflightLiveAccountAllowsEmptyBuyDisabledAccount(t *testing.T) {
+	client := &livePreflightProbeClient{
+		account: polymarket.AccountProbe{ExecutionAccountID: "wallet-1", FunderAddress: "0xfunder"},
+		funding: polymarket.FundingProbe{
+			ExecutionAccountID: "wallet-1", CollateralBalancePositive: false, RequiredAllowancesPositive: true,
+		},
+	}
+	eligibility := &livePreflightEligibility{}
+	result, err := preflightLiveAccount(context.Background(), "wallet-1", false, true, client, eligibility)
+	if err != nil || result.funding == nil || result.eligibility == nil {
+		t.Fatalf("preflightLiveAccount() = %#v, error %v, want an empty BUY-disabled account accepted", result, err)
+	}
+	// Missing allowances still fail: only the balance requirement is relaxed.
+	client.funding.RequiredAllowancesPositive = false
+	if _, err := preflightLiveAccount(context.Background(), "wallet-1", false, true, client, eligibility); err == nil ||
+		!strings.Contains(err.Error(), "missing a positive pUSD allowance") {
+		t.Fatalf("preflightLiveAccount() without allowance error = %v", err)
 	}
 }
 
@@ -346,7 +366,7 @@ func TestPreflightLiveAccountRejectsUnfundedActiveAccount(t *testing.T) {
 	eligibility := &livePreflightEligibility{}
 
 	_, err := preflightLiveAccount(
-		context.Background(), "main", false, client, eligibility,
+		context.Background(), "main", false, false, client, eligibility,
 	)
 	if err == nil || !strings.Contains(err.Error(), "has no positive CLOB pUSD collateral balance") {
 		t.Fatalf("preflightLiveAccount() error = %v, want active collateral rejection", err)
