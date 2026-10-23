@@ -97,6 +97,20 @@ type Params struct {
 	// the value, asset reservation stays in batch order (see
 	// port.ReservationSequence).
 	DeliveryConcurrency int
+	// NotSubmittedReporter is told about BUY decisions that never became an
+	// order, so the strategy can release the market it occupied. Optional.
+	NotSubmittedReporter NotSubmittedReporter
+}
+
+// NotSubmittedReporter reports SUBMIT decisions that were not turned into
+// orders. Implementations must not block for long and must not fail the cycle.
+type NotSubmittedReporter interface {
+	ReportNotSubmitted(
+		ctx context.Context,
+		execution domain.StrategyExecutionContext,
+		decisions []domain.StrategyUndeliveredDecision,
+		failureCode, failureReason string,
+	)
 }
 
 // Service 表示后端使用的 Service 类型。
@@ -138,6 +152,7 @@ type Service struct {
 	deliveryConcurrency              int
 	now                              func() time.Time
 	logger                           *slog.Logger
+	notSubmittedReporter             NotSubmittedReporter
 }
 
 // IntentResult 表示后端使用的 IntentResult 类型。
@@ -294,6 +309,7 @@ func New(params Params) (*Service, error) {
 		deliveryConcurrency:              params.DeliveryConcurrency,
 		now:                              params.Now,
 		logger:                           params.Logger,
+		notSubmittedReporter:             params.NotSubmittedReporter,
 	}, nil
 }
 
@@ -603,7 +619,13 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	}
 	intents, err := validateResponseWithEntryPolicy(request, response, service.venue, params.allowEntries, params.entryBlockReason)
 	if err != nil {
+		// The strategy may already have occupied the markets of every SUBMIT in
+		// a response we refuse as a whole; tell it none of them was placed.
+		service.reportNotSubmitted(ctx, params.binding, submitEvaluations(response), "STRATEGY_RESPONSE_REJECTED", err.Error())
 		return run, err
+	}
+	if !params.allowEntries {
+		service.reportNotSubmitted(ctx, params.binding, submitEvaluations(response), "ENTRY_BLOCKED", params.entryBlockReason)
 	}
 	deliverableIntents, venueDryRunIntents := service.submissionIntents(intents)
 	response, _, err = service.recorder.ClaimOutput(ctx, response, deliverableIntents, params.submitEnabled)
@@ -617,12 +639,14 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 	}
 	_, venueDryRunIntents = service.submissionIntents(intents)
 	if !params.submitEnabled {
+		service.reportNotSubmitted(ctx, params.binding, buyIntentDecisions(intents), "ORDER_SUBMISSION_DISABLED", "decision-cycle order submission is disabled")
 		run.Intents = make([]IntentResult, 0, len(intents))
 		for _, intent := range intents {
 			run.Intents = append(run.Intents, IntentResult{Intent: intent, SubmissionDisabled: true})
 		}
 		return run, nil
 	}
+	service.reportNotSubmitted(ctx, params.binding, buyIntentDecisions(venueDryRunIntents), "VENUE_SUBMISSION_DISABLED", "venue route does not accept submissions")
 	accountDelivery, claimErr := service.deliverPendingForAccount(
 		ctx, params.binding.ExecutionAccountID, response.CycleID, "",
 	)
@@ -651,6 +675,49 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 		})
 	}
 	return run, deliveryErr
+}
+
+// reportNotSubmitted is best effort: a failure is logged by the reporter and
+// never changes the cycle outcome.
+func (service *Service) reportNotSubmitted(
+	ctx context.Context,
+	execution domain.StrategyExecutionContext,
+	decisions []domain.StrategyUndeliveredDecision,
+	failureCode, failureReason string,
+) {
+	if service.notSubmittedReporter == nil || len(decisions) == 0 {
+		return
+	}
+	service.notSubmittedReporter.ReportNotSubmitted(ctx, execution, decisions, failureCode, failureReason)
+}
+
+// submitEvaluations lists the SUBMIT decisions of a strategy response.
+func submitEvaluations(response domain.StrategyDecisionResponse) []domain.StrategyUndeliveredDecision {
+	decisions := make([]domain.StrategyUndeliveredDecision, 0)
+	for _, evaluation := range response.Evaluations {
+		if evaluation.Action != domain.StrategyActionSubmit || strings.TrimSpace(evaluation.DecisionID) == "" {
+			continue
+		}
+		decisions = append(decisions, domain.StrategyUndeliveredDecision{
+			DecisionID: strings.TrimSpace(evaluation.DecisionID), ConditionID: evaluation.ConditionID, TokenID: evaluation.TokenID,
+		})
+	}
+	return decisions
+}
+
+// buyIntentDecisions lists the entry decisions behind intents that were not
+// queued for delivery.
+func buyIntentDecisions(intents []domain.OrderIntent) []domain.StrategyUndeliveredDecision {
+	decisions := make([]domain.StrategyUndeliveredDecision, 0, len(intents))
+	for _, intent := range intents {
+		if intent.Side != domain.SideBuy || strings.TrimSpace(intent.SignalID) == "" {
+			continue
+		}
+		decisions = append(decisions, domain.StrategyUndeliveredDecision{
+			DecisionID: strings.TrimSpace(intent.SignalID), ConditionID: intent.ConditionID, TokenID: intent.TokenID,
+		})
+	}
+	return decisions
 }
 
 // submissionIntents keeps the current Polymarket execution/reconciliation

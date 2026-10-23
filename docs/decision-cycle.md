@@ -191,6 +191,30 @@ strategy/market/token 归属一致，数量不超过 lot 剩余与 position 可�
 由交易所确认是否接受小额退出；shares、金额精度与正数要求不变。单个退出订单在市场校验、预占或下单阶段失败只拒绝该订单，不影响同一响应中的其他
 intent；`exits[]` 的身份/格式错误仍会使整个策略响应被拒绝。
 
+## 订单回报（策略占位释放）
+
+`brier_mid_edge_once` 在应答时就给市场“占位”，只有收到终态回报才释放（累计成交为 0 的终态 = 可重试，
+有成交 = 永久已交易，UNKNOWN 或无回报 = 一直占着）。因此每个 SUBMIT 的 `decision_id`
+都必须被回报，接口为 `POST {DECISION_CYCLE_STRATEGY_URL}/api/v1/strategy-order-reports`
+（同一个 Bearer token，`trading.strategy_order_report.v1`，≤500 条/请求）。
+
+- 开关：`DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON='["brier_mid_edge_once"]'`；留空 = 不回报。
+  列出的策略必须有绑定，否则启动失败。`DECISION_CYCLE_ORDER_REPORT_LOOKBACK`（默认 24h）是每次回读订单的窗口。
+- 有订单的决策：每个决策周期**结束后**（无论成功、失败、没有预测）扫一次这些策略账户在窗口内更新过的 BUY 订单，
+  对尚未确认过当前 `revision` 的订单发回报。无状态：`report_seq` = 订单 `revision`（严格递增、不要求连续），
+  `decision_id` = `OrderIntent.SignalID`，内容由订单行决定，所以重发是幂等的（对方按 `(decision_id, report_seq)` 去重）；
+  进程内只记“已确认的 revision”，重启后整窗重发一遍即可。整批失败（5xx/超时）下个周期自动重发；
+  单条被拒（`UNKNOWN_DECISION`/`REPORT_CONFLICT`/`INVALID_ORDER_REPORT`）只打一条 WARN，不再重试。
+  该钩子有独立的 30 秒超时，错误只记日志，不影响周期结果和 readiness。
+- 状态映射：未到交易所的 RECEIVED/VALIDATING/RESERVED/SUBMITTING 不报；ACKNOWLEDGED→SUBMITTED，LIVE/CANCEL_PENDING→OPEN，
+  有成交→PARTIALLY_FILLED，FILLED/CANCELLED 原样；REJECTED 且无 `venue_order_id`（余额不足、价格漂移、kill switch 等）→
+  NOT_SUBMITTED，交易所拒绝→REJECTED；UNKNOWN/RECONCILING/MANUAL_REVIEW→UNKNOWN（保持占位）。
+  有成交但缺均价时用 `filled_notional / filled_size` 推算，推不出来就不报。
+- 没有订单的决策：`runBinding` 里同步报 NOT_SUBMITTED（`report_seq=1`，重试 3 次、总超时 20 秒，失败只打 ERROR）：
+  策略响应整体被 Go 校验拒绝（`STRATEGY_RESPONSE_REJECTED`，响应里每个 SUBMIT 都报）、下单开关关闭
+  （`ORDER_SUBMISSION_DISABLED`）、入口被封（`ENTRY_BLOCKED`）、路由不接单（`VENUE_SUBMISSION_DISABLED`）。
+- 不覆盖：`Decide` 本身超时/出错（策略可能已占位但我们没拿到响应）和 `ClaimOutput` 出错，仍需人工重置占位。
+
 ## 审计和失败语义
 
 - 概率快照失败：整个周期失败，不使用上一次内存数据；

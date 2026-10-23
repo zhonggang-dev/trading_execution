@@ -395,3 +395,38 @@ func TestDecisionBusyCoversInFlightAndLeadWindow(t *testing.T) {
 		t.Fatal("DecisionBusy() = true after the loop stopped")
 	}
 }
+
+func TestRunBoundaryRunsAfterCycleHookEvenWhenCycleFails(t *testing.T) {
+	now := time.Date(2026, 8, 19, 4, 20, 5, 0, time.UTC)
+	clock := &fakeClock{now: now}
+	calls := 0
+	var hookDeadline bool
+	runner, err := New(Params{
+		Cycle:    &failingCycle{},
+		Interval: RequiredInterval, Timeout: time.Minute, Now: clock.Now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AfterCycle: func(ctx context.Context) error {
+			calls++
+			_, hookDeadline = ctx.Deadline()
+			return errors.New("strategy unavailable") // logged, never propagated
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, runErr := runner.runBoundary(context.Background(), now.Truncate(RequiredInterval)); runErr == nil || runErr.Error() != "cycle failed" {
+		t.Fatalf("runBoundary() error = %v, want the cycle error untouched by the hook", runErr)
+	}
+	if calls != 1 || !hookDeadline {
+		t.Fatalf("hook calls = %d, bounded = %v", calls, hookDeadline)
+	}
+	if runner.inFlight {
+		t.Fatal("the hook must run after the cycle is no longer in flight")
+	}
+}
+
+type failingCycle struct{}
+
+func (failingCycle) Run(_ context.Context, boundary time.Time) (decisioncycle.RunResult, error) {
+	return decisioncycle.RunResult{DecisionAt: boundary}, errors.New("cycle failed")
+}

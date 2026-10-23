@@ -26,6 +26,7 @@ type Params struct {
 // Client 表示后端使用的 Client 类型。
 type Client struct {
 	endpoint    *url.URL
+	reportURL   *url.URL
 	bearerToken string
 	httpClient  *http.Client
 }
@@ -41,6 +42,7 @@ func New(params Params) (*Client, error) {
 	}
 	return &Client{
 		endpoint:    baseURL.ResolveReference(&url.URL{Path: "/api/v4/decisions"}),
+		reportURL:   baseURL.ResolveReference(&url.URL{Path: "/api/v1/strategy-order-reports"}),
 		bearerToken: strings.TrimSpace(params.BearerToken),
 		httpClient:  params.HTTPClient,
 	}, nil

@@ -225,3 +225,52 @@ func selectedFixtureOrderIDs(orders []domain.Order, fixtures map[string]struct{}
 	}
 	return result
 }
+
+func TestOrderRepositoryListUpdatedSincePostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	insertAccount(t, db, "account-reported", "0xreported", "100", "100", "0")
+	insertAccount(t, db, "account-other", "0xother", "100", "100", "0")
+	repository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	fixtures := []struct {
+		id, account string
+		updatedAt   time.Time
+	}{
+		{"updated-old", "account-reported", now.Add(-48 * time.Hour)},
+		{"updated-second", "account-reported", now.Add(-time.Hour)},
+		{"updated-first", "account-reported", now.Add(-2 * time.Hour)},
+		{"updated-other-account", "account-other", now.Add(-time.Hour)},
+	}
+	for _, fixture := range fixtures {
+		order := integrationOrder(fixture.id, fixture.account, "token-"+fixture.id, domain.SideBuy, "1", "0.5")
+		order.Intent.SignalID = "decision-" + fixture.id
+		order.Status = domain.OrderStatusRejected
+		order.FailureCode = "INSUFFICIENT_WALLET_BALANCE"
+		order.CreatedAt = fixture.updatedAt
+		order.UpdatedAt = fixture.updatedAt
+		insertReconciliationSelectionOrder(t, db, order)
+	}
+	got, err := repository.ListUpdatedSince(context.Background(), []string{"account-reported"}, now.Add(-24*time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "order-updated-first" || got[1].ID != "order-updated-second" {
+		t.Fatalf("ListUpdatedSince() = %#v, want the two recent orders of the account, oldest change first", got)
+	}
+	if got[0].Intent.SignalID != "decision-updated-first" || got[0].Revision != 1 || got[0].FailureCode != "INSUFFICIENT_WALLET_BALANCE" {
+		t.Fatalf("scanned order = %#v", got[0])
+	}
+	if limited, err := repository.ListUpdatedSince(context.Background(), []string{"account-reported"}, now.Add(-24*time.Hour), 1); err != nil || len(limited) != 1 {
+		t.Fatalf("limited = %#v, error = %v", limited, err)
+	}
+	if _, err := repository.ListUpdatedSince(context.Background(), nil, now, 10); err == nil {
+		t.Fatal("ListUpdatedSince() without accounts returned no error")
+	}
+}
