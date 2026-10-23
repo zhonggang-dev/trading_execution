@@ -297,3 +297,38 @@ func TestResolveAmendedBaselineIssues(t *testing.T) {
 			statusOf("issue-retired"), statusOf("issue-dust"), statusOf("issue-unamended"))
 	}
 }
+
+// TestBaselineAmendmentFactsReadManagedPositionIdentity runs the position and
+// lot identity queries against the real schema: a residual takes its identity
+// from the managed position, so these must resolve (and tolerate a position
+// without lots, whose neg_risk is then reported as unknown rather than guessed).
+func TestBaselineAmendmentFactsReadManagedPositionIdentity(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	const accountID = "account-baseline-amendment-facts"
+	insertAccount(t, db, accountID, "0xBaselineAmendmentFacts", "20", "20", "0")
+	if _, err := db.Exec(`
+		INSERT INTO execution_positions (
+			execution_account_id, market_id, condition_id, token_id, outcome_index, outcome_name,
+			total_shares, available_shares, reserved_shares, cost_basis
+		) VALUES ($1,'market-facts','condition-facts','token-facts',1,'No',5,5,0,3.4)`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewBaselineAmendmentStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := store.Facts(context.Background(), accountID, "token-facts")
+	if err != nil {
+		t.Fatalf("facts: %v", err)
+	}
+	if facts.WalletAddress != "0xbaselineamendmentfacts" || facts.ManagedShares.String() != "5" ||
+		facts.Position == nil || facts.Position.ConditionID != "condition-facts" ||
+		facts.Position.OutcomeIndex == nil || *facts.Position.OutcomeIndex != 1 ||
+		facts.Position.OutcomeName != "No" || facts.Position.NegRisk != nil || facts.Baseline != nil {
+		t.Fatalf("facts = %#v position=%#v", facts, facts.Position)
+	}
+}
