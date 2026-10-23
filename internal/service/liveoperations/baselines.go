@@ -3,6 +3,7 @@ package liveoperations
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strings"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
@@ -96,7 +97,8 @@ func managedExternalPosition(
 	if err != nil || remoteShares.Sign() <= 0 {
 		return domain.ExternalPosition{}, false, fmt.Errorf("external shares for baseline token %q are invalid", baseline.TokenID)
 	}
-	if expected.Cmp(remoteShares) != 0 {
+	if expected.Cmp(remoteShares) != 0 && !liveSharesWithinTolerance(
+		expected, remoteShares, domain.BaselineSharesTolerance(baseline, external.Source)) {
 		return domain.ExternalPosition{}, false, fmt.Errorf(
 			"external position baseline quantity drift for account %q token %q",
 			accountID, baseline.TokenID,
@@ -132,4 +134,15 @@ func liveOutcomeIndexesEqual(left, right *int) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
+}
+
+// liveSharesWithinTolerance reports |expected-remote| <= tolerance; a zero
+// tolerance keeps the sealed-baseline comparison exact.
+func liveSharesWithinTolerance(expected, remote *big.Rat, tolerance domain.Decimal) bool {
+	limit, err := decimalRat(tolerance)
+	if err != nil {
+		return false
+	}
+	difference := new(big.Rat).Sub(expected, remote)
+	return difference.Abs(difference).Cmp(limit) <= 0
 }

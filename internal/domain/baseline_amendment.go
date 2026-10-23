@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -38,4 +39,26 @@ type BaselineAmendment struct {
 	Evidence           json.RawMessage       `json:"evidence"`
 	Actor              string                `json:"actor"`
 	Reason             string                `json:"reason"`
+}
+
+// ExternalPositionBaselineSourceAmendment is the source of a baseline entry
+// that exists only because of an ADD_RESIDUAL amendment.
+const ExternalPositionBaselineSourceAmendment = "BASELINE_AMENDMENT"
+
+// DataAPIShareQuantum is the display precision of the Polymarket Data API
+// position read model (a millishare). Amendment residuals are exact chain
+// amounts, so a Data API total can legitimately differ from the ownership
+// equation by up to one quantum.
+const DataAPIShareQuantum = Decimal("0.001")
+
+// BaselineSharesTolerance returns how far an external total may differ from
+// baseline + managed shares. Sealed baseline evidence stays exact; only an
+// amendment-derived residual compared against the Data API is allowed the
+// source's own display quantum.
+func BaselineSharesTolerance(baseline ExternalPositionBaseline, externalSource string) Decimal {
+	if baseline.Source == ExternalPositionBaselineSourceAmendment &&
+		strings.EqualFold(strings.TrimSpace(externalSource), "POLYMARKET_DATA_API") {
+		return DataAPIShareQuantum
+	}
+	return "0"
 }
