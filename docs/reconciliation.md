@@ -211,6 +211,40 @@ impact_scoped_tokens` 给出影响范围；`/health/ready` 只在账户级问题
 撤单终局也共享恢复租约。宽限期以已持久化的撤单观察为起点，不能因每次 GET 的新读取时间重置。
 相同错误不再重复追加 CANCELLED→CANCELLED 事件；交易所 404、成交明细不足或累计成交量不符仍保持预占。
 
+### 接管基线增补（baseline amendment）
+
+接管基线（0014）每个账户只封存一份，处置（0016）只能通过带成交编号的外部卖出或采纳来消耗它。
+有两种真实情况不属于这两者，会让 token 级 `POSITION_DRIFT` / `EXTERNAL_POSITION_BASELINE_DRIFT` 永远关不掉：
+
+- **ADD_RESIDUAL**：账本接管前钱包里就有、基线没登记的零头。系统之后买入同一 token，链上就等于账本加零头。
+- **RETIRE_CONSUMED**：未托管的基线份额已被链上销毁（例如败结算 outcome 的零收款赎回），基线却仍声称持有。
+
+增补记录（迁移 0037，表 `execution_external_position_baseline_amendments`）把这两类事实连同链上证据追加写入，
+只改变对账使用的所有权等式 `链上份额 = 未托管基线剩余 + 托管账本份额`，不改基线、持仓、lot、成交和现金：
+
+- 追加写入；`UPDATE` / `DELETE` / `TRUNCATE` 被触发器拒绝。
+- 数据库触发器再次校验：证据必须带 `wallet_address`、`block_number`、`chain_shares`；token 身份必须与封存基线项和更早的增补一致；
+  `RETIRE_CONSUMED` 必须恰好消耗全部剩余，且证据中钱包已不再持有；`ADD_RESIDUAL` 的证据中钱包必须持有该 token。
+- 视图 `execution_external_position_baseline_remaining` 是“未托管剩余”的唯一定义（基线项 − 处置 + 增补）。
+  读取模型 `ListExternalPositionBaselines` 与三处赎回安全检查（待赎回同步、提交前检查、入账前检查）都读它，
+  因此被登记的零头同样会让该 condition 的自动赎回转 `MANUAL_REVIEW`，不会把未托管份额一并赎掉。
+- 基线里没有的 token 以 `BASELINE_AMENDMENT` 来源并入基线集合，集合整体使用同一个 `effective-baseline:<account>` 标识。
+- 已有的人工 issue 由 `resolveAmendedBaselineIssues` 自动关闭，条件是：该 token 有增补；本轮独立核验了该 token
+  （`verified_position:<token>`），或其未托管基线已被完全退役且 `verified_source:EXTERNAL_POSITIONS`；并且本轮该 token 没有新问题。
+
+运维命令 `cmd/baselineamend` 只推导、不猜测：从链上读取钱包 ERC-1155 余额（已确认区块），从账本读取托管份额与基线剩余，
+身份取自托管持仓（ADD）或封存基线项（RETIRE），`neg_risk` 未知即拒绝。残余默认不得超过 `--max-add-shares 0.1`。
+
+```bash
+# 干跑：打印将要写入的增补及其 amendment_id
+baselineamend --account main --token <id> --kind add|retire --actor <运维> --reason <原因> [--note <交易哈希>]
+# 写入：必须固定同一区块，并回填干跑打印的 id
+baselineamend ... --block <N> --apply --confirm-id <amendment_id>
+```
+
+需要 `TRADING_EXECUTION_DATABASE_URL`（有 INSERT 权限的角色）、`POLYGON_RPC_URL`、`POLYGON_ORDER_FILLED_CONFIRMATIONS`。
+同一增补重复写入是 no-op（`amendment_id` 由账户、token、类型、份额与区块哈希决定）。写错只能追加反向增补，不能改。
+
 ## 自动修复白名单
 
 | 事实 | 证据要求 | 自动动作 |

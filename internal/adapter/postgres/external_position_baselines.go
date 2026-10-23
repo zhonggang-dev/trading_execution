@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
@@ -46,7 +47,13 @@ func (repository *ExternalPositionBaselineRepository) ListExternalPositionBaseli
 			       item.outcome_index,
 			       item.outcome_name,
 			       item.neg_risk,
-			       item.shares - COALESCE(sum(disposition.shares_delta),0) AS shares
+			       item.shares - COALESCE(sum(disposition.shares_delta),0)
+			         + COALESCE((
+			             SELECT sum(CASE amendment.kind WHEN 'ADD_RESIDUAL' THEN amendment.shares ELSE -amendment.shares END)
+			             FROM execution_external_position_baseline_amendments AS amendment
+			             WHERE amendment.execution_account_id=item.execution_account_id
+			               AND amendment.token_id=item.token_id
+			         ),0) AS shares
 			FROM execution_external_position_baseline_items AS item
 			LEFT JOIN execution_external_position_dispositions AS disposition
 			  ON disposition.baseline_id=item.baseline_id
@@ -146,6 +153,121 @@ func (repository *ExternalPositionBaselineRepository) ListExternalPositionBaseli
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate external position ownership baseline: %w", err)
+	}
+	return repository.appendAmendmentOnlyBaselines(ctx, executionAccountID, baselines, seenTokens)
+}
+
+// appendAmendmentOnlyBaselines exposes tokens that are not in the sealed
+// baseline but carry an audited ADD_RESIDUAL amendment. Their identity,
+// evidence, actor and reason come from the latest amendment of the token. When
+// any is added the merged set is re-sorted and shares one set identity, because
+// every consumer requires a single baseline set per account.
+func (repository *ExternalPositionBaselineRepository) appendAmendmentOnlyBaselines(
+	ctx context.Context,
+	executionAccountID string,
+	baselines []domain.ExternalPositionBaseline,
+	seenTokens map[string]struct{},
+) ([]domain.ExternalPositionBaseline, error) {
+	rows, err := repository.db.QueryContext(ctx, `
+		WITH net AS (
+			SELECT amendment.token_id,
+			       sum(CASE amendment.kind WHEN 'ADD_RESIDUAL' THEN amendment.shares ELSE -amendment.shares END) AS shares
+			FROM execution_external_position_baseline_amendments AS amendment
+			WHERE amendment.execution_account_id=$1
+			GROUP BY amendment.token_id
+		)
+		SELECT latest.amendment_id, latest.condition_id, latest.token_id, latest.outcome_index,
+		       latest.outcome_name, latest.neg_risk, net.shares::text,
+		       latest.observed_at, latest.evidence, latest.actor, latest.reason
+		FROM net
+		JOIN LATERAL (
+			SELECT candidate.*
+			FROM execution_external_position_baseline_amendments AS candidate
+			WHERE candidate.execution_account_id=$1 AND candidate.token_id=net.token_id
+			ORDER BY candidate.created_at DESC, candidate.amendment_id DESC
+			LIMIT 1
+		) AS latest ON TRUE
+		WHERE net.shares>0
+		  AND NOT EXISTS (
+			SELECT 1 FROM execution_external_position_baseline_items AS item
+			WHERE item.execution_account_id=$1 AND item.token_id=net.token_id
+		  )
+		ORDER BY latest.condition_id, latest.outcome_index NULLS LAST, latest.token_id`, executionAccountID)
+	if err != nil {
+		return nil, fmt.Errorf("query external position baseline amendments: %w", err)
+	}
+	defer rows.Close()
+	added := 0
+	for rows.Next() {
+		var baseline domain.ExternalPositionBaseline
+		var amendmentID, shares string
+		var outcomeIndex sql.NullInt64
+		var evidence []byte
+		if err := rows.Scan(&amendmentID, &baseline.ConditionID, &baseline.TokenID, &outcomeIndex,
+			&baseline.OutcomeName, &baseline.NegRisk, &shares,
+			&baseline.ObservedAt, &evidence, &baseline.Actor, &baseline.Reason); err != nil {
+			return nil, fmt.Errorf("scan external position baseline amendment: %w", err)
+		}
+		baseline.BaselineID = "baseline-amendment:" + strings.TrimSpace(amendmentID)
+		baseline.ExecutionAccountID = executionAccountID
+		baseline.Source = "BASELINE_AMENDMENT"
+		baseline.ConditionID = strings.TrimSpace(baseline.ConditionID)
+		baseline.TokenID = strings.TrimSpace(baseline.TokenID)
+		baseline.OutcomeName = strings.TrimSpace(baseline.OutcomeName)
+		baseline.Actor = strings.TrimSpace(baseline.Actor)
+		baseline.Reason = strings.TrimSpace(baseline.Reason)
+		baseline.ObservedAt = baseline.ObservedAt.UTC()
+		baseline.Evidence = append(json.RawMessage(nil), evidence...)
+		if outcomeIndex.Valid {
+			value := int(outcomeIndex.Int64)
+			baseline.OutcomeIndex = &value
+		}
+		parsed, parseErr := domain.ParseDecimal(shares)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse external position baseline amendment shares for token %q: %w", baseline.TokenID, parseErr)
+		}
+		baseline.Shares = parsed
+		if err := validateExternalPositionBaseline(baseline, executionAccountID); err != nil {
+			return nil, err
+		}
+		if _, exists := seenTokens[baseline.TokenID]; exists {
+			return nil, fmt.Errorf("external position baseline contains duplicate token %q", baseline.TokenID)
+		}
+		seenTokens[baseline.TokenID] = struct{}{}
+		baselines = append(baselines, baseline)
+		added++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate external position baseline amendments: %w", err)
+	}
+	if added == 0 {
+		return baselines, nil
+	}
+	sort.Slice(baselines, func(i, j int) bool {
+		if baselines[i].ConditionID != baselines[j].ConditionID {
+			return baselines[i].ConditionID < baselines[j].ConditionID
+		}
+		if baselines[i].OutcomeIndex == nil || baselines[j].OutcomeIndex == nil {
+			return baselines[i].TokenID < baselines[j].TokenID
+		}
+		if *baselines[i].OutcomeIndex != *baselines[j].OutcomeIndex {
+			return *baselines[i].OutcomeIndex < *baselines[j].OutcomeIndex
+		}
+		return baselines[i].TokenID < baselines[j].TokenID
+	})
+	// One effective set identity, as the reconciliation and live-operations
+	// consumers require; the original ids stay in each row's evidence.
+	setID := baselines[0].BaselineID
+	for _, value := range baselines[1:] {
+		if value.BaselineID != setID {
+			setID = "effective-baseline:" + executionAccountID
+			break
+		}
+	}
+	if strings.HasPrefix(setID, "effective-baseline:") {
+		for index := range baselines {
+			baselines[index].BaselineID = setID
+		}
 	}
 	return baselines, nil
 }
