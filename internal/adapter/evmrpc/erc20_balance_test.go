@@ -82,3 +82,79 @@ func TestERC20BalanceClientFailsAfterReadRetriesInsteadOfReturningZero(t *testin
 		t.Fatalf("GetExternalBalance() = %#v, %v, calls=%d; want unknown after 3 read retries", balance, err, calls)
 	}
 }
+
+const unknownBlockBody = `{"id":1,"jsonrpc":"2.0","error":{"message":"Unknown block","code":26}}`
+
+// unknownBlockClient answers eth_blockNumber normally and fails the first
+// unknownCalls eth_call requests with the load-balancer "Unknown block" error.
+func unknownBlockClient(t *testing.T, unknownCalls int, ethCalls *int) *ERC20BalanceClient {
+	t.Helper()
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(request.Body)
+		if strings.Contains(string(body), `"method":"eth_blockNumber"`) {
+			return &http.Response{
+				StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":1,"result":"0x64"}`)),
+				Request: request,
+			}, nil
+		}
+		*ethCalls++
+		if *ethCalls <= unknownCalls {
+			return &http.Response{
+				StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(unknownBlockBody)), Request: request,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":1,"result":"0x75bcd15"}`)),
+			Request: request,
+		}, nil
+	})}
+	client, err := NewERC20BalanceClient(ERC20BalanceParams{
+		RPCURL: "https://rpc.example", TokenAddress: "0x2222222222222222222222222222222222222222",
+		Asset: "USDC", Decimals: 6, HTTPClient: httpClient,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+// TestERC20BalanceClientWaitsForLaggingNodeToSeeSnapshotBlock 验证节点落后时等待而不是立刻判定余额源不可用。
+func TestERC20BalanceClientWaitsForLaggingNodeToSeeSnapshotBlock(t *testing.T) {
+	ethCalls := 0
+	client := unknownBlockClient(t, 4, &ethCalls)
+	var delays []time.Duration
+	client.sleep = func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		return nil
+	}
+	balance, err := client.GetExternalBalance(context.Background(), "0x1111111111111111111111111111111111111111", "USDC")
+	if err != nil || balance.Amount != "123.456789" || balance.BlockNumber != 100 || ethCalls != 5 {
+		t.Fatalf("GetExternalBalance() = %#v, %v, eth_call=%d; want recovery on the 5th attempt", balance, err, ethCalls)
+	}
+	if len(delays) != 4 || delays[0] != rpcUnknownBlockRetryDelay || delays[3] != 4*rpcUnknownBlockRetryDelay {
+		t.Fatalf("delays = %v; want growing waits between attempts", delays)
+	}
+}
+
+// TestERC20BalanceClientStillFailsWhenBlockStaysUnknown 验证区块始终不可见时仍返回未知结果而不是零。
+func TestERC20BalanceClientStillFailsWhenBlockStaysUnknown(t *testing.T) {
+	ethCalls := 0
+	client := unknownBlockClient(t, 1000, &ethCalls)
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+	balance, err := client.GetExternalBalance(context.Background(), "0x1111111111111111111111111111111111111111", "USDC")
+	if err == nil || !balance.Amount.IsEmpty() || ethCalls != rpcUnknownBlockAttempts ||
+		!strings.Contains(err.Error(), "Unknown block") {
+		t.Fatalf("GetExternalBalance() = %#v, %v, eth_call=%d; want failure after %d attempts", balance, err, ethCalls, rpcUnknownBlockAttempts)
+	}
+}
+
+// TestERC20BalanceClientStopsWaitingWhenContextEnds 验证等待期间上下文结束会立即停止重试。
+func TestERC20BalanceClientStopsWaitingWhenContextEnds(t *testing.T) {
+	ethCalls := 0
+	client := unknownBlockClient(t, 1000, &ethCalls)
+	client.sleep = func(ctx context.Context, delay time.Duration) error { return context.Canceled }
+	_, err := client.GetExternalBalance(context.Background(), "0x1111111111111111111111111111111111111111", "USDC")
+	if err == nil || ethCalls != 1 {
+		t.Fatalf("GetExternalBalance() error = %v, eth_call=%d; want one attempt then stop", err, ethCalls)
+	}
+}
