@@ -26,6 +26,8 @@ type API interface {
 	DecisionCycle(context.Context, string) (DecisionCycleDetail, error)
 	Orders(context.Context, ListFilter) (Page[Order], error)
 	OrderTrace(context.Context, string) (OrderTrace, error)
+	Holdings(context.Context, ListFilter) (Page[Holding], error)
+	HoldingLots(context.Context, HoldingIdentity, ListFilter) (Page[PositionLot], error)
 	PositionLots(context.Context, ListFilter) (Page[PositionLot], error)
 	ReconciliationRuns(context.Context, ListFilter) (Page[ReconciliationRun], error)
 	ReconciliationIssues(context.Context, ListFilter) (Page[ReconciliationIssue], error)
@@ -241,6 +243,8 @@ type Order struct {
 	MarketID           string               `json:"market_id"`
 	ConditionID        string               `json:"condition_id,omitempty"`
 	TokenID            string               `json:"token_id"`
+	MarketQuestion     *string              `json:"market_question"`
+	OutcomeName        *string              `json:"outcome_name"`
 	Side               string               `json:"side,omitempty"`
 	Price              string               `json:"price,omitempty"`
 	Shares             string               `json:"shares,omitempty"`
@@ -337,6 +341,49 @@ type PositionLot struct {
 	AverageEntryPrice  string     `json:"average_entry_price"`
 	OpenedAt           time.Time  `json:"opened_at"`
 	ClosedAt           *time.Time `json:"closed_at,omitempty"`
+}
+
+// HoldingIdentity is the complete grouping key returned by Holdings. Empty
+// market source and empty outcome name retain the projection's normalized
+// grouping semantics; a nil outcome index is a real nullable identity.
+type HoldingIdentity struct {
+	ExecutionAccountID string
+	ModelID            string
+	StrategyID         string
+	MarketSource       string
+	MarketID           string
+	ConditionID        string
+	TokenID            string
+	OutcomeIndex       *int
+	OutcomeName        *string
+}
+
+// Holding is the current, account-scoped position projection used by the
+// trading workspace. Quantities are grouped from durable position lots so
+// historical model/strategy ownership is preserved. Market values are
+// nullable because a missing or stale local mark must never be presented as a
+// fabricated zero.
+type Holding struct {
+	ExecutionAccountID string     `json:"execution_account_id"`
+	ModelID            string     `json:"model_id"`
+	StrategyID         string     `json:"strategy_id"`
+	MarketSource       string     `json:"market_source,omitempty"`
+	MarketID           string     `json:"market_id"`
+	ConditionID        string     `json:"condition_id,omitempty"`
+	TokenID            string     `json:"token_id"`
+	OutcomeIndex       *int       `json:"outcome_index"`
+	OutcomeName        *string    `json:"outcome_name"`
+	MarketQuestion     *string    `json:"market_question"`
+	Status             string     `json:"status"`
+	RemainingShares    string     `json:"remaining_shares"`
+	RemainingCost      string     `json:"remaining_cost"`
+	LotCount           int        `json:"lot_count"`
+	FirstOpenedAt      time.Time  `json:"first_opened_at"`
+	LastOpenedAt       time.Time  `json:"last_opened_at"`
+	MarkPrice          *string    `json:"mark_price"`
+	MarkObservedAt     *time.Time `json:"mark_observed_at"`
+	MarketValue        *string    `json:"market_value"`
+	UnrealizedPnL      *string    `json:"unrealized_pnl"`
 }
 
 type ReconciliationRun struct {

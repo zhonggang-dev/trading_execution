@@ -77,7 +77,7 @@ func TestReaderAgainstMigratedTradingSchema(t *testing.T) {
 		VALUES ($1, 'ACCOUNT', '', TRUE)`, accountID); err != nil {
 		t.Fatal(err)
 	}
-	intent := `{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"console-v2-test-account","client_order_id":"console-v2-client","market_source":"POLYMARKET","condition_id":"` + condition + `","side":"BUY","price":"0.4","size":"2"}`
+	intent := `{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"console-v2-test-account","client_order_id":"console-v2-client","market_source":"POLYMARKET","condition_id":"` + condition + `","side":"BUY","price":"0.4","size":"2","outcome_name":"Yes","metadata":{"market_question":"Historical console question"}}`
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO execution_orders (
 			order_id, client_order_id, execution_account_id, venue, market_id, token_id,
@@ -161,7 +161,7 @@ func TestReaderAgainstMigratedTradingSchema(t *testing.T) {
 		t.Fatalf("cycle detail=%#v err=%v", detail, err)
 	}
 	orders, err := reader.Orders(ctx, ListFilter{Limit: 5})
-	if err != nil || orders.Total != 1 || len(orders.Items) != 1 || orders.Items[0].OrderID != orderID || orders.Items[0].Shares != "2" {
+	if err != nil || orders.Total != 1 || len(orders.Items) != 1 || orders.Items[0].OrderID != orderID || orders.Items[0].Shares != "2" || orders.Items[0].MarketQuestion == nil || *orders.Items[0].MarketQuestion != "Historical console question" || orders.Items[0].OutcomeName == nil || *orders.Items[0].OutcomeName != "Yes" {
 		t.Fatalf("orders=%#v err=%v", orders, err)
 	}
 	filteredOrders, err := reader.Orders(ctx, ListFilter{Limit: 5, Query: "does-not-exist"})
@@ -169,7 +169,7 @@ func TestReaderAgainstMigratedTradingSchema(t *testing.T) {
 		t.Fatalf("filtered empty orders=%#v err=%v", filteredOrders, err)
 	}
 	trace, err := reader.OrderTrace(ctx, orderID)
-	if err != nil || trace.Order.OrderID != orderID || len(trace.Events) != 0 {
+	if err != nil || trace.Order.OrderID != orderID || trace.Order.MarketQuestion == nil || *trace.Order.MarketQuestion != "Historical console question" || trace.Order.OutcomeName == nil || *trace.Order.OutcomeName != "Yes" || len(trace.Events) != 0 {
 		t.Fatalf("trace=%#v err=%v", trace, err)
 	}
 	lots, err := reader.PositionLots(ctx, ListFilter{Limit: 5})
