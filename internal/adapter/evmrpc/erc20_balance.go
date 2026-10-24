@@ -35,9 +35,16 @@ type ERC20BalanceClient struct {
 	decimals     int
 	httpClient   *http.Client
 	now          func() time.Time
+	sleep        func(context.Context, time.Duration) error
 }
 
 var _ port.ExternalBalanceSource = (*ERC20BalanceClient)(nil)
+
+const (
+	rpcResultAttempts         = 3
+	rpcUnknownBlockAttempts   = 6
+	rpcUnknownBlockRetryDelay = 300 * time.Millisecond
+)
 
 // NewERC20BalanceClient 创建并初始化 ERC 20 Balance Client。
 func NewERC20BalanceClient(params ERC20BalanceParams) (*ERC20BalanceClient, error) {
@@ -61,7 +68,7 @@ func NewERC20BalanceClient(params ERC20BalanceParams) (*ERC20BalanceClient, erro
 	}
 	return &ERC20BalanceClient{
 		rpcURL: rpcURL, tokenAddress: token, asset: params.Asset, decimals: params.Decimals,
-		httpClient: params.HTTPClient, now: params.Now,
+		httpClient: params.HTTPClient, now: params.Now, sleep: sleepContext,
 	}, nil
 }
 
@@ -109,41 +116,79 @@ func (client *ERC20BalanceClient) GetExternalBalance(
 func (client *ERC20BalanceClient) rpcResult(ctx context.Context, requestBody map[string]any) (string, error) {
 	payload, _ := json.Marshal(requestBody)
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, client.rpcURL.String(), bytes.NewReader(payload))
-		if err != nil {
-			return "", err
+	for attempt := 1; ; attempt++ {
+		result, err := client.rpcOnce(ctx, payload)
+		if err == nil {
+			return result, nil
 		}
-		request.Header.Set("Content-Type", "application/json")
-		response, err := client.httpClient.Do(request)
-		if err != nil {
-			lastErr = err
-			continue
+		lastErr = err
+		limit := rpcResultAttempts
+		if isUnknownBlockError(err) {
+			// A load-balanced provider can answer eth_blockNumber from a node
+			// that is ahead of the node serving the next eth_call. The block
+			// becomes visible within moments, so wait instead of burning the
+			// retries back to back.
+			limit = rpcUnknownBlockAttempts
 		}
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-		response.Body.Close()
-		if readErr != nil || response.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("RPC HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
-			continue
+		if attempt >= limit {
+			return "", fmt.Errorf("RPC request failed after %d attempts: %w", attempt, lastErr)
 		}
-		var result struct {
-			Result string `json:"result"`
-			Error  *struct {
-				Code    int    `json:"code"`
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal(body, &result); err != nil || result.Error != nil || !strings.HasPrefix(result.Result, "0x") {
-			if result.Error != nil {
-				lastErr = fmt.Errorf("RPC error %d: %s", result.Error.Code, result.Error.Message)
-			} else {
-				lastErr = fmt.Errorf("invalid RPC balance response")
+		if isUnknownBlockError(err) {
+			if err := client.sleep(ctx, time.Duration(attempt)*rpcUnknownBlockRetryDelay); err != nil {
+				return "", fmt.Errorf("RPC request failed after %d attempts: %w", attempt, lastErr)
 			}
-			continue
 		}
-		return result.Result, nil
 	}
-	return "", fmt.Errorf("RPC request failed after 3 attempts: %w", lastErr)
+}
+
+// rpcOnce sends one request and returns its hex result.
+func (client *ERC20BalanceClient) rpcOnce(ctx context.Context, payload []byte) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, client.rpcURL.String(), bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.httpClient.Do(request)
+	if err != nil {
+		return "", err
+	}
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	response.Body.Close()
+	if readErr != nil || response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("RPC HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var result struct {
+		Result string `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil || result.Error != nil || !strings.HasPrefix(result.Result, "0x") {
+		if result.Error != nil {
+			return "", fmt.Errorf("RPC error %d: %s", result.Error.Code, result.Error.Message)
+		}
+		return "", fmt.Errorf("invalid RPC balance response")
+	}
+	return result.Result, nil
+}
+
+// isUnknownBlockError reports whether the node has not seen the requested block yet.
+func isUnknownBlockError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unknown block") || strings.Contains(message, "header not found") ||
+		strings.Contains(message, "block not found")
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // normalizedAddress 规范化 d Address 的字段和表示。
