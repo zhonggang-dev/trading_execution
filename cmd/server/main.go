@@ -14,6 +14,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/paper"
+	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarketdata"
 	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/risk"
 	"github.com/UniPat-AI/trading_execution/internal/config"
@@ -26,6 +27,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 	"github.com/UniPat-AI/trading_execution/internal/service/tradehistory"
+	"github.com/UniPat-AI/trading_execution/internal/service/walletpnl"
 	"github.com/UniPat-AI/trading_execution/internal/transport/httpapi"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -114,6 +116,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	walletPnLService, err := buildWalletPnLService(database, cfg, live)
+	if err != nil {
+		return err
+	}
 	edgeDistributionService, err := buildEdgeDistributionService(database)
 	if err != nil {
 		return err
@@ -121,6 +127,7 @@ func run() error {
 	httpParams := httpapi.Params{
 		Service:          executionService,
 		TradeHistory:     tradeHistoryService,
+		WalletPnL:        walletPnLService,
 		EdgeDistribution: edgeDistributionService,
 		Logger:           logger,
 		APIToken:         cfg.HTTP.APIToken,
@@ -218,6 +225,27 @@ func run() error {
 		}
 		return err
 	}
+}
+
+// buildWalletPnLService wires the public Data API to the authoritative
+// execution_accounts identity for the four live wallets. It is read-only and
+// deliberately absent from paper-mode servers.
+func buildWalletPnLService(database *sql.DB, cfg config.Config, live *liveRuntime) (*walletpnl.Service, error) {
+	if database == nil || live == nil || len(live.activeAccounts) == 0 {
+		return nil, nil
+	}
+	addresses, err := postgresadapter.NewWalletAddressRepository(database)
+	if err != nil {
+		return nil, err
+	}
+	source, err := polymarketdata.NewPnLClient(polymarketdata.PnLClientParams{
+		BaseURL:    cfg.Polymarket.DataAPIURL,
+		HTTPClient: noRedirectHTTPClient(cfg.Polymarket.RequestTimeout),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return walletpnl.New(walletpnl.Params{Addresses: addresses, Source: source, Accounts: live.activeAccounts, TTL: 5 * time.Minute})
 }
 
 // consoleV2RuntimeConfig builds the browser-safe runtime projection. It keeps

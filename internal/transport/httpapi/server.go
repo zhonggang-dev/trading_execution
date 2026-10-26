@@ -24,6 +24,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/positionexit"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
+	"github.com/UniPat-AI/trading_execution/internal/service/walletpnl"
 )
 
 const maxRequestBodyBytes = 1 << 20
@@ -76,6 +77,7 @@ type Params struct {
 	PositionExitJob  positionExitJob
 	Reconciliation   reconciliationJob
 	TradeHistory     tradeHistoryService
+	WalletPnL        *walletpnl.Service
 	LiveOperations   liveOperationsService
 	EdgeDistribution edgeDistributionService
 	ConsoleV2        consolev2.API
@@ -97,6 +99,7 @@ type Server struct {
 	positionExitJob  positionExitJob
 	reconciliation   reconciliationJob
 	tradeHistory     tradeHistoryService
+	walletPnL        *walletpnl.Service
 	liveOperations   liveOperationsService
 	edgeDistribution edgeDistributionService
 	consoleV2        consolev2.API
@@ -140,6 +143,7 @@ func New(params Params) (*Server, error) {
 		positionExitJob:  params.PositionExitJob,
 		reconciliation:   params.Reconciliation,
 		tradeHistory:     params.TradeHistory,
+		walletPnL:        params.WalletPnL,
 		liveOperations:   params.LiveOperations,
 		edgeDistribution: params.EdgeDistribution,
 		consoleV2:        params.ConsoleV2,
@@ -165,6 +169,10 @@ func New(params Params) (*Server, error) {
 		mux.Handle("GET /api/v1/ledger-activities", server.authenticate(http.HandlerFunc(server.ledgerActivities)))
 		mux.Handle("GET /api/v1/daily-pnl", server.authenticate(http.HandlerFunc(server.dailyPnL)))
 	}
+	// Keep the route stable even in paper/unconfigured mode; the handler
+	// returns a truthful 503 instead of making the BFF infer availability from
+	// a 404 or risking a nil service call.
+	mux.Handle("GET /api/v1/wallet-pnl", server.authenticateReadOnly(http.HandlerFunc(server.walletPnLHandler)))
 	if server.liveOperations != nil {
 		mux.Handle("GET /api/v1/live-operations", server.authenticateReadOnly(http.HandlerFunc(server.getLiveOperations)))
 	}
