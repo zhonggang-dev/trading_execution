@@ -188,6 +188,9 @@ func TestReaderPaginationSnapshotAndCancellation(t *testing.T) {
 			if page.Total != check.want || len(page.Items) != wantItems || page.HasMore != (check.want > 100) {
 				t.Fatalf("page total=%d items=%d has_more=%v, want total=%d items=%d has_more=%v", page.Total, len(page.Items), page.HasMore, check.want, wantItems, check.want > 100)
 			}
+			if len(page.Items) > 0 && (page.Items[0].MarketQuestion != nil || page.Items[0].OutcomeName != nil) {
+				t.Fatalf("legacy order labels should remain nullable: %#v", page.Items[0])
+			}
 			if check.want == 101 {
 				last, err := reader.Orders(ctx, ListFilter{Limit: 100, Offset: 100, Status: check.status, ExecutionAccountID: matrixAccount})
 				if err != nil {

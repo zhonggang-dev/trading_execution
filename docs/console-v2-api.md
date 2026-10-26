@@ -121,7 +121,10 @@ is invoked.
 - `GET /api/v1/console/v2/orders` reads `execution_orders`. It returns
   `order_id`, client/venue order identity, lifecycle status, account and
   binding identity, venue/market/condition/token identity, side, requested
-  shares/price, filled shares/average fill price, and created/updated times.
+  shares/price, filled shares/average fill price, the nullable
+  order-owned `market_question` and `outcome_name` frozen in `intent`, and
+  created/updated times. These labels are never looked up from current market
+  data; missing historical fields remain JSON `null`.
   The default view covers recent orders and includes all non-terminal statuses
   (`UNKNOWN`, `RECONCILING`, and `MANUAL_REVIEW` remain visible when present).
   Filters are `q`, `model_id`, `strategy_id`, `execution_account_id`,
@@ -138,6 +141,33 @@ is invoked.
   confirmed fill, and applied fill remain separate fields/statuses.
 
 ## Lots, reconciliation, and redemptions
+
+- `GET /api/v1/console/v2/holdings` returns the current positive holdings
+  projection, grouped by account, historical model/strategy ownership, market,
+  condition, token, and stored outcome identity. It includes `OPEN` and
+  `SETTLED_PENDING_REDEEM` lots regardless of age and sums their remaining
+  shares/cost with an exact `lot_count`. A group containing both lifecycle
+  states is returned as `MIXED`; a status filter applies to this complete group,
+  never to a partial lot sum. `market_source` and `market_question` are read
+  only from an opening order matching the lot account, market, condition and
+  token. The returned outcome identity remains the lot identity. `mark_price`, `market_value`, and
+  `unrealized_pnl` are nullable and are populated only when the matching
+  account/market/condition/token row in `execution_positions` has a mark; a
+  missing mark is not returned as zero. This current projection does not accept
+  `from` or `to`; use `position-lots` for an explicit opened-at history query.
+  Supported filters are `q`, `model_id`, `strategy_id`,
+  `execution_account_id`, `market_source`, `status`, `limit`, and `offset`.
+
+- `GET /api/v1/console/v2/holdings/lots` returns the exact current lot members
+  for one Holdings row. Pass `holding_identity` as a URL-encoded JSON array in
+  the order `[execution_account_id, model_id, strategy_id, market_source,
+  market_id, condition_id, token_id, outcome_index, outcome_name]`; source
+  `null`/empty and outcome name `null`/empty use the same normalized grouping
+  semantics as `holdings`, and `outcome_index` may be `null`. The endpoint only
+  includes positive `OPEN` and `SETTLED_PENDING_REDEEM` lots, uses the same
+  strict opening-order identity checks and exact count/page snapshot, and does
+  not accept `q`, `from`, or `to`. It returns the existing `PositionLot` page
+  shape and an unmatched identity returns `total: 0`.
 
 - `GET /api/v1/console/v2/position-lots` reads the durable lot identity and
   ownership fields: `lot_id`, model/strategy/account, market identity,

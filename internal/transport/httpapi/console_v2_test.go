@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +58,14 @@ func (fake *fakeConsoleV2Service) Orders(context.Context, consolev2.ListFilter) 
 
 func (fake *fakeConsoleV2Service) OrderTrace(context.Context, string) (consolev2.OrderTrace, error) {
 	return consolev2.OrderTrace{}, fake.readErr
+}
+
+func (fake *fakeConsoleV2Service) Holdings(context.Context, consolev2.ListFilter) (consolev2.Page[consolev2.Holding], error) {
+	return consolev2.Page[consolev2.Holding]{}, fake.readErr
+}
+
+func (fake *fakeConsoleV2Service) HoldingLots(context.Context, consolev2.HoldingIdentity, consolev2.ListFilter) (consolev2.Page[consolev2.PositionLot], error) {
+	return consolev2.Page[consolev2.PositionLot]{}, fake.readErr
 }
 
 func (fake *fakeConsoleV2Service) PositionLots(context.Context, consolev2.ListFilter) (consolev2.Page[consolev2.PositionLot], error) {
@@ -132,6 +141,7 @@ func TestConsoleV2RejectsWritesAndInvalidFilters(t *testing.T) {
 		"/api/v1/console/v2/orders?model=echo&model_id=echo",
 		"/api/v1/console/v2/runtime?limit=1",
 		"/api/v1/console/v2/decision-cycles?from=not-a-time",
+		"/api/v1/console/v2/holdings?from=2026-01-01T00:00:00Z",
 	} {
 		response := performRequest(t, server, http.MethodGet, path, "", "readonly-secret")
 		if response.Code != http.StatusBadRequest {
@@ -141,6 +151,8 @@ func TestConsoleV2RejectsWritesAndInvalidFilters(t *testing.T) {
 	for _, path := range []string{
 		"/api/v1/console/v2/orders?account=wallet-1&source=POLYMARKET&side=BUY",
 		"/api/v1/console/v2/decision-cycles?account=wallet-1&model=echo",
+		"/api/v1/console/v2/holdings?account=wallet-1&source=POLYMARKET",
+		"/api/v1/console/v2/holdings?status=MIXED",
 	} {
 		response := performRequest(t, server, http.MethodGet, path, "", "readonly-secret")
 		if response.Code != http.StatusOK {
@@ -161,6 +173,35 @@ func TestConsoleV2AcceptsBrowserSafeDeepOffset(t *testing.T) {
 	}
 	if filter.Offset != consolev2.MaxOffset {
 		t.Fatalf("offset=%d, want %d", filter.Offset, consolev2.MaxOffset)
+	}
+}
+
+func TestConsoleV2HoldingLotsIdentityQuery(t *testing.T) {
+	raw := `["wallet-1","model-1","strategy-1",null,"market-1","condition-1","token-1",null,null]`
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/console/v2/holdings/lots?holding_identity="+url.QueryEscape(raw)+"&limit=1&offset=2", nil)
+	identity, filter, err := parseConsoleV2HoldingLotsQuery(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.ExecutionAccountID != "wallet-1" || identity.MarketSource != "" || identity.OutcomeIndex != nil || identity.OutcomeName != nil || filter.Limit != 1 || filter.Offset != 2 {
+		t.Fatalf("identity=%#v filter=%#v", identity, filter)
+	}
+	server := testConsoleV2Server(t, &fakeConsoleV2Service{})
+	response := performRequest(t, server, http.MethodGet, "/api/v1/console/v2/holdings/lots?holding_identity="+url.QueryEscape(raw), "", "readonly-secret")
+	if response.Code != http.StatusOK {
+		t.Fatalf("holding lots response status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, target := range []string{
+		"/api/v1/console/v2/holdings/lots",
+		"/api/v1/console/v2/holdings/lots?holding_identity=" + url.QueryEscape(`["a"]`),
+		"/api/v1/console/v2/holdings/lots?holding_identity=" + url.QueryEscape(raw) + "&q=token-1",
+		"/api/v1/console/v2/holdings/lots?holding_identity=" + url.QueryEscape(raw) + "&holding_identity=" + url.QueryEscape(raw),
+		"/api/v1/console/v2/holdings/lots?holding_identity=" + url.QueryEscape(`["a","b","c","","m","c","t",2,"Yes"]`),
+		"/api/v1/console/v2/holdings/lots?holding_identity=" + url.QueryEscape(`[null,"b","c","","m","c","t",null,null]`),
+	} {
+		if _, _, err := parseConsoleV2HoldingLotsQuery(httptest.NewRequest(http.MethodGet, target, nil)); err == nil {
+			t.Fatalf("accepted invalid holding lots query %s", target)
+		}
 	}
 }
 
