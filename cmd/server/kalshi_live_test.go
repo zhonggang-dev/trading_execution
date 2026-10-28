@@ -79,6 +79,9 @@ func TestKalshiPreflightFailureLeavesPolymarketRouteOperational(t *testing.T) {
 	if len(composition.activeAccounts) != 0 {
 		t.Fatalf("active Kalshi accounts = %#v, want none after failed preflight", composition.activeAccounts)
 	}
+	if len(composition.settlements) != 0 {
+		t.Fatalf("settlement services = %d, want none for a route that failed preflight", len(composition.settlements))
+	}
 	polymarketIntent := domain.OrderIntent{
 		ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main",
 		MarketSource: domain.MarketSourcePolymarket, Venue: "polymarket", MarketID: "pm-market", TokenID: "pm-token",

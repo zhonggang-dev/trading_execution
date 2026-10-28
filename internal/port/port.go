@@ -297,6 +297,23 @@ type RedemptionReceiptSource interface {
 	ResolveRedemptionReceipt(ctx context.Context, transactionHash, walletAddress, conditionID string, negRisk bool) (domain.RedemptionReceipt, error)
 }
 
+// KalshiSettlementSource reads the exchange's settlement records and balance.
+type KalshiSettlementSource interface {
+	ListSettlements(ctx context.Context, ticker string) ([]domain.KalshiSettlement, error)
+	AvailableBalance(ctx context.Context) (domain.Decimal, error)
+}
+
+// KalshiSettlementStore applies exchange settlements to the local ledger.
+type KalshiSettlementStore interface {
+	// OpenKalshiSettlementTickers lists markets in which the account still holds
+	// open shares and that have no settlement row yet.
+	OpenKalshiSettlementTickers(ctx context.Context, executionAccountID string) ([]string, error)
+	ApplyKalshiSettlement(ctx context.Context, executionAccountID string, settlement domain.KalshiSettlement, appliedAt time.Time) (domain.KalshiSettlementOutcome, error)
+	// CheckKalshiBalance compares the exchange balance with the local total and
+	// records or resolves a drift row. It never changes the ledger.
+	CheckKalshiBalance(ctx context.Context, executionAccountID string, exchangeBalance, threshold domain.Decimal, observedAt time.Time) (domain.KalshiBalanceCheck, error)
+}
+
 type RedemptionVenue interface {
 	RedemptionApproved(ctx context.Context, walletAddress string, negRisk bool) (bool, error)
 	SubmitRedemptionApproval(ctx context.Context, executionAccountID string, negRisk bool) (domain.RedemptionSubmission, error)
