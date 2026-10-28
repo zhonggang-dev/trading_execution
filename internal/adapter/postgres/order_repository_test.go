@@ -274,3 +274,83 @@ func TestOrderRepositoryListUpdatedSincePostgresIntegration(t *testing.T) {
 		t.Fatal("ListUpdatedSince() without accounts returned no error")
 	}
 }
+
+// TestOrderRepositoryCreateStoresDecisionQuotesPostgresIntegration 验证买入单创建时写入决策盘口和 YES 概率，
+// 缺失的一侧和不带盘口的订单为 NULL，重复创建不改写已存的值。
+func TestOrderRepositoryCreateStoresDecisionQuotesPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	insertAccount(t, db, "account-quotes", "0xquotes", "100", "100", "0")
+	repository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	full := integrationOrder("quotes-full", "account-quotes", "token-full", domain.SideBuy, "10", "0.5")
+	full.Intent.DecisionQuotes = &domain.OrderDecisionQuotes{YesBid: "0.48", YesAsk: "0.50", NoBid: "0.49", NoAsk: "0.52", YesProbability: "0.7"}
+	partial := integrationOrder("quotes-partial", "account-quotes", "token-partial", domain.SideBuy, "10", "0.5")
+	partial.Intent.DecisionQuotes = &domain.OrderDecisionQuotes{YesBid: "0.37", YesAsk: "0.39", YesProbability: "0.65"}
+	none := integrationOrder("quotes-none", "account-quotes", "token-none", domain.SideSell, "10", "0.5")
+	for _, order := range []domain.Order{full, partial, none} {
+		if _, created, err := repository.Create(ctx, order); err != nil || !created {
+			t.Fatalf("Create(%s) created=%v error=%v", order.ID, created, err)
+		}
+	}
+	replay := full
+	replay.Intent.DecisionQuotes = &domain.OrderDecisionQuotes{YesBid: "0.01"}
+	if _, created, err := repository.Create(ctx, replay); err != nil || created {
+		t.Fatalf("replayed Create() created=%v error=%v, want idempotent no-op", created, err)
+	}
+
+	type stored struct{ yesBid, yesAsk, noBid, noAsk, yesProbability sql.NullString }
+	read := func(orderID string) stored {
+		t.Helper()
+		var row stored
+		if err := db.QueryRowContext(ctx, `
+			SELECT decision_yes_bid::text, decision_yes_ask::text, decision_no_bid::text,
+			       decision_no_ask::text, decision_yes_probability::text
+			FROM execution_orders WHERE order_id = $1`, orderID).
+			Scan(&row.yesBid, &row.yesAsk, &row.noBid, &row.noAsk, &row.yesProbability); err != nil {
+			t.Fatalf("read %s: %v", orderID, err)
+		}
+		return row
+	}
+	text := func(value sql.NullString) string {
+		if !value.Valid {
+			return "NULL"
+		}
+		return value.String
+	}
+	for _, test := range []struct {
+		orderID string
+		want    [5]string
+	}{
+		{orderID: full.ID, want: [5]string{"0.48", "0.50", "0.49", "0.52", "0.7"}},
+		{orderID: partial.ID, want: [5]string{"0.37", "0.39", "NULL", "NULL", "0.65"}},
+		{orderID: none.ID, want: [5]string{"NULL", "NULL", "NULL", "NULL", "NULL"}},
+	} {
+		row := read(test.orderID)
+		got := [5]string{text(row.yesBid), text(row.yesAsk), text(row.noBid), text(row.noAsk), text(row.yesProbability)}
+		if got != test.want {
+			t.Fatalf("%s decision quotes = %v, want %v", test.orderID, got, test.want)
+		}
+	}
+
+	var intentQuotes json.RawMessage
+	if err := db.QueryRowContext(ctx, `SELECT intent -> 'decision_quotes' FROM execution_orders WHERE order_id = $1`, full.ID).Scan(&intentQuotes); err != nil {
+		t.Fatal(err)
+	}
+	var decoded domain.OrderDecisionQuotes
+	if err := json.Unmarshal(intentQuotes, &decoded); err != nil || decoded != *full.Intent.DecisionQuotes {
+		t.Fatalf("intent decision_quotes = %s (%v), want %#v", intentQuotes, err, *full.Intent.DecisionQuotes)
+	}
+
+	bad := integrationOrder("quotes-bad", "account-quotes", "token-bad", domain.SideBuy, "10", "0.5")
+	bad.Intent.DecisionQuotes = &domain.OrderDecisionQuotes{YesBid: "1.2"}
+	if _, _, err := repository.Create(ctx, bad); err == nil {
+		t.Fatal("Create() accepted a decision bid above 1")
+	}
+}

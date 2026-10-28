@@ -71,6 +71,33 @@ func TestSubmitGrandfathersExistingKalshiFOKOrderDuringIOCRollout(t *testing.T) 
 	}
 }
 
+// TestSubmitReplaysAcrossDecisionQuotesRollout 验证上线前已创建、不带决策盘口的订单，
+// 上线后以带盘口的同一意图重放时按幂等返回原订单，不报冲突也不二次下单；
+// 同时叠加 Kalshi FOK 到 IOC 的过渡判定。
+func TestSubmitReplaysAcrossDecisionQuotesRollout(t *testing.T) {
+	venue := &fakeVenue{name: "kalshi"}
+	service := newService(t, venue, allowGuard{})
+	legacy := validKalshiExecutionIntent("client-kalshi-quotes-rollout")
+	first, err := service.Submit(context.Background(), legacy)
+	if err != nil {
+		t.Fatalf("legacy Submit() error = %v", err)
+	}
+	current := legacy
+	current.TimeInForce = domain.TimeInForceIOC
+	current.Metadata = map[string]string{
+		"strategy_time_in_force":  "FOK",
+		"execution_time_in_force": "IOC",
+	}
+	current.DecisionQuotes = &domain.OrderDecisionQuotes{YesBid: "0.48", YesAsk: "0.50", YesProbability: "0.7"}
+	replayed, err := service.Submit(context.Background(), current)
+	if err != nil || replayed.Created || replayed.Order.ID != first.Order.ID || replayed.Order.Intent.DecisionQuotes != nil {
+		t.Fatalf("quotes rollout replay = %#v, %v", replayed, err)
+	}
+	if venue.placeCalls.Load() != 1 {
+		t.Fatalf("venue placement calls = %d, want one historical placement", venue.placeCalls.Load())
+	}
+}
+
 // TestSubmitRejectsClientOrderIDConflict 验证 Submit Rejects Client Order ID Conflict 场景下的行为。
 func TestSubmitRejectsClientOrderIDConflict(t *testing.T) {
 	venue := &fakeVenue{}

@@ -562,6 +562,11 @@ func TestRunBuildsFrozenInputAndExecutesRecordedStrategyOutput(t *testing.T) {
 		!intent.SignalAt.Equal(strategy.response.DecidedAt) || intent.WorstPrice != "0.50" {
 		t.Fatalf("execution market context = %#v", intent)
 	}
+	// 买入单经过冻结、投递、执行后仍带着本轮决策的 YES 盘口和 YES 概率。
+	if intent.DecisionQuotes == nil || intent.DecisionQuotes.YesBid != "0.48" || intent.DecisionQuotes.YesAsk != "0.50" ||
+		intent.DecisionQuotes.YesProbability != "0.7" {
+		t.Fatalf("executed decision quotes = %#v", intent.DecisionQuotes)
+	}
 }
 
 func samePriceLevels(left, right []domain.PriceLevel) bool {
@@ -3149,6 +3154,9 @@ func TestValidateResponseBuildsSellExitWithoutHoldPriceOrDepthGates(t *testing.T
 	if intent.Side != domain.SideSell || intent.TargetLotID != "lot-1" || intent.WorstPrice != "0.60" ||
 		intent.Price != "0.60" || intent.Size != "12.50" || intent.TimeInForce != domain.TimeInForceFOK {
 		t.Fatalf("exit intent = %#v", intent)
+	}
+	if intent.DecisionQuotes != nil {
+		t.Fatalf("SELL decision quotes = %#v, want nil", intent.DecisionQuotes)
 	}
 	if intent.Metadata["strategy_reason_code"] != "STOP_LOSS" || intent.Metadata["strategy_reference_price"] != "0.49" {
 		t.Fatalf("exit metadata = %#v", intent.Metadata)

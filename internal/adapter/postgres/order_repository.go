@@ -38,6 +38,10 @@ func (repository *OrderRepository) Create(ctx context.Context, order domain.Orde
 	if err != nil {
 		return domain.Order{}, false, err
 	}
+	quotes := domain.OrderDecisionQuotes{}
+	if order.Intent.DecisionQuotes != nil {
+		quotes = *order.Intent.DecisionQuotes
+	}
 	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return domain.Order{}, false, fmt.Errorf("begin order create: %w", err)
@@ -48,11 +52,14 @@ func (repository *OrderRepository) Create(ctx context.Context, order domain.Orde
 			order_id, client_order_id, execution_account_id, venue, market_id,
 			token_id, intent, market_validation, venue_order_id, status,
 			filled_size, filled_notional, total_fees, average_fill_price, failure_code, failure_reason,
-			venue_last_observed_at, revision, created_at, updated_at
+			venue_last_observed_at, revision, created_at, updated_at,
+			decision_yes_bid, decision_yes_ask, decision_no_bid, decision_no_ask, decision_yes_probability
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10,
 			$11::numeric, $12::numeric, $13::numeric, NULLIF($14, '')::numeric,
-			$15, $16, $17, $18, $19, $20
+			$15, $16, $17, $18, $19, $20,
+			NULLIF($21, '')::numeric, NULLIF($22, '')::numeric, NULLIF($23, '')::numeric,
+			NULLIF($24, '')::numeric, NULLIF($25, '')::numeric
 		)
 		ON CONFLICT (client_order_id) DO NOTHING`,
 		order.ID, order.Intent.ClientOrderID, order.Intent.ExecutionAccountID,
@@ -61,7 +68,9 @@ func (repository *OrderRepository) Create(ctx context.Context, order domain.Orde
 		decimalOrZero(order.FilledSize), decimalOrZero(order.FilledNotional),
 		decimalOrZero(order.TotalFees), order.AverageFillPrice.String(),
 		order.FailureCode, order.FailureReason, order.VenueLastObservedAt,
-		order.Revision, order.CreatedAt, order.UpdatedAt)
+		order.Revision, order.CreatedAt, order.UpdatedAt,
+		quotes.YesBid.String(), quotes.YesAsk.String(), quotes.NoBid.String(),
+		quotes.NoAsk.String(), quotes.YesProbability.String())
 	if err != nil {
 		return domain.Order{}, false, fmt.Errorf("insert execution order: %w", err)
 	}

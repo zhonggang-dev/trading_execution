@@ -1823,8 +1823,78 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		TimeInForce:        executionTimeInForce,
 		ExpiresAt:          order.ExpiresAt,
 		Metadata:           metadata,
+		DecisionQuotes:     buyDecisionQuotes(request.OrderBooks, prediction),
 	}).Build()
 	return intent, err
+}
+
+// buyDecisionQuotes 从本轮冻结的盘口和预测中取出 YES/NO 两侧的买一卖一与 YES 概率，
+// 写到买入单上供逐笔回看。缺书或某一侧为空时对应值留空，不影响下单。
+func buyDecisionQuotes(books []domain.OrderBookSnapshot, prediction domain.Prediction) *domain.OrderDecisionQuotes {
+	yes, no := -1, -1
+	kalshi := prediction.MarketSource.Normalize() == domain.MarketSourceKalshi
+	for index, outcome := range prediction.Outcomes {
+		if kalshi {
+			switch strings.ToUpper(strings.TrimSpace(outcome.OutcomeID)) {
+			case "YES":
+				yes = index
+			case "NO":
+				no = index
+			}
+			continue
+		}
+		switch outcome.Index {
+		case 0:
+			yes = index
+		case 1:
+			no = index
+		}
+	}
+	quotes := &domain.OrderDecisionQuotes{}
+	if yes >= 0 {
+		outcome := prediction.Outcomes[yes]
+		if book, found := strategyBook(books, outcome.TokenID); found {
+			quotes.YesBid, quotes.YesAsk = bookTopOfBook(book)
+		}
+		quotes.YesProbability = unitQuote(domain.Decimal(strconv.FormatFloat(outcome.Probability, 'f', -1, 64)))
+	}
+	if no >= 0 {
+		if book, found := strategyBook(books, prediction.Outcomes[no].TokenID); found {
+			quotes.NoBid, quotes.NoAsk = bookTopOfBook(book)
+		}
+	}
+	return quotes
+}
+
+// bookTopOfBook 返回盘口的买一、卖一；best 字段为空时退回首档，MISSING/ERROR 的书一律为空。
+func bookTopOfBook(book domain.OrderBookSnapshot) (domain.Decimal, domain.Decimal) {
+	if book.Status == domain.OrderBookStatusMissing || book.Status == domain.OrderBookStatusError {
+		return "", ""
+	}
+	bid, ask := book.BestBid, book.BestAsk
+	if bid.IsEmpty() && len(book.Bids) > 0 {
+		bid = book.Bids[0].Price
+	}
+	if ask.IsEmpty() && len(book.Asks) > 0 {
+		ask = book.Asks[0].Price
+	}
+	return unitQuote(bid), unitQuote(ask)
+}
+
+// unitQuote 只保留能解析且落在 [0,1] 内的值，其余记为空。这些值只作审计，
+// 异常盘口不能让订单写入因 execution_orders 的范围约束或 JSON 编码失败而被阻断。
+func unitQuote(value domain.Decimal) domain.Decimal {
+	value = domain.Decimal(strings.TrimSpace(value.String()))
+	if value.IsEmpty() {
+		return ""
+	}
+	if low, err := value.Compare("0"); err != nil || low < 0 {
+		return ""
+	}
+	if high, err := value.Compare("1"); err != nil || high > 0 {
+		return ""
+	}
+	return value
 }
 
 // buildExitIntent 根据策略退出结果构建卖出订单意图。Trading 只核对退出指向的 lot
