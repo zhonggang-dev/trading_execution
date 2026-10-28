@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/executionrouter"
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
+	"github.com/UniPat-AI/trading_execution/internal/service/kalshisettlement"
 	"github.com/UniPat-AI/trading_execution/internal/service/positionsource"
 )
 
@@ -25,6 +26,9 @@ type kalshiComposition struct {
 	execution      *executionrouter.Service
 	positionSource port.StrategyPositionSource
 	activeAccounts []string
+	// settlements apply Kalshi's own settlement records to the ledger of each
+	// tradable route; the caller runs them for the life of the process.
+	settlements []*kalshisettlement.Service
 }
 
 func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sql.DB, repository port.OrderRepository,
@@ -40,6 +44,7 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 	routes := make([]executionrouter.Route, 0, len(cfg.Kalshi.LiveBindings))
 	positionRoutes := make([]positionsource.Route, 0, len(cfg.Kalshi.LiveBindings))
 	active := make([]string, 0, len(cfg.Kalshi.LiveBindings))
+	settlements := make([]*kalshisettlement.Service, 0, len(cfg.Kalshi.LiveBindings))
 	for _, binding := range cfg.Kalshi.LiveBindings {
 		if !configuredBinding(cfg.DecisionCycle.Bindings, binding) {
 			return kalshiComposition{}, fmt.Errorf("Kalshi live route is not an exact decision binding")
@@ -66,6 +71,9 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 		routes = append(routes, built.route)
 		positionRoutes = append(positionRoutes, built.positionRoute)
 		active = append(active, built.internalAccountID)
+		if built.settlement != nil {
+			settlements = append(settlements, built.settlement)
+		}
 		logger.Info("Kalshi live binding preflight passed", "model_id", binding.ModelID, "strategy_id", binding.StrategyID,
 			"execution_account_id", binding.ExecutionAccountID, "internal_account_id", built.internalAccountID,
 			"buy_funded", built.buyFunded, "maintenance_only", built.maintenanceOnly,
@@ -79,7 +87,7 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 	if err != nil {
 		return kalshiComposition{}, err
 	}
-	return kalshiComposition{execution: router, positionSource: positionRouter, activeAccounts: active}, nil
+	return kalshiComposition{execution: router, positionSource: positionRouter, activeAccounts: active, settlements: settlements}, nil
 }
 
 type builtKalshiLiveRoute struct {
@@ -87,6 +95,7 @@ type builtKalshiLiveRoute struct {
 	positionRoute       positionsource.Route
 	internalAccountID   string
 	buyFunded           bool
+	settlement          *kalshisettlement.Service
 	maintenanceOnly     bool
 	balanceSyncDeferred bool
 }
@@ -163,11 +172,27 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 	if err != nil {
 		return builtKalshiLiveRoute{}, err
 	}
+	var settlement *kalshisettlement.Service
+	// A route that failed its remote preflight is maintenance-only; its API
+	// access is not trusted, so it does not settle until a clean restart.
+	if cfg.Kalshi.SettlementEnabled && !maintenanceOnly {
+		settlementStore, storeErr := postgresadapter.NewKalshiSettlementStore(database, []string{internalID})
+		if storeErr != nil {
+			return builtKalshiLiveRoute{}, storeErr
+		}
+		settlement, err = kalshisettlement.New(kalshisettlement.Params{
+			ExecutionAccountID: internalID, Source: client, Store: settlementStore,
+			Interval: cfg.Kalshi.SettlementInterval, BalanceDriftThreshold: cfg.Kalshi.BalanceDriftThreshold,
+		})
+		if err != nil {
+			return builtKalshiLiveRoute{}, err
+		}
+	}
 	cashSign, _ := cashBalance.Sign()
 	return builtKalshiLiveRoute{
 		route:             executionrouter.Route{ModelID: binding.ModelID, StrategyID: binding.StrategyID, LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID, Execution: service, MaintenanceOnly: maintenanceOnly},
 		positionRoute:     positionsource.Route{LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID},
-		internalAccountID: internalID, buyFunded: cashSign > 0,
+		internalAccountID: internalID, buyFunded: cashSign > 0, settlement: settlement,
 		maintenanceOnly: maintenanceOnly, balanceSyncDeferred: balanceSyncDeferred,
 	}, nil
 }
@@ -312,6 +337,22 @@ func syncKalshiExecutionAccount(
 			return false, "", fmt.Errorf("commit deferred Kalshi account sync: %w", err)
 		}
 		return true, balance, nil
+	}
+	// The overwrite below replaces the local cash with the exchange balance, so
+	// whatever the two disagreed by is written down before it disappears.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO execution_account_events (
+			account_event_id, execution_account_id, event_type, total_balance_delta,
+			available_balance_delta, reserved_balance_delta, total_balance_after,
+			available_balance_after, reserved_balance_after, occurred_at
+		)
+		SELECT 'kalshi-balance-sync:'||execution_account_id||':'||to_char(clock_timestamp(),'YYYYMMDD"T"HH24MISSUS'),
+		       execution_account_id, 'KALSHI_BALANCE_SYNC', $2::numeric - total_balance,
+		       $2::numeric - available_balance, 0, $2::numeric, $2::numeric, reserved_balance, clock_timestamp()
+		FROM execution_accounts
+		WHERE execution_account_id=$1 AND (total_balance <> $2::numeric OR available_balance <> $2::numeric)`,
+		accountID, balance.String()); err != nil {
+		return false, "", fmt.Errorf("record Kalshi balance sync: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE execution_accounts

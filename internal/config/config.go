@@ -219,6 +219,13 @@ type Kalshi struct {
 	PrivateKeyPath    string
 	RequestTimeout    time.Duration
 	LiveBindings      []KalshiLiveBinding
+	// SettlementEnabled applies Kalshi's own settlement records to the ledger
+	// of each tradable Kalshi route.
+	SettlementEnabled  bool
+	SettlementInterval time.Duration
+	// BalanceDriftThreshold is the largest tolerated gap, in dollars, between
+	// the local cash ledger and the exchange balance.
+	BalanceDriftThreshold domain.Decimal
 }
 
 // KalshiLiveBinding binds one exact strategy route to one isolated Kalshi
@@ -333,6 +340,18 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	kalshiLiveBindings, err := decodeKalshiLiveBindings(os.Getenv("KALSHI_LIVE_BINDINGS_JSON"))
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiSettlementEnabled, err := boolean("KALSHI_SETTLEMENT_ENABLED", true)
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiSettlementInterval, err := duration("KALSHI_SETTLEMENT_INTERVAL", 5*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiBalanceDriftThreshold, err := decimal("KALSHI_BALANCE_DRIFT_THRESHOLD", "0.01")
 	if err != nil {
 		return Config{}, err
 	}
@@ -568,6 +587,10 @@ func Load() (Config, error) {
 			PrivateKeyPath:    strings.TrimSpace(os.Getenv("KALSHI_PRIVATE_KEY_PATH")),
 			RequestTimeout:    kalshiRequestTimeout,
 			LiveBindings:      kalshiLiveBindings,
+
+			SettlementEnabled:     kalshiSettlementEnabled,
+			SettlementInterval:    kalshiSettlementInterval,
+			BalanceDriftThreshold: kalshiBalanceDriftThreshold,
 		},
 		LiveOperations: LiveOperations{
 			Interval: liveOperationsInterval, RefreshTimeout: liveOperationsRefreshTimeout,
@@ -713,6 +736,14 @@ func (config Config) Validate() error {
 		}
 		if config.Kalshi.RequestTimeout <= 0 || config.Kalshi.RequestTimeout > time.Minute {
 			return fmt.Errorf("KALSHI_REQUEST_TIMEOUT must be positive and at most 1m")
+		}
+	}
+	if config.Kalshi.SettlementEnabled {
+		if config.Kalshi.SettlementInterval < 30*time.Second || config.Kalshi.SettlementInterval > time.Hour {
+			return fmt.Errorf("KALSHI_SETTLEMENT_INTERVAL must be between 30s and 1h")
+		}
+		if sign, err := config.Kalshi.BalanceDriftThreshold.Sign(); err != nil || sign <= 0 {
+			return fmt.Errorf("KALSHI_BALANCE_DRIFT_THRESHOLD must be a positive dollar amount")
 		}
 	}
 	if config.DecisionCycle.OrderSubmissionEnabled && !config.DecisionCycle.RequireCompleteModelCoverage {

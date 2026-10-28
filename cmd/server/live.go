@@ -26,6 +26,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/executionrouter"
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
+	"github.com/UniPat-AI/trading_execution/internal/service/kalshisettlement"
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/marketvalidation"
 	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
@@ -40,15 +41,16 @@ const reconciliationAccountTimeout = 6 * time.Minute
 
 // liveRuntime 保存已经通过预检的实盘依赖图和后台服务。
 type liveRuntime struct {
-	repository     *postgresadapter.OrderRepository
-	execution      executionrouter.Execution
-	readiness      *readiness.All
-	heartbeat      *clobheartbeat.Service
-	runner         *reconciliation.Runner
-	operations     *liveoperations.Service
-	decisionRunner *decisionrunner.Runner
-	autoRedeem     *autoredeem.Service
-	activeAccounts []string
+	repository        *postgresadapter.OrderRepository
+	execution         executionrouter.Execution
+	readiness         *readiness.All
+	heartbeat         *clobheartbeat.Service
+	runner            *reconciliation.Runner
+	operations        *liveoperations.Service
+	decisionRunner    *decisionrunner.Runner
+	autoRedeem        *autoredeem.Service
+	kalshiSettlements []*kalshisettlement.Service
+	activeAccounts    []string
 	// recovery is the order-level lease guard shared with the order coordinator.
 	recovery *orderrecovery.Guard
 }
@@ -594,9 +596,10 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		repository: repository, execution: kalshiRuntime.execution,
 		readiness: combinedReadiness,
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
-		autoRedeem:     autoRedeemService,
-		activeAccounts: append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
-		recovery:       recoveryGuard,
+		autoRedeem:        autoRedeemService,
+		kalshiSettlements: kalshiRuntime.settlements,
+		activeAccounts:    append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
+		recovery:          recoveryGuard,
 	}, nil
 }
 
@@ -966,6 +969,13 @@ func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Lo
 				logger.Error("Polymarket auto redeem loop stopped", "error", err)
 			}
 		}()
+	}
+	for _, settlement := range runtime.kalshiSettlements {
+		go func(settlement *kalshisettlement.Service) {
+			if err := settlement.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("Kalshi settlement loop stopped", "error", err)
+			}
+		}(settlement)
 	}
 	if decisionErrors != nil {
 		go func() {
