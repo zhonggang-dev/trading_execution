@@ -297,6 +297,9 @@ type bindingRunSummary struct {
 	AccountStrategyDisabled   bool   `json:"account_strategy_disabled"`
 	EntrySubmissionEnabled    bool   `json:"entry_submission_enabled"`
 	EntryBlockReason          string `json:"entry_block_reason,omitempty"`
+	KalshiInputWithheld       bool   `json:"kalshi_input_withheld"`
+	KalshiPredictionsWithheld int    `json:"kalshi_predictions_withheld,omitempty"`
+	KalshiLotsWithheld        int    `json:"kalshi_position_lots_withheld,omitempty"`
 	Failed                    bool   `json:"failed"`
 }
 
@@ -316,6 +319,9 @@ func bindingRunSummaries(result decisioncycle.RunResult) []bindingRunSummary {
 			AccountStrategyDisabled:   run.AccountStrategyDisabled,
 			EntrySubmissionEnabled:    run.EntrySubmissionEnabled,
 			EntryBlockReason:          run.EntryBlockReason,
+			KalshiInputWithheld:       run.KalshiInputWithheld,
+			KalshiPredictionsWithheld: run.KalshiPredictionsWithheld,
+			KalshiLotsWithheld:        run.KalshiPositionLotsWithheld,
 			Failed:                    run.Error != nil || run.EntryBlockReason != "",
 		})
 	}

@@ -29,6 +29,9 @@ type buildDecisionRunnerParams struct {
 	accountIDs       []string
 	logger           *slog.Logger
 	submissionPolicy decisioncycle.IntentSubmissionPolicy
+	// kalshiInputPolicy limits Kalshi strategy input to bindings with a
+	// tradable Kalshi route; nil sends it to every binding.
+	kalshiInputPolicy decisioncycle.KalshiInputPolicy
 }
 
 // buildDecisionRunner composes the pull-based production workflow without
@@ -125,6 +128,7 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		EntryDisabledAccounts:        cycleConfig.EntryDisabledAccounts,
 		StrategyDisabledAccounts:     cycleConfig.StrategyDisabledAccounts,
 		KalshiStrategyInputDisabled:  !cycleConfig.KalshiStrategyInputEnabled,
+		KalshiInputPolicy:            params.kalshiInputPolicy,
 		RequireCompleteModelCoverage: cycleConfig.RequireCompleteModelCoverage,
 		Bindings:                     cycleConfig.Bindings,
 		PredictionSourceModes:        cycleConfig.PredictionSourceModes,

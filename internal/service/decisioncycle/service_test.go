@@ -3216,3 +3216,155 @@ func TestValidateResponseStillRejectsMalformedExit(t *testing.T) {
 		})
 	}
 }
+
+type kalshiInputAllowlist map[string]bool
+
+func (allowlist kalshiInputAllowlist) KalshiInputEnabled(binding domain.StrategyExecutionContext) bool {
+	return allowlist[binding.ExecutionAccountID]
+}
+
+// kalshiRoutedBindings returns two bindings fed by the same prediction model;
+// only the first is meant to have a tradable Kalshi route.
+func kalshiRoutedBindings() []domain.StrategyExecutionBinding {
+	return []domain.StrategyExecutionBinding{
+		testExecutionBinding(),
+		{ModelID: testBinding().ModelID, StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-no-kalshi"},
+	}
+}
+
+// kalshiRoutedPositions gives the routed binding a Polymarket lot and the
+// unrouted binding a Polymarket lot plus a Kalshi lot.
+func kalshiRoutedPositions(decisionAt time.Time, polymarket domain.Prediction) accountPositionSource {
+	positions := mixedVenuePositions(decisionAt, polymarket)
+	routed := testBinding().ExecutionAccountID
+	unrouted := make([]domain.PositionLot, 0, 2)
+	for _, lot := range positions[routed] {
+		lot.LotID += "-unrouted"
+		lot.ExecutionAccountID = "account-no-kalshi"
+		lot.StrategyID = domain.StrategyIDMultfactorV1
+		unrouted = append(unrouted, lot)
+	}
+	positions[routed] = positions[routed][:1]
+	positions["account-no-kalshi"] = unrouted
+	return positions
+}
+
+func TestRunSendsKalshiInputOnlyToBindingsWithTradableRoute(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	polymarket := validPrediction(decisionAt)
+	kalshi := kalshiPrediction(decisionAt)
+	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
+	strategy := &matrixStrategy{}
+	service, err := newTestService(Params{
+		PredictionSource:  fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
+		PositionSource:    kalshiRoutedPositions(decisionAt, polymarket),
+		OrderBookSource:   bookSource,
+		Strategy:          strategy,
+		Recorder:          &fakeRecorder{},
+		KalshiInputPolicy: kalshiInputAllowlist{testBinding().ExecutionAccountID: true},
+		Bindings:          kalshiRoutedBindings(),
+		Venue:             "polymarket-paper",
+		Now:               func() time.Time { return decisionAt.Add(5 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.KalshiStrategyInputDisabled || result.KalshiPredictionsWithheld != 0 || result.KalshiPositionLotsWithheld != 1 {
+		t.Fatalf("cycle kalshi summary = disabled:%v predictions:%d lots:%d, want only the unrouted Kalshi lot withheld",
+			result.KalshiStrategyInputDisabled, result.KalshiPredictionsWithheld, result.KalshiPositionLotsWithheld)
+	}
+	kalshiTargets := 0
+	for _, target := range bookSource.targets {
+		if target.MarketSource.Normalize() == domain.MarketSourceKalshi {
+			kalshiTargets++
+		}
+	}
+	if kalshiTargets != 2 {
+		t.Fatalf("book targets = %#v, want the two Kalshi outcomes captured for the routed binding", bookSource.targets)
+	}
+	requests := make(map[string]domain.StrategyDecisionRequest, len(strategy.requests))
+	for _, request := range strategy.requests {
+		requests[request.Context.ExecutionAccountID] = request
+	}
+	routed, unrouted := requests[testBinding().ExecutionAccountID], requests["account-no-kalshi"]
+	if len(routed.Predictions) != 2 || len(routed.Positions) != 1 {
+		t.Fatalf("routed request predictions=%d positions=%d, want both venues and its Polymarket lot",
+			len(routed.Predictions), len(routed.Positions))
+	}
+	if len(unrouted.Predictions) != 1 || unrouted.Predictions[0].PredictionID != polymarket.PredictionID {
+		t.Fatalf("unrouted request predictions = %#v, want only the Polymarket prediction", unrouted.Predictions)
+	}
+	if len(unrouted.Positions) != 1 || unrouted.Positions[0].MarketSource.Normalize() == domain.MarketSourceKalshi {
+		t.Fatalf("unrouted request positions = %#v, want only the Polymarket lot", unrouted.Positions)
+	}
+	for _, book := range unrouted.OrderBooks {
+		if book.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(book.TokenID, "kalshi:") {
+			t.Fatalf("unrouted request carries Kalshi orderbook %#v", book)
+		}
+	}
+	for _, run := range result.Runs {
+		switch run.Context.ExecutionAccountID {
+		case testBinding().ExecutionAccountID:
+			if run.KalshiInputWithheld || run.KalshiPredictionsWithheld != 0 || run.KalshiPositionLotsWithheld != 0 || run.Error != nil {
+				t.Fatalf("routed binding run = %#v, want Kalshi input delivered", run)
+			}
+		case "account-no-kalshi":
+			if !run.KalshiInputWithheld || run.KalshiPredictionsWithheld != 1 || run.KalshiPositionLotsWithheld != 1 || run.Error != nil {
+				t.Fatalf("unrouted binding run = %#v, want one Kalshi prediction and one Kalshi lot withheld", run)
+			}
+		default:
+			t.Fatalf("unexpected binding run %#v", run)
+		}
+	}
+}
+
+func TestRunCapturesNoKalshiBookWhenNoBindingHasTradableRoute(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	polymarket := validPrediction(decisionAt)
+	kalshi := kalshiPrediction(decisionAt)
+	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
+	strategy := &matrixStrategy{}
+	service, err := newTestService(Params{
+		PredictionSource:  fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
+		PositionSource:    kalshiRoutedPositions(decisionAt, polymarket),
+		OrderBookSource:   bookSource,
+		Strategy:          strategy,
+		Recorder:          &fakeRecorder{},
+		KalshiInputPolicy: kalshiInputAllowlist{},
+		Bindings:          kalshiRoutedBindings(),
+		Venue:             "polymarket-paper",
+		Now:               func() time.Time { return decisionAt.Add(5 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.KalshiStrategyInputDisabled || result.KalshiPredictionsWithheld != 1 || result.KalshiPositionLotsWithheld != 1 {
+		t.Fatalf("cycle kalshi summary = disabled:%v predictions:%d lots:%d, want the Kalshi prediction and lot withheld",
+			result.KalshiStrategyInputDisabled, result.KalshiPredictionsWithheld, result.KalshiPositionLotsWithheld)
+	}
+	for _, target := range bookSource.targets {
+		if target.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(target.TokenID, "kalshi:") {
+			t.Fatalf("book target %#v captured although no binding accepts Kalshi input", target)
+		}
+	}
+	for _, request := range strategy.requests {
+		for _, prediction := range request.Predictions {
+			if prediction.MarketSource.Normalize() == domain.MarketSourceKalshi {
+				t.Fatalf("request for %s carries Kalshi prediction %#v", request.Context.ExecutionAccountID, prediction)
+			}
+		}
+	}
+	for _, run := range result.Runs {
+		if !run.KalshiInputWithheld || run.Error != nil {
+			t.Fatalf("binding run = %#v, want Kalshi input withheld without error", run)
+		}
+	}
+}

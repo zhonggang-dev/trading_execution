@@ -142,3 +142,29 @@ func TestMaintenanceRouteRejectsNewIntentButStillRoutesHistoricalOrder(t *testin
 		t.Fatalf("maintenance deferral was not durably audited: %#v", deferred)
 	}
 }
+
+func TestKalshiInputFollowsTradableRoutes(t *testing.T) {
+	router, err := New(memory.NewOrderRepository(), &fakeExecution{}, []Route{
+		{ModelID: "deepseek_masked", StrategyID: "brier_mid_edge_once", LogicalAccountID: "main",
+			InternalAccountID: "kalshi:main", Execution: &fakeExecution{}},
+		{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1, LogicalAccountID: "wallet-6",
+			InternalAccountID: "kalshi:wallet-6", Execution: &fakeExecution{}, MaintenanceOnly: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		binding domain.StrategyExecutionContext
+		want    bool
+	}{
+		{"tradable route", domain.StrategyExecutionContext{ModelID: "deepseek_masked", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main"}, true},
+		{"maintenance-only route", domain.StrategyExecutionContext{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"}, false},
+		{"no route", domain.StrategyExecutionContext{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"}, false},
+		{"same account, other strategy", domain.StrategyExecutionContext{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main"}, false},
+	} {
+		if got := router.KalshiInputEnabled(test.binding); got != test.want {
+			t.Errorf("%s: KalshiInputEnabled = %v, want %v", test.name, got, test.want)
+		}
+	}
+}

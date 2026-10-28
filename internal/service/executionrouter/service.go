@@ -66,6 +66,14 @@ func (service *Service) KalshiEnabled(intent domain.OrderIntent) bool {
 	return intent.MarketSource.Normalize() == domain.MarketSourceKalshi && ok && !route.MaintenanceOnly
 }
 
+// KalshiInputEnabled reports whether a binding may receive Kalshi strategy
+// input. It uses the same rule as KalshiEnabled so a strategy is only shown
+// Kalshi markets it can actually trade.
+func (service *Service) KalshiInputEnabled(binding domain.StrategyExecutionContext) bool {
+	route, ok := service.routes[routeKey(binding.ModelID, binding.StrategyID, binding.ExecutionAccountID)]
+	return ok && !route.MaintenanceOnly
+}
+
 func (service *Service) Enabled(intent domain.OrderIntent) bool {
 	if intent.MarketSource.Normalize() == domain.MarketSourcePolymarket {
 		return true

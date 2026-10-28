@@ -42,6 +42,12 @@ type IntentSubmissionPolicy interface {
 	Enabled(domain.OrderIntent) bool
 }
 
+// KalshiInputPolicy narrows Kalshi strategy input to the bindings that can
+// trade Kalshi, so a strategy never sees Kalshi markets it cannot act on.
+type KalshiInputPolicy interface {
+	KalshiInputEnabled(domain.StrategyExecutionContext) bool
+}
+
 // Params 表示后端使用的 Params 类型。
 type Params struct {
 	PredictionSource port.PredictionSource
@@ -80,6 +86,10 @@ type Params struct {
 	// recovery/delivery of already persisted intents are unaffected. The zero
 	// value keeps sending Kalshi input.
 	KalshiStrategyInputDisabled bool
+	// KalshiInputPolicy, when set, limits Kalshi predictions and Kalshi lots to
+	// the bindings it accepts while KalshiStrategyInputDisabled is false. Nil
+	// sends Kalshi input to every binding.
+	KalshiInputPolicy KalshiInputPolicy
 	// RequireCompleteModelCoverage keeps live BUY submission fail closed for a
 	// binding that has no fresh probability. Coverage is evaluated independently
 	// per configured source model; a Market is never required to have results
@@ -133,6 +143,7 @@ type Service struct {
 	strategyDisabledAccounts     []string
 	strategyDisabledAccountSet   map[string]struct{}
 	kalshiStrategyInputDisabled  bool
+	kalshiInputPolicy            KalshiInputPolicy
 	requireCompleteModelCoverage bool
 	bindings                     []domain.StrategyExecutionBinding
 	predictionSourceModes        map[string]domain.PredictionSourceMode
@@ -176,12 +187,18 @@ type BindingRunResult struct {
 	// AccountStrategyDisabled marks a binding that stayed active but was not
 	// sent to the strategy because of StrategyDisabledAccounts.
 	AccountStrategyDisabled bool
-	EntrySubmissionEnabled  bool
-	EntryBlockReason        string
-	Request                 domain.StrategyDecisionRequest
-	Response                domain.StrategyDecisionResponse
-	Intents                 []IntentResult
-	Error                   error
+	// KalshiInputWithheld marks a binding that was sent no Kalshi input, either
+	// because the venue switch is off or because it has no tradable Kalshi
+	// route. The counters cover input dropped for this binding alone.
+	KalshiInputWithheld        bool
+	KalshiPredictionsWithheld  int
+	KalshiPositionLotsWithheld int
+	EntrySubmissionEnabled     bool
+	EntryBlockReason           string
+	Request                    domain.StrategyDecisionRequest
+	Response                   domain.StrategyDecisionResponse
+	Intents                    []IntentResult
+	Error                      error
 }
 
 // RunResult 表示后端使用的 RunResult 类型。
@@ -293,6 +310,7 @@ func New(params Params) (*Service, error) {
 		strategyDisabledAccounts:         strategyDisabledAccounts,
 		strategyDisabledAccountSet:       strategyDisabledAccountSet,
 		kalshiStrategyInputDisabled:      params.KalshiStrategyInputDisabled,
+		kalshiInputPolicy:                params.KalshiInputPolicy,
 		requireCompleteModelCoverage:     params.RequireCompleteModelCoverage,
 		bindings:                         bindings,
 		predictionSourceModes:            predictionSourceModes,
@@ -329,10 +347,10 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err := snapshot.Validate(decisionAt); err != nil {
 		return RunResult{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}
-	kalshiPredictionsWithheld := 0
-	if service.kalshiStrategyInputDisabled {
-		snapshot.Predictions, kalshiPredictionsWithheld = withholdKalshiPredictions(snapshot.Predictions)
-	}
+	kalshiInputAccounts := service.kalshiInputAccounts()
+	var kalshiPredictionsWithheld int
+	snapshot.Predictions, kalshiPredictionsWithheld = withholdKalshiPredictionsOutside(
+		snapshot.Predictions, kalshiInputModels(service.strategyEntryEnabledBindings, kalshiInputAccounts))
 	modelIDs := configuredPredictionModels(service.strategyEntryEnabledBindings)
 	selectedPredictions, err := selectAvailablePredictions(
 		snapshot.Predictions, modelIDs, service.predictionSourceModes,
@@ -341,7 +359,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err != nil {
 		return RunResult{}, err
 	}
-	positionLots, kalshiPositionLotsWithheld, err := service.loadPositionLots(ctx, decisionAt)
+	positionLots, lotsWithheldByAccount, err := service.loadPositionLots(ctx, decisionAt, kalshiInputAccounts)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -386,7 +404,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		PredictionSnapshotID:        snapshot.SnapshotID,
 		KalshiStrategyInputDisabled: service.kalshiStrategyInputDisabled,
 		KalshiPredictionsWithheld:   kalshiPredictionsWithheld,
-		KalshiPositionLotsWithheld:  kalshiPositionLotsWithheld,
+		KalshiPositionLotsWithheld:  sumCounts(lotsWithheldByAccount),
 		Runs:                        make([]BindingRunResult, 0, len(service.bindings)),
 	}
 	runErrors := make([]error, 0)
@@ -396,7 +414,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		if bindingSubmissionDisabled {
 			result.Runs = append(result.Runs, BindingRunResult{
 				Context: executionContext, PredictionModelID: binding.PredictionModelID,
-				PredictionCount:        len(predictionsForBinding(selectedPredictions, binding)),
+				PredictionCount:        len(bindingPredictions(selectedPredictions, binding, kalshiInputAccounts)),
 				OrderSubmissionEnabled: false, AccountSubmissionDisabled: true,
 			})
 			continue
@@ -406,7 +424,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			// but this cycle sends nothing about it to the strategy.
 			result.Runs = append(result.Runs, BindingRunResult{
 				Context: executionContext, PredictionModelID: binding.PredictionModelID,
-				PredictionCount:        len(predictionsForBinding(selectedPredictions, binding)),
+				PredictionCount:        len(bindingPredictions(selectedPredictions, binding, kalshiInputAccounts)),
 				OrderSubmissionEnabled: false, AccountStrategyDisabled: true,
 			})
 			continue
@@ -416,7 +434,7 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		accountEntryDisabled = accountEntryDisabled || service.entrySubmissionDisabled
 		predictions := make([]domain.Prediction, 0)
 		if !accountEntryDisabled {
-			predictions = predictionsForBinding(selectedPredictions, binding)
+			predictions = bindingPredictions(selectedPredictions, binding, kalshiInputAccounts)
 		}
 		var bindingCoverageErr error
 		if service.requireCompleteModelCoverage && len(predictions) == 0 {
@@ -461,6 +479,17 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 			runErrors = append(runErrors, fmt.Errorf("run %s/%s: %w", binding.ModelID, binding.StrategyID, runErr))
 		}
 	}
+	for index := range result.Runs {
+		account := result.Runs[index].Context.ExecutionAccountID
+		if _, accepted := kalshiInputAccounts[account]; accepted {
+			continue
+		}
+		result.Runs[index].KalshiInputWithheld = true
+		result.Runs[index].KalshiPositionLotsWithheld = lotsWithheldByAccount[account]
+		if binding, ok := bindingForAccount(service.bindings, account); ok {
+			result.Runs[index].KalshiPredictionsWithheld = countKalshi(predictionsForBinding(selectedPredictions, binding))
+		}
+	}
 	return result, errors.Join(runErrors...)
 }
 
@@ -472,30 +501,33 @@ func sameClaimedOrderBookSnapshotBatch(left, right domain.OrderBookSnapshotBatch
 		left.MissingCount == right.MissingCount && left.ErrorCount == right.ErrorCount
 }
 
-// loadPositionLots 加载 Position Lots。The second result counts Kalshi lots
-// withheld from the strategy because KalshiStrategyInputDisabled is set; those
+// loadPositionLots 加载 Position Lots。The second result counts, per account,
+// the Kalshi lots withheld from a binding that receives no Kalshi input; those
 // lots still pass the binding-ownership checks before they are dropped.
-func (service *Service) loadPositionLots(ctx context.Context, decisionAt time.Time) (map[string][]domain.StrategyPositionLot, int, error) {
+func (service *Service) loadPositionLots(
+	ctx context.Context, decisionAt time.Time, kalshiInputAccounts map[string]struct{},
+) (map[string][]domain.StrategyPositionLot, map[string]int, error) {
 	result := make(map[string][]domain.StrategyPositionLot, len(service.strategyBindings))
-	kalshiWithheld := 0
+	kalshiWithheld := make(map[string]int)
 	for _, binding := range service.strategyBindings {
+		_, kalshiInput := kalshiInputAccounts[binding.ExecutionAccountID]
 		lots, err := service.positionSource.ListOpenLots(ctx, binding.Context())
 		if err != nil {
-			return nil, 0, fmt.Errorf("load position lots for %s: %w", binding.ExecutionAccountID, err)
+			return nil, nil, fmt.Errorf("load position lots for %s: %w", binding.ExecutionAccountID, err)
 		}
 		strategyLots := make([]domain.StrategyPositionLot, 0, len(lots))
 		seen := make(map[string]struct{}, len(lots))
 		for _, lot := range lots {
 			if lot.ExecutionAccountID != binding.ExecutionAccountID || domain.CanonicalStrategyID(lot.StrategyID) != binding.StrategyID ||
 				strings.TrimSpace(lot.ModelID) != binding.ModelID || lot.Status != domain.PositionLotOpen || lot.OutcomeIndex == nil || lot.NegRisk == nil {
-				return nil, 0, fmt.Errorf("position lot %q does not belong to binding %s/%s/%s", lot.LotID, binding.ModelID, binding.StrategyID, binding.ExecutionAccountID)
+				return nil, nil, fmt.Errorf("position lot %q does not belong to binding %s/%s/%s", lot.LotID, binding.ModelID, binding.StrategyID, binding.ExecutionAccountID)
 			}
 			if _, exists := seen[lot.LotID]; exists {
-				return nil, 0, fmt.Errorf("duplicate open position lot %q", lot.LotID)
+				return nil, nil, fmt.Errorf("duplicate open position lot %q", lot.LotID)
 			}
 			seen[lot.LotID] = struct{}{}
-			if service.kalshiStrategyInputDisabled && lot.MarketSource.Normalize() == domain.MarketSourceKalshi {
-				kalshiWithheld++
+			if !kalshiInput && lot.MarketSource.Normalize() == domain.MarketSourceKalshi {
+				kalshiWithheld[binding.ExecutionAccountID]++
 				continue
 			}
 			strategyLot, err := (domain.StrategyPositionLotParams{
@@ -505,7 +537,7 @@ func (service *Service) loadPositionLots(ctx context.Context, decisionAt time.Ti
 				EnteredAt: lot.OpenedAt.UTC(), Shares: lot.RemainingShares, EntryPrice: lot.AverageEntryPrice,
 			}).Build(decisionAt)
 			if err != nil {
-				return nil, 0, fmt.Errorf("position lot %q: %w", lot.LotID, err)
+				return nil, nil, fmt.Errorf("position lot %q: %w", lot.LotID, err)
 			}
 			strategyLots = append(strategyLots, strategyLot)
 		}
@@ -514,20 +546,96 @@ func (service *Service) loadPositionLots(ctx context.Context, decisionAt time.Ti
 	return result, kalshiWithheld, nil
 }
 
+// kalshiInputAccounts returns the execution accounts whose binding receives
+// Kalshi input in this cycle. The venue switch wins over the policy.
+func (service *Service) kalshiInputAccounts() map[string]struct{} {
+	accounts := make(map[string]struct{}, len(service.bindings))
+	if service.kalshiStrategyInputDisabled {
+		return accounts
+	}
+	for _, binding := range service.bindings {
+		if service.kalshiInputPolicy == nil || service.kalshiInputPolicy.KalshiInputEnabled(binding.Context()) {
+			accounts[binding.ExecutionAccountID] = struct{}{}
+		}
+	}
+	return accounts
+}
+
+// kalshiInputModels returns the prediction models used by at least one binding
+// that receives Kalshi input.
+func kalshiInputModels(bindings []domain.StrategyExecutionBinding, accounts map[string]struct{}) map[string]struct{} {
+	models := make(map[string]struct{}, len(accounts))
+	for _, binding := range bindings {
+		if _, accepted := accounts[binding.ExecutionAccountID]; accepted {
+			models[binding.PredictionModelID] = struct{}{}
+		}
+	}
+	return models
+}
+
 // withholdKalshiPredictions returns the snapshot predictions without any
 // Kalshi market, plus the number of predictions that were dropped. It never
 // mutates the caller's slice.
 func withholdKalshiPredictions(predictions []domain.Prediction) ([]domain.Prediction, int) {
+	return withholdKalshiPredictionsOutside(predictions, nil)
+}
+
+// withholdKalshiPredictionsOutside drops every Kalshi prediction whose model
+// is not in keepModels, so no binding-less Kalshi orderbook is captured. It
+// never mutates the caller's slice.
+func withholdKalshiPredictionsOutside(predictions []domain.Prediction, keepModels map[string]struct{}) ([]domain.Prediction, int) {
 	kept := make([]domain.Prediction, 0, len(predictions))
 	withheld := 0
 	for _, prediction := range predictions {
 		if prediction.MarketSource.Normalize() == domain.MarketSourceKalshi {
-			withheld++
-			continue
+			if _, keep := keepModels[strings.TrimSpace(prediction.Model.Name)]; !keep {
+				withheld++
+				continue
+			}
 		}
 		kept = append(kept, prediction)
 	}
 	return kept, withheld
+}
+
+// bindingPredictions selects a binding's predictions and drops Kalshi rows for
+// a binding that receives no Kalshi input.
+func bindingPredictions(
+	predictions []domain.Prediction, binding domain.StrategyExecutionBinding, kalshiInputAccounts map[string]struct{},
+) []domain.Prediction {
+	selected := predictionsForBinding(predictions, binding)
+	if _, accepted := kalshiInputAccounts[binding.ExecutionAccountID]; accepted {
+		return selected
+	}
+	kept, _ := withholdKalshiPredictions(selected)
+	return kept
+}
+
+func countKalshi(predictions []domain.Prediction) int {
+	count := 0
+	for _, prediction := range predictions {
+		if prediction.MarketSource.Normalize() == domain.MarketSourceKalshi {
+			count++
+		}
+	}
+	return count
+}
+
+func bindingForAccount(bindings []domain.StrategyExecutionBinding, account string) (domain.StrategyExecutionBinding, bool) {
+	for _, binding := range bindings {
+		if binding.ExecutionAccountID == account {
+			return binding, true
+		}
+	}
+	return domain.StrategyExecutionBinding{}, false
+}
+
+func sumCounts(counts map[string]int) int {
+	total := 0
+	for _, count := range counts {
+		total += count
+	}
+	return total
 }
 
 // flattenPositionLots 展平 Position Lots。
