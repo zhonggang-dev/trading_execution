@@ -89,6 +89,18 @@ type OrderIntent struct {
 	TimeInForce        TimeInForce       `json:"time_in_force"`
 	ExpiresAt          *time.Time        `json:"expires_at,omitempty"`
 	Metadata           map[string]string `json:"metadata,omitempty"`
+	// DecisionQuotes 只用于审计，不参与 Equivalent 比较。
+	DecisionQuotes *OrderDecisionQuotes `json:"decision_quotes,omitempty"`
+}
+
+// OrderDecisionQuotes 记录买入决策那一刻本轮盘口的 YES/NO 买一卖一和模型给出的 YES 概率。
+// 空值表示该侧盘口缺失；YES 在 Kalshi 指 outcome_id=YES，在 Polymarket 指 outcome_index=0。
+type OrderDecisionQuotes struct {
+	YesBid         Decimal `json:"yes_bid,omitempty"`
+	YesAsk         Decimal `json:"yes_ask,omitempty"`
+	NoBid          Decimal `json:"no_bid,omitempty"`
+	NoAsk          Decimal `json:"no_ask,omitempty"`
+	YesProbability Decimal `json:"yes_probability,omitempty"`
 }
 
 // Normalize 规范化当前模型的文本、时间和可变字段。
@@ -132,6 +144,16 @@ func (intent OrderIntent) Normalize() OrderIntent {
 	if intent.ExpectedNegRisk != nil {
 		value := *intent.ExpectedNegRisk
 		intent.ExpectedNegRisk = &value
+	}
+	if intent.DecisionQuotes != nil {
+		quotes := OrderDecisionQuotes{
+			YesBid:         Decimal(strings.TrimSpace(intent.DecisionQuotes.YesBid.String())),
+			YesAsk:         Decimal(strings.TrimSpace(intent.DecisionQuotes.YesAsk.String())),
+			NoBid:          Decimal(strings.TrimSpace(intent.DecisionQuotes.NoBid.String())),
+			NoAsk:          Decimal(strings.TrimSpace(intent.DecisionQuotes.NoAsk.String())),
+			YesProbability: Decimal(strings.TrimSpace(intent.DecisionQuotes.YesProbability.String())),
+		}
+		intent.DecisionQuotes = &quotes
 	}
 	return intent
 }
@@ -210,7 +232,8 @@ func (intent OrderIntent) Validate() error {
 	return nil
 }
 
-// Equivalent 判断两个订单意图在规范化后是否具有相同业务语义。
+// Equivalent 判断两个订单意图在规范化后是否具有相同业务语义。DecisionQuotes 是审计附带信息，
+// 不参与比较：上线前冻结、上线后重放的同一意图不带它，不能因此判为冲突。
 func (intent OrderIntent) Equivalent(other OrderIntent) bool {
 	left := intent.Normalize()
 	right := other.Normalize()

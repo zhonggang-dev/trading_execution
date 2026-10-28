@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -152,5 +153,62 @@ func validIntent() OrderIntent {
 		Price:              "0.5",
 		Size:               "10",
 		TimeInForce:        TimeInForceGTC,
+	}
+}
+
+// TestOrderIntentEquivalentIgnoresDecisionQuotes 验证决策盘口只作审计附带信息，不改变意图身份：
+// 上线前冻结、上线后重放的同一意图不带它，不能被判为冲突。
+func TestOrderIntentEquivalentIgnoresDecisionQuotes(t *testing.T) {
+	base := OrderIntent{ClientOrderID: "client-1", Side: SideBuy, Size: "10", Metadata: map[string]string{"cycle_id": "c-1"}}
+	withQuotes := base
+	withQuotes.DecisionQuotes = &OrderDecisionQuotes{YesBid: "0.48", YesAsk: "0.50", NoBid: "0.49", NoAsk: "0.52", YesProbability: "0.7"}
+	if !base.Equivalent(withQuotes) || !withQuotes.Equivalent(base) {
+		t.Fatal("intents differing only by decision quotes must stay equivalent")
+	}
+	other := withQuotes
+	other.DecisionQuotes = &OrderDecisionQuotes{YesBid: "0.10"}
+	if !withQuotes.Equivalent(other) {
+		t.Fatal("different decision quotes must not change intent identity")
+	}
+}
+
+// TestOrderIntentNormalizeCopiesDecisionQuotes 验证规范化会深复制并清理决策盘口。
+func TestOrderIntentNormalizeCopiesDecisionQuotes(t *testing.T) {
+	quotes := &OrderDecisionQuotes{YesBid: " 0.48 ", YesAsk: "0.50", YesProbability: "0.7 "}
+	intent := OrderIntent{DecisionQuotes: quotes}.Normalize()
+	if intent.DecisionQuotes == quotes {
+		t.Fatal("Normalize must copy decision quotes")
+	}
+	if intent.DecisionQuotes.YesBid != "0.48" || intent.DecisionQuotes.YesProbability != "0.7" || intent.DecisionQuotes.NoBid != "" {
+		t.Fatalf("normalized quotes = %#v", intent.DecisionQuotes)
+	}
+	quotes.YesAsk = "0.99"
+	if intent.DecisionQuotes.YesAsk != "0.50" {
+		t.Fatal("normalized intent must not share the caller's quotes")
+	}
+	if (OrderIntent{}).Normalize().DecisionQuotes != nil {
+		t.Fatal("intent without decision quotes must stay nil")
+	}
+}
+
+// TestOrderIntentJSONCarriesDecisionQuotesOnlyWhenPresent 验证 intent JSON 只在有值时带 decision_quotes，旧 JSON 解码后为空。
+func TestOrderIntentJSONCarriesDecisionQuotesOnlyWhenPresent(t *testing.T) {
+	plain, err := json.Marshal(OrderIntent{ClientOrderID: "client-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "decision_quotes") {
+		t.Fatalf("intent without quotes JSON = %s", plain)
+	}
+	encoded, err := json.Marshal(OrderIntent{ClientOrderID: "client-1", DecisionQuotes: &OrderDecisionQuotes{YesBid: "0.48", NoAsk: "0.52"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded OrderIntent
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.DecisionQuotes == nil || decoded.DecisionQuotes.YesBid != "0.48" || decoded.DecisionQuotes.NoAsk != "0.52" || decoded.DecisionQuotes.YesAsk != "" {
+		t.Fatalf("decoded quotes = %#v from %s", decoded.DecisionQuotes, encoded)
 	}
 }
