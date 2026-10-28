@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/config"
@@ -105,5 +108,63 @@ func TestKalshiPreflightFailureLeavesPolymarketRouteOperational(t *testing.T) {
 	}
 	if !reflect.DeepEqual(positions.accounts, []string{"main"}) {
 		t.Fatalf("Polymarket position source changed after Kalshi preflight failure: %#v", positions.accounts)
+	}
+}
+
+func rateLimitedError() error {
+	return fmt.Errorf("probe Kalshi balance: %w", &port.VenueError{
+		Kind: port.VenueErrorUnavailable, Code: "KALSHI_RATE_LIMITED", HTTPStatus: 429,
+	})
+}
+
+func TestRetryKalshiRateLimitRecoversAfterBackoff(t *testing.T) {
+	calls := 0
+	var waits []time.Duration
+	value, err := retryKalshiRateLimit(context.Background(),
+		func(_ context.Context, delay time.Duration) error { waits = append(waits, delay); return nil },
+		func(context.Context) (string, error) {
+			calls++
+			if calls <= 2 {
+				return "", rateLimitedError()
+			}
+			return "ok", nil
+		})
+	if err != nil || value != "ok" || calls != 3 {
+		t.Fatalf("value=%q err=%v calls=%d", value, err, calls)
+	}
+	if !reflect.DeepEqual(waits, []time.Duration{time.Second, 2 * time.Second}) {
+		t.Fatalf("waits=%v", waits)
+	}
+}
+
+func TestRetryKalshiRateLimitGivesUpAndKeepsError(t *testing.T) {
+	calls := 0
+	_, err := retryKalshiRateLimit(context.Background(),
+		func(context.Context, time.Duration) error { return nil },
+		func(context.Context) (string, error) { calls++; return "", rateLimitedError() })
+	if !kalshiRateLimited(err) || calls != len(kalshiPreflightRetryDelays)+1 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+func TestRetryKalshiRateLimitDoesNotRetryOtherErrors(t *testing.T) {
+	calls := 0
+	boom := errors.New("auth failed")
+	_, err := retryKalshiRateLimit(context.Background(),
+		func(context.Context, time.Duration) error { t.Fatal("must not wait"); return nil },
+		func(context.Context) (string, error) { calls++; return "", boom })
+	if !errors.Is(err, boom) || calls != 1 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+func TestRetryKalshiRateLimitStopsWhenContextEnds(t *testing.T) {
+	calls := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := retryKalshiRateLimit(ctx,
+		func(ctx context.Context, _ time.Duration) error { cancel(); return ctx.Err() },
+		func(context.Context) (string, error) { calls++; return "", rateLimitedError() })
+	if !kalshiRateLimited(err) || calls != 1 {
+		t.Fatalf("err=%v calls=%d", err, calls)
 	}
 }

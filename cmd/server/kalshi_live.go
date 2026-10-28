@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/kalshi"
 	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
@@ -101,7 +102,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 	maintenanceOnly := false
 	balanceSyncDeferred := false
 	cashBalance := domain.Decimal("0")
-	capabilities, preflightErr := client.ProbeCapabilities(ctx)
+	capabilities, preflightErr := retryKalshiRateLimit(ctx, sleepContext, client.ProbeCapabilities)
 	if preflightErr == nil && !capabilities.Write {
 		preflightErr = fmt.Errorf("Kalshi API key lacks write scope")
 	}
@@ -109,7 +110,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 		balanceSyncDeferred, cashBalance, preflightErr = syncKalshiExecutionAccount(
 			ctx, database, internalID, binding.APIKeyID,
 			func() (domain.Decimal, error) {
-				balance, balanceErr := client.GetBalance(ctx)
+				balance, balanceErr := retryKalshiRateLimit(ctx, sleepContext, client.GetBalance)
 				if balanceErr != nil {
 					return "", fmt.Errorf("read Kalshi balance: %w", balanceErr)
 				}
@@ -169,6 +170,43 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 		internalAccountID: internalID, buyFunded: cashSign > 0,
 		maintenanceOnly: maintenanceOnly, balanceSyncDeferred: balanceSyncDeferred,
 	}, nil
+}
+
+// kalshiPreflightRetryDelays spaces the retries of a rate-limited preflight
+// read. Kalshi throttles repeated balance reads from the same key inside a
+// second, and the preflight reads the balance twice back to back.
+var kalshiPreflightRetryDelays = []time.Duration{time.Second, 2 * time.Second, 3 * time.Second}
+
+// retryKalshiRateLimit repeats a read-only Kalshi request that was rejected
+// with KALSHI_RATE_LIMITED. Any other error, and the last rate-limit error, is
+// returned unchanged so the caller still downgrades the binding to maintenance.
+func retryKalshiRateLimit[T any](ctx context.Context, wait func(context.Context, time.Duration) error,
+	call func(context.Context) (T, error)) (T, error) {
+	for attempt := 0; ; attempt++ {
+		value, err := call(ctx)
+		if err == nil || !kalshiRateLimited(err) || attempt >= len(kalshiPreflightRetryDelays) {
+			return value, err
+		}
+		if waitErr := wait(ctx, kalshiPreflightRetryDelays[attempt]); waitErr != nil {
+			return value, err
+		}
+	}
+}
+
+func kalshiRateLimited(err error) bool {
+	var venueError *port.VenueError
+	return errors.As(err, &venueError) && venueError.Code == "KALSHI_RATE_LIMITED"
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func internalEntryDisabledAccounts(logicalAccountID, internalAccountID string, disabled []string) []string {
