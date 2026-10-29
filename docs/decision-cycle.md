@@ -7,29 +7,28 @@
 
 策略规则、edge、概率聚合、MOM/MACD 和动态仓位仍全部属于外部策略服务。
 
-Go 启动时注入绑定表，例如：
+一个执行账户就是一个组合：平台 + 资金 + 预测模型 + 策略 + 运行模式。配置只有两部分：
 
 ```text
-deepseek_masked / <main 策略标识> / main
-deepseek_masked / <wallet-1 策略标识> / wallet-1
-deepseek_masked / multfactor_v1 / wallet-6
-deepseek_masked / multfactor_v2 / wallet-7
+DECISION_CYCLE_PREDICTION_MODEL_ID = v4.1 flash          # 全局唯一的预测模型名
+DECISION_CYCLE_ACCOUNTS_JSON（每账户一行）:
+  main         POLYMARKET  brier_mid_edge_once  ACTIVE
+  wallet-1     POLYMARKET  strategy_pending_b   PAUSED
+  wallet-6     POLYMARKET  multfactor_v1        ACTIVE
+  wallet-7     POLYMARKET  multfactor_v2        ACTIVE
+  kalshi:main  KALSHI      brier_mid_edge_once  ACTIVE
 ```
 
-框架拒绝重复的 model/strategy 组合，也拒绝把同一个 execution account 绑定两次。
-这里的 `model_id` 是策略、订单和风控使用的稳定业务身份。可选的
-`prediction_model_id` 是 prediction snapshot 里 `model.name` 的精确值；两者不同时，
-Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `prediction.model.name`
-投影为 `model_id`。Python 协议不增加字段，它仍会看到
-`prediction.model.name == context.model_id`。
-
-当前四钱包配置中，`#0` 是现有 literal account ID `main`，不是隐式的
-`wallet-0` 别名。上线前必须从当前 PIT snapshot 确认 `prediction_model_id`；
-新 masked producer 当前配置为 `v4.1 flash`；实际值必须以新 Worker 回调后
-快照中的 `model.name` 为准，不能由 `deepseek_masked` 业务名猜测。
-新二进制在禁单部署阶段仍接受原 `gemini_masked` 或临时 `qwen_masked`
-四钱包绑定，以便在旧 lot 后继路由切换前安全启动和回滚；钱包 6/7
-不能混用不同的 masked 逻辑名。
+- 预测模型名就是发给策略、写进订单和 lot 的 `model_id`，没有另一个内部名；
+  `prediction.model.name == context.model_id` 由 Trading 保证。换模型只改这一项。
+- 每个账户只交易一个平台，只收到该平台的预测、该账户的 OPEN lot 和对应盘口；
+  Kalshi 账户（`kalshi:<name>`）与 Polymarket 钱包平级，有自己的策略和模式，
+  不挂在任何钱包下面。
+- 持仓只按账户归属：lot 上的 `model_id`/`strategy_id` 是开仓时的审计记录，换模型或换策略后，
+  账户里的 lot 由当前策略继续管理。
+- `mode`：`ACTIVE` 正常；`SELL_ONLY` 照常调用策略但拦截所有 BUY；`PAUSED` 不再调用策略、
+  拦截 BUY，对账与已持久化 intent 的恢复投递照常。
+- 账户数量、名字、策略都不固定；同一模型或同一策略可以跑在多个账户上。
 
 ## 周期顺序
 
@@ -38,13 +37,12 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
   -> GET prediction_infra snapshot(as_of=T)
   -> filter each source model by its configured DIRECT/SANDBOX provenance
   -> select the newest fresh PIT result per Market/source model
-  -> load every binding's OPEN position lots
+  -> load every routed account's OPEN position lots (by account only)
   -> capture CLOB books and [T-48h,T] midpoint histories once for the prediction/position token union
   -> normalize bids DESC / asks ASC / top 15 each side
   -> atomically freeze the complete shared orderbook batch in PostgreSQL
-  -> project source identity to logical model_id
-  -> expand configured (model, strategy, execution account) bindings
-  -> one isolated trading.strategy_input.v4 per binding
+  -> one isolated trading.strategy_input.v4 per account, holding only
+     that account's venue predictions, its own lots and their books
   -> POST strategy /api/v4/decisions (Idempotency-Key: cycle_id)
   -> validate context and durably record trading.strategy_output.v4
   -> submit each OrderIntent through execution.Service
@@ -65,7 +63,7 @@ Trading 先按 `prediction_model_id` 选择 Market，再在发送副本中把 `p
   "cycle_id": "main:20260818T042000Z",
   "input_id": "strategy-input-...",
   "context": {
-    "model_id": "deepseek_masked",
+    "model_id": "v4.1 flash",
     "strategy_id": "brier_mid_edge_once",
     "execution_account_id": "main"
   },
@@ -108,31 +106,27 @@ Kalshi 盘口可能跳过中间 tick，因此不套用固定的两 tick 距离�
 `worst_price`，价格方向正确、位于 tick 上，且保护价范围内至少有可见的可成交 shares。
 下单前 Go 还会用最新官方盘口重复校验最优价没有越过保护线且保护价内仍有正数深度（仅 BUY）。
 
-`predictions` 每个周期发送当前 binding 所属模型的全部当前有效 Market。一条 Market/Model 预测仍包含两个按原始
+`predictions` 每个周期发送配置模型在该账户平台上的全部当前有效 Market。一条 Market/Model 预测仍包含两个按原始
 Outcome 顺序对齐且和为 1 的概率和 token，而不是只传一个脱离 Outcome 的 `prob`。
 Prediction snapshot 保留 lookback 内的 immutable 结果，同时携带由 Direct Prediction task
 生成的 `expected_predictions[]`。Trading 的运行时来源契约由
-`DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON` 固定：`DIRECT` 模型只接受空
-`sandbox_id`，`SANDBOX` 模型只接受非空 `sandbox_id`；配置必须精确覆盖所有 binding 的
-上游 `prediction_model_id`。来源过滤在 freshness 与 effective selection 之前执行，因此错误来源中更新的
+`DECISION_CYCLE_PREDICTION_SOURCE_MODE`（默认 `SANDBOX`）固定：`DIRECT` 只接受空
+`sandbox_id`，`SANDBOX` 只接受非空 `sandbox_id`。来源过滤在 freshness 与 effective selection 之前执行，因此错误来源中更新的
 revision 不会覆盖正确来源。候选结果要求 `prediction_as_of` 和 `completed_at` 均不早于
 `decision_at - DECISION_CYCLE_PREDICTION_LOOKBACK`，再按 `prediction_as_of`、
 `available_at`、`completed_at` 选择每个 `(market_id, prediction_model_id)` 的最新结果；三类时间戳
 完全相同但 payload 不同的 revision 会因歧义直接失败，等价 delivery duplicate 才按 prediction ID
 确定性择一。不同模型对同一 Market 的 Condition、Outcome 顺序和 token 必须完全一致。
-四钱包部署 preflight 另外对当前 dry-run snapshot 做更严格的来源证据检查：四个钱包共用一个
-Sandbox 模型，它必须至少有一条 fresh、PIT-visible 且 `sandbox_id` 非空的 effective 结果，
-Sandbox 模型不得伪装成 Direct expectation。
-`DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true` 时，每个 active binding 的上游模型至少要有一条
-符合来源与 freshness 契约的结果；缺失模型只关闭该 binding 的 BUY entry，并继续允许其 OPEN lots 走合法
-SELL exit。该门禁不要求不同模型覆盖完全相同的 Market 集合。
-Order submission 打开时该覆盖开关是强制项；四钱包生产拓扑必须开启它，dry-run 也建议开启以便先观察完整矩阵。
+`DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true` 时，每个账户在自己的平台上至少要有一条
+符合来源与 freshness 契约的结果；缺失时只关闭该账户的 BUY entry，并继续允许其 OPEN lots 走合法
+SELL exit（例如某轮没有 Kalshi 预测，只有 `kalshi:main` 进入 sell-only）。
+Order submission 打开时该覆盖开关是强制项。
 发往 Python 前已确保 `prediction.model.name == context.model_id`。不同策略处理同一模型时复用完全相同的冻结
 prob 和盘口，但使用不同 `strategy_id`、`execution_account_id`、`cycle_id` 和 `input_id`。
 某个模型当轮没有 Market 时仍调用对应 binding，因为该钱包可能还有需要退出的 OPEN lots；
 严格覆盖模式会关闭整个周期的 entry intent 构建并把该轮标记为失败，不会把这种不完整矩阵视为健康。
 运行日志会逐 binding 记录上游模型和 prediction count，空预测不再与“未调用”混淆。
-`positions` 按开仓批次发送当前 binding 的全部 OPEN lot，不按 token 聚合；`entry_price` 是开仓成交
+`positions` 按开仓批次发送当前账户的全部 OPEN lot，不按 token 聚合；`entry_price` 是开仓成交
 `gross_notional ÷ shares` 的完整精度，不是两位小数的 CLOB 展示价。`orderbooks` 覆盖
 prediction 和 position 的 token 并固定请求 top 15，每侧返回实际存在的最多 15 档；价格和数量必须使用 JSON string decimal。
 Trading 不再抓取或发送 `mid_price_histories`。`multfactor_v2` 计算 MOM/MACD 所需的历史由策略服务
@@ -183,8 +177,8 @@ Python 响应的 `decided_at` 会成为 `OrderIntent.signal_at`，供 Go 硬风�
 
 SELL 仍然受以下门禁约束：重复卖单（同 lot 或同 token 已有活动 SELL 预留，`DUPLICATE_SELL_ORDER`）；
 账户门禁（全局 Kill Switch、账户/策略/市场暂停、binding 未启用、risk policy 未启用、最近一次
-COMPLETED 对账超出时效窗或存在 OPEN reconciliation issue）；账本一致性（目标 lot 存在且 model/
-strategy/market/token 归属一致，数量不超过 lot 剩余与 position 可用 shares）；以及 Polymarket 下单前
+COMPLETED 对账超出时效窗或存在 OPEN reconciliation issue）；账本一致性（目标 lot 属于同一账户且
+market/token 一致，数量不超过 lot 剩余与 position 可用 shares；lot 的开仓模型/策略不参与比较）；以及 Polymarket 下单前
 的 outcome token 余额/授权检查。市场身份、outcome/token 映射、tick 对齐和成功读取的最新盘口证据
 仍然必须满足。官方单边或空盘口允许 SELL 提交，记录 `book_status=EMPTY`，不伪造缺失报价；
 官方读取失败（ERROR/MISSING）仍拒绝。Polymarket 签名前也不再用 `min_order_size` 拦截 SELL，
@@ -257,54 +251,47 @@ intent；`exits[]` 的身份/格式错误仍会使整个策略响应被拒绝。
   `DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true`，否则配置校验和服务装配都会拒绝启动；
 - `DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=true` 是独立的 sell-only 闸门：即使订单提交已开启，
   Trading 仍会在 Go 侧拒绝所有 BUY，只允许当前 managed lot 的合法 SELL exit；
-- `DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON` 是账户级“暂不下发给策略”的窄开关：列出的
-  execution account 仍保留在拓扑中，继续参与 reconciliation、auto redeem、账户入场闸门和已
-  持久化 intent 的恢复/投递，但决策周期不再为它们加载 position lots，也不再调用策略 API；该轮
-  结果中对应绑定标记 `account_strategy_disabled=true`。默认 `[]`；例如设为
-  `["main","wallet-1"]` 即只把 wallet-6/wallet-7 发给策略。它不能覆盖全部绑定，也不同于
-  `DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON` 的隔离（后者还会移出 reconciliation）；
-- `DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED` 是场所级“是否把 Kalshi 发给策略”的开关，默认
-  `true`。设为 `false` 时，决策周期在拉取 PIT 快照之后、构建策略请求之前丢弃所有
-  `market_source=KALSHI` 的预测和所有 Kalshi position lots，因此不会采集 Kalshi 订单簿，策略
-  请求（predictions/positions/order_books）中不再出现任何 Kalshi 市场，策略也无法据此产出
-  Kalshi intent。Polymarket 输入、账户级闸门、reconciliation 以及已持久化 intent 的恢复/投递
-  不受影响；该轮日志带 `kalshi_strategy_input_disabled=true` 及
-  `kalshi_predictions_withheld` / `kalshi_position_lots_withheld` 计数。若某个绑定的模型在
-  该轮只有 Kalshi 预测，且 `DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE=true`，该绑定会按
-  既有规则以 `INCOMPLETE_MODEL_COVERAGE` 进入 sell-only；
-- Go 绑定表保证一个 `(model_id, strategy_id)` 只对应一个唯一 `execution_account_id`，同一
-  execution account 不能重复绑定；同一逻辑 `model_id` 不能来自多个 `prediction_model_id`，
-  同一 `prediction_model_id` 也不能路由到多个逻辑模型。
+- 账户行的 `mode` 是唯一的账户级开关：`SELL_ONLY` 等价于账户只卖，`PAUSED` 不加载 lot、
+  不调用策略，并在执行层拦截 BUY，结果中标记 `account_strategy_disabled=true`；不能把全部账户设为
+  `PAUSED`。旧的 submission/entry/strategy disabled 三个名单与 Kalshi 输入开关已删除，
+  任何旧变量出现都会拒绝启动；要彻底停一个平台，就把该平台的账户设为 `PAUSED`；
+- Kalshi 账户启动预检失败（维护态）时，本轮不为它调用策略（`route_unavailable=true`），也不抓
+  Kalshi 盘口；对账、结算和历史订单恢复照常；
+- 同一 execution account 只能出现一次；账户之间可以共享模型或策略。
 
 生产装配使用 migrations `0012_strategy_decision_cycles.sql`、
 `0013_strategy_intent_deliveries.sql`、`0026_strategy_orderbook_snapshots.sql`，并通过 PostgreSQL
 recorders 持久化共享盘口、完整 binding 输入、输出与订单意图投递状态。共享盘口的表结构、查询和
 容量观察见 [`orderbook-snapshot-storage.md`](orderbook-snapshot-storage.md)。配置通过
-`DECISION_CYCLE_BINDINGS_JSON` 注入，并要求绑定账户存在于
-受限钱包文件。只有 live 模式且两个显式开关都打开，OrderIntent 才会进入执行层；之后仍受
-数据库 Kill Switch、账户/策略暂停、binding、余额和 reconciliation freshness 等硬风控阻断。
+`DECISION_CYCLE_ACCOUNTS_JSON` 注入，Polymarket 账户集合必须与受限钱包文件完全一致，
+Kalshi 账户的凭据由 `KALSHI_LIVE_ACCOUNTS_JSON` 提供（每账户一把独立 API key）。只有 live 模式且两个显式开关都打开，OrderIntent 才会进入执行层；之后仍受
+数据库 Kill Switch、账户/策略暂停、（账户, 策略）binding、余额和 reconciliation freshness 等硬风控阻断。
 
-四钱包示例配置。四个钱包共用同一个 `deepseek_masked` 与同一个上游模型；wallet-6/wallet-7
-固定为 `multfactor_v1/v2`，main/wallet-1 的 `strategy_id` 由配置决定，只要求格式安全
-（字母开头，只含字母数字 `._-`，最长 64）、两者互不相同、且不占用 `multfactor_v1/v2`。
-拿到正式策略标识后，按 [`deploy/rebind_main_wallet1.sql`](../deploy/rebind_main_wallet1.sql)
-切换数据库绑定，并同步修改下面两个 `strategy_id`，重启即可，不需要改代码：
+当前生产等价配置：
 
-```json
-[
-  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"brier_mid_edge_once","execution_account_id":"main"},
-  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-  {"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
+```text
+DECISION_CYCLE_PREDICTION_MODEL_ID=v4.1 flash
+DECISION_CYCLE_PREDICTION_SOURCE_MODE=SANDBOX
+DECISION_CYCLE_ACCOUNTS_JSON=[
+  {"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"},
+  {"execution_account_id":"wallet-1","market_source":"POLYMARKET","strategy_id":"strategy_pending_b","mode":"PAUSED"},
+  {"execution_account_id":"wallet-6","market_source":"POLYMARKET","strategy_id":"multfactor_v1","mode":"ACTIVE"},
+  {"execution_account_id":"wallet-7","market_source":"POLYMARKET","strategy_id":"multfactor_v2","mode":"ACTIVE"},
+  {"execution_account_id":"kalshi:main","market_source":"KALSHI","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"}
 ]
+KALSHI_LIVE_ACCOUNTS_JSON=[{"execution_account_id":"kalshi:main","api_key_id":"...","private_key_path":"/opt/trading-execution/secrets/kalshi-main-20261028.pem"}]
 ```
 
-`execution_strategy_bindings.model_id` 必须使用逻辑名 `deepseek_masked`，并与
-`strategy_id + execution_account_id` 组成相同的四条绑定；上游真实名只存在运行配置中。
-OPEN lot 保留开仓时的 `model_id` 和 `strategy_id`。每个策略周期只查询与当前
-`model_id + strategy_id + execution_account_id` 完全匹配且至少 0.01 shares 的 lot；
-旧模型的持仓不会被新模型接管，也不会阻塞新模型周期。小于交易所两位小数 SELL
-精度的真实链上 dust 留在账本等待结算/赎回，不会被舍入为零。
+数据库授权按（账户, 策略）：每个 Polymarket 账户必须恰有一条启用的
+`execution_strategy_bindings`（`strategy_id + execution_account_id`），行上的 `model_id`
+只是审计字段，不必等于配置模型名，换模型不需要改库；全局启用的（策略, 账户）集合必须与
+配置完全一致。Go 预占校验与 migration `0041` 的提交触发器使用同一规则。Kalshi 账户不走这张表，
+其授权是 `KALSHI_LIVE_ACCOUNTS_JSON` 中的路由：Kalshi intent 的策略必须等于该账户配置的策略。
+换策略时同步修改账户行与数据库绑定（见 [`deploy/rebind_main_wallet1.sql`](../deploy/rebind_main_wallet1.sql) 的做法）。
+
+OPEN lot 保留开仓时的 `model_id` 和 `strategy_id` 作审计。每个策略周期查询该账户全部至少
+0.01 shares 的 lot（Kalshi lot 不受此下限），与开仓模型/策略无关，因此换模型或换策略不会留下
+无人管理的持仓。小于交易所两位小数 SELL 精度的真实链上 dust 留在账本等待结算/赎回，不会被舍入为零。
 最新 BBO 和价格保护由独立 Market Validation 层负责，详见
 [`market-validation.md`](market-validation.md)；余额、仓位、敞口与暂停检查由 Go Hard Risk
 负责，详见 [`risk-control.md`](risk-control.md)。

@@ -59,10 +59,11 @@ Go 实现沿用这个边界，并使用 `execution_account_id` 选择钱包。�
 
 旧格式的 key（例子里的 `10`）就是 `execution_account_id`。如果 `funder/address` 与 private key
 推导出的 signer 不同，必须显式填写 `signature_type`，防止把 proxy/safe 误签成 EOA。
-当前四钱包部署约定是 `#0=main`、`#1=wallet-1`、`#6=wallet-6`、
+当前部署约定是 `#0=main`、`#1=wallet-1`、`#6=wallet-6`、
 `#7=wallet-7`。这只是部署命名约定；loader 不会把 `0` 或 `wallet-0` 自动翻译成
-`main`，因此钱包文件、`DECISION_CYCLE_BINDINGS_JSON` 和数据库必须使用完全一致的
-literal `execution_account_id`。
+`main`，因此钱包文件、`DECISION_CYCLE_ACCOUNTS_JSON` 里的 POLYMARKET 账户行和数据库必须使用
+完全一致的 literal `execution_account_id`；钱包文件中的账户集合必须与 POLYMARKET 账户行完全一致。
+Kalshi 账户（`kalshi:<name>`）没有钱包，不进钱包文件，凭据在 `KALSHI_LIVE_ACCOUNTS_JSON`。
 
 ## 钱包类型
 
