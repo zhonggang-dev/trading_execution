@@ -3330,6 +3330,74 @@ func TestRunSendsKalshiInputOnlyToBindingsWithTradableRoute(t *testing.T) {
 	}
 }
 
+// TestRunBuildsBookTargetsForKalshiLotsHeldByRoutedBinding is the regression
+// for the 2026-10-29 outage: the first filled Kalshi order became an open lot
+// whose book target carried no outcome_id, so every later cycle failed with
+// "book target venue identity is invalid" for all venues and wallets.
+func TestRunBuildsBookTargetsForKalshiLotsHeldByRoutedBinding(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	polymarket := validPrediction(decisionAt)
+	kalshi := kalshiPrediction(decisionAt)
+	positions := mixedVenuePositions(decisionAt, polymarket)
+	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
+	strategy := &matrixStrategy{}
+	service, err := newTestService(Params{
+		PredictionSource:  fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
+		PositionSource:    positions,
+		OrderBookSource:   bookSource,
+		Strategy:          strategy,
+		Recorder:          &fakeRecorder{},
+		KalshiInputPolicy: kalshiInputAllowlist{testBinding().ExecutionAccountID: true},
+		Bindings:          []domain.StrategyExecutionBinding{testExecutionBinding()},
+		Venue:             "polymarket-paper",
+		Now:               func() time.Time { return decisionAt.Add(5 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want a Kalshi lot to produce a valid book target", err)
+	}
+	var lotTarget *domain.BookTarget
+	for index := range bookSource.targets {
+		if bookSource.targets[index].TokenID == "kalshi:KXLOT:YES" {
+			lotTarget = &bookSource.targets[index]
+		}
+	}
+	if lotTarget == nil || lotTarget.OutcomeID != "YES" || lotTarget.MarketSource.Normalize() != domain.MarketSourceKalshi {
+		t.Fatalf("book targets = %#v, want the Kalshi lot token captured with outcome_id YES", bookSource.targets)
+	}
+	if len(strategy.requests) != 1 || len(strategy.requests[0].Positions) != 2 {
+		t.Fatalf("strategy requests = %#v, want one request carrying both lots", strategy.requests)
+	}
+	for _, run := range result.Runs {
+		if run.Error != nil {
+			t.Fatalf("binding run error = %v", run.Error)
+		}
+	}
+}
+
+// TestBuildInputTargetsAcceptsKalshiLotOnPredictedToken checks that a Kalshi
+// lot on a token that also has a prediction resolves to the identical target.
+func TestBuildInputTargetsAcceptsKalshiLotOnPredictedToken(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	kalshi := kalshiPrediction(decisionAt)
+	lot := domain.StrategyPositionLot{
+		LotID: "lot-same", MarketSource: domain.MarketSourceKalshi, MarketID: "KXTEST", ConditionID: "kalshi:KXTEST",
+		OutcomeIndex: 1, OutcomeName: "No", TokenID: "kalshi:KXTEST:NO",
+	}
+	targets, err := buildInputTargets([]domain.Prediction{kalshi}, []domain.StrategyPositionLot{lot})
+	if err != nil || len(targets) != 2 {
+		t.Fatalf("buildInputTargets() = %#v, %v, want the two predicted Kalshi outcomes without conflict", targets, err)
+	}
+	broken := lot
+	broken.TokenID = "kalshi:OTHER:NO"
+	if _, err := buildInputTargets(nil, []domain.StrategyPositionLot{broken}); err == nil {
+		t.Fatal("a Kalshi lot whose token does not match its condition must be rejected")
+	}
+}
+
 func TestRunCapturesNoKalshiBookWhenNoBindingHasTradableRoute(t *testing.T) {
 	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
 	polymarket := validPrediction(decisionAt)

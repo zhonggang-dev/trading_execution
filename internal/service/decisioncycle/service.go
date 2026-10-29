@@ -1371,9 +1371,15 @@ func buildInputTargets(predictions []domain.Prediction, positions []domain.Strat
 		}
 	}
 	for _, lot := range positions {
+		// Kalshi identity is condition+outcome, so the lot must carry the YES/NO
+		// outcome its token encodes; Polymarket lots have no outcome id.
+		outcomeID, err := executionOutcomeID(lot.MarketSource, lot.ConditionID, lot.TokenID)
+		if err != nil {
+			return nil, err
+		}
 		target, err := (domain.BookTargetParams{
 			MarketSource: lot.MarketSource, MarketID: lot.MarketID, ConditionID: lot.ConditionID,
-			OutcomeIndex: lot.OutcomeIndex, TokenID: lot.TokenID,
+			OutcomeIndex: lot.OutcomeIndex, TokenID: lot.TokenID, OutcomeID: outcomeID,
 		}).Build()
 		if err != nil {
 			return nil, err
@@ -1502,10 +1508,8 @@ func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleI
 			return fmt.Errorf("claimed strategy prediction %q: %w", prediction.PredictionID, err)
 		}
 		for _, outcome := range prediction.Outcomes {
-			target := domain.BookTarget{
-				MarketSource: prediction.MarketSource, MarketID: prediction.MarketID, ConditionID: prediction.ConditionID,
-				OutcomeIndex: outcome.Index, TokenID: outcome.TokenID, OutcomeID: outcome.OutcomeID,
-			}
+			target := claimedBookIdentity(prediction.MarketSource, prediction.MarketID, prediction.ConditionID,
+				outcome.Index, outcome.TokenID, outcome.OutcomeID)
 			if existing, exists := tokens[outcome.TokenID]; exists && existing != target {
 				return fmt.Errorf("claimed strategy prediction token %q has conflicting market identity", outcome.TokenID)
 			}
@@ -1521,7 +1525,11 @@ func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleI
 			return fmt.Errorf("claimed strategy input contains duplicate position lot %q", lot.LotID)
 		}
 		seenLots[lot.LotID] = struct{}{}
-		target := domain.BookTarget{MarketID: lot.MarketID, ConditionID: lot.ConditionID, OutcomeIndex: lot.OutcomeIndex, TokenID: lot.TokenID}
+		outcomeID, err := executionOutcomeID(lot.MarketSource, lot.ConditionID, lot.TokenID)
+		if err != nil {
+			return fmt.Errorf("claimed strategy position lot %q: %w", lot.LotID, err)
+		}
+		target := claimedBookIdentity(lot.MarketSource, lot.MarketID, lot.ConditionID, lot.OutcomeIndex, lot.TokenID, outcomeID)
 		if existing, exists := tokens[lot.TokenID]; exists && existing != target {
 			return fmt.Errorf("claimed strategy position token %q has conflicting market identity", lot.TokenID)
 		}
@@ -1556,6 +1564,16 @@ func validateClaimedInput(request domain.StrategyDecisionRequest, expectedCycleI
 		return fmt.Errorf("claimed strategy input hash does not match its payload")
 	}
 	return nil
+}
+
+// claimedBookIdentity 以统一口径表示已领取输入中的盘口身份，使预测与持仓批次可直接比较。
+func claimedBookIdentity(
+	source domain.MarketSource, marketID, conditionID string, outcomeIndex int, tokenID, outcomeID string,
+) domain.BookTarget {
+	return domain.BookTarget{
+		MarketSource: source.Normalize(), MarketID: marketID, ConditionID: conditionID,
+		OutcomeIndex: outcomeIndex, TokenID: tokenID, OutcomeID: strings.ToUpper(strings.TrimSpace(outcomeID)),
+	}
 }
 
 // validateExecutionConstraints 校验 Execution Constraints 的字段和业务约束。
