@@ -298,6 +298,61 @@ func TestAcceptedPlacementWithMismatchedOrderIDIsAmbiguous(t *testing.T) {
 	}
 }
 
+// TestPlacementDuringExchangePauseIsDefinitiveRejection 验证交易所暂停时下单返回的 503 被视为确定拒绝，而普通 503 仍为结果不明。
+func TestPlacementDuringExchangePauseIsDefinitiveRejection(t *testing.T) {
+	now := time.Date(2026, 10, 29, 18, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name     string
+		message  string
+		wantKind port.VenueErrorKind
+		wantCode string
+	}{
+		{name: "observed pause", message: "trading is disabled", wantKind: port.VenueErrorRejected, wantCode: "CLOB_TRADING_PAUSED"},
+		{name: "documented pause", message: "Trading is currently disabled. Check polymarket.com for updates", wantKind: port.VenueErrorRejected, wantCode: "CLOB_TRADING_PAUSED"},
+		{name: "cancel-only", message: "Trading is currently cancel-only. New orders are not accepted, but cancels are allowed.", wantKind: port.VenueErrorRejected, wantCode: "CLOB_TRADING_PAUSED"},
+		{name: "post-only", message: "post-only mode: only post-only orders and cancels are allowed", wantKind: port.VenueErrorRejected, wantCode: "CLOB_TRADING_PAUSED"},
+		{name: "generic unavailable", message: "upstream unavailable", wantKind: port.VenueErrorAmbiguous, wantCode: "CLOB_SERVER_ERROR"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/version":
+					writeTestJSON(writer, map[string]any{"version": 2})
+				case "/tick-size":
+					writeTestJSON(writer, map[string]any{"minimum_tick_size": "0.01"})
+				case "/neg-risk":
+					writeTestJSON(writer, map[string]any{"neg_risk": false})
+				case "/order":
+					writer.Header().Set("Content-Type", "application/json")
+					writer.WriteHeader(http.StatusServiceUnavailable)
+					_ = json.NewEncoder(writer).Encode(map[string]any{"error": testCase.message})
+				default:
+					http.NotFound(writer, request)
+				}
+			}))
+			defer server.Close()
+
+			client := newTestTradingClient(t, server.URL, now)
+			_, err := client.Place(context.Background(), adapterOrder())
+			var venueError *port.VenueError
+			if !errors.As(err, &venueError) || venueError.Kind != testCase.wantKind ||
+				venueError.Code != testCase.wantCode || venueError.HTTPStatus != http.StatusServiceUnavailable {
+				t.Fatalf("Place() error = %#v, want kind %s code %s", err, testCase.wantKind, testCase.wantCode)
+			}
+		})
+	}
+}
+
+// TestCancelDuringExchangePauseStaysAmbiguous 验证暂停期 503 只对下单视为确定拒绝，撤单仍按结果不明处理。
+func TestCancelDuringExchangePauseStaysAmbiguous(t *testing.T) {
+	err := mapHTTPError(http.MethodDelete, http.StatusServiceUnavailable, http.Header{}, []byte(`{"error":"trading is disabled"}`))
+	var venueError *port.VenueError
+	if !errors.As(err, &venueError) || venueError.Kind != port.VenueErrorAmbiguous {
+		t.Fatalf("mapHTTPError(DELETE) = %#v, want ambiguous", err)
+	}
+}
+
 // TestAcceptedPlacementWithoutOrderIDIsAmbiguous 验证 Accepted Placement Without Order ID Is Ambiguous 场景下的行为。
 func TestAcceptedPlacementWithoutOrderIDIsAmbiguous(t *testing.T) {
 	now := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
