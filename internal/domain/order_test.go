@@ -212,3 +212,70 @@ func TestOrderIntentJSONCarriesDecisionQuotesOnlyWhenPresent(t *testing.T) {
 		t.Fatalf("decoded quotes = %#v from %s", decoded.DecisionQuotes, encoded)
 	}
 }
+
+// TestOrderIntentEquivalentIgnoresDecisionMeta 验证复盘信息只作审计附带，不改变意图身份：
+// 上线前冻结、上线后重放的同一意图不带它，不能被判为冲突。
+func TestOrderIntentEquivalentIgnoresDecisionMeta(t *testing.T) {
+	base := OrderIntent{ClientOrderID: "client-1", Side: SideBuy, Size: "10", Metadata: map[string]string{"cycle_id": "c-1"}}
+	endAt := time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)
+	withMeta := base
+	withMeta.DecisionMeta = &OrderDecisionMeta{MarketEndAt: &endAt, Domains: []string{"Politics", "Economics"}}
+	if !base.Equivalent(withMeta) || !withMeta.Equivalent(base) {
+		t.Fatal("intents differing only by decision meta must stay equivalent")
+	}
+}
+
+// TestOrderIntentNormalizeCopiesDecisionMeta 验证规范化会深复制、转 UTC 并清理 domain 的空白和空值。
+func TestOrderIntentNormalizeCopiesDecisionMeta(t *testing.T) {
+	local := time.FixedZone("CST", 8*3600)
+	endAt := time.Date(2026, 11, 6, 8, 0, 0, 0, local)
+	meta := &OrderDecisionMeta{MarketEndAt: &endAt, Domains: []string{" Politics ", "", "Economics"}}
+	intent := OrderIntent{DecisionMeta: meta}.Normalize()
+	if intent.DecisionMeta == meta || intent.DecisionMeta.MarketEndAt == meta.MarketEndAt {
+		t.Fatal("Normalize must copy decision meta")
+	}
+	if got := intent.DecisionMeta.MarketEndAt; got.Location() != time.UTC || !got.Equal(endAt) {
+		t.Fatalf("normalized end = %v, want the same instant in UTC", got)
+	}
+	if got := intent.DecisionMeta.Domains; len(got) != 2 || got[0] != "Politics" || got[1] != "Economics" {
+		t.Fatalf("normalized domains = %#v, want trimmed non-empty", got)
+	}
+	meta.Domains[0] = "changed"
+	if intent.DecisionMeta.Domains[0] != "Politics" {
+		t.Fatal("normalized intent must not share the caller's domains")
+	}
+	if (OrderIntent{}).Normalize().DecisionMeta != nil {
+		t.Fatal("intent without decision meta must stay nil")
+	}
+}
+
+// TestOrderIntentJSONCarriesDecisionMetaOnlyWhenPresent 验证 intent JSON 只在有值时带 decision_meta，旧 JSON 解码后为空。
+func TestOrderIntentJSONCarriesDecisionMetaOnlyWhenPresent(t *testing.T) {
+	plain, err := json.Marshal(OrderIntent{ClientOrderID: "client-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "decision_meta") {
+		t.Fatalf("intent without meta JSON = %s", plain)
+	}
+	endAt := time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)
+	encoded, err := json.Marshal(OrderIntent{ClientOrderID: "client-1", DecisionMeta: &OrderDecisionMeta{MarketEndAt: &endAt, Domains: []string{"Politics"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded OrderIntent
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.DecisionMeta == nil || decoded.DecisionMeta.MarketEndAt == nil || !decoded.DecisionMeta.MarketEndAt.Equal(endAt) ||
+		len(decoded.DecisionMeta.Domains) != 1 || decoded.DecisionMeta.Domains[0] != "Politics" {
+		t.Fatalf("decoded meta = %#v from %s", decoded.DecisionMeta, encoded)
+	}
+}
+
+func TestOrderDecisionMetaIsEmpty(t *testing.T) {
+	endAt := time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)
+	if !(OrderDecisionMeta{}).IsEmpty() || (OrderDecisionMeta{MarketEndAt: &endAt}).IsEmpty() || (OrderDecisionMeta{Domains: []string{"Politics"}}).IsEmpty() {
+		t.Fatal("IsEmpty must be true only when neither end date nor domains are set")
+	}
+}

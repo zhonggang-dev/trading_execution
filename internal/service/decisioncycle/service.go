@@ -1842,6 +1842,7 @@ func buildEntryIntent(request domain.StrategyDecisionRequest, signalAt time.Time
 		ExpiresAt:          order.ExpiresAt,
 		Metadata:           metadata,
 		DecisionQuotes:     buyDecisionQuotes(request.OrderBooks, prediction),
+		DecisionMeta:       buyDecisionMeta(prediction),
 	}).Build()
 	return intent, err
 }
@@ -1882,6 +1883,25 @@ func buyDecisionQuotes(books []domain.OrderBookSnapshot, prediction domain.Predi
 		}
 	}
 	return quotes
+}
+
+// buyDecisionMeta 取出预测快照里官方标注的到期日和市场所属的全部 domain，写到买入单上供复盘；
+// 两项都缺失时返回 nil。到期日不合法的时间（零值）记为空，不影响下单。
+func buyDecisionMeta(prediction domain.Prediction) *domain.OrderDecisionMeta {
+	meta := &domain.OrderDecisionMeta{}
+	if prediction.EndAt != nil && !prediction.EndAt.IsZero() {
+		endAt := prediction.EndAt.UTC()
+		meta.MarketEndAt = &endAt
+	}
+	for _, name := range prediction.Domains {
+		if name = strings.TrimSpace(name); name != "" {
+			meta.Domains = append(meta.Domains, name)
+		}
+	}
+	if meta.IsEmpty() {
+		return nil
+	}
+	return meta
 }
 
 // bookTopOfBook 返回盘口的买一、卖一；best 字段为空时退回首档，MISSING/ERROR 的书一律为空。

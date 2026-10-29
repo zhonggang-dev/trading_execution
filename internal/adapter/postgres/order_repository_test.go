@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -352,5 +353,82 @@ func TestOrderRepositoryCreateStoresDecisionQuotesPostgresIntegration(t *testing
 	bad.Intent.DecisionQuotes = &domain.OrderDecisionQuotes{YesBid: "1.2"}
 	if _, _, err := repository.Create(ctx, bad); err == nil {
 		t.Fatal("Create() accepted a decision bid above 1")
+	}
+}
+
+// TestOrderRepositoryCreateStoresDecisionMetaPostgresIntegration 验证买入单创建时写入到期日和 domain 列表，
+// 只有一项、没有内容和卖出单的订单按预期落库，重复创建不改写已存的值。
+func TestOrderRepositoryCreateStoresDecisionMetaPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	insertAccount(t, db, "account-meta", "0xmeta", "100", "100", "0")
+	repository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	endAt := time.Date(2026, 11, 6, 16, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	full := integrationOrder("meta-full", "account-meta", "token-full", domain.SideBuy, "10", "0.5")
+	full.Intent.DecisionMeta = &domain.OrderDecisionMeta{MarketEndAt: &endAt, Domains: []string{"Politics", "Economics"}}
+	domainsOnly := integrationOrder("meta-domains", "account-meta", "token-domains", domain.SideBuy, "10", "0.5")
+	domainsOnly.Intent.DecisionMeta = &domain.OrderDecisionMeta{Domains: []string{"Finance"}}
+	emptyMeta := integrationOrder("meta-empty", "account-meta", "token-empty", domain.SideBuy, "10", "0.5")
+	emptyMeta.Intent.DecisionMeta = &domain.OrderDecisionMeta{}
+	none := integrationOrder("meta-none", "account-meta", "token-none", domain.SideSell, "10", "0.5")
+	for _, order := range []domain.Order{full, domainsOnly, emptyMeta, none} {
+		if _, created, err := repository.Create(ctx, order); err != nil || !created {
+			t.Fatalf("Create(%s) created=%v error=%v", order.ID, created, err)
+		}
+	}
+	replay := full
+	replay.Intent.DecisionMeta = &domain.OrderDecisionMeta{Domains: []string{"Overwritten"}}
+	if _, created, err := repository.Create(ctx, replay); err != nil || created {
+		t.Fatalf("replayed Create() created=%v error=%v, want idempotent no-op", created, err)
+	}
+
+	read := func(orderID string) sql.NullString {
+		t.Helper()
+		var meta sql.NullString
+		if err := db.QueryRowContext(ctx, `SELECT decision_meta::text FROM execution_orders WHERE order_id = $1`, orderID).Scan(&meta); err != nil {
+			t.Fatalf("read %s: %v", orderID, err)
+		}
+		return meta
+	}
+	var stored struct {
+		MarketEndAt *time.Time `json:"market_end_at"`
+		Domains     []string   `json:"domains"`
+	}
+	meta := read(full.ID)
+	if !meta.Valid {
+		t.Fatal("full order stored no decision meta")
+	}
+	if err := json.Unmarshal([]byte(meta.String), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.MarketEndAt == nil || !stored.MarketEndAt.Equal(endAt) || len(stored.Domains) != 2 || stored.Domains[0] != "Politics" || stored.Domains[1] != "Economics" {
+		t.Fatalf("full decision meta = %s, want end %v and both domains", meta.String, endAt)
+	}
+	var endText string
+	if err := db.QueryRowContext(ctx, `SELECT decision_meta ->> 'market_end_at' FROM execution_orders WHERE order_id = $1`, full.ID).Scan(&endText); err != nil || endText != "2026-11-06T08:00:00Z" {
+		t.Fatalf("stored market_end_at = %q (%v), want UTC 2026-11-06T08:00:00Z", endText, err)
+	}
+	meta = read(domainsOnly.ID)
+	stored.MarketEndAt, stored.Domains = nil, nil
+	if err := json.Unmarshal([]byte(meta.String), &stored); err != nil || stored.MarketEndAt != nil || len(stored.Domains) != 1 || stored.Domains[0] != "Finance" {
+		t.Fatalf("domains-only decision meta = %v / %v", meta, err)
+	}
+	if strings.Contains(meta.String, "market_end_at") {
+		t.Fatalf("domains-only decision meta = %s, must not carry an empty end date", meta.String)
+	}
+	for _, orderID := range []string{emptyMeta.ID, none.ID} {
+		if got := read(orderID); got.Valid {
+			t.Fatalf("%s decision meta = %s, want NULL", orderID, got.String)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE execution_orders SET decision_meta = '[]'::jsonb WHERE order_id = $1`, full.ID); err == nil {
+		t.Fatal("decision_meta accepted a JSON array")
 	}
 }

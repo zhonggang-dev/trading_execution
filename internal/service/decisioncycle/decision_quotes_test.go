@@ -208,3 +208,75 @@ func TestBuildEntryIntentDropsQuotesOutsideUnitRange(t *testing.T) {
 		t.Fatalf("json.Marshal(intent) error = %v", err)
 	}
 }
+
+// TestBuildEntryIntentRecordsMarketEndAndAllDomains 验证买入单记录预测里的到期日（UTC）和完整 domain 列表，
+// Polymarket 与 Kalshi 一致。
+func TestBuildEntryIntentRecordsMarketEndAndAllDomains(t *testing.T) {
+	decisionAt := time.Date(2026, 10, 28, 8, 30, 0, 0, time.UTC)
+	local := time.FixedZone("CST", 8*3600)
+	endAt := time.Date(2026, 11, 6, 16, 0, 0, 0, local)
+	for name, prediction := range map[string]domain.Prediction{
+		"polymarket": validPrediction(decisionAt),
+		"kalshi":     kalshiQuotesPrediction(decisionAt),
+	} {
+		t.Run(name, func(t *testing.T) {
+			prediction.EndAt = &endAt
+			prediction.Domains = []string{"Politics", " Economics ", ""}
+			request := decisionQuotesRequest(decisionAt, prediction,
+				quotesBook(prediction, 0, decisionAt, "0.48", "0.50"), quotesBook(prediction, 1, decisionAt, "0.49", "0.52"))
+			intent, err := buildEntryIntent(request, decisionAt, quotesBuyEvaluation(prediction, 0, "0.50", 0.7), "polymarket")
+			if err != nil {
+				t.Fatalf("buildEntryIntent() error = %v", err)
+			}
+			meta := intent.DecisionMeta
+			if meta == nil || meta.MarketEndAt == nil || meta.MarketEndAt.Location() != time.UTC || !meta.MarketEndAt.Equal(endAt) {
+				t.Fatalf("decision meta = %#v, want the end date as the same instant in UTC", meta)
+			}
+			if len(meta.Domains) != 2 || meta.Domains[0] != "Politics" || meta.Domains[1] != "Economics" {
+				t.Fatalf("domains = %#v, want every non-empty domain in order", meta.Domains)
+			}
+		})
+	}
+}
+
+// TestBuildEntryIntentLeavesDecisionMetaOutWhenPredictionHasNone 验证预测没有到期日和 domain 时不带复盘信息，
+// 只有一项时只记录这一项，都不影响下单。
+func TestBuildEntryIntentLeavesDecisionMetaOutWhenPredictionHasNone(t *testing.T) {
+	decisionAt := time.Date(2026, 10, 28, 8, 30, 0, 0, time.UTC)
+	endAt := time.Date(2026, 11, 6, 8, 0, 0, 0, time.UTC)
+	zero := time.Time{}
+	for _, test := range []struct {
+		name        string
+		end         *time.Time
+		domains     []string
+		wantNil     bool
+		wantEnd     bool
+		wantDomains int
+	}{
+		{name: "neither", wantNil: true},
+		{name: "zero end and blank domains", end: &zero, domains: []string{" ", ""}, wantNil: true},
+		{name: "end only", end: &endAt, wantEnd: true},
+		{name: "domains only", domains: []string{"Finance"}, wantDomains: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prediction := validPrediction(decisionAt)
+			prediction.EndAt, prediction.Domains = test.end, test.domains
+			request := decisionQuotesRequest(decisionAt, prediction,
+				quotesBook(prediction, 0, decisionAt, "0.48", "0.50"), quotesBook(prediction, 1, decisionAt, "0.49", "0.52"))
+			intent, err := buildEntryIntent(request, decisionAt, quotesBuyEvaluation(prediction, 0, "0.50", 0.7), "polymarket")
+			if err != nil {
+				t.Fatalf("buildEntryIntent() error = %v", err)
+			}
+			if test.wantNil {
+				if intent.DecisionMeta != nil {
+					t.Fatalf("decision meta = %#v, want nil", intent.DecisionMeta)
+				}
+				return
+			}
+			meta := intent.DecisionMeta
+			if meta == nil || (meta.MarketEndAt != nil) != test.wantEnd || len(meta.Domains) != test.wantDomains {
+				t.Fatalf("decision meta = %#v, want end=%v domains=%d", meta, test.wantEnd, test.wantDomains)
+			}
+		})
+	}
+}

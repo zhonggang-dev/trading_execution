@@ -89,8 +89,21 @@ type OrderIntent struct {
 	TimeInForce        TimeInForce       `json:"time_in_force"`
 	ExpiresAt          *time.Time        `json:"expires_at,omitempty"`
 	Metadata           map[string]string `json:"metadata,omitempty"`
-	// DecisionQuotes 只用于审计，不参与 Equivalent 比较。
+	// DecisionQuotes 和 DecisionMeta 只用于审计，不参与 Equivalent 比较。
 	DecisionQuotes *OrderDecisionQuotes `json:"decision_quotes,omitempty"`
+	DecisionMeta   *OrderDecisionMeta   `json:"decision_meta,omitempty"`
+}
+
+// OrderDecisionMeta 记录买入决策那一刻预测快照里的复盘信息：官方标注的市场到期日（UTC）
+// 和市场所属的全部 domain。两项都为空时不写入订单。
+type OrderDecisionMeta struct {
+	MarketEndAt *time.Time `json:"market_end_at,omitempty"`
+	Domains     []string   `json:"domains,omitempty"`
+}
+
+// IsEmpty 判断是否没有任何可记录的内容。
+func (meta OrderDecisionMeta) IsEmpty() bool {
+	return meta.MarketEndAt == nil && len(meta.Domains) == 0
 }
 
 // OrderDecisionQuotes 记录买入决策那一刻本轮盘口的 YES/NO 买一卖一和模型给出的 YES 概率。
@@ -154,6 +167,19 @@ func (intent OrderIntent) Normalize() OrderIntent {
 			YesProbability: Decimal(strings.TrimSpace(intent.DecisionQuotes.YesProbability.String())),
 		}
 		intent.DecisionQuotes = &quotes
+	}
+	if intent.DecisionMeta != nil {
+		meta := OrderDecisionMeta{}
+		if intent.DecisionMeta.MarketEndAt != nil {
+			endAt := intent.DecisionMeta.MarketEndAt.UTC()
+			meta.MarketEndAt = &endAt
+		}
+		for _, domain := range intent.DecisionMeta.Domains {
+			if domain = strings.TrimSpace(domain); domain != "" {
+				meta.Domains = append(meta.Domains, domain)
+			}
+		}
+		intent.DecisionMeta = &meta
 	}
 	return intent
 }
@@ -232,7 +258,7 @@ func (intent OrderIntent) Validate() error {
 	return nil
 }
 
-// Equivalent 判断两个订单意图在规范化后是否具有相同业务语义。DecisionQuotes 是审计附带信息，
+// Equivalent 判断两个订单意图在规范化后是否具有相同业务语义。DecisionQuotes 和 DecisionMeta 是审计附带信息，
 // 不参与比较：上线前冻结、上线后重放的同一意图不带它，不能因此判为冲突。
 func (intent OrderIntent) Equivalent(other OrderIntent) bool {
 	left := intent.Normalize()
