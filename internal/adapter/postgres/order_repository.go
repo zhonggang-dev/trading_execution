@@ -42,6 +42,10 @@ func (repository *OrderRepository) Create(ctx context.Context, order domain.Orde
 	if order.Intent.DecisionQuotes != nil {
 		quotes = *order.Intent.DecisionQuotes
 	}
+	decisionMeta, err := encodeDecisionMeta(order.Intent.DecisionMeta)
+	if err != nil {
+		return domain.Order{}, false, err
+	}
 	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return domain.Order{}, false, fmt.Errorf("begin order create: %w", err)
@@ -53,13 +57,15 @@ func (repository *OrderRepository) Create(ctx context.Context, order domain.Orde
 			token_id, intent, market_validation, venue_order_id, status,
 			filled_size, filled_notional, total_fees, average_fill_price, failure_code, failure_reason,
 			venue_last_observed_at, revision, created_at, updated_at,
-			decision_yes_bid, decision_yes_ask, decision_no_bid, decision_no_ask, decision_yes_probability
+			decision_yes_bid, decision_yes_ask, decision_no_bid, decision_no_ask, decision_yes_probability,
+			decision_meta
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10,
 			$11::numeric, $12::numeric, $13::numeric, NULLIF($14, '')::numeric,
 			$15, $16, $17, $18, $19, $20,
 			NULLIF($21, '')::numeric, NULLIF($22, '')::numeric, NULLIF($23, '')::numeric,
-			NULLIF($24, '')::numeric, NULLIF($25, '')::numeric
+			NULLIF($24, '')::numeric, NULLIF($25, '')::numeric,
+			$26::jsonb
 		)
 		ON CONFLICT (client_order_id) DO NOTHING`,
 		order.ID, order.Intent.ClientOrderID, order.Intent.ExecutionAccountID,
@@ -70,7 +76,7 @@ func (repository *OrderRepository) Create(ctx context.Context, order domain.Orde
 		order.FailureCode, order.FailureReason, order.VenueLastObservedAt,
 		order.Revision, order.CreatedAt, order.UpdatedAt,
 		quotes.YesBid.String(), quotes.YesAsk.String(), quotes.NoBid.String(),
-		quotes.NoAsk.String(), quotes.YesProbability.String())
+		quotes.NoAsk.String(), quotes.YesProbability.String(), decisionMeta)
 	if err != nil {
 		return domain.Order{}, false, fmt.Errorf("insert execution order: %w", err)
 	}
@@ -722,3 +728,20 @@ func decimalOrZero(value domain.Decimal) string {
 // ensure time import remains pinned in the public adapter's SQL scanning
 // contract when database drivers return time.Time through interface values.
 var _ = time.Time{}
+
+// encodeDecisionMeta 把买入单的复盘信息编码为 JSON；没有内容时返回 nil，写入 NULL。
+func encodeDecisionMeta(meta *domain.OrderDecisionMeta) (any, error) {
+	if meta == nil {
+		return nil, nil
+	}
+	// 写入前统一规范化（到期日转 UTC、domain 去空白和空值），不依赖调用方。
+	normalized := domain.OrderIntent{DecisionMeta: meta}.Normalize().DecisionMeta
+	if normalized.IsEmpty() {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, fmt.Errorf("encode order decision meta: %w", err)
+	}
+	return string(encoded), nil
+}
