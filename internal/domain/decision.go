@@ -569,11 +569,25 @@ type StrategyExecutionContext struct {
 // StrategyExecutionBinding 把上游预测生产者身份与下游稳定业务身份分开。
 // PredictionModelID 只用于从 prediction snapshot 精确选择记录，不会发给 Python。
 // 为了兼容旧的三字段配置，留空时它默认等于 ModelID。
+// MarketSource is the one venue the account trades: the account only receives
+// that venue's predictions and holds that venue's lots. Empty means Polymarket.
 type StrategyExecutionBinding struct {
-	PredictionModelID  string `json:"prediction_model_id,omitempty"`
-	ModelID            string `json:"model_id"`
-	StrategyID         string `json:"strategy_id"`
-	ExecutionAccountID string `json:"execution_account_id"`
+	PredictionModelID  string       `json:"prediction_model_id,omitempty"`
+	ModelID            string       `json:"model_id"`
+	StrategyID         string       `json:"strategy_id"`
+	ExecutionAccountID string       `json:"execution_account_id"`
+	MarketSource       MarketSource `json:"market_source,omitempty"`
+}
+
+// KalshiExecutionAccountPrefix marks the execution accounts that trade Kalshi.
+// The prefix is part of the account identity: Kalshi ledgers, settlements and
+// routes are all keyed by it, and a Polymarket account can never carry it.
+const KalshiExecutionAccountPrefix = "kalshi:"
+
+// IsKalshiExecutionAccount reports whether the account identity is a Kalshi
+// account.
+func IsKalshiExecutionAccount(executionAccountID string) bool {
+	return strings.HasPrefix(strings.TrimSpace(executionAccountID), KalshiExecutionAccountPrefix)
 }
 
 const (
@@ -612,6 +626,7 @@ func (binding StrategyExecutionBinding) Normalize() StrategyExecutionBinding {
 	binding.ModelID = strings.TrimSpace(binding.ModelID)
 	binding.StrategyID = CanonicalStrategyID(binding.StrategyID)
 	binding.ExecutionAccountID = strings.TrimSpace(binding.ExecutionAccountID)
+	binding.MarketSource = binding.MarketSource.Normalize()
 	if binding.PredictionModelID == "" {
 		binding.PredictionModelID = binding.ModelID
 	}
@@ -633,6 +648,20 @@ func (binding StrategyExecutionBinding) Validate() error {
 	binding = binding.Normalize()
 	if binding.PredictionModelID == "" {
 		return fmt.Errorf("prediction_model_id is required")
+	}
+	switch binding.MarketSource {
+	case MarketSourcePolymarket:
+		if IsKalshiExecutionAccount(binding.ExecutionAccountID) {
+			return fmt.Errorf("Polymarket execution account %q cannot use the %q prefix",
+				binding.ExecutionAccountID, KalshiExecutionAccountPrefix)
+		}
+	case MarketSourceKalshi:
+		if !IsKalshiExecutionAccount(binding.ExecutionAccountID) {
+			return fmt.Errorf("Kalshi execution account %q must start with %q",
+				binding.ExecutionAccountID, KalshiExecutionAccountPrefix)
+		}
+	default:
+		return fmt.Errorf("unsupported market_source %q", binding.MarketSource)
 	}
 	return binding.Context().Validate()
 }
