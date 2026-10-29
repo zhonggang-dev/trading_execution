@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -237,5 +238,303 @@ func TestCheckBindingAuthorizationMigrationPostgresIntegration(t *testing.T) {
 	if err := CheckBindingAuthorizationMigration(context.Background(), db); err == nil ||
 		!strings.Contains(err.Error(), "0041_binding_authorization_without_model.sql is not applied") {
 		t.Fatalf("pre-0041 trigger error = %v", err)
+	}
+}
+
+// ownershipFixture is one account holding a 10-share lot opened under the
+// pre-cutover identity (deepseek_masked, multfactor_v1).
+type ownershipFixture struct {
+	db           *sql.DB
+	ctx          context.Context
+	now          time.Time
+	accountID    string
+	tokenID      string
+	lotID        string
+	repository   *OrderRepository
+	reservations *ReservationManager
+	ledger       *FillLedger
+	processor    *fillprocessor.Service
+}
+
+func newOwnershipFixture(t *testing.T, databaseURL string) ownershipFixture {
+	t.Helper()
+	fixture := ownershipFixture{
+		db: newIntegrationDatabase(t, databaseURL), ctx: context.Background(),
+		now:       time.Now().UTC().Truncate(time.Microsecond),
+		accountID: "account-ownership", tokenID: "token-ownership",
+	}
+	insertAccount(t, fixture.db, fixture.accountID, "0xownership", "100", "100", "0")
+	var err error
+	if fixture.repository, err = NewOrderRepository(fixture.db); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.reservations, err = NewReservationManager(ReservationManagerParams{DB: fixture.db, MaxBuyFeeRateBPS: "0"}); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.ledger, err = NewFillLedger(FillLedgerParams{DB: fixture.db, DustSharesThreshold: "0.01", DustNotionalThreshold: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.processor, err = fillprocessor.New(fillprocessor.Params{Orders: fixture.repository, Source: noFillsSource{}, Ledger: fixture.ledger}); err != nil {
+		t.Fatal(err)
+	}
+	buy := integrationOrder("ownership-buy", fixture.accountID, fixture.tokenID, domain.SideBuy, "10", "0.6")
+	buy.Intent.Venue = "paper"
+	buy.Intent.ModelID = "deepseek_masked"
+	buy.Intent.StrategyID = domain.StrategyIDMultfactorV1
+	buy = createAcknowledgedIntegrationOrder(t, fixture.ctx, fixture.repository, fixture.reservations, buy, "0xbuy-ownership", fixture.now)
+	if _, err := fixture.processor.Process(fixture.ctx, buy, ownershipFill("trade-ownership-buy", "10", "0.5", "5", fixture.now.Add(10*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	lots, err := fixture.ledger.ListLots(fixture.ctx, fixture.accountID, fixture.tokenID)
+	if err != nil || len(lots) != 1 {
+		t.Fatalf("opened lot = %#v err=%v", lots, err)
+	}
+	fixture.lotID = lots[0].LotID
+	return fixture
+}
+
+// acknowledgedSell places a FAK SELL on the fixture lot and leaves its
+// reservation ACTIVE, as a live order between acknowledgement and finality.
+func (fixture ownershipFixture) acknowledgedSell(t *testing.T, orderID, modelID, strategyID, size string) domain.Order {
+	t.Helper()
+	sell := integrationOrder(orderID, fixture.accountID, fixture.tokenID, domain.SideSell, size, "0.3")
+	sell.Intent.Venue = "paper"
+	sell.Intent.ModelID = modelID
+	sell.Intent.StrategyID = strategyID
+	sell.Intent.TargetLotID = fixture.lotID
+	sell.Intent.TimeInForce = domain.TimeInForceFAK
+	sell = createAcknowledgedIntegrationOrder(t, fixture.ctx, fixture.repository, fixture.reservations, sell, "0x"+orderID, fixture.now.Add(20*time.Second))
+	// The paper fixture reserves without a risk receipt, which the live
+	// bootstrap counts as a legacy reservation. Give it one so the checks below
+	// isolate the SELL identity rule.
+	if _, err := fixture.db.Exec(`UPDATE asset_reservations
+		SET risk_policy_id='ownership-policy', risk_policy_version=1, risk_day=CURRENT_DATE, daily_risk_notional=1
+		WHERE order_id=$1`, sell.ID); err != nil {
+		t.Fatal(err)
+	}
+	return sell
+}
+
+func (fixture ownershipFixture) bootstrap() error {
+	return CheckLiveLedgerBootstrap(fixture.ctx, fixture.db, []ExpectedExecutionAccount{{ExecutionAccountID: fixture.accountID}})
+}
+
+// rollbackGateRows runs the runbook's rollback gate a) verbatim.
+func (fixture ownershipFixture) rollbackGateRows(t *testing.T) []string {
+	t.Helper()
+	runbook, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "account-portfolio-cutover.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(runbook)
+	marker := strings.Index(text, "-- rollback-gate: legacy-sell-identity")
+	if marker < 0 {
+		t.Fatal("runbook has no rollback gate a)")
+	}
+	end := strings.Index(text[marker:], "```")
+	if end < 0 {
+		t.Fatal("runbook rollback gate a) is not a closed SQL block")
+	}
+	rows, err := fixture.db.Query(text[marker : marker+end])
+	if err != nil {
+		t.Fatalf("run rollback gate: %v", err)
+	}
+	defer rows.Close()
+	var blockers []string
+	for rows.Next() {
+		var accountID, orderID, reservationStatus, lotID string
+		var orderStatus sql.NullString
+		if err := rows.Scan(&accountID, &orderID, &reservationStatus, &orderStatus, &lotID); err != nil {
+			t.Fatal(err)
+		}
+		blockers = append(blockers, orderID+"/"+reservationStatus+"/"+orderStatus.String)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return blockers
+}
+
+func (fixture ownershipFixture) activeSellReservedShares(t *testing.T) string {
+	t.Helper()
+	var reserved string
+	if err := fixture.db.QueryRow(`SELECT COALESCE(sum(remaining_reserved_shares),0)::text FROM asset_reservations
+		WHERE execution_account_id=$1 AND side='SELL' AND status IN ('ACTIVE','RECONCILIATION_REQUIRED')`, fixture.accountID).Scan(&reserved); err != nil {
+		t.Fatal(err)
+	}
+	return reserved
+}
+
+func (fixture ownershipFixture) assertHolding(t *testing.T, shares string) {
+	t.Helper()
+	lots, err := fixture.ledger.ListLots(fixture.ctx, fixture.accountID, fixture.tokenID)
+	if err != nil || len(lots) != 1 || !lots[0].RemainingShares.Equal(domain.Decimal(shares)) ||
+		lots[0].ModelID != "deepseek_masked" || lots[0].StrategyID != domain.StrategyIDMultfactorV1 {
+		t.Fatalf("lot = %#v err=%v, want %s shares and its opening identity kept", lots, err, shares)
+	}
+	var positionShares string
+	if err := fixture.db.QueryRow(`SELECT total_shares::text FROM execution_positions
+		WHERE execution_account_id=$1 AND token_id=$2`, fixture.accountID, fixture.tokenID).Scan(&positionShares); err != nil {
+		t.Fatal(err)
+	}
+	if !sameNumeric(positionShares, shares) {
+		t.Fatalf("position shares = %s, want %s", positionShares, shares)
+	}
+}
+
+func ownershipFill(venueFillID string, shares, price, gross domain.Decimal, confirmedAt time.Time) domain.Fill {
+	return domain.Fill{
+		VenueFillID: venueFillID, LiquidityRole: domain.LiquidityRoleMaker,
+		Status: domain.FillStatusConfirmed, Shares: shares, Price: price,
+		GrossNotional: gross, FeeRateBPS: "0", PlatformFeeRate: "0", FeeExponent: "0",
+		PlatformFee: "0", BuilderFeeRateBPS: "0", BuilderFee: "0", TotalFee: "0",
+		FeeSource: "TEST_AUTHORITATIVE_SETTLEMENT",
+		MatchedAt: confirmedAt.Add(-time.Second), VenueUpdatedAt: confirmedAt,
+		ObservedAt: confirmedAt, ConfirmedAt: &confirmedAt,
+	}
+}
+
+// TestCrossIdentitySellSurvivesRestartPostgresIntegration: after the cutover
+// every SELL of a pre-cutover lot carries the new model (and possibly another
+// strategy). A restart while such a SELL still holds its reservation must not
+// be refused by the startup ledger check; the rollback gate must flag it,
+// because the previous release's identical check would refuse it.
+func TestCrossIdentitySellSurvivesRestartPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	for _, test := range []struct {
+		name, modelID, strategyID string
+		rollbackBlocked           bool
+	}{
+		{name: "opening-identity", modelID: "deepseek_masked", strategyID: domain.StrategyIDMultfactorV1},
+		{name: "new-model", modelID: "v4.1 flash", strategyID: domain.StrategyIDMultfactorV1, rollbackBlocked: true},
+		{name: "new-model-and-strategy", modelID: "v4.1 flash", strategyID: "brier_mid_edge_once", rollbackBlocked: true},
+		{name: "same-model-new-strategy", modelID: "deepseek_masked", strategyID: "brier_mid_edge_once", rollbackBlocked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newOwnershipFixture(t, databaseURL)
+			sell := fixture.acknowledgedSell(t, "ownership-sell", test.modelID, test.strategyID, "4")
+			if reserved := fixture.activeSellReservedShares(t); !sameNumeric(reserved, "4") {
+				t.Fatalf("active SELL reserved shares = %s, want 4", reserved)
+			}
+			if err := fixture.bootstrap(); err != nil {
+				t.Fatalf("restart with an active SELL reservation was refused: %v", err)
+			}
+			if blockers := fixture.rollbackGateRows(t); (len(blockers) == 1) != test.rollbackBlocked || len(blockers) > 1 {
+				t.Fatalf("rollback gate = %v, want blocked=%v", blockers, test.rollbackBlocked)
+			}
+			sold, err := fixture.processor.Process(fixture.ctx, sell, ownershipFill("trade-ownership-sell", "4", "0.7", "2.8", fixture.now.Add(31*time.Second)))
+			if err != nil || sold.Order.Status != domain.OrderStatusFilled {
+				t.Fatalf("SELL application = %#v err=%v", sold, err)
+			}
+			fixture.assertHolding(t, "6")
+			if err := fixture.bootstrap(); err != nil {
+				t.Fatalf("restart after the SELL filled: %v", err)
+			}
+			if blockers := fixture.rollbackGateRows(t); len(blockers) != 0 {
+				t.Fatalf("rollback gate after the SELL filled = %v", blockers)
+			}
+		})
+	}
+}
+
+// TestCancelledPartialSellLateFillPostgresIntegration: a FAK SELL fills 4 of 6
+// and is CANCELLED, but the remaining 2-share reservation stays unreleased
+// (RECONCILIATION_REQUIRED) until cancel finality. Restart must pass, rollback must stay blocked, and a late
+// fill must close the order without booking any share or cash twice.
+func TestCancelledPartialSellLateFillPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	fixture := newOwnershipFixture(t, databaseURL)
+	sell := fixture.acknowledgedSell(t, "ownership-sell", "v4.1 flash", domain.StrategyIDMultfactorV1, "6")
+	partial, err := fixture.processor.Process(fixture.ctx, sell, ownershipFill("trade-ownership-sell-1", "4", "0.7", "2.8", fixture.now.Add(31*time.Second)))
+	if err != nil || partial.Order.Status != domain.OrderStatusCancelled {
+		t.Fatalf("partial FAK SELL = %#v err=%v, want CANCELLED", partial, err)
+	}
+	fixture.assertHolding(t, "6")
+	if reserved := fixture.activeSellReservedShares(t); !sameNumeric(reserved, "2") {
+		t.Fatalf("active SELL reserved shares after cancel = %s, want 2", reserved)
+	}
+	if err := fixture.bootstrap(); err != nil {
+		t.Fatalf("restart inside the cancel finality window was refused: %v", err)
+	}
+	blockers := fixture.rollbackGateRows(t)
+	// The cancelled remainder waits for finality as RECONCILIATION_REQUIRED.
+	if len(blockers) != 1 || !strings.HasSuffix(blockers[0], "/RECONCILIATION_REQUIRED/CANCELLED") {
+		t.Fatalf("rollback gate for a CANCELLED SELL with an active reservation = %v", blockers)
+	}
+	var cashAfterPartial string
+	if err := fixture.db.QueryRow(`SELECT total_balance::text FROM execution_accounts WHERE execution_account_id=$1`, fixture.accountID).Scan(&cashAfterPartial); err != nil {
+		t.Fatal(err)
+	}
+
+	late := ownershipFill("trade-ownership-sell-2", "2", "0.7", "1.4", fixture.now.Add(45*time.Second))
+	filled, err := fixture.processor.Process(fixture.ctx, partial.Order, late)
+	if err != nil || filled.Order.Status != domain.OrderStatusFilled {
+		t.Fatalf("late fill after cancel = %#v err=%v, want FILLED", filled, err)
+	}
+	fixture.assertHolding(t, "4")
+	var lateCredited bool
+	if err := fixture.db.QueryRow(`SELECT total_balance=$2::numeric+1.4 FROM execution_accounts WHERE execution_account_id=$1`,
+		fixture.accountID, cashAfterPartial).Scan(&lateCredited); err != nil || !lateCredited {
+		t.Fatalf("late fill credited the 1.4 proceeds exactly once: %v err=%v", lateCredited, err)
+	}
+	if reserved := fixture.activeSellReservedShares(t); !sameNumeric(reserved, "0") {
+		t.Fatalf("active SELL reserved shares after the late fill = %s, want 0", reserved)
+	}
+	if err := fixture.bootstrap(); err != nil {
+		t.Fatalf("restart after the late fill: %v", err)
+	}
+	if blockers := fixture.rollbackGateRows(t); len(blockers) != 0 {
+		t.Fatalf("rollback gate after the late fill = %v", blockers)
+	}
+
+	// Replaying the same venue fill (reconciliation re-observing it) changes nothing.
+	var cashAfterLate string
+	if err := fixture.db.QueryRow(`SELECT total_balance::text FROM execution_accounts WHERE execution_account_id=$1`, fixture.accountID).Scan(&cashAfterLate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.processor.Process(fixture.ctx, filled.Order, late); err != nil {
+		t.Fatalf("replay late fill: %v", err)
+	}
+	fixture.assertHolding(t, "4")
+	assertAccount(t, fixture.db, fixture.accountID, cashAfterLate, cashAfterLate, "0")
+}
+
+// TestCheckBindingAuthorizationMigrationIgnoresOtherSchemasPostgresIntegration:
+// the guard reads the function the application's trigger calls, so a migrated
+// same-named function in another schema cannot mask a pre-0041 one.
+func TestCheckBindingAuthorizationMigrationIgnoresOtherSchemasPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	migratedElsewhere := newIntegrationDatabase(t, databaseURL)
+	application := newIntegrationDatabase(t, databaseURL)
+	ctx := context.Background()
+	previous, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "0025_sell_exit_freshness_exemption.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.Exec(string(previous)); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckBindingAuthorizationMigration(ctx, migratedElsewhere); err != nil {
+		t.Fatalf("migrated schema: %v", err)
+	}
+	if err := CheckBindingAuthorizationMigration(ctx, application); err == nil ||
+		!strings.Contains(err.Error(), "0041_binding_authorization_without_model.sql is not applied") {
+		t.Fatalf("pre-0041 application schema next to a migrated one: %v", err)
+	}
+	if _, err := migratedElsewhere.Exec(`DROP TRIGGER execution_orders_live_submit_risk_trigger ON execution_orders`); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckBindingAuthorizationMigration(ctx, migratedElsewhere); err == nil ||
+		!strings.Contains(err.Error(), "has no enforce_live_order_submit_risk trigger") {
+		t.Fatalf("schema without the submit trigger: %v", err)
 	}
 }

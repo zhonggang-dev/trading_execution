@@ -1064,8 +1064,11 @@ func normalizeBindings(bindings []domain.StrategyExecutionBinding) ([]domain.Str
 		result[index] = binding
 	}
 	// Polymarket accounts run (and deliver) before Kalshi accounts, so a slow
-	// Kalshi call never delays a Polymarket BUY; within a venue the order is
-	// the historical model/strategy/account order.
+	// Kalshi strategy call or delivery does not delay a Polymarket one. This is
+	// ordering only, not venue isolation: the shared input stage (lots and one
+	// orderbook capture for both venues) still fails the whole cycle when the
+	// Kalshi capture fails. Within a venue the order is the historical
+	// model/strategy/account order.
 	sort.Slice(result, func(i, j int) bool {
 		leftKalshi := result[i].MarketSource == domain.MarketSourceKalshi
 		rightKalshi := result[j].MarketSource == domain.MarketSourceKalshi

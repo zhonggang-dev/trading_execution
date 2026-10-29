@@ -128,20 +128,40 @@ DECISION_CYCLE_ACCOUNTS_JSON='[{"execution_account_id":"main","market_source":"P
 
 ## 6. 回滚
 
-回滚 = 恢复 env 备份 + 切回旧 release；迁移 0041 保留（旧二进制兼容）。回滚前必须先确认：
+回滚 = 恢复 env 备份 + 切回旧 release；迁移 0041 保留（旧二进制兼容）。
+
+旧二进制的启动检查（`CheckLiveLedgerBootstrap`）要求每个活跃 SELL 预占的目标 lot 与该卖单的模型、策略一致，
+旧的 SELL 入账也按模型/策略锁 lot。新版本卖旧 lot 时两者不一致，所以**判断能不能回滚要看预占，不能看订单状态**：
+FAK 部分成交后订单是 `CANCELLED`，但剩余份额的预占不会释放，而是转为 `RECONCILIATION_REQUIRED`，等取消最终性
+（`CANCEL_FILL_FINALITY_GRACE`，默认 30s，要对账确认）后才释放，期间还可能收到晚到成交；对账卡住时会持续更久。
+
+回滚前两条查询都必须返回 0 行。新 SELL 每个决策周期都会产生，所以选在两轮决策之间、确认 0 行后立即切换：
 
 ```sql
--- a) 没有新版本下的未终态 SELL：旧二进制入账时会因 lot 的模型/策略与订单不一致而拒绝该成交
-SELECT order_id, status, intent->>'model_id', intent->>'target_lot_id' FROM execution_orders
-WHERE intent->>'side'='SELL' AND intent->>'model_id' <> 'deepseek_masked'
-  AND status NOT IN ('FILLED','CANCELLED','REJECTED');
+-- rollback-gate: legacy-sell-identity
+-- a) 旧二进制启动检查会拒绝的活跃 SELL 预占（与旧版 CheckLiveLedgerBootstrap 的身份比较一致，含 CANCELLED 订单）
+SELECT reservation.execution_account_id, reservation.order_id, reservation.status AS reservation_status,
+       order_row.status AS order_status, lot.lot_id
+FROM asset_reservations reservation
+JOIN position_lots lot ON lot.lot_id=reservation.target_lot_id
+LEFT JOIN execution_orders order_row ON order_row.order_id=reservation.order_id
+WHERE reservation.side='SELL'
+  AND reservation.status IN ('ACTIVE','RECONCILIATION_REQUIRED')
+  AND (lot.model_id<>COALESCE(order_row.intent->>'model_id','')
+    OR execution_canonical_strategy_id(lot.strategy_id)
+       <>execution_canonical_strategy_id(reservation.strategy_id));
+```
 
+```sql
 -- b) 没有挂在 kalshi:* 账户名下的未完成投递：旧二进制只认 main 名下的 Kalshi 投递
 SELECT count(*) FROM strategy_order_intent_deliveries
 WHERE intent_payload->>'execution_account_id' LIKE 'kalshi:%' AND status IN ('PENDING','SUBMITTING');
 ```
 
-回滚后的已知限制：新版本期间开出的 lot（`model_id='v4.1 flash'`），旧二进制不会把它们发给策略（旧版按模型筛选 lot），直到再次前滚。它们仍在账本、对账、结算与赎回里。
+a) 不为 0：等预占释放（晚到成交确认，或宽限期过后由对账释放）再查；长时间不释放先按对账手册处理，不能直接回滚。
+
+回滚是**有损**的：新版本期间开出的 lot（`model_id='v4.1 flash'`），旧二进制不会把它们发给策略（旧版按模型筛选 lot），
+策略不会卖出它们，直到再次前滚。它们仍在账本、对账、结算与赎回里。回滚前评估这些 lot 是否需要人工退出，能前滚修复就优先前滚。
 
 ## 7. 已知限制与行为差异（审查结论，均不影响下单主路径）
 
@@ -159,4 +179,3 @@ WHERE intent_payload->>'execution_account_id' LIKE 'kalshi:%' AND status IN ('PE
   - `ListOpenPositionExitTrades`/`positionexit` 仍按模型筛选，但 server 未接线。
 - 某账户的 lot 数据异常（outcome/neg_risk 为空、平台与账户不符）会让整轮失败，与改造前 lot 归属异常同级；
   10-29 只读核对线上 OPEN lot 无此类数据。
-
