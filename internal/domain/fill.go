@@ -257,6 +257,11 @@ func (status FillStatus) CanTransitionTo(next FillStatus) bool {
 func NormalizeFillStatus(status FillStatus) FillStatus {
 	value := strings.ToUpper(strings.TrimSpace(string(status)))
 	value = strings.TrimPrefix(value, "TRADE_STATUS_")
+	// MATCHED_NOT_BROADCASTED 是 CLOB 已撮合、尚未广播上链的中间态，
+	// 与 MATCHED 一样只保存观察结果，不进入资金与仓位账本。
+	if value == "MATCHED_NOT_BROADCASTED" {
+		return FillStatusMatched
+	}
 	return FillStatus(value)
 }
 

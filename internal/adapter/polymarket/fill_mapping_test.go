@@ -49,6 +49,25 @@ func TestMapTradeToOrderFillKeepsNonFinalStatusUnbooked(t *testing.T) {
 	}
 }
 
+// TestMapTradeToOrderFillTreatsNotBroadcastedAsMatched 验证 CLOB 返回 MATCHED_NOT_BROADCASTED 时按未终局的 MATCHED 处理，不报不支持的状态。
+func TestMapTradeToOrderFillTreatsNotBroadcastedAsMatched(t *testing.T) {
+	now := time.Date(2026, 10, 29, 16, 50, 0, 0, time.UTC)
+	order := adapterOrder()
+	order.VenueOrderID = "0xvenue"
+	for _, status := range []string{"MATCHED_NOT_BROADCASTED", "TRADE_STATUS_MATCHED_NOT_BROADCASTED"} {
+		fill, matched, err := mapTradeToOrderFill(Trade{
+			ID: "trade-1", TakerOrderID: "0xvenue", Size: "2", Price: "0.5",
+			Status: status, FeeRateBPS: "10", MatchTime: "1793291420", LastUpdate: "1793291421",
+		}, order, now)
+		if err != nil || !matched {
+			t.Fatalf("%s: map result matched=%v err=%v", status, matched, err)
+		}
+		if fill.Status != domain.FillStatusMatched || fill.ConfirmedAt != nil {
+			t.Fatalf("%s: non-final fill = %#v", status, fill)
+		}
+	}
+}
+
 // TestPreferTradeObservationKeepsConfirmedDuplicate 验证 Prefer Trade Observation Keeps Confirmed Duplicate 场景下的行为。
 func TestPreferTradeObservationKeepsConfirmedDuplicate(t *testing.T) {
 	existing := domain.Fill{
