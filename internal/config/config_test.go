@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -29,8 +30,8 @@ func TestLoadSafeDefaults(t *testing.T) {
 	if config.Kalshi.MarketDataEnabled {
 		t.Fatalf("Kalshi market data must be disabled without explicit credentials: %#v", config.Kalshi)
 	}
-	if !config.DecisionCycle.KalshiStrategyInputEnabled {
-		t.Fatalf("Kalshi strategy input must stay enabled unless an operator turns it off: %#v", config.DecisionCycle)
+	if len(config.DecisionCycle.Accounts) != 0 || len(config.Kalshi.LiveAccounts) != 0 {
+		t.Fatalf("paper defaults must not configure accounts: %#v / %#v", config.DecisionCycle.Accounts, config.Kalshi.LiveAccounts)
 	}
 }
 
@@ -102,35 +103,6 @@ func TestLoadChainCashConfiguration(t *testing.T) {
 	}
 }
 
-// TestLoadKalshiStrategyInputSwitch covers the venue-level "do not send Kalshi
-// to the strategy" switch: an explicit false turns it off, the default keeps
-// sending Kalshi, and a non-boolean value is rejected.
-func TestLoadKalshiStrategyInputSwitch(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED", "false")
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if config.DecisionCycle.KalshiStrategyInputEnabled {
-		t.Fatalf("Kalshi strategy input = %#v, want disabled", config.DecisionCycle)
-	}
-	t.Setenv("DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED", "")
-	config, err = Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if !config.DecisionCycle.KalshiStrategyInputEnabled {
-		t.Fatalf("Kalshi strategy input = %#v, want enabled by default", config.DecisionCycle)
-	}
-	t.Setenv("DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED", "off-please")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED must be a boolean") {
-		t.Fatalf("Load() error = %v, want boolean validation failure", err)
-	}
-}
-
 func TestLoadKalshiMarketDataRequiresCredentialFiles(t *testing.T) {
 	clearConfigEnvironment(t)
 	t.Setenv("KALSHI_MARKET_DATA_ENABLED", "true")
@@ -148,206 +120,6 @@ func TestLoadKalshiMarketDataRequiresCredentialFiles(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsDecisionCycleWithSubmissionDisabled(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if !config.DecisionCycle.Enabled || config.DecisionCycle.OrderSubmissionEnabled ||
-		len(config.DecisionCycle.Bindings) != 4 || config.DecisionCycle.Interval != 10*time.Minute ||
-		config.DecisionCycle.Bindings[0].PredictionModelID != "masked-source" ||
-		config.DecisionCycle.PredictionSourceModes["masked-source"] != domain.PredictionSourceModeSandbox {
-		t.Fatalf("decision cycle config = %#v", config.DecisionCycle)
-	}
-}
-
-func TestLoadRejectsInvalidDecisionPredictionSourceModes(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		value string
-		want  string
-	}{
-		{
-			name:  "missing configured model",
-			value: `{}`,
-			want:  `missing configured prediction model "masked-source"`,
-		},
-		{
-			name:  "extra model",
-			value: `{"masked-source":"SANDBOX","other":"DIRECT"}`,
-			want:  `contains unconfigured prediction model "other"`,
-		},
-		{
-			name:  "unknown exact value",
-			value: `{"masked-source":"sandbox"}`,
-			want:  "must be exactly DIRECT or SANDBOX",
-		},
-		{
-			name:  "wrong masked release mode",
-			value: `{"masked-source":"DIRECT"}`,
-			want:  "logical model qwen_masked to use SANDBOX",
-		},
-		{
-			name:  "duplicate model key",
-			value: `{"masked-source":"SANDBOX","masked-source":"SANDBOX"}`,
-			want:  `duplicate prediction model "masked-source"`,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			clearConfigEnvironment(t)
-			setCompleteLiveEnvironment(t)
-			setCompleteDecisionCycleEnvironment(t)
-			t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", test.value)
-			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("Load() error = %v, want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestLoadAcceptsFourWalletPredictionRoutes(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-	]`)
-	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"masked-producer-current":"SANDBOX"}`)
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if !config.DecisionCycle.RequireCompleteModelCoverage || len(config.DecisionCycle.Bindings) != 4 ||
-		config.DecisionCycle.Bindings[0].ExecutionAccountID != "main" ||
-		config.DecisionCycle.Bindings[0].StrategyID != "strategy_pending_a" ||
-		config.DecisionCycle.Bindings[1].ExecutionAccountID != "wallet-1" ||
-		config.DecisionCycle.Bindings[1].StrategyID != "strategy_pending_b" ||
-		config.DecisionCycle.Bindings[2].PredictionModelID != "masked-producer-current" ||
-		config.DecisionCycle.Bindings[2].ModelID != "qwen_masked" {
-		t.Fatalf("decision routes = %#v", config.DecisionCycle.Bindings)
-	}
-}
-
-func TestLoadAcceptsMainBrierMidEdgeOnceWithWallet1Held(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
-	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"brier_mid_edge_once","execution_account_id":"main"},
-		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-	]`)
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"v4.1 flash":"SANDBOX"}`)
-	t.Setenv("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON", `["wallet-1"]`)
-	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `["wallet-1"]`)
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if config.DecisionCycle.Bindings[0].ExecutionAccountID != "main" ||
-		config.DecisionCycle.Bindings[0].StrategyID != "brier_mid_edge_once" ||
-		config.DecisionCycle.Bindings[1].StrategyID != "strategy_pending_b" {
-		t.Fatalf("decision routes = %#v", config.DecisionCycle.Bindings)
-	}
-}
-
-func TestLoadAcceptsLegacyGeminiWallet67Route(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-	]`)
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"gemini-3.6-flash":"SANDBOX"}`)
-	config, err := Load()
-	if err != nil || config.DecisionCycle.Bindings[2].ModelID != "gemini_masked" {
-		t.Fatalf("legacy Gemini route config = %#v, error = %v", config.DecisionCycle.Bindings, err)
-	}
-}
-
-func TestLoadAcceptsV41FlashWallet67Route(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
-	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"v4.1 flash","model_id":"deepseek_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-	]`)
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"v4.1 flash":"SANDBOX"}`)
-	config, err := Load()
-	if err != nil || config.DecisionCycle.Bindings[2].ModelID != "deepseek_masked" {
-		t.Fatalf("v4.1 flash route config = %#v, error = %v", config.DecisionCycle.Bindings, err)
-	}
-}
-
-func TestLoadRejectsMixedGeminiQwenWalletRoutes(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"gemini-3.6-flash","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-	]`)
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"gemini-3.6-flash":"SANDBOX","qwen":"SANDBOX"}`)
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "one logical model for all four wallets") {
-		t.Fatalf("Load() error = %v, want mixed model rejection", err)
-	}
-}
-
-func TestLoadRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"producer-a","model_id":"qwen_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"producer-a","model_id":"gemini_masked","strategy_id":"multfactor_v1","execution_account_id":"account-b"}
-	]`)
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "multiple logical models") {
-		t.Fatalf("Load() error = %v", err)
-	}
-}
-
-func TestLoadAcceptsExplicitShadowDecisionCycle(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"masked-producer-current","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-	]`)
-	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "false")
-	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"masked-producer-current":"SANDBOX"}`)
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if config.DecisionCycle.OrderSubmissionEnabled {
-		t.Fatal("shadow decision-cycle order submission was enabled")
-	}
-}
-
 func TestLoadIgnoresRetiredDecisionCycleMidPriceLookback(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -355,265 +127,6 @@ func TestLoadIgnoresRetiredDecisionCycleMidPriceLookback(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_MID_PRICE_LOOKBACK", "not-a-duration")
 	if _, err := Load(); err != nil {
 		t.Fatalf("Load() error = %v, want retired mid-price lookback to be ignored", err)
-	}
-}
-
-func TestLoadRejectsRemappedFourWalletRoutes(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-7"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-6"}
-	]`)
-	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must use strategy") {
-		t.Fatalf("Load() error = %v, want exact-route rejection", err)
-	}
-}
-
-func TestLoadAcceptsConfiguredMainWallet1Strategies(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"alpha_new.v2","execution_account_id":"main"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"beta-new","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-	]`)
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"qwen":"SANDBOX"}`)
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if config.DecisionCycle.Bindings[0].StrategyID != "alpha_new.v2" ||
-		config.DecisionCycle.Bindings[1].StrategyID != "beta-new" {
-		t.Fatalf("configured strategies = %#v", config.DecisionCycle.Bindings)
-	}
-}
-
-func TestLoadRejectsUnsafeOrConflictingMainWallet1Strategies(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		mainID    string
-		wallet1ID string
-		want      string
-	}{
-		{name: "unsafe format", mainID: "alpha new", wallet1ID: "beta_new", want: "invalid format"},
-		{name: "duplicate", mainID: "alpha_new", wallet1ID: "alpha_new", want: "duplicate model/strategy"},
-		{name: "claims wallet-6 strategy", mainID: "multfactor_v1", wallet1ID: "beta_new", want: "duplicate model/strategy"},
-		{name: "historical alias of wallet-7 strategy", mainID: "strategy-v2", wallet1ID: "beta_new", want: "duplicate model/strategy"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			clearConfigEnvironment(t)
-			setCompleteLiveEnvironment(t)
-			setCompleteDecisionCycleEnvironment(t)
-			t.Setenv("DECISION_CYCLE_BINDINGS_JSON", fmt.Sprintf(`[
-				{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":%q,"execution_account_id":"main"},
-				{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":%q,"execution_account_id":"wallet-1"},
-				{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-				{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-			]`, test.mainID, test.wallet1ID))
-			t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"qwen":"SANDBOX"}`)
-			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("Load() error = %v, want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestLoadRejectsRetiredWalletTopology(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-2"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-3"}
-	]`)
-	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
-	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "wallet-6") {
-		t.Fatalf("Load() error = %v, want retired-wallet rejection", err)
-	}
-}
-
-func TestLoadAcceptsRequiredMainWallet1EntryDisabledAccounts(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"qwen","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-	]`)
-	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `[" wallet-1 ","main"]`)
-	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "false")
-	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"qwen":"SANDBOX"}`)
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if len(config.DecisionCycle.EntryDisabledAccounts) != 2 ||
-		config.DecisionCycle.EntryDisabledAccounts[0] != "wallet-1" ||
-		config.DecisionCycle.EntryDisabledAccounts[1] != "main" {
-		t.Fatalf("entry-disabled accounts = %#v", config.DecisionCycle.EntryDisabledAccounts)
-	}
-}
-
-func TestLoadRejectsInvalidDecisionSubmissionDisabledAccounts(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		value string
-		want  string
-	}{
-		{name: "not array", value: `"wallet-3"`, want: "cannot unmarshal"},
-		{name: "trailing value", value: `["account-a"] []`, want: "exactly one JSON array"},
-		{name: "empty", value: `[" "]`, want: "account 0 is empty"},
-		{name: "duplicate", value: `["wallet-7","wallet-7"]`, want: "duplicate account"},
-		{name: "unbound", value: `["wallet-3"]`, want: "not a configured binding"},
-		{name: "wallet quarantine", value: `["wallet-6"]`, want: "requires DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON=[]"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			clearConfigEnvironment(t)
-			setCompleteLiveEnvironment(t)
-			setCompleteDecisionCycleEnvironment(t)
-			t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", test.value)
-			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("Load() error = %v, want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestLoadAcceptsStrategyDisabledMainAndWallet1(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON", `[" main ","wallet-1"]`)
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if len(config.DecisionCycle.StrategyDisabledAccounts) != 2 ||
-		config.DecisionCycle.StrategyDisabledAccounts[0] != "main" ||
-		config.DecisionCycle.StrategyDisabledAccounts[1] != "wallet-1" ||
-		len(config.DecisionCycle.SubmissionDisabledAccounts) != 0 ||
-		len(config.DecisionCycle.EntryDisabledAccounts) != 2 {
-		t.Fatalf("decision cycle config = %#v", config.DecisionCycle)
-	}
-}
-
-func TestLoadDefaultsStrategyDisabledAccountsToNone(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	config, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if len(config.DecisionCycle.StrategyDisabledAccounts) != 0 {
-		t.Fatalf("strategy-disabled accounts = %#v, want none by default", config.DecisionCycle.StrategyDisabledAccounts)
-	}
-}
-
-func TestLoadRejectsInvalidStrategyDisabledAccounts(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		value string
-		want  string
-	}{
-		{name: "not array", value: `"main"`, want: "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON: "},
-		{name: "trailing value", value: `["main"] []`, want: "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON must contain exactly one JSON array"},
-		{name: "empty", value: `[" "]`, want: "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON account 0 is empty"},
-		{name: "duplicate", value: `["main","main"]`, want: `DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON contains duplicate account "main"`},
-		{name: "unbound", value: `["wallet-3"]`, want: `DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON account "wallet-3" is not a configured binding`},
-		{name: "every binding", value: `["main","wallet-1","wallet-6","wallet-7"]`, want: "cannot disable the strategy for every configured binding"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			clearConfigEnvironment(t)
-			setCompleteLiveEnvironment(t)
-			setCompleteDecisionCycleEnvironment(t)
-			t.Setenv("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON", test.value)
-			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("Load() error = %v, want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestLoadRejectsGlobalSellOnlyGateForWallet67ShadowRelease(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED", "true")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "requires DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false") {
-		t.Fatalf("Load() error = %v", err)
-	}
-}
-
-func TestLoadRejectsInvalidEntryDisabledAccounts(t *testing.T) {
-	for _, value := range []string{`["wallet-6"]`, `["wallet-6","wallet-7"]`, `["main","main"]`} {
-		t.Run(value, func(t *testing.T) {
-			clearConfigEnvironment(t)
-			setCompleteLiveEnvironment(t)
-			setCompleteDecisionCycleEnvironment(t)
-			t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", value)
-			if _, err := Load(); err == nil {
-				t.Fatalf("Load() accepted entry-disabled accounts %s", value)
-			}
-		})
-	}
-}
-
-func TestDecodeKalshiLiveBindingsRequiresExactIsolatedRoutes(t *testing.T) {
-	bindings, err := decodeKalshiLiveBindings(`[
-		{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"echo-key","private_key_path":"/run/secrets/kalshi-echo.pem"},
-		{"model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7","api_key_id":"gemini-key","private_key_path":"/run/secrets/kalshi-gemini.pem"}
-	]`)
-	if err != nil || len(bindings) != 2 {
-		t.Fatalf("bindings=%#v err=%v", bindings, err)
-	}
-	if bindings[0].StrategyID != domain.StrategyIDMultfactorV2 || bindings[1].ExecutionAccountID != "wallet-7" {
-		t.Fatalf("bindings=%#v", bindings)
-	}
-	for _, invalid := range []string{
-		`[{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"same","private_key_path":"relative.pem"}]`,
-		`[{"model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main","api_key_id":"same","private_key_path":"/a.pem"},{"model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7","api_key_id":"same","private_key_path":"/b.pem"}]`,
-	} {
-		if _, err := decodeKalshiLiveBindings(invalid); err == nil {
-			t.Fatalf("invalid bindings accepted: %s", invalid)
-		}
-	}
-}
-
-func TestLoadKeepsCurrentLiveAccountEntryGateWhenSchedulerDisabled(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		key   string
-		value string
-		want  string
-	}{
-		{name: "wrong entry accounts", key: "DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", value: `["wallet-6","wallet-7"]`, want: "only main and wallet-1"},
-		{name: "quarantined account", key: "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", value: `["wallet-6"]`, want: "requires DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON=[]"},
-		{name: "global sell only", key: "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED", value: "true", want: "requires DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			clearConfigEnvironment(t)
-			setCompleteLiveEnvironment(t)
-			setCompleteDecisionCycleEnvironment(t)
-			t.Setenv("DECISION_CYCLE_ENABLED", "false")
-			t.Setenv(test.key, test.value)
-			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("Load() error = %v, want %q", err, test.want)
-			}
-		})
 	}
 }
 
@@ -657,20 +170,6 @@ func TestLoadRequiresDedicatedLiveJobToken(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsSingleBindingLiveDecisionSubmission(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"echo-source","model_id":"echo","strategy_id":"multfactor_v2","execution_account_id":"main"}
-	]`)
-	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
-	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "exactly 4 bindings") {
-		t.Fatalf("Load() error = %v", err)
-	}
-}
-
 func TestLoadRejectsDecisionSubmissionWithoutCompleteModelCoverage(t *testing.T) {
 	clearConfigEnvironment(t)
 	setCompleteLiveEnvironment(t)
@@ -705,19 +204,6 @@ func TestLoadRejectsDecisionSubmissionWithoutCycle(t *testing.T) {
 	clearConfigEnvironment(t)
 	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECISION_CYCLE_ENABLED") {
-		t.Fatalf("Load() error = %v", err)
-	}
-}
-
-func TestLoadRejectsDuplicateDecisionBinding(t *testing.T) {
-	clearConfigEnvironment(t)
-	setCompleteLiveEnvironment(t)
-	setCompleteDecisionCycleEnvironment(t)
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"model_id":"model-a","strategy_id":"multfactor_v1","execution_account_id":"account-a"},
-		{"model_id":"model-b","strategy_id":"multfactor_v2","execution_account_id":"account-a"}
-	]`)
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "duplicate execution account") {
 		t.Fatalf("Load() error = %v", err)
 	}
 }
@@ -1012,6 +498,239 @@ func TestLoadRequiresProductionDatabase(t *testing.T) {
 	}
 }
 
+func TestReconciliationScheduleOffset(t *testing.T) {
+	t.Setenv("RECONCILIATION_SCHEDULE_OFFSET", "")
+	if offset, err := reconciliationScheduleOffset(5 * time.Minute); err != nil || offset != nil {
+		t.Fatalf("unset offset = %v, %v; want nil", offset, err)
+	}
+	t.Setenv("RECONCILIATION_SCHEDULE_OFFSET", "3m30s")
+	if offset, err := reconciliationScheduleOffset(5 * time.Minute); err != nil || offset == nil || *offset != 210*time.Second {
+		t.Fatalf("3m30s offset = %v, %v", offset, err)
+	}
+	for _, value := range []string{"5m", "-1s", "soon"} {
+		t.Setenv("RECONCILIATION_SCHEDULE_OFFSET", value)
+		if _, err := reconciliationScheduleOffset(5 * time.Minute); err == nil {
+			t.Fatalf("offset %q accepted", value)
+		}
+	}
+}
+
+// productionEquivalentAccounts is the live topology of 2026-10-29 expressed in
+// the account-row format: wallet-1 was entry- and strategy-disabled (PAUSED)
+// and the Kalshi account becomes its own row instead of riding on main.
+const productionEquivalentAccounts = `[
+	{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"},
+	{"execution_account_id":"wallet-1","market_source":"POLYMARKET","strategy_id":"strategy_pending_b","mode":"PAUSED"},
+	{"execution_account_id":"wallet-6","market_source":"POLYMARKET","strategy_id":"strategy-v1","mode":"ACTIVE"},
+	{"execution_account_id":"wallet-7","market_source":"POLYMARKET","strategy_id":"multfactor_v2","mode":"ACTIVE"},
+	{"execution_account_id":"kalshi:main","market_source":"KALSHI","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"}
+]`
+
+const productionEquivalentKalshiAccounts = `[
+	{"execution_account_id":"kalshi:main","api_key_id":"kalshi-key-main","private_key_path":"/opt/trading-execution/secrets/kalshi-main.pem"}
+]`
+
+func TestLoadDecisionAccountsDerivesTheProductionTopology(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_PREDICTION_MODEL_ID", " v4.1 flash ")
+	t.Setenv("DECISION_CYCLE_ACCOUNTS_JSON", productionEquivalentAccounts)
+	t.Setenv("KALSHI_LIVE_ACCOUNTS_JSON", productionEquivalentKalshiAccounts)
+	t.Setenv("DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "true")
+	t.Setenv("DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "true")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	cycle := config.DecisionCycle
+	if cycle.PredictionModelID != "v4.1 flash" || cycle.PredictionSourceMode != domain.PredictionSourceModeSandbox {
+		t.Fatalf("model = %q / %q", cycle.PredictionModelID, cycle.PredictionSourceMode)
+	}
+	want := []domain.StrategyExecutionBinding{
+		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: "strategy_pending_b", ExecutionAccountID: "wallet-1", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi},
+	}
+	if got := cycle.Bindings(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("Bindings() =\n%#v\nwant\n%#v", got, want)
+	}
+	if got := cycle.EntryDisabledAccounts(); fmt.Sprint(got) != "[wallet-1]" {
+		t.Fatalf("EntryDisabledAccounts() = %v", got)
+	}
+	if got := cycle.StrategyDisabledAccounts(); fmt.Sprint(got) != "[wallet-1]" {
+		t.Fatalf("StrategyDisabledAccounts() = %v", got)
+	}
+	if got := cycle.PredictionSourceModes(); len(got) != 1 || got["v4.1 flash"] != domain.PredictionSourceModeSandbox {
+		t.Fatalf("PredictionSourceModes() = %v", got)
+	}
+	if got := cycle.AccountsForSource(domain.MarketSourceKalshi); len(got) != 1 || got[0].ExecutionAccountID != "kalshi:main" {
+		t.Fatalf("Kalshi accounts = %#v", got)
+	}
+	if got := config.Kalshi.LiveAccounts; len(got) != 1 || got[0].ExecutionAccountID != "kalshi:main" ||
+		got[0].APIKeyID != "kalshi-key-main" || got[0].PrivateKeyPath != "/opt/trading-execution/secrets/kalshi-main.pem" {
+		t.Fatalf("Kalshi live accounts = %#v", got)
+	}
+}
+
+func TestLoadDecisionAccountsHaveNoFixedTopology(t *testing.T) {
+	for name, accounts := range map[string]string{
+		"single account": `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"}]`,
+		"new names and one strategy on two wallets": `[
+			{"execution_account_id":"wallet-8","market_source":"POLYMARKET","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"},
+			{"execution_account_id":"wallet-9","market_source":"POLYMARKET","strategy_id":"brier_mid_edge_once","mode":"SELL_ONLY"}
+		]`,
+		"wallet-6 on another strategy": `[{"execution_account_id":"wallet-6","market_source":"POLYMARKET","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"}]`,
+		"lower-case enums":             `[{"execution_account_id":"main","market_source":"polymarket","strategy_id":"brier_mid_edge_once","mode":"active"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			t.Setenv("DECISION_CYCLE_ACCOUNTS_JSON", accounts)
+			if _, err := Load(); err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsDirectPredictionSourceAndAnyModelName(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_PREDICTION_MODEL_ID", "kimi-k2")
+	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODE", "direct")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.DecisionCycle.PredictionModelID != "kimi-k2" || config.DecisionCycle.PredictionSourceMode != domain.PredictionSourceModeDirect {
+		t.Fatalf("decision cycle = %#v", config.DecisionCycle)
+	}
+	for _, binding := range config.DecisionCycle.Bindings() {
+		if binding.ModelID != "kimi-k2" || binding.PredictionModelID != "kimi-k2" {
+			t.Fatalf("binding model = %#v", binding)
+		}
+	}
+}
+
+func TestLoadRejectsLegacyDecisionVariables(t *testing.T) {
+	for _, name := range legacyDecisionVariables {
+		t.Run(name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			// An empty line in an EnvironmentFile still defines the variable.
+			t.Setenv(name, "")
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("Load() error = %v, want rejection naming %s", err, name)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidDecisionAccounts(t *testing.T) {
+	const kalshiRow = `{"execution_account_id":"kalshi:main","market_source":"KALSHI","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"}`
+	for _, test := range []struct {
+		name     string
+		model    string
+		mode     string
+		accounts string
+		kalshi   string
+		want     string
+	}{
+		{name: "empty account list", accounts: `[]`, want: "at least one account"},
+		{name: "missing account list", accounts: "", want: "at least one account"},
+		{name: "not an array", accounts: `{"execution_account_id":"main"}`, want: "DECISION_CYCLE_ACCOUNTS_JSON"},
+		{name: "trailing value", accounts: `[] []`, want: "exactly one JSON array"},
+		{name: "unknown field", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"s","mode":"ACTIVE","model_id":"x"}]`, want: "unknown field"},
+		{name: "empty account id", accounts: `[{"execution_account_id":" ","market_source":"POLYMARKET","strategy_id":"s","mode":"ACTIVE"}]`, want: "execution_account_id is required"},
+		{name: "duplicate account", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"a","mode":"ACTIVE"},{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"b","mode":"ACTIVE"}]`, want: `repeats account "main"`},
+		{name: "missing market source", accounts: `[{"execution_account_id":"main","strategy_id":"s","mode":"ACTIVE"}]`, want: "market_source must be POLYMARKET or KALSHI"},
+		{name: "unknown market source", accounts: `[{"execution_account_id":"main","market_source":"MANIFOLD","strategy_id":"s","mode":"ACTIVE"}]`, want: "market_source must be POLYMARKET or KALSHI"},
+		{name: "Kalshi account without prefix", accounts: `[{"execution_account_id":"main","market_source":"KALSHI","strategy_id":"s","mode":"ACTIVE"}]`, kalshi: `[]`, want: `must start with "kalshi:"`},
+		{name: "Polymarket account with Kalshi prefix", accounts: `[{"execution_account_id":"kalshi:main","market_source":"POLYMARKET","strategy_id":"s","mode":"ACTIVE"}]`, want: "cannot use the"},
+		{name: "missing mode", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"s"}]`, want: "mode must be ACTIVE, SELL_ONLY or PAUSED"},
+		{name: "unknown mode", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"s","mode":"QUARANTINED"}]`, want: "mode must be ACTIVE, SELL_ONLY or PAUSED"},
+		{name: "missing strategy", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"","mode":"ACTIVE"}]`, want: "strategy_id"},
+		{name: "unsafe strategy", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"rm -rf","mode":"ACTIVE"}]`, want: "invalid format"},
+		{name: "every account paused", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"s","mode":"PAUSED"}]`, want: "cannot pause every account"},
+		{name: "missing model", model: " ", want: "DECISION_CYCLE_PREDICTION_MODEL_ID must contain 1-200 bytes"},
+		{name: "model too long", model: strings.Repeat("m", 201), want: "DECISION_CYCLE_PREDICTION_MODEL_ID must contain 1-200 bytes"},
+		{name: "unknown source mode", mode: "REDIS", want: "DECISION_CYCLE_PREDICTION_SOURCE_MODE must be exactly DIRECT or SANDBOX"},
+		{name: "Kalshi account without credential", accounts: `[` + kalshiRow + `]`, kalshi: `[]`, want: `KALSHI account "kalshi:main" has no credential`},
+		{name: "credential for unknown account", kalshi: `[{"execution_account_id":"kalshi:wallet-7","api_key_id":"k","private_key_path":"/k.pem"}]`, want: `"kalshi:wallet-7" is not a KALSHI account`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			setCompleteLiveEnvironment(t)
+			setCompleteDecisionCycleEnvironment(t)
+			if test.model != "" {
+				t.Setenv("DECISION_CYCLE_PREDICTION_MODEL_ID", test.model)
+			}
+			if test.mode != "" {
+				t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODE", test.mode)
+			}
+			if test.accounts != "" || test.name == "missing account list" {
+				t.Setenv("DECISION_CYCLE_ACCOUNTS_JSON", test.accounts)
+			}
+			if test.kalshi != "" {
+				t.Setenv("KALSHI_LIVE_ACCOUNTS_JSON", test.kalshi)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestDecodeKalshiLiveAccountsRequiresIsolatedCredentials(t *testing.T) {
+	accounts, err := decodeKalshiLiveAccounts(` [{"execution_account_id":" kalshi:main ","api_key_id":" key ","private_key_path":" /k.pem "}] `)
+	if err != nil || len(accounts) != 1 || accounts[0].ExecutionAccountID != "kalshi:main" ||
+		accounts[0].APIKeyID != "key" || accounts[0].PrivateKeyPath != "/k.pem" {
+		t.Fatalf("decoded = %#v, %v", accounts, err)
+	}
+	for name, invalid := range map[string]string{
+		"not an array":     `{"execution_account_id":"kalshi:main"}`,
+		"incomplete":       `[{"execution_account_id":"kalshi:main","api_key_id":"key"}]`,
+		"relative key":     `[{"execution_account_id":"kalshi:main","api_key_id":"key","private_key_path":"k.pem"}]`,
+		"missing prefix":   `[{"execution_account_id":"main","api_key_id":"key","private_key_path":"/k.pem"}]`,
+		"repeated account": `[{"execution_account_id":"kalshi:main","api_key_id":"a","private_key_path":"/a.pem"},{"execution_account_id":"kalshi:main","api_key_id":"b","private_key_path":"/b.pem"}]`,
+		"shared key":       `[{"execution_account_id":"kalshi:a","api_key_id":"key","private_key_path":"/a.pem"},{"execution_account_id":"kalshi:b","api_key_id":"key","private_key_path":"/b.pem"}]`,
+		"unknown field":    `[{"execution_account_id":"kalshi:main","api_key_id":"key","private_key_path":"/k.pem","model_id":"m"}]`,
+	} {
+		if _, err := decodeKalshiLiveAccounts(invalid); err == nil {
+			t.Fatalf("%s: accepted %s", name, invalid)
+		}
+	}
+}
+
+func TestLoadLiveModeRequiresAccountsWhileSchedulerDisabled(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	unsetConfigEnvironment(t, "DECISION_CYCLE_ACCOUNTS_JSON")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least one account") {
+		t.Fatalf("Load() error = %v, live startup derives authorization from the account rows", err)
+	}
+}
+
+func TestLoadAcceptsGlobalSellOnlyGateInLiveMode(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED", "true")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !config.DecisionCycle.EntrySubmissionDisabled {
+		t.Fatal("global sell-only gate was not loaded")
+	}
+}
+
 // clearConfigEnvironment 实现当前测试场景所需的辅助行为。
 func clearConfigEnvironment(t *testing.T) {
 	t.Helper()
@@ -1037,18 +756,33 @@ func clearConfigEnvironment(t *testing.T) {
 		"CHAIN_CASH_REWARD_SENDERS", "CHAIN_CASH_DEPOSIT_SOURCES", "CHAIN_CASH_MAX_BLOCKS_PER_RUN",
 		"CHAIN_CASH_LOG_CHUNK_BLOCKS",
 		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",
+		"KALSHI_LIVE_ACCOUNTS_JSON",
 		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
 		"DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON", "DECISION_CYCLE_ORDER_REPORT_LOOKBACK",
-		"DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE", "DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED",
+		"DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",
 		"DECISION_CYCLE_PREDICTION_INFRA_URL", "DECISION_CYCLE_PREDICTION_INFRA_TOKEN",
 		"DECISION_CYCLE_STRATEGY_URL", "DECISION_CYCLE_STRATEGY_TOKEN",
 		"DECISION_CYCLE_INTERVAL", "DECISION_CYCLE_STARTUP_DELAY", "DECISION_CYCLE_MAX_START_LATENESS", "DECISION_CYCLE_TIMEOUT",
 		"DECISION_CYCLE_PREDICTION_LOOKBACK", "DECISION_CYCLE_MID_PRICE_LOOKBACK",
-		"DECISION_CYCLE_BINDINGS_JSON", "DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
-		"DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", "DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON",
-		"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", "DECISION_CYCLE_DELIVERY_CONCURRENCY",
+		"DECISION_CYCLE_PREDICTION_MODEL_ID", "DECISION_CYCLE_PREDICTION_SOURCE_MODE", "DECISION_CYCLE_ACCOUNTS_JSON",
+		"DECISION_CYCLE_DELIVERY_CONCURRENCY",
 	} {
 		t.Setenv(key, "")
+	}
+	// Replaced variables must be absent, not empty: an empty definition is
+	// itself rejected at startup.
+	unsetConfigEnvironment(t, legacyDecisionVariables...)
+}
+
+// unsetConfigEnvironment removes variables for one test and restores them
+// afterwards.
+func unsetConfigEnvironment(t *testing.T, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		t.Setenv(key, "")
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -1065,17 +799,10 @@ func setCompleteDecisionCycleEnvironment(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_MAX_START_LATENESS", "30s")
 	t.Setenv("DECISION_CYCLE_TIMEOUT", "8m")
 	t.Setenv("DECISION_CYCLE_PREDICTION_LOOKBACK", "3h")
-	t.Setenv("DECISION_CYCLE_BINDINGS_JSON", `[
-		{"prediction_model_id":"masked-source","model_id":"qwen_masked","strategy_id":"strategy_pending_a","execution_account_id":"main"},
-		{"prediction_model_id":"masked-source","model_id":"qwen_masked","strategy_id":"strategy_pending_b","execution_account_id":"wallet-1"},
-		{"prediction_model_id":"masked-source","model_id":"qwen_masked","strategy_id":"multfactor_v1","execution_account_id":"wallet-6"},
-		{"prediction_model_id":"masked-source","model_id":"qwen_masked","strategy_id":"multfactor_v2","execution_account_id":"wallet-7"}
-	]`)
-	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[]`)
-	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `["main","wallet-1"]`)
-	t.Setenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON", `{"masked-source":"SANDBOX"}`)
 }
 
+// setCompleteLiveEnvironment also sets the account rows: live startup needs
+// them even while the decision cycle is disabled.
 func setCompleteLiveEnvironment(t *testing.T) {
 	t.Helper()
 	t.Setenv("APP_ENV", "production")
@@ -1092,23 +819,11 @@ func setCompleteLiveEnvironment(t *testing.T) {
 	t.Setenv("POLYMARKET_ACCOUNTS_FILE", "/run/secrets/trading_execution/wallets.json")
 	t.Setenv("POLYGON_RPC_URL", "https://polygon-rpc.example.invalid")
 	t.Setenv("DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED", "false")
-	t.Setenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", `["main","wallet-1"]`)
-	t.Setenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", `[]`)
-}
-
-func TestReconciliationScheduleOffset(t *testing.T) {
-	t.Setenv("RECONCILIATION_SCHEDULE_OFFSET", "")
-	if offset, err := reconciliationScheduleOffset(5 * time.Minute); err != nil || offset != nil {
-		t.Fatalf("unset offset = %v, %v; want nil", offset, err)
-	}
-	t.Setenv("RECONCILIATION_SCHEDULE_OFFSET", "3m30s")
-	if offset, err := reconciliationScheduleOffset(5 * time.Minute); err != nil || offset == nil || *offset != 210*time.Second {
-		t.Fatalf("3m30s offset = %v, %v", offset, err)
-	}
-	for _, value := range []string{"5m", "-1s", "soon"} {
-		t.Setenv("RECONCILIATION_SCHEDULE_OFFSET", value)
-		if _, err := reconciliationScheduleOffset(5 * time.Minute); err == nil {
-			t.Fatalf("offset %q accepted", value)
-		}
-	}
+	t.Setenv("DECISION_CYCLE_PREDICTION_MODEL_ID", "masked-source")
+	t.Setenv("DECISION_CYCLE_ACCOUNTS_JSON", `[
+		{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"strategy_pending_a","mode":"SELL_ONLY"},
+		{"execution_account_id":"wallet-1","market_source":"POLYMARKET","strategy_id":"strategy_pending_b","mode":"SELL_ONLY"},
+		{"execution_account_id":"wallet-6","market_source":"POLYMARKET","strategy_id":"multfactor_v1","mode":"ACTIVE"},
+		{"execution_account_id":"wallet-7","market_source":"POLYMARKET","strategy_id":"multfactor_v2","mode":"ACTIVE"}
+	]`)
 }

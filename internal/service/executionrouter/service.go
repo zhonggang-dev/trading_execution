@@ -25,9 +25,16 @@ type Execution interface {
 	Attempts(context.Context, string) ([]domain.OrderAttempt, error)
 }
 
+// Route is one Kalshi execution account. Kalshi accounts are first-class
+// accounts (kalshi:<name>): they are not attached to a Polymarket wallet.
 type Route struct {
-	ModelID, StrategyID, LogicalAccountID, InternalAccountID string
-	Execution                                                Execution
+	// AccountID is the Kalshi execution account, e.g. kalshi:main.
+	AccountID string
+	// StrategyID is the strategy configured for the account. Kalshi orders do
+	// not pass the PostgreSQL strategy-binding gate, so the route is their
+	// authorization: an intent for the account must carry this strategy.
+	StrategyID string
+	Execution  Execution
 	// MaintenanceOnly keeps historical orders routable while preventing new
 	// strategy deliveries after a degraded Kalshi startup preflight.
 	MaintenanceOnly bool
@@ -45,55 +52,89 @@ func New(repository port.OrderRepository, primary Execution, routes []Route) (*S
 	}
 	service := &Service{repository: repository, primary: primary, routes: make(map[string]Route, len(routes))}
 	for _, route := range routes {
-		route.ModelID = strings.TrimSpace(route.ModelID)
+		route.AccountID = strings.TrimSpace(route.AccountID)
 		route.StrategyID = domain.CanonicalStrategyID(route.StrategyID)
-		route.LogicalAccountID = strings.TrimSpace(route.LogicalAccountID)
-		route.InternalAccountID = strings.TrimSpace(route.InternalAccountID)
-		if route.ModelID == "" || route.StrategyID == "" || route.LogicalAccountID == "" || route.InternalAccountID == "" || route.Execution == nil {
+		if route.AccountID == "" || route.StrategyID == "" || route.Execution == nil {
 			return nil, fmt.Errorf("Kalshi execution route is incomplete")
 		}
-		key := routeKey(route.ModelID, route.StrategyID, route.LogicalAccountID)
-		if _, exists := service.routes[key]; exists {
+		if !domain.IsKalshiExecutionAccount(route.AccountID) {
+			return nil, fmt.Errorf("Kalshi execution route account %q must start with %q",
+				route.AccountID, domain.KalshiExecutionAccountPrefix)
+		}
+		if _, exists := service.routes[route.AccountID]; exists {
 			return nil, fmt.Errorf("duplicate Kalshi execution route")
 		}
-		service.routes[key] = route
+		service.routes[route.AccountID] = route
 	}
 	return service, nil
 }
 
-func (service *Service) KalshiEnabled(intent domain.OrderIntent) bool {
-	route, ok := service.routes[routeKey(intent.ModelID, intent.StrategyID, intent.ExecutionAccountID)]
-	return intent.MarketSource.Normalize() == domain.MarketSourceKalshi && ok && !route.MaintenanceOnly
+// kalshiRoute finds the route of a Kalshi intent. A durable delivery persisted
+// before Kalshi accounts became first-class carries the Polymarket account it
+// used to ride on (e.g. "main"); it is resolved to "kalshi:main" so the frozen
+// intent can still be recovered exactly once.
+func (service *Service) kalshiRoute(intent domain.OrderIntent) (Route, bool) {
+	accountID := strings.TrimSpace(intent.ExecutionAccountID)
+	route, ok := service.routes[accountID]
+	if !ok && accountID != "" && !domain.IsKalshiExecutionAccount(accountID) {
+		route, ok = service.routes[domain.KalshiExecutionAccountPrefix+accountID]
+	}
+	if !ok || domain.CanonicalStrategyID(intent.StrategyID) != route.StrategyID {
+		return Route{}, false
+	}
+	return route, true
 }
 
-// KalshiInputEnabled reports whether a binding may receive Kalshi strategy
-// input. It uses the same rule as KalshiEnabled so a strategy is only shown
-// Kalshi markets it can actually trade.
-func (service *Service) KalshiInputEnabled(binding domain.StrategyExecutionContext) bool {
-	route, ok := service.routes[routeKey(binding.ModelID, binding.StrategyID, binding.ExecutionAccountID)]
+// KalshiEnabled reports whether a Kalshi intent has a tradable route.
+func (service *Service) KalshiEnabled(intent domain.OrderIntent) bool {
+	if intent.MarketSource.Normalize() != domain.MarketSourceKalshi {
+		return false
+	}
+	route, ok := service.kalshiRoute(intent)
 	return ok && !route.MaintenanceOnly
+}
+
+// StrategyInputEnabled reports whether an account may be sent to the strategy
+// this cycle. Polymarket accounts always may; a Kalshi account needs a
+// tradable route for its configured strategy, so a strategy is never asked to
+// decide for an account that cannot place the order.
+func (service *Service) StrategyInputEnabled(binding domain.StrategyExecutionBinding) bool {
+	binding = binding.Normalize()
+	if binding.MarketSource != domain.MarketSourceKalshi {
+		return true
+	}
+	route, ok := service.routes[binding.ExecutionAccountID]
+	return ok && !route.MaintenanceOnly && route.StrategyID == binding.StrategyID
 }
 
 func (service *Service) Enabled(intent domain.OrderIntent) bool {
 	if intent.MarketSource.Normalize() == domain.MarketSourcePolymarket {
-		return true
+		return !domain.IsKalshiExecutionAccount(intent.ExecutionAccountID)
 	}
 	return service.KalshiEnabled(intent)
 }
 
 func (service *Service) Submit(ctx context.Context, intent domain.OrderIntent) (port.OrderSubmitResult, error) {
 	if intent.MarketSource.Normalize() != domain.MarketSourceKalshi {
+		if domain.IsKalshiExecutionAccount(intent.ExecutionAccountID) {
+			return port.OrderSubmitResult{}, fmt.Errorf("Polymarket intent cannot use Kalshi execution account %q", intent.ExecutionAccountID)
+		}
 		return service.primary.Submit(ctx, intent)
 	}
-	route, ok := service.routes[routeKey(intent.ModelID, intent.StrategyID, intent.ExecutionAccountID)]
+	route, ok := service.kalshiRoute(intent)
 	if !ok || route.MaintenanceOnly {
-		return port.OrderSubmitResult{}, fmt.Errorf("Kalshi live route is not enabled for binding")
+		return port.OrderSubmitResult{}, fmt.Errorf("Kalshi live route is not enabled for account %q", intent.ExecutionAccountID)
 	}
-	intent.ExecutionAccountID = route.InternalAccountID
-	if intent.Metadata == nil {
-		intent.Metadata = map[string]string{}
+	if intent.ExecutionAccountID != route.AccountID {
+		// Legacy delivery: record which account it was persisted under.
+		metadata := make(map[string]string, len(intent.Metadata)+1)
+		for key, value := range intent.Metadata {
+			metadata[key] = value
+		}
+		metadata["logical_execution_account_id"] = intent.ExecutionAccountID
+		intent.Metadata = metadata
+		intent.ExecutionAccountID = route.AccountID
 	}
-	intent.Metadata["logical_execution_account_id"] = route.LogicalAccountID
 	return route.Execution.Submit(ctx, intent)
 }
 
@@ -105,10 +146,8 @@ func (service *Service) executionForOrder(ctx context.Context, orderID string) (
 	if order.Intent.MarketSource.Normalize() != domain.MarketSourceKalshi {
 		return service.primary, nil
 	}
-	for _, route := range service.routes {
-		if route.InternalAccountID == order.Intent.ExecutionAccountID {
-			return route.Execution, nil
-		}
+	if route, ok := service.routes[strings.TrimSpace(order.Intent.ExecutionAccountID)]; ok {
+		return route.Execution, nil
 	}
 	return nil, fmt.Errorf("Kalshi order has no configured execution route")
 }
@@ -122,24 +161,22 @@ func (service *Service) Resume(ctx context.Context, id string) (domain.Order, er
 		return domain.Order{}, lookupErr
 	}
 	if order.Intent.MarketSource.Normalize() == domain.MarketSourceKalshi {
-		for _, route := range service.routes {
-			if route.InternalAccountID == order.Intent.ExecutionAccountID && route.MaintenanceOnly {
-				next, event, deferErr := orderstate.Apply(order, orderstate.Transition{
-					EventID:    fmt.Sprintf("event:%s:%d", order.ID, order.Revision+1),
-					To:         order.Status,
-					Trigger:    domain.TransitionTriggerMaintenance,
-					ReasonCode: "KALSHI_ROUTE_MAINTENANCE",
-					Reason:     "Kalshi preflight is unavailable; pre-venue recovery is deferred without submission",
-					At:         time.Now().UTC(),
-				})
-				if deferErr == nil {
-					deferErr = service.repository.Transition(ctx, next, event)
-				}
-				if deferErr != nil {
-					return order, errors.Join(ErrMaintenanceOnly, deferErr)
-				}
-				return next, ErrMaintenanceOnly
+		if route, ok := service.routes[strings.TrimSpace(order.Intent.ExecutionAccountID)]; ok && route.MaintenanceOnly {
+			next, event, deferErr := orderstate.Apply(order, orderstate.Transition{
+				EventID:    fmt.Sprintf("event:%s:%d", order.ID, order.Revision+1),
+				To:         order.Status,
+				Trigger:    domain.TransitionTriggerMaintenance,
+				ReasonCode: "KALSHI_ROUTE_MAINTENANCE",
+				Reason:     "Kalshi preflight is unavailable; pre-venue recovery is deferred without submission",
+				At:         time.Now().UTC(),
+			})
+			if deferErr == nil {
+				deferErr = service.repository.Transition(ctx, next, event)
 			}
+			if deferErr != nil {
+				return order, errors.Join(ErrMaintenanceOnly, deferErr)
+			}
+			return next, ErrMaintenanceOnly
 		}
 	}
 	e, err := service.executionForOrder(ctx, id)
@@ -182,8 +219,4 @@ func (service *Service) Attempts(ctx context.Context, id string) ([]domain.Order
 		return nil, err
 	}
 	return e.Attempts(ctx, id)
-}
-
-func routeKey(model, strategy, account string) string {
-	return strings.TrimSpace(model) + "\x00" + domain.CanonicalStrategyID(strategy) + "\x00" + strings.TrimSpace(account)
 }

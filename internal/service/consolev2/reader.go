@@ -156,10 +156,14 @@ SELECT configured.model_id, configured.strategy_id, configured.execution_account
        reconciliation.started_at, reconciliation.status,
        COALESCE(issues.open_issue_count, 0), COALESCE(orders.open_order_count, 0)
 FROM configured
-LEFT JOIN execution_strategy_bindings binding
-  ON binding.model_id=configured.model_id
- AND binding.strategy_id=configured.strategy_id
- AND binding.execution_account_id=configured.execution_account_id
+-- Authorization is (strategy, account); the binding row's model_id is audit
+-- history and does not have to equal the configured prediction model.
+LEFT JOIN LATERAL (
+    SELECT bool_or(b.enabled) AS enabled
+    FROM execution_strategy_bindings b
+    WHERE b.strategy_id=configured.strategy_id
+      AND b.execution_account_id=configured.execution_account_id
+) binding ON TRUE
 LEFT JOIN execution_risk_policies policy
   ON policy.execution_account_id=configured.execution_account_id
 LEFT JOIN execution_risk_controls control

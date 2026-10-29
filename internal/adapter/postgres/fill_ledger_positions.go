@@ -365,21 +365,18 @@ func updateReservationForFill(
 
 // lotBalance 表示后端使用的 lotBalance 类型。
 type lotBalance struct {
-	id       string
-	account  string
-	market   string
-	token    string
-	model    string
-	strategy string
-	shares   domain.Decimal
-	cost     domain.Decimal
+	id      string
+	account string
+	market  string
+	token   string
+	shares  domain.Decimal
+	cost    domain.Decimal
 }
 
 // lockTargetSellLot 在当前事务中锁定 Target Sell Lot。
 func lockTargetSellLot(ctx context.Context, tx *sql.Tx, order domain.Order, before domain.Position) (lotBalance, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT lot.lot_id, lot.execution_account_id, lot.market_id, lot.token_id,
-		       lot.model_id, lot.strategy_id,
 		       lot.remaining_shares::text, lot.remaining_cost::text
 		FROM position_lots AS lot
 		WHERE lot.execution_account_id=$1 AND lot.token_id=$2 AND lot.status='OPEN'
@@ -390,7 +387,7 @@ func lockTargetSellLot(ctx context.Context, tx *sql.Tx, order domain.Order, befo
 	var lots []lotBalance
 	for rows.Next() {
 		var lot lotBalance
-		if err := rows.Scan(&lot.id, &lot.account, &lot.market, &lot.token, &lot.model, &lot.strategy, &lot.shares, &lot.cost); err != nil {
+		if err := rows.Scan(&lot.id, &lot.account, &lot.market, &lot.token, &lot.shares, &lot.cost); err != nil {
 			rows.Close()
 			return lotBalance{}, err
 		}
@@ -411,8 +408,9 @@ func lockTargetSellLot(ctx context.Context, tx *sql.Tx, order domain.Order, befo
 	}
 	for _, lot := range lots {
 		if lot.id == order.Intent.TargetLotID {
-			if lot.account != order.Intent.ExecutionAccountID || lot.market != order.Intent.MarketID || lot.token != order.Intent.TokenID ||
-				lot.model != order.Intent.ModelID || domain.CanonicalStrategyID(lot.strategy) != domain.CanonicalStrategyID(order.Intent.StrategyID) {
+			// Ownership is the account; the lot's opening model and strategy are
+			// audit history and may differ from the strategy that sells it now.
+			if lot.account != order.Intent.ExecutionAccountID || lot.market != order.Intent.MarketID || lot.token != order.Intent.TokenID {
 				return lotBalance{}, reject("TARGET_LOT_IDENTITY_MISMATCH", "selected lot does not belong to the SELL order identity")
 			}
 			return lot, nil
@@ -682,11 +680,10 @@ func (ledger *FillLedger) ListOpenLots(ctx context.Context, binding domain.Strat
 		       lot.original_cost::text, lot.remaining_cost::text, lot.average_entry_price::text,
 		       lot.status, lot.opened_at, lot.closed_at
 		FROM position_lots AS lot
-		WHERE lot.execution_account_id=$1 AND lot.model_id=$2
-		  AND execution_canonical_strategy_id(lot.strategy_id)=execution_canonical_strategy_id($3)
+		WHERE lot.execution_account_id=$1
 		  AND lot.status='OPEN'
 		  AND (lot.token_id LIKE 'kalshi:%' OR lot.remaining_shares >= 0.01)
-		ORDER BY lot.opened_at, lot.lot_id`, binding.ExecutionAccountID, binding.ModelID, binding.StrategyID)
+		ORDER BY lot.opened_at, lot.lot_id`, binding.ExecutionAccountID)
 	if err != nil {
 		return nil, fmt.Errorf("query open position lots: %w", err)
 	}

@@ -252,30 +252,32 @@ func buildWalletPnLService(database *sql.DB, cfg config.Config, live *liveRuntim
 // the real DecisionRunner status and configured binding identities while
 // excluding all upstream/venue credentials and URLs.
 func consoleV2RuntimeConfig(cfg config.Config, live *liveRuntime, startedAt time.Time) consolev2.RuntimeConfig {
-	bindings := make([]consolev2.Binding, 0, len(cfg.DecisionCycle.Bindings))
-	for _, rawBinding := range cfg.DecisionCycle.Bindings {
-		binding := rawBinding.Normalize()
-		mode := ""
-		if configured, ok := cfg.DecisionCycle.PredictionSourceModes[binding.PredictionModelID]; ok {
-			mode = string(configured)
-		}
+	bindings := make([]consolev2.Binding, 0, len(cfg.DecisionCycle.Accounts))
+	accountModes := make(map[string]string, len(cfg.DecisionCycle.Accounts))
+	for _, account := range cfg.DecisionCycle.Accounts {
+		accountModes[account.ExecutionAccountID] = string(account.Mode)
+	}
+	for _, binding := range cfg.DecisionCycle.Bindings() {
 		bindings = append(bindings, consolev2.Binding{
 			PredictionModelID: binding.PredictionModelID,
 			ModelID:           binding.ModelID, StrategyID: binding.StrategyID,
-			ExecutionAccountID: binding.ExecutionAccountID, SourceMode: mode,
+			ExecutionAccountID: binding.ExecutionAccountID, SourceMode: string(cfg.DecisionCycle.PredictionSourceMode),
+			MarketSource: string(binding.MarketSource), Mode: accountModes[binding.ExecutionAccountID],
 		})
 	}
 	config := consolev2.RuntimeConfig{
-		StartedAt:                  startedAt,
-		RunnerEnabled:              cfg.DecisionCycle.Enabled,
-		RunnerInterval:             cfg.DecisionCycle.Interval,
-		Bindings:                   bindings,
-		OrderSubmissionEnabled:     cfg.DecisionCycle.OrderSubmissionEnabled,
-		EntrySubmissionDisabled:    cfg.DecisionCycle.EntrySubmissionDisabled,
-		SubmissionDisabledAccounts: cfg.DecisionCycle.SubmissionDisabledAccounts,
-		EntryDisabledAccounts:      cfg.DecisionCycle.EntryDisabledAccounts,
-		StrategyDisabledAccounts:   cfg.DecisionCycle.StrategyDisabledAccounts,
-		KalshiStrategyInputEnabled: cfg.DecisionCycle.KalshiStrategyInputEnabled,
+		StartedAt:               startedAt,
+		RunnerEnabled:           cfg.DecisionCycle.Enabled,
+		RunnerInterval:          cfg.DecisionCycle.Interval,
+		Bindings:                bindings,
+		OrderSubmissionEnabled:  cfg.DecisionCycle.OrderSubmissionEnabled,
+		EntrySubmissionDisabled: cfg.DecisionCycle.EntrySubmissionDisabled,
+		// Account quarantine and the global Kalshi input switch no longer exist;
+		// the fields stay in the console contract with their neutral values.
+		SubmissionDisabledAccounts: nil,
+		EntryDisabledAccounts:      cfg.DecisionCycle.EntryDisabledAccounts(),
+		StrategyDisabledAccounts:   cfg.DecisionCycle.StrategyDisabledAccounts(),
+		KalshiStrategyInputEnabled: true,
 	}
 	if live != nil && live.decisionRunner != nil {
 		config.RunnerSnapshot = func() consolev2.RunnerSnapshot {
@@ -324,7 +326,7 @@ func buildPaperRuntime(cfg config.Config, database *sql.DB, guard port.Guard) (p
 		MarketValidator:         paper.NewMarketValidator(),
 		Reservations:            reservations,
 		EntrySubmissionDisabled: cfg.DecisionCycle.EntrySubmissionDisabled,
-		EntryDisabledAccounts:   cfg.DecisionCycle.EntryDisabledAccounts,
+		EntryDisabledAccounts:   cfg.DecisionCycle.EntryDisabledAccounts(),
 		// 模拟交易所同步返回结果，不会产生延迟出现的外部成交。
 		ImmediateCancelFinality: true,
 	})

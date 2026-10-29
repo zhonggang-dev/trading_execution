@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/kalshi"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/marketbooks"
@@ -13,6 +14,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/adapter/predictioninfra"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/strategyhttp"
 	"github.com/UniPat-AI/trading_execution/internal/config"
+	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisioncycle"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
@@ -29,9 +31,9 @@ type buildDecisionRunnerParams struct {
 	accountIDs       []string
 	logger           *slog.Logger
 	submissionPolicy decisioncycle.IntentSubmissionPolicy
-	// kalshiInputPolicy limits Kalshi strategy input to bindings with a
-	// tradable Kalshi route; nil sends it to every binding.
-	kalshiInputPolicy decisioncycle.KalshiInputPolicy
+	// routeInputPolicy skips the strategy call for accounts whose venue route
+	// cannot place orders (a Kalshi account in maintenance); nil routes all.
+	routeInputPolicy decisioncycle.RouteInputPolicy
 }
 
 // buildDecisionRunner composes the pull-based production workflow without
@@ -123,15 +125,13 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		AccountGate:                  params.accountGate,
 		SubmissionPolicy:             params.submissionPolicy,
 		SubmitEnabled:                cycleConfig.OrderSubmissionEnabled,
-		SubmissionDisabledAccounts:   cycleConfig.SubmissionDisabledAccounts,
 		EntrySubmissionDisabled:      cycleConfig.EntrySubmissionDisabled,
-		EntryDisabledAccounts:        cycleConfig.EntryDisabledAccounts,
-		StrategyDisabledAccounts:     cycleConfig.StrategyDisabledAccounts,
-		KalshiStrategyInputDisabled:  !cycleConfig.KalshiStrategyInputEnabled,
-		KalshiInputPolicy:            params.kalshiInputPolicy,
+		EntryDisabledAccounts:        cycleConfig.EntryDisabledAccounts(),
+		StrategyDisabledAccounts:     cycleConfig.StrategyDisabledAccounts(),
+		RouteInputPolicy:             params.routeInputPolicy,
 		RequireCompleteModelCoverage: cycleConfig.RequireCompleteModelCoverage,
-		Bindings:                     cycleConfig.Bindings,
-		PredictionSourceModes:        cycleConfig.PredictionSourceModes,
+		Bindings:                     cycleConfig.Bindings(),
+		PredictionSourceModes:        cycleConfig.PredictionSourceModes(),
 		Venue:                        params.cfg.Execution.Venue,
 		PredictionLookback:           cycleConfig.PredictionLookback,
 		DeliveryStaleAge:             cycleConfig.Timeout,
@@ -169,7 +169,7 @@ func buildOrderReporter(
 	bound := make(map[string]struct{}, len(configured))
 	accounts := make([]string, 0)
 	seenAccounts := make(map[string]struct{})
-	for _, binding := range cycleConfig.Bindings {
+	for _, binding := range cycleConfig.Bindings() {
 		if _, reported := configured[binding.StrategyID]; !reported {
 			continue
 		}
@@ -203,6 +203,9 @@ func orderReportHook(reporter *strategyreport.Reporter) func(context.Context) er
 	return reporter.Sync
 }
 
+// validateDecisionAccounts proves that the Polymarket wallet file holds
+// exactly the configured Polymarket accounts. Kalshi accounts have no wallet
+// and are checked against their credentials by the Kalshi composition.
 func validateDecisionAccounts(cycleConfig config.DecisionCycle, accountIDs []string) error {
 	available := make(map[string]struct{}, len(accountIDs))
 	for index, raw := range accountIDs {
@@ -216,26 +219,71 @@ func validateDecisionAccounts(cycleConfig config.DecisionCycle, accountIDs []str
 		available[accountID] = struct{}{}
 	}
 	if len(available) == 0 {
-		return fmt.Errorf("decision cycle requires at least one wallet-file execution account")
+		return fmt.Errorf("live execution requires at least one wallet-file execution account")
 	}
-	bound := make(map[string]struct{}, len(cycleConfig.Bindings))
-	for _, binding := range cycleConfig.Bindings {
-		binding = binding.Normalize()
-		if binding.ExecutionAccountID == "" {
-			return fmt.Errorf("decision-cycle binding execution account is empty")
+	bound := make(map[string]struct{}, len(cycleConfig.Accounts))
+	for _, account := range cycleConfig.AccountsForSource(domain.MarketSourcePolymarket) {
+		accountID := strings.TrimSpace(account.ExecutionAccountID)
+		if accountID == "" {
+			return fmt.Errorf("decision-cycle account execution account is empty")
 		}
-		if _, duplicate := bound[binding.ExecutionAccountID]; duplicate {
-			return fmt.Errorf("decision-cycle binding repeats execution account %q", binding.ExecutionAccountID)
+		if _, duplicate := bound[accountID]; duplicate {
+			return fmt.Errorf("decision-cycle accounts repeat execution account %q", accountID)
 		}
-		bound[binding.ExecutionAccountID] = struct{}{}
-		if _, exists := available[binding.ExecutionAccountID]; !exists {
-			return fmt.Errorf("decision-cycle binding references execution account %q which is absent from the wallet file", binding.ExecutionAccountID)
+		bound[accountID] = struct{}{}
+		if _, exists := available[accountID]; !exists {
+			return fmt.Errorf("Polymarket account %q is absent from the wallet file", accountID)
 		}
 	}
 	for accountID := range available {
 		if _, exists := bound[accountID]; !exists {
-			return fmt.Errorf("wallet file execution account %q has no decision-cycle binding", accountID)
+			return fmt.Errorf("wallet file execution account %q is not a POLYMARKET account in DECISION_CYCLE_ACCOUNTS_JSON", accountID)
 		}
 	}
 	return nil
+}
+
+// venueAccountGate serializes intent delivery per execution account. A
+// Polymarket account is held through the reconciliation runner so delivery
+// never overlaps its reconciliation; a Kalshi account has no Polymarket
+// reconciliation and uses its own in-process slot.
+type venueAccountGate struct {
+	polymarket port.ExecutionAccountGate
+	kalshi     map[string]chan struct{}
+}
+
+func newVenueAccountGate(polymarketGate port.ExecutionAccountGate, kalshiAccounts []string) (*venueAccountGate, error) {
+	if polymarketGate == nil {
+		return nil, fmt.Errorf("Polymarket execution account gate is required")
+	}
+	gate := &venueAccountGate{polymarket: polymarketGate, kalshi: make(map[string]chan struct{}, len(kalshiAccounts))}
+	for _, raw := range kalshiAccounts {
+		accountID := strings.TrimSpace(raw)
+		if !domain.IsKalshiExecutionAccount(accountID) {
+			return nil, fmt.Errorf("Kalshi execution account gate %q must start with %q", accountID, domain.KalshiExecutionAccountPrefix)
+		}
+		if _, duplicate := gate.kalshi[accountID]; duplicate {
+			return nil, fmt.Errorf("Kalshi execution account gate %q is duplicated", accountID)
+		}
+		gate.kalshi[accountID] = make(chan struct{}, 1)
+	}
+	return gate, nil
+}
+
+func (gate *venueAccountGate) AcquireExecutionAccount(ctx context.Context, executionAccountID string) (func(), error) {
+	accountID := strings.TrimSpace(executionAccountID)
+	if !domain.IsKalshiExecutionAccount(accountID) {
+		return gate.polymarket.AcquireExecutionAccount(ctx, accountID)
+	}
+	slot, exists := gate.kalshi[accountID]
+	if !exists {
+		return nil, fmt.Errorf("Kalshi execution account %q is not configured", accountID)
+	}
+	select {
+	case slot <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-slot }) }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }

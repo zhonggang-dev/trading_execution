@@ -2144,7 +2144,10 @@ func TestExternalPositionAdjustmentBatchSealPostgresIntegration(t *testing.T) {
 	}
 }
 
-func TestOpenLotQueriesScopeToBindingAndExcludeUntradeableDust(t *testing.T) {
+// TestOpenLotQueriesScopeToAccountAndExcludeUntradeableDust: strategy input
+// lots belong to the account whatever model opened them; the unwired exit-job
+// query keeps its historical model scope.
+func TestOpenLotQueriesScopeToAccountAndExcludeUntradeableDust(t *testing.T) {
 	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
@@ -2166,8 +2169,24 @@ func TestOpenLotQueriesScopeToBindingAndExcludeUntradeableDust(t *testing.T) {
 		t.Fatal(err)
 	}
 	lots, err := ledger.ListOpenLots(context.Background(), binding)
-	if err != nil || len(lots) != 2 || lots[0].LotID != "lot-current" || lots[1].LotID != "lot-kalshi-dust" || lots[0].ModelID != binding.ModelID {
-		t.Fatalf("binding open lots = %#v err=%v", lots, err)
+	if err != nil || len(lots) != 3 || lots[0].LotID != "lot-current" || lots[1].LotID != "lot-other" ||
+		lots[2].LotID != "lot-kalshi-dust" || lots[0].ModelID != "deepseek_masked" || lots[1].ModelID != "gemini_masked" {
+		t.Fatalf("account open lots = %#v err=%v", lots, err)
+	}
+	// A model change (the binding context now names another model) reads the
+	// very same lots: nothing is orphaned.
+	renamed := binding
+	renamed.ModelID = "v4.1 flash"
+	renamed.StrategyID = "brier_mid_edge_once"
+	again, err := ledger.ListOpenLots(context.Background(), renamed)
+	if err != nil || len(again) != 3 {
+		t.Fatalf("open lots after a model/strategy change = %#v err=%v", again, err)
+	}
+	other, err := ledger.ListOpenLots(context.Background(), domain.StrategyExecutionContext{
+		ExecutionAccountID: "another-account", ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1,
+	})
+	if err != nil || len(other) != 0 {
+		t.Fatalf("another account read %#v err=%v", other, err)
 	}
 	trades, err := ledger.ListOpenPositionExitTrades(context.Background(), binding)
 	if err != nil || len(trades) != 2 || trades[0].LotID != "lot-current" || trades[1].LotID != "lot-kalshi-dust" || trades[0].ModelID != binding.ModelID {
@@ -2505,7 +2524,7 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 			t.Fatalf("apply migration %s: %v", name, err)
 		}
 	}
-	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql", "0029_position_lot_model_route_successors.sql", "0030_remove_position_lot_model_routes.sql", "0031_reconciliation_balance_snapshot_block.sql", "0032_redeemed_zero_mark_price.sql", "0033_chain_cash_ledger.sql", "0034_polymarket_redemption_submit_failures.sql", "0037_external_position_baseline_amendments.sql", "0038_kalshi_settlements.sql", "0039_order_decision_quotes.sql", "0040_order_decision_meta.sql"} {
+	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql", "0029_position_lot_model_route_successors.sql", "0030_remove_position_lot_model_routes.sql", "0031_reconciliation_balance_snapshot_block.sql", "0032_redeemed_zero_mark_price.sql", "0033_chain_cash_ledger.sql", "0034_polymarket_redemption_submit_failures.sql", "0037_external_position_baseline_amendments.sql", "0038_kalshi_settlements.sql", "0039_order_decision_quotes.sql", "0040_order_decision_meta.sql", "0041_binding_authorization_without_model.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatal(err)

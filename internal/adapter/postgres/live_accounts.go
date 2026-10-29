@@ -17,10 +17,10 @@ type ExpectedExecutionAccount struct {
 
 // ExpectedActiveExecutionAccount is the exact database authorization that an
 // account must hold before the live process may include it in placement or
-// automatic reconciliation.
+// automatic reconciliation. An account is authorized for a strategy; the
+// binding row's model_id is audit history and is not compared.
 type ExpectedActiveExecutionAccount struct {
 	ExecutionAccountID string
-	ModelID            string
 	StrategyID         string
 }
 
@@ -43,19 +43,17 @@ func CheckLiveActiveAccountAuthorization(
 	normalized := make([]ExpectedActiveExecutionAccount, 0, len(accounts))
 	for _, expected := range accounts {
 		accountID := strings.TrimSpace(expected.ExecutionAccountID)
-		modelID := strings.TrimSpace(expected.ModelID)
 		strategyID := strings.TrimSpace(expected.StrategyID)
-		if accountID == "" || modelID == "" || strategyID == "" {
+		if accountID == "" || strategyID == "" {
 			return fmt.Errorf("active execution account authorization is incomplete")
 		}
 		if _, duplicate := seen[accountID]; duplicate {
 			return fmt.Errorf("active execution account %q is duplicated", accountID)
 		}
 		seen[accountID] = struct{}{}
-		expectedBindings[modelID+"\x00"+strategyID+"\x00"+accountID] = struct{}{}
+		expectedBindings[strategyID+"\x00"+accountID] = struct{}{}
 		normalized = append(normalized, ExpectedActiveExecutionAccount{
 			ExecutionAccountID: accountID,
-			ModelID:            modelID,
 			StrategyID:         strategyID,
 		})
 	}
@@ -70,35 +68,39 @@ func CheckLiveActiveAccountAuthorization(
 	defer tx.Rollback()
 
 	for _, expected := range normalized {
-		var bindingEnabled, policyEnabled, accountPaused bool
+		var enabledBindings int64
+		var policyEnabled, accountPaused bool
 		var policyID string
 		var policyVersion int64
 		err := tx.QueryRowContext(ctx, `
-			SELECT binding.enabled, policy.policy_id, policy.version,
-			       policy.enabled, control.paused
-			FROM execution_strategy_bindings AS binding
-			JOIN execution_risk_policies AS policy
-			  ON policy.execution_account_id=binding.execution_account_id
+			SELECT (SELECT count(*) FROM execution_strategy_bindings AS binding
+			        WHERE binding.execution_account_id=$1 AND binding.strategy_id=$2 AND binding.enabled),
+			       policy.policy_id, policy.version, policy.enabled, control.paused
+			FROM execution_risk_policies AS policy
 			JOIN execution_risk_controls AS control
-			  ON control.execution_account_id=binding.execution_account_id
+			  ON control.execution_account_id=policy.execution_account_id
 			 AND control.control_scope='ACCOUNT' AND control.control_key=''
-			WHERE binding.execution_account_id=$1
-			  AND binding.model_id=$2 AND binding.strategy_id=$3`,
-			expected.ExecutionAccountID, expected.ModelID, expected.StrategyID,
+			WHERE policy.execution_account_id=$1`,
+			expected.ExecutionAccountID, expected.StrategyID,
 		).Scan(
-			&bindingEnabled, &policyID, &policyVersion, &policyEnabled, &accountPaused,
+			&enabledBindings, &policyID, &policyVersion, &policyEnabled, &accountPaused,
 		)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf(
-				"active execution account %q is missing its exact database binding, risk policy, or ACCOUNT control",
+				"active execution account %q is missing its risk policy or ACCOUNT control",
 				expected.ExecutionAccountID,
 			)
 		}
 		if err != nil {
 			return fmt.Errorf("read active execution account %q authorization: %w", expected.ExecutionAccountID, err)
 		}
-		if !bindingEnabled {
-			return fmt.Errorf("active execution account %q strategy binding is disabled", expected.ExecutionAccountID)
+		if enabledBindings == 0 {
+			return fmt.Errorf("active execution account %q has no enabled binding for strategy %q",
+				expected.ExecutionAccountID, expected.StrategyID)
+		}
+		if enabledBindings > 1 {
+			return fmt.Errorf("active execution account %q has %d enabled bindings for strategy %q",
+				expected.ExecutionAccountID, enabledBindings, expected.StrategyID)
 		}
 		if strings.TrimSpace(policyID) == "" || policyVersion < 1 {
 			return fmt.Errorf("active execution account %q risk policy identity is invalid", expected.ExecutionAccountID)
@@ -112,7 +114,7 @@ func CheckLiveActiveAccountAuthorization(
 	}
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT model_id, strategy_id, execution_account_id
+		SELECT strategy_id, execution_account_id
 		FROM execution_strategy_bindings
 		WHERE enabled=TRUE`)
 	if err != nil {
@@ -120,15 +122,20 @@ func CheckLiveActiveAccountAuthorization(
 	}
 	actualBindings := make(map[string]struct{}, len(expectedBindings))
 	for rows.Next() {
-		var modelID, strategyID, accountID string
-		if err := rows.Scan(&modelID, &strategyID, &accountID); err != nil {
+		var strategyID, accountID string
+		if err := rows.Scan(&strategyID, &accountID); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan globally enabled strategy binding: %w", err)
 		}
 		// Use the stored identity verbatim. Normalizing here could collapse an
 		// additional enabled whitespace-variant row onto the reviewed route and
-		// make a non-exact database set appear exact.
-		key := modelID + "\x00" + strategyID + "\x00" + accountID
+		// make a non-exact database set appear exact. A second enabled row for
+		// the same (strategy, account) under another model_id is a duplicate.
+		key := strategyID + "\x00" + accountID
+		if _, duplicate := actualBindings[key]; duplicate {
+			rows.Close()
+			return fmt.Errorf("execution account %q has more than one enabled binding for strategy %q", accountID, strategyID)
+		}
 		actualBindings[key] = struct{}{}
 	}
 	if err := rows.Close(); err != nil {

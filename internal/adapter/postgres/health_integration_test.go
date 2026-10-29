@@ -187,9 +187,10 @@ func TestLiveActiveAccountAuthorizationPostgresIntegration(t *testing.T) {
 		) VALUES ($1,'ACCOUNT','',FALSE,'ACTIVE')`, accountID); err != nil {
 		t.Fatal(err)
 	}
+	// The binding row was written under an older model name; authorization is
+	// (account, strategy) and does not compare it.
 	expected := []ExpectedActiveExecutionAccount{{
 		ExecutionAccountID: accountID,
-		ModelID:            "model-active",
 		StrategyID:         "multfactor_v1",
 	}}
 	if err := CheckLiveActiveAccountAuthorization(context.Background(), db, expected); err != nil {
@@ -201,7 +202,7 @@ func TestLiveActiveAccountAuthorizationPostgresIntegration(t *testing.T) {
 		sql  string
 		want string
 	}{
-		{name: "binding disabled", sql: `UPDATE execution_strategy_bindings SET enabled=FALSE, version=version+1`, want: "strategy binding is disabled"},
+		{name: "binding disabled", sql: `UPDATE execution_strategy_bindings SET enabled=FALSE, version=version+1`, want: `has no enabled binding for strategy "multfactor_v1"`},
 		{name: "policy disabled", sql: `UPDATE execution_risk_policies SET enabled=FALSE, version=version+1`, want: "risk policy is disabled"},
 		{name: "account paused", sql: `UPDATE execution_risk_controls SET paused=TRUE, version=version+1`, want: "ACCOUNT risk control is paused"},
 	} {
@@ -253,7 +254,7 @@ func TestLiveActiveAccountAuthorizationPostgresIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("unexpected whitespace variant route", func(t *testing.T) {
+	t.Run("second enabled row for the same strategy under another model", func(t *testing.T) {
 		if _, err := db.Exec(`
 			INSERT INTO execution_strategy_bindings (
 				model_id, strategy_id, execution_account_id, enabled
@@ -261,8 +262,8 @@ func TestLiveActiveAccountAuthorizationPostgresIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		err := CheckLiveActiveAccountAuthorization(context.Background(), db, expected)
-		if err == nil || !strings.Contains(err.Error(), "globally enabled strategy binding set differs") {
-			t.Fatalf("unexpected whitespace-variant route error = %v", err)
+		if err == nil || !strings.Contains(err.Error(), `has 2 enabled bindings for strategy "multfactor_v1"`) {
+			t.Fatalf("duplicate enabled route error = %v", err)
 		}
 		if _, err := db.Exec(`
 			DELETE FROM execution_strategy_bindings

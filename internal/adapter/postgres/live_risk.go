@@ -206,13 +206,17 @@ func loadLiveRiskPolicy(ctx context.Context, tx *sql.Tx, accountID string) (live
 
 func checkLiveRiskBindingAndControls(ctx context.Context, tx *sql.Tx, intent domain.OrderIntent) error {
 	canonicalStrategy := domain.CanonicalStrategyID(intent.StrategyID)
+	// An account is authorized for a strategy. The prediction model is not part
+	// of the authorization (it is an audit field on the binding row), so a
+	// model change never needs new binding rows. Mirrors migration 0041.
 	var bindingEnabled bool
 	err := tx.QueryRowContext(ctx, `
-		SELECT enabled FROM execution_strategy_bindings
-		WHERE model_id = $1 AND strategy_id = $2 AND execution_account_id = $3
-		FOR SHARE`, intent.ModelID, canonicalStrategy, intent.ExecutionAccountID).Scan(&bindingEnabled)
-	if errors.Is(err, sql.ErrNoRows) || (err == nil && !bindingEnabled) {
-		return reject("STRATEGY_ACCOUNT_BINDING_DENIED", "model and strategy are not enabled for this execution account")
+		SELECT TRUE FROM execution_strategy_bindings
+		WHERE strategy_id = $1 AND execution_account_id = $2 AND enabled
+		LIMIT 1
+		FOR SHARE`, canonicalStrategy, intent.ExecutionAccountID).Scan(&bindingEnabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return reject("STRATEGY_ACCOUNT_BINDING_DENIED", "strategy is not enabled for this execution account")
 	}
 	if err != nil {
 		return fmt.Errorf("load strategy execution binding: %w", err)

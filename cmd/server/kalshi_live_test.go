@@ -44,35 +44,29 @@ func (*routeTestExecution) Attempts(context.Context, string) ([]domain.OrderAtte
 	return nil, nil
 }
 
-type routeTestPositions struct{ accounts []string }
-
-func (source *routeTestPositions) ListOpenLots(_ context.Context, binding domain.StrategyExecutionContext) ([]domain.PositionLot, error) {
-	source.accounts = append(source.accounts, binding.ExecutionAccountID)
-	return nil, nil
-}
-
-func TestInternalEntryDisabledAccountsPreservesLogicalGate(t *testing.T) {
-	if got := internalEntryDisabledAccounts("main", "kalshi:main", []string{"main", "wallet-1"}); !reflect.DeepEqual(got, []string{"kalshi:main"}) {
-		t.Fatalf("main Kalshi gate=%#v", got)
+func TestAccountEntryDisabledFollowsTheKalshiAccountMode(t *testing.T) {
+	if got := accountEntryDisabled("kalshi:main", []string{"wallet-1", "kalshi:main"}); !reflect.DeepEqual(got, []string{"kalshi:main"}) {
+		t.Fatalf("SELL_ONLY/PAUSED Kalshi gate=%#v", got)
 	}
-	if got := internalEntryDisabledAccounts("wallet-7", "kalshi:wallet-7", []string{"main", "wallet-1"}); len(got) != 0 {
-		t.Fatalf("wallet-7 Kalshi gate=%#v", got)
+	// The Polymarket wallet's mode no longer leaks onto the Kalshi account.
+	if got := accountEntryDisabled("kalshi:main", []string{"main", "wallet-1"}); len(got) != 0 {
+		t.Fatalf("ACTIVE Kalshi gate=%#v", got)
 	}
 }
 
 func TestKalshiPreflightFailureLeavesPolymarketRouteOperational(t *testing.T) {
-	binding := domain.StrategyExecutionBinding{PredictionModelID: "echo", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main"}
 	cfg := config.Config{
-		Kalshi: config.Kalshi{MarketDataEnabled: true, LiveBindings: []config.KalshiLiveBinding{{
-			ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main",
-			APIKeyID: "unavailable-key", PrivateKeyPath: "/tmp/does-not-exist/kalshi.pem",
+		Kalshi: config.Kalshi{MarketDataEnabled: true, LiveAccounts: []config.KalshiLiveAccount{{
+			ExecutionAccountID: "kalshi:main", APIKeyID: "unavailable-key", PrivateKeyPath: "/tmp/does-not-exist/kalshi.pem",
 		}}},
-		DecisionCycle: config.DecisionCycle{Bindings: []domain.StrategyExecutionBinding{binding}},
+		DecisionCycle: config.DecisionCycle{PredictionModelID: "echo", Accounts: []config.DecisionAccount{
+			{ExecutionAccountID: "main", MarketSource: domain.MarketSourcePolymarket, StrategyID: domain.StrategyIDMultfactorV2, Mode: config.DecisionAccountActive},
+			{ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi, StrategyID: domain.StrategyIDMultfactorV2, Mode: config.DecisionAccountActive},
+		}},
 	}
 	primary := &routeTestExecution{}
-	positions := &routeTestPositions{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	composition, err := composeKalshiExecution(context.Background(), cfg, nil, memory.NewOrderRepository(), nil, nil, primary, positions, logger)
+	composition, err := composeKalshiExecution(context.Background(), cfg, nil, memory.NewOrderRepository(), nil, nil, primary, logger)
 	if err != nil {
 		t.Fatalf("composeKalshiExecution() error = %v", err)
 	}
@@ -98,19 +92,33 @@ func TestKalshiPreflightFailureLeavesPolymarketRouteOperational(t *testing.T) {
 	}
 	kalshiIntent := polymarketIntent
 	kalshiIntent.MarketSource = domain.MarketSourceKalshi
+	kalshiIntent.ExecutionAccountID = "kalshi:main"
 	if composition.execution.Enabled(kalshiIntent) {
 		t.Fatal("failed Kalshi route must remain dry-run")
 	}
 	if _, err := composition.execution.Submit(context.Background(), kalshiIntent); err == nil {
 		t.Fatal("failed Kalshi route submission must fail closed")
 	}
-	if _, err := composition.positionSource.ListOpenLots(context.Background(), domain.StrategyExecutionContext{
-		ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main",
-	}); err != nil {
-		t.Fatal(err)
+	if composition.execution.StrategyInputEnabled(domain.StrategyExecutionBinding{
+		ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi,
+	}) {
+		t.Fatal("a Kalshi account whose preflight failed must not be sent to the strategy")
 	}
-	if !reflect.DeepEqual(positions.accounts, []string{"main"}) {
-		t.Fatalf("Polymarket position source changed after Kalshi preflight failure: %#v", positions.accounts)
+}
+
+func TestComposeKalshiRejectsCredentialWithoutKalshiAccount(t *testing.T) {
+	cfg := config.Config{
+		Kalshi: config.Kalshi{MarketDataEnabled: true, LiveAccounts: []config.KalshiLiveAccount{{
+			ExecutionAccountID: "kalshi:wallet-7", APIKeyID: "k", PrivateKeyPath: "/k.pem",
+		}}},
+		DecisionCycle: config.DecisionCycle{PredictionModelID: "echo", Accounts: []config.DecisionAccount{
+			{ExecutionAccountID: "main", MarketSource: domain.MarketSourcePolymarket, StrategyID: "s", Mode: config.DecisionAccountActive},
+		}},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := composeKalshiExecution(context.Background(), cfg, nil, memory.NewOrderRepository(), nil, nil,
+		&routeTestExecution{}, logger); err == nil {
+		t.Fatal("a Kalshi credential without a KALSHI account row must fail startup")
 	}
 }
 

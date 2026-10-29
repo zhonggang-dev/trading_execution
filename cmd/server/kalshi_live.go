@@ -19,12 +19,12 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/executionrouter"
 	"github.com/UniPat-AI/trading_execution/internal/service/fillprocessor"
 	"github.com/UniPat-AI/trading_execution/internal/service/kalshisettlement"
-	"github.com/UniPat-AI/trading_execution/internal/service/positionsource"
 )
 
 type kalshiComposition struct {
-	execution      *executionrouter.Service
-	positionSource port.StrategyPositionSource
+	execution *executionrouter.Service
+	// activeAccounts are the Kalshi execution accounts with a route (tradable
+	// or maintenance-only).
 	activeAccounts []string
 	// settlements apply Kalshi's own settlement records to the ledger of each
 	// tradable route; the caller runs them for the life of the process.
@@ -32,26 +32,26 @@ type kalshiComposition struct {
 }
 
 func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sql.DB, repository port.OrderRepository,
-	guard port.Guard, ledger *postgresadapter.FillLedger, primary executionrouter.Execution, basePositions port.StrategyPositionSource,
+	guard port.Guard, ledger *postgresadapter.FillLedger, primary executionrouter.Execution,
 	logger *slog.Logger) (kalshiComposition, error) {
-	if len(cfg.Kalshi.LiveBindings) == 0 {
+	if len(cfg.Kalshi.LiveAccounts) == 0 {
 		router, err := executionrouter.New(repository, primary, nil)
-		return kalshiComposition{execution: router, positionSource: basePositions}, err
+		return kalshiComposition{execution: router}, err
 	}
 	if !cfg.Kalshi.MarketDataEnabled {
-		return kalshiComposition{}, fmt.Errorf("Kalshi live bindings require KALSHI_MARKET_DATA_ENABLED=true")
+		return kalshiComposition{}, fmt.Errorf("Kalshi live accounts require KALSHI_MARKET_DATA_ENABLED=true")
 	}
-	routes := make([]executionrouter.Route, 0, len(cfg.Kalshi.LiveBindings))
-	positionRoutes := make([]positionsource.Route, 0, len(cfg.Kalshi.LiveBindings))
-	active := make([]string, 0, len(cfg.Kalshi.LiveBindings))
-	settlements := make([]*kalshisettlement.Service, 0, len(cfg.Kalshi.LiveBindings))
-	for _, binding := range cfg.Kalshi.LiveBindings {
-		if !configuredBinding(cfg.DecisionCycle.Bindings, binding) {
-			return kalshiComposition{}, fmt.Errorf("Kalshi live route is not an exact decision binding")
+	routes := make([]executionrouter.Route, 0, len(cfg.Kalshi.LiveAccounts))
+	active := make([]string, 0, len(cfg.Kalshi.LiveAccounts))
+	settlements := make([]*kalshisettlement.Service, 0, len(cfg.Kalshi.LiveAccounts))
+	for _, liveAccount := range cfg.Kalshi.LiveAccounts {
+		account, ok := configuredKalshiAccount(cfg.DecisionCycle, liveAccount.ExecutionAccountID)
+		if !ok {
+			return kalshiComposition{}, fmt.Errorf("Kalshi live account %q is not a KALSHI decision account", liveAccount.ExecutionAccountID)
 		}
-		built, err := buildKalshiLiveRoute(ctx, cfg, binding, database, repository, guard, ledger)
+		built, err := buildKalshiLiveRoute(ctx, cfg, account, liveAccount, database, repository, guard, ledger)
 		if err != nil {
-			needsMaintenance, maintenanceErr := kalshiAccountNeedsMaintenance(ctx, database, "kalshi:"+binding.ExecutionAccountID)
+			needsMaintenance, maintenanceErr := kalshiAccountNeedsMaintenance(ctx, database, account.ExecutionAccountID)
 			if maintenanceErr != nil {
 				return kalshiComposition{}, fmt.Errorf("inspect failed Kalshi route maintenance state: %w", maintenanceErr)
 			}
@@ -59,23 +59,22 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 				// Never start without the only route capable of recovering an owned
 				// order or releasing protected assets. A bad local key/configuration
 				// must be repaired instead of silently orphaning durable trading state.
-				return kalshiComposition{}, fmt.Errorf("Kalshi binding with unresolved protected assets cannot enter maintenance mode: %w", err)
+				return kalshiComposition{}, fmt.Errorf("Kalshi account with unresolved protected assets cannot enter maintenance mode: %w", err)
 			}
 			// Kalshi is an additive venue. A credential/API failure downgrades only
-			// a binding with no durable work to dry-run; it must never take
-			// Polymarket offline merely because a new Kalshi account is unavailable.
-			logger.Error("Kalshi live binding disabled after preflight", "model_id", binding.ModelID,
-				"strategy_id", binding.StrategyID, "execution_account_id", binding.ExecutionAccountID, "error", err)
+			// an account with no durable work to dry-run; it must never take
+			// Polymarket offline merely because a Kalshi account is unavailable.
+			logger.Error("Kalshi live account disabled after preflight", "strategy_id", account.StrategyID,
+				"execution_account_id", account.ExecutionAccountID, "error", err)
 			continue
 		}
 		routes = append(routes, built.route)
-		positionRoutes = append(positionRoutes, built.positionRoute)
-		active = append(active, built.internalAccountID)
+		active = append(active, account.ExecutionAccountID)
 		if built.settlement != nil {
 			settlements = append(settlements, built.settlement)
 		}
-		logger.Info("Kalshi live binding preflight passed", "model_id", binding.ModelID, "strategy_id", binding.StrategyID,
-			"execution_account_id", binding.ExecutionAccountID, "internal_account_id", built.internalAccountID,
+		logger.Info("Kalshi live account preflight passed", "strategy_id", account.StrategyID,
+			"execution_account_id", account.ExecutionAccountID, "mode", string(account.Mode),
 			"buy_funded", built.buyFunded, "maintenance_only", built.maintenanceOnly,
 			"balance_sync_deferred", built.balanceSyncDeferred)
 	}
@@ -83,31 +82,25 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 	if err != nil {
 		return kalshiComposition{}, err
 	}
-	positionRouter, err := positionsource.New(basePositions, positionRoutes)
-	if err != nil {
-		return kalshiComposition{}, err
-	}
-	return kalshiComposition{execution: router, positionSource: positionRouter, activeAccounts: active, settlements: settlements}, nil
+	return kalshiComposition{execution: router, activeAccounts: active, settlements: settlements}, nil
 }
 
 type builtKalshiLiveRoute struct {
 	route               executionrouter.Route
-	positionRoute       positionsource.Route
-	internalAccountID   string
 	buyFunded           bool
 	settlement          *kalshisettlement.Service
 	maintenanceOnly     bool
 	balanceSyncDeferred bool
 }
 
-func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config.KalshiLiveBinding, database *sql.DB,
-	repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger) (builtKalshiLiveRoute, error) {
-	client, err := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, APIKeyID: binding.APIKeyID,
-		PrivateKeyPath: binding.PrivateKeyPath, HTTPClient: noRedirectHTTPClient(cfg.Kalshi.RequestTimeout), LiveTradingEnabled: true})
+func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config.DecisionAccount, credential config.KalshiLiveAccount,
+	database *sql.DB, repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger) (builtKalshiLiveRoute, error) {
+	client, err := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, APIKeyID: credential.APIKeyID,
+		PrivateKeyPath: credential.PrivateKeyPath, HTTPClient: noRedirectHTTPClient(cfg.Kalshi.RequestTimeout), LiveTradingEnabled: true})
 	if err != nil {
 		return builtKalshiLiveRoute{}, err
 	}
-	internalID := "kalshi:" + binding.ExecutionAccountID
+	internalID := account.ExecutionAccountID
 	maintenanceOnly := false
 	balanceSyncDeferred := false
 	cashBalance := domain.Decimal("0")
@@ -117,7 +110,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 	}
 	if preflightErr == nil {
 		balanceSyncDeferred, cashBalance, preflightErr = syncKalshiExecutionAccount(
-			ctx, database, internalID, binding.APIKeyID,
+			ctx, database, internalID, credential.APIKeyID,
 			func() (domain.Decimal, error) {
 				balance, balanceErr := retryKalshiRateLimit(ctx, sleepContext, client.GetBalance)
 				if balanceErr != nil {
@@ -128,7 +121,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 		)
 	}
 	if preflightErr != nil {
-		exists, accountErr := kalshiExecutionAccountExists(ctx, database, internalID, binding.APIKeyID)
+		exists, accountErr := kalshiExecutionAccountExists(ctx, database, internalID, credential.APIKeyID)
 		if accountErr != nil {
 			return builtKalshiLiveRoute{}, accountErr
 		}
@@ -163,7 +156,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 	if err != nil {
 		return builtKalshiLiveRoute{}, err
 	}
-	entryDisabledAccounts := internalEntryDisabledAccounts(binding.ExecutionAccountID, internalID, cfg.DecisionCycle.EntryDisabledAccounts)
+	entryDisabledAccounts := accountEntryDisabled(internalID, cfg.DecisionCycle.EntryDisabledAccounts())
 	service, err := execution.New(execution.Params{Repository: repository, Venue: venue, Guard: guard, MarketValidator: validator,
 		Reservations: reservations, FillSynchronizer: processor, AuthoritativeFills: true, AccountScope: scope,
 		RequirePreparedPlacement: true, MaxReconcileAttempts: cfg.Polymarket.MaxReconcileAttempts,
@@ -190,9 +183,9 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 	}
 	cashSign, _ := cashBalance.Sign()
 	return builtKalshiLiveRoute{
-		route:             executionrouter.Route{ModelID: binding.ModelID, StrategyID: binding.StrategyID, LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID, Execution: service, MaintenanceOnly: maintenanceOnly},
-		positionRoute:     positionsource.Route{LogicalAccountID: binding.ExecutionAccountID, InternalAccountID: internalID},
-		internalAccountID: internalID, buyFunded: cashSign > 0, settlement: settlement,
+		route: executionrouter.Route{AccountID: internalID, StrategyID: account.StrategyID, Execution: service,
+			MaintenanceOnly: maintenanceOnly},
+		buyFunded: cashSign > 0, settlement: settlement,
 		maintenanceOnly: maintenanceOnly, balanceSyncDeferred: balanceSyncDeferred,
 	}, nil
 }
@@ -234,23 +227,26 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func internalEntryDisabledAccounts(logicalAccountID, internalAccountID string, disabled []string) []string {
-	for _, accountID := range disabled {
-		if strings.TrimSpace(accountID) == logicalAccountID {
-			return []string{internalAccountID}
+// accountEntryDisabled returns the account as the execution entry gate when
+// its mode blocks BUY (SELL_ONLY or PAUSED).
+func accountEntryDisabled(accountID string, disabled []string) []string {
+	for _, disabledID := range disabled {
+		if strings.TrimSpace(disabledID) == accountID {
+			return []string{accountID}
 		}
 	}
 	return nil
 }
 
-func configuredBinding(bindings []domain.StrategyExecutionBinding, candidate config.KalshiLiveBinding) bool {
-	for _, binding := range bindings {
-		binding = binding.Normalize()
-		if binding.ModelID == candidate.ModelID && binding.StrategyID == candidate.StrategyID && binding.ExecutionAccountID == candidate.ExecutionAccountID {
-			return true
+// configuredKalshiAccount finds the KALSHI decision account a credential
+// belongs to.
+func configuredKalshiAccount(cycle config.DecisionCycle, accountID string) (config.DecisionAccount, bool) {
+	for _, account := range cycle.AccountsForSource(domain.MarketSourceKalshi) {
+		if account.ExecutionAccountID == strings.TrimSpace(accountID) {
+			return account, true
 		}
 	}
-	return false
+	return config.DecisionAccount{}, false
 }
 
 // syncKalshiExecutionAccount updates an external cash baseline only when no
