@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -213,5 +214,28 @@ func TestLiveBindingAuthorizesStrategyNotModelPostgresIntegration(t *testing.T) 
 				t.Fatalf("database submit trigger rejected an order whose strategy is bound: %v", err)
 			}
 		})
+	}
+}
+
+func TestCheckBindingAuthorizationMigrationPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	if err := CheckBindingAuthorizationMigration(context.Background(), db); err != nil {
+		t.Fatalf("migrated schema: %v", err)
+	}
+	// Re-applying the pre-0041 trigger body must make startup fail closed.
+	previous, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "0025_sell_exit_freshness_exemption.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(previous)); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckBindingAuthorizationMigration(context.Background(), db); err == nil ||
+		!strings.Contains(err.Error(), "0041_binding_authorization_without_model.sql is not applied") {
+		t.Fatalf("pre-0041 trigger error = %v", err)
 	}
 }

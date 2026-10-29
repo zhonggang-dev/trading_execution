@@ -20,6 +20,7 @@ CREATE OR REPLACE FUNCTION enforce_live_order_submit_risk()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
+-- binding-authorization: strategy+account (migration 0041)
 DECLARE
     reservation_policy_id TEXT;
     reservation_policy_version BIGINT;

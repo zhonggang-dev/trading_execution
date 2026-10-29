@@ -164,6 +164,10 @@ func TestReaderAgainstMigratedTradingSchema(t *testing.T) {
 		if (want == nil) != (got == nil) || (want != nil && *got != *want) {
 			t.Fatalf("strategy %s binding enabled = %v, want %v", strategy, got, want)
 		}
+		// The account's latest cycle is shown whatever model/strategy ran it.
+		if value.Accounts[0].LastCycleAt == nil {
+			t.Fatalf("strategy %s: latest account cycle hidden after a model change: %#v", strategy, value.Accounts[0])
+		}
 	}
 	if _, err := db.ExecContext(ctx, `
 		UPDATE execution_strategy_bindings SET enabled=FALSE, version=version+1

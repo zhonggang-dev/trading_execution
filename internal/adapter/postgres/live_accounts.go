@@ -24,6 +24,31 @@ type ExpectedActiveExecutionAccount struct {
 	StrategyID         string
 }
 
+// bindingAuthorizationMarker is written into enforce_live_order_submit_risk by
+// migration 0041. Its absence means the database still compares the order's
+// model_id with the binding row and would reject every order placed under the
+// configured prediction model.
+const bindingAuthorizationMarker = "binding-authorization: strategy+account (migration 0041)"
+
+// CheckBindingAuthorizationMigration fails closed unless the submit trigger
+// authorizes (strategy, account) as this release does.
+func CheckBindingAuthorizationMigration(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("postgres is required")
+	}
+	var applied bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT COALESCE(bool_or(strpos(prosrc, $1) > 0), FALSE)
+		FROM pg_proc WHERE proname='enforce_live_order_submit_risk'`, bindingAuthorizationMarker).Scan(&applied); err != nil {
+		return fmt.Errorf("inspect live submit trigger: %w", err)
+	}
+	if !applied {
+		return fmt.Errorf("migration 0041_binding_authorization_without_model.sql is not applied; " +
+			"the submit trigger would reject orders whose model_id differs from the binding row")
+	}
+	return nil
+}
+
 // CheckLiveActiveAccountAuthorization verifies the three independent durable
 // activation gates for every active account: the globally enabled strategy
 // binding set is exactly the expected active routes, every risk policy is

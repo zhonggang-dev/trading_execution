@@ -1063,7 +1063,15 @@ func normalizeBindings(bindings []domain.StrategyExecutionBinding) ([]domain.Str
 		seenAccounts[binding.ExecutionAccountID] = struct{}{}
 		result[index] = binding
 	}
+	// Polymarket accounts run (and deliver) before Kalshi accounts, so a slow
+	// Kalshi call never delays a Polymarket BUY; within a venue the order is
+	// the historical model/strategy/account order.
 	sort.Slice(result, func(i, j int) bool {
+		leftKalshi := result[i].MarketSource == domain.MarketSourceKalshi
+		rightKalshi := result[j].MarketSource == domain.MarketSourceKalshi
+		if leftKalshi != rightKalshi {
+			return !leftKalshi
+		}
 		if result[i].ModelID != result[j].ModelID {
 			return result[i].ModelID < result[j].ModelID
 		}
@@ -1134,12 +1142,20 @@ func filterEntryDisabledBindings(
 	return result
 }
 
+// executionAccountIDs returns the bindings' accounts in delivery order:
+// Polymarket accounts first, then Kalshi accounts, each sorted by ID.
 func executionAccountIDs(bindings []domain.StrategyExecutionBinding) []string {
 	result := make([]string, 0, len(bindings))
 	for _, binding := range bindings {
 		result = append(result, binding.ExecutionAccountID)
 	}
-	sort.Strings(result)
+	sort.Slice(result, func(i, j int) bool {
+		leftKalshi, rightKalshi := domain.IsKalshiExecutionAccount(result[i]), domain.IsKalshiExecutionAccount(result[j])
+		if leftKalshi != rightKalshi {
+			return !leftKalshi
+		}
+		return result[i] < result[j]
+	})
 	return result
 }
 

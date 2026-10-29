@@ -148,6 +148,9 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := postgresadapter.CheckBindingAuthorizationMigration(ctx, database); err != nil {
+		return nil, err
+	}
 	if err := postgresadapter.CheckLiveActiveAccountAuthorization(
 		ctx, database, activeAuthorizations,
 	); err != nil {
@@ -544,7 +547,10 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err := operations.Refresh(ctx); err != nil {
 		return nil, fmt.Errorf("build initial live operations snapshot: %w", err)
 	}
-	decisionAccountGate, err := newVenueAccountGate(runner, kalshiRuntime.activeAccounts)
+	// Every configured Kalshi account gets a delivery slot, including one whose
+	// preflight failed: its persisted intents are then claimed and held back by
+	// the submission policy instead of failing delivery for every account.
+	decisionAccountGate, err := newVenueAccountGate(runner, configuredKalshiAccountIDs(cfg.DecisionCycle))
 	if err != nil {
 		return nil, err
 	}

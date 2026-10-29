@@ -99,6 +99,17 @@ func TestKalshiPreflightFailureLeavesPolymarketRouteOperational(t *testing.T) {
 	if _, err := composition.execution.Submit(context.Background(), kalshiIntent); err == nil {
 		t.Fatal("failed Kalshi route submission must fail closed")
 	}
+	// The Kalshi account keeps its delivery slot although its route failed:
+	// claiming its persisted intents must not fail delivery for Polymarket.
+	gate, err := newVenueAccountGate(&recordingAccountGate{}, configuredKalshiAccountIDs(cfg.DecisionCycle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := gate.AcquireExecutionAccount(context.Background(), "kalshi:main")
+	if err != nil {
+		t.Fatalf("configured Kalshi account without a route has no delivery slot: %v", err)
+	}
+	release()
 	if composition.execution.StrategyInputEnabled(domain.StrategyExecutionBinding{
 		ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi,
 	}) {

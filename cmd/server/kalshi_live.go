@@ -238,6 +238,17 @@ func accountEntryDisabled(accountID string, disabled []string) []string {
 	return nil
 }
 
+// configuredKalshiAccountIDs returns every KALSHI account row, whether or not
+// its route passed the startup preflight.
+func configuredKalshiAccountIDs(cycle config.DecisionCycle) []string {
+	accounts := cycle.AccountsForSource(domain.MarketSourceKalshi)
+	ids := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		ids = append(ids, account.ExecutionAccountID)
+	}
+	return ids
+}
+
 // configuredKalshiAccount finds the KALSHI decision account a credential
 // belongs to.
 func configuredKalshiAccount(cycle config.DecisionCycle, accountID string) (config.DecisionAccount, bool) {

@@ -186,9 +186,8 @@ LEFT JOIN LATERAL (
 	           END AS entry_enabled,
            NULLIF(r.output_payload->'entry_policy'->>'block_reason', '') AS entry_block_reason
     FROM strategy_decision_runs r
-    WHERE r.model_id=configured.model_id
-      AND r.strategy_id=configured.strategy_id
-      AND r.execution_account_id=configured.execution_account_id
+    -- The account's latest cycle, whatever model or strategy ran it.
+    WHERE r.execution_account_id=configured.execution_account_id
     ORDER BY r.decision_at DESC, r.cycle_id DESC
     LIMIT 1
 ) cycle ON TRUE

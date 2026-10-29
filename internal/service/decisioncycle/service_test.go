@@ -3338,3 +3338,28 @@ func TestNewAllowsAccountsToShareModelAndStrategy(t *testing.T) {
 		t.Fatal("New() accepted a Kalshi binding on a Polymarket account identity")
 	}
 }
+
+// TestPolymarketAccountsRunAndDeliverBeforeKalshiAccounts keeps a slow Kalshi
+// call from delaying Polymarket: "kalshi:main" sorts before "main" by name,
+// but every Polymarket account runs and delivers first.
+func TestPolymarketAccountsRunAndDeliverBeforeKalshiAccounts(t *testing.T) {
+	bindings, err := normalizeBindings([]domain.StrategyExecutionBinding{
+		{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi},
+		{ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+		{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main"},
+		{ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		order = append(order, binding.ExecutionAccountID)
+	}
+	if got := strings.Join(order, ","); got != "main,wallet-6,wallet-7,kalshi:main" {
+		t.Fatalf("binding order = %s", got)
+	}
+	if got := strings.Join(executionAccountIDs(bindings), ","); got != "main,wallet-6,wallet-7,kalshi:main" {
+		t.Fatalf("delivery account order = %s", got)
+	}
+}

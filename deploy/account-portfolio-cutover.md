@@ -11,8 +11,9 @@
 | 新订单/新 lot 的 `model_id` | `deepseek_masked` | `v4.1 flash`（预测模型名本身） |
 | Kalshi | 挂在 `main` 的策略请求里，`main` 的策略/模型 | `kalshi:main` 独立一次策略请求，cycle_id `kalshi:main:<T>` |
 | `main` 的策略请求 | 含 PM + Kalshi 市场、PM + Kalshi lot | 只含 PM |
-| lot 归属 | 账户 + 模型 + 策略 | 只看账户：wallet-6 的 2 个、wallet-7 的 13 个 `gemini_masked` 旧 lot 会进入现策略请求，可能被卖出（已接受） |
-| 授权 | 按（模型, 策略, 账户） | 按（策略, 账户）；迁移 0041 放宽提交触发器 |
+| lot 归属 | 账户 + 模型 + 策略 | 只看账户。10-29 核对：wallet-6 的 2 个、wallet-7 的 13 个 `gemini_masked` 旧 lot 全是不足 0.01 股的 dust，仍被 0.01 下限排除，不会进入策略请求；其余 OPEN lot 本来就是当前模型/策略 |
+| 授权 | 按（模型, 策略, 账户） | 按（策略, 账户）；迁移 0041 放宽提交触发器；未执行 0041 时新二进制拒绝启动 |
+| 执行顺序 | — | 每轮先跑并投递全部 Polymarket 账户，再跑 Kalshi 账户 |
 
 策略服务影响（已核实 10-29）：
 
@@ -55,8 +56,8 @@ psql -X -w -v ON_ERROR_STOP=1 -h <私网主机> -U adminuser -d trading_executio
 验证：
 
 ```sql
-SELECT prosrc LIKE '%AND enabled%' AND prosrc NOT LIKE '%model_id = btrim%'
-FROM pg_proc WHERE proname='enforce_live_order_submit_risk';   -- 期望 true
+SELECT strpos(prosrc, 'binding-authorization: strategy+account (migration 0041)') > 0
+FROM pg_proc WHERE proname='enforce_live_order_submit_risk';   -- 期望 true；新二进制启动时做同样检查
 ```
 
 函数属主不变，应用账号无需新增授权。
@@ -141,3 +142,21 @@ WHERE intent_payload->>'execution_account_id' LIKE 'kalshi:%' AND status IN ('PE
 ```
 
 回滚后的已知限制：新版本期间开出的 lot（`model_id='v4.1 flash'`），旧二进制不会把它们发给策略（旧版按模型筛选 lot），直到再次前滚。它们仍在账本、对账、结算与赎回里。
+
+## 7. 已知限制与行为差异（审查结论，均不影响下单主路径）
+
+- **订单回报**：`kalshi:main` 进入回报账户集合。回看窗口（24h）内旧版本下的 Kalshi 订单会第一次以
+  `kalshi:main` 名义回报，而策略服务当时记录的账户是 `main`，会对这几条打 orphan 告警（不影响交易）。
+  切换时距 10-29 02:40 那笔 Kalshi 单已超过 24h，则不会发生。
+- **控制台**：`kalshi:main` 的数据库绑定/风险策略显示为空（Kalshi 本来就不走这些表）。
+- **运维工具仍按模型匹配**（本次未改，使用时注意）：
+  - `externalsellrepair` / 迁移 0024 的托管外部卖出：同一 token 上同时有旧 `deepseek_masked` lot 与新
+    `v4.1 flash` lot 时，会判为"归属不明确"并拒绝。
+  - 外部持仓接管（迁移 0016）要求绑定行 `model_id` 与接管时填的模型一致：接管时填绑定行上的
+    `model_id`（当前 `deepseek_masked`）即可。
+  - 0017 唯一索引是"启用状态下（模型, 策略）唯一"：两个 Polymarket 账户若要跑同一策略，绑定行需写不同的
+    审计 `model_id`（授权不比较它）。
+  - `ListOpenPositionExitTrades`/`positionexit` 仍按模型筛选，但 server 未接线。
+- 某账户的 lot 数据异常（outcome/neg_risk 为空、平台与账户不符）会让整轮失败，与改造前 lot 归属异常同级；
+  10-29 只读核对线上 OPEN lot 无此类数据。
+
