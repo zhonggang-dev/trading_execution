@@ -148,22 +148,3 @@ func TestNewRejectsUnsafeParameters(t *testing.T) {
 		t.Fatalf("New() rejected good parameters: %v", err)
 	}
 }
-
-func TestSettleOpenMarketsAppliesSettlementsWithoutBalanceCheck(t *testing.T) {
-	source := &fakeSource{
-		records:    map[string][]domain.KalshiSettlement{"KX-DONE": {{Ticker: "KX-DONE", MarketResult: "yes"}}},
-		listErr:    map[string]error{"KX-BAD": errors.New("exchange down")},
-		balanceErr: errors.New("balance must not be read before the startup sync"),
-	}
-	store := &fakeStore{
-		tickers:  []string{"KX-BAD", "KX-DONE"},
-		outcomes: map[string]domain.KalshiSettlementOutcome{"KX-DONE": {Result: domain.KalshiSettlementApplied, Payout: "10"}},
-	}
-	err := newService(t, source, store).SettleOpenMarkets(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "KX-BAD") {
-		t.Fatalf("error = %v, want the failed market reported", err)
-	}
-	if strings.Join(store.applied, ",") != "KX-DONE" || len(store.checks) != 0 {
-		t.Fatalf("applied = %v checks = %v, want the settled market applied and no balance check", store.applied, store.checks)
-	}
-}

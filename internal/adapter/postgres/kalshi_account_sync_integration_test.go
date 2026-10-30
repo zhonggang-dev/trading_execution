@@ -76,38 +76,11 @@ func settledWhileDown(t *testing.T, accountID string) (*sql.DB, *fakeKalshiExcha
 	}
 }
 
-// TestKalshiStartupBooksSettlementOnceBeforeBalanceSyncPostgresIntegration
-// replays the startup order: settle open markets, sync the cash baseline, then
-// the settlement loop's first sweep. The payout is booked exactly once.
-func TestKalshiStartupBooksSettlementOnceBeforeBalanceSyncPostgresIntegration(t *testing.T) {
-	const account = "kalshi:sync-settled"
-	database, exchange := settledWhileDown(t, account)
-	ctx := context.Background()
-	service := newKalshiSettlementService(t, database, account, exchange)
-
-	if err := service.SettleOpenMarkets(ctx); err != nil {
-		t.Fatal(err)
-	}
-	assertKalshiCash(t, database, account, "110")
-	deferred, balance, err := exchange.sync(ctx, database, account)
-	if err != nil || deferred || !balance.Equal("110") {
-		t.Fatalf("sync = deferred %v balance %s err %v", deferred, balance, err)
-	}
-	assertKalshiCash(t, database, account, "110")
-	if err := service.Sweep(ctx); err != nil {
-		t.Fatal(err)
-	}
-	assertKalshiCash(t, database, account, "110")
-	if got := scalar(t, database, `SELECT count(*)::text FROM execution_account_events
-		WHERE execution_account_id=$1 AND event_type='KALSHI_BALANCE_SYNC'`, account); got != "0" {
-		t.Fatalf("balance sync events = %s, want 0: the ledger already matched", got)
-	}
-}
-
-// TestKalshiBalanceSyncDefersWhileASettlementIsUnbookedPostgresIntegration:
-// when the payout cannot be booked before the sync (settlement disabled, the
-// pre-sync sweep failed, or the record is held for review), the sync must not
-// write the exchange balance over the cash.
+// TestKalshiBalanceSyncDefersWhileASettlementIsUnbookedPostgresIntegration
+// replays a restart after a held market settled while the process was down:
+// the startup sync must not write the exchange balance (which already contains
+// the payout) over the cash; the settlement loop, started after order
+// recovery, books the payout once.
 func TestKalshiBalanceSyncDefersWhileASettlementIsUnbookedPostgresIntegration(t *testing.T) {
 	ctx := context.Background()
 	t.Run("settled on the exchange, no local row", func(t *testing.T) {
@@ -136,7 +109,8 @@ func TestKalshiBalanceSyncDefersWhileASettlementIsUnbookedPostgresIntegration(t 
 		database, exchange := settledWhileDown(t, account)
 		exchange.settlements["KXSYNC-1"] = []domain.KalshiSettlement{kalshiRecord("KXSYNC-1", "yes", "10", "0", "9.5", "1")}
 		exchange.balance = "109.5"
-		if err := newKalshiSettlementService(t, database, account, exchange).SettleOpenMarkets(ctx); err != nil {
+		// A sweep of the previous run held the record for review.
+		if err := newKalshiSettlementService(t, database, account, exchange).Sweep(ctx); err != nil {
 			t.Fatal(err)
 		}
 		if got := scalar(t, database, `SELECT status FROM kalshi_settlements WHERE execution_account_id=$1`, account); got != "MANUAL_REVIEW" {

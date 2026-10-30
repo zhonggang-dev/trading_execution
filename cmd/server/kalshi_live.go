@@ -49,7 +49,7 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 		if !ok {
 			return kalshiComposition{}, fmt.Errorf("Kalshi live account %q is not a KALSHI decision account", liveAccount.ExecutionAccountID)
 		}
-		built, err := buildKalshiLiveRoute(ctx, cfg, account, liveAccount, database, repository, guard, ledger, logger)
+		built, err := buildKalshiLiveRoute(ctx, cfg, account, liveAccount, database, repository, guard, ledger)
 		if err != nil {
 			needsMaintenance, maintenanceErr := kalshiAccountNeedsMaintenance(ctx, database, account.ExecutionAccountID)
 			if maintenanceErr != nil {
@@ -94,8 +94,7 @@ type builtKalshiLiveRoute struct {
 }
 
 func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config.DecisionAccount, credential config.KalshiLiveAccount,
-	database *sql.DB, repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger,
-	logger *slog.Logger) (builtKalshiLiveRoute, error) {
+	database *sql.DB, repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger) (builtKalshiLiveRoute, error) {
 	client, err := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, APIKeyID: credential.APIKeyID,
 		PrivateKeyPath: credential.PrivateKeyPath, HTTPClient: noRedirectHTTPClient(cfg.Kalshi.RequestTimeout), LiveTradingEnabled: true})
 	if err != nil {
@@ -108,36 +107,6 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 	capabilities, preflightErr := retryKalshiRateLimit(ctx, sleepContext, client.ProbeCapabilities)
 	if preflightErr == nil && !capabilities.Write {
 		preflightErr = fmt.Errorf("Kalshi API key lacks write scope")
-	}
-	var settlement *kalshisettlement.Service
-	if cfg.Kalshi.SettlementEnabled {
-		settlementStore, storeErr := postgresadapter.NewKalshiSettlementStore(database, []string{internalID})
-		if storeErr != nil {
-			return builtKalshiLiveRoute{}, storeErr
-		}
-		settlement, err = kalshisettlement.New(kalshisettlement.Params{
-			ExecutionAccountID: internalID, Source: client, Store: settlementStore,
-			Interval: cfg.Kalshi.SettlementInterval, BalanceDriftThreshold: cfg.Kalshi.BalanceDriftThreshold,
-		})
-		if err != nil {
-			return builtKalshiLiveRoute{}, err
-		}
-	}
-	if preflightErr == nil && settlement != nil {
-		// Book what the exchange already paid before its balance replaces the
-		// local cash; otherwise the first sweep would credit those payouts again.
-		// Only for the same Kalshi identity: the sync below rejects a changed key.
-		// A market that cannot be applied keeps the sync deferred below.
-		sameIdentity, identityErr := kalshiExecutionAccountExists(ctx, database, internalID, credential.APIKeyID)
-		if identityErr != nil {
-			return builtKalshiLiveRoute{}, identityErr
-		}
-		if sameIdentity {
-			if settleErr := settlement.SettleOpenMarkets(ctx); settleErr != nil {
-				logger.Warn("Kalshi settlement before balance sync needs attention",
-					"execution_account_id", internalID, "error", settleErr)
-			}
-		}
 	}
 	if preflightErr == nil {
 		balanceSyncDeferred, cashBalance, preflightErr = postgresadapter.SyncKalshiExecutionAccount(
@@ -201,10 +170,21 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 	if err != nil {
 		return builtKalshiLiveRoute{}, err
 	}
+	var settlement *kalshisettlement.Service
 	// A route that failed its remote preflight is maintenance-only; its API
 	// access is not trusted, so it does not settle until a clean restart.
-	if maintenanceOnly {
-		settlement = nil
+	if cfg.Kalshi.SettlementEnabled && !maintenanceOnly {
+		settlementStore, storeErr := postgresadapter.NewKalshiSettlementStore(database, []string{internalID})
+		if storeErr != nil {
+			return builtKalshiLiveRoute{}, storeErr
+		}
+		settlement, err = kalshisettlement.New(kalshisettlement.Params{
+			ExecutionAccountID: internalID, Source: client, Store: settlementStore,
+			Interval: cfg.Kalshi.SettlementInterval, BalanceDriftThreshold: cfg.Kalshi.BalanceDriftThreshold,
+		})
+		if err != nil {
+			return builtKalshiLiveRoute{}, err
+		}
 	}
 	cashSign, _ := cashBalance.Sign()
 	return builtKalshiLiveRoute{

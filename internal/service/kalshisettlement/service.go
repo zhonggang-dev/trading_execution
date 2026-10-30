@@ -88,36 +88,20 @@ func (service *Service) Run(ctx context.Context) error {
 // the cash ledger with the exchange. Settlement runs first so a payout that the
 // exchange already credited is not reported as drift.
 func (service *Service) Sweep(ctx context.Context) error {
-	tickers, err := service.store.OpenKalshiSettlementTickers(ctx, service.account)
-	if err != nil {
-		return fmt.Errorf("list open Kalshi markets: %w", err)
-	}
-	failures := service.settleAll(ctx, tickers)
-	if err := service.checkBalance(ctx); err != nil {
-		failures = append(failures, fmt.Errorf("balance check: %w", err))
-	}
-	return errors.Join(failures...)
-}
-
-// SettleOpenMarkets applies every settled market the account still holds,
-// without the balance check. Startup runs it before replacing the local cash
-// with the exchange balance, which already contains those payouts.
-func (service *Service) SettleOpenMarkets(ctx context.Context) error {
-	tickers, err := service.store.OpenKalshiSettlementTickers(ctx, service.account)
-	if err != nil {
-		return fmt.Errorf("list open Kalshi markets: %w", err)
-	}
-	return errors.Join(service.settleAll(ctx, tickers)...)
-}
-
-func (service *Service) settleAll(ctx context.Context, tickers []string) []error {
 	var failures []error
+	tickers, err := service.store.OpenKalshiSettlementTickers(ctx, service.account)
+	if err != nil {
+		return fmt.Errorf("list open Kalshi markets: %w", err)
+	}
 	for _, ticker := range tickers {
 		if err := service.settle(ctx, ticker); err != nil {
 			failures = append(failures, fmt.Errorf("%s: %w", ticker, err))
 		}
 	}
-	return failures
+	if err := service.checkBalance(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("balance check: %w", err))
+	}
+	return errors.Join(failures...)
 }
 
 func (service *Service) settle(ctx context.Context, ticker string) error {
