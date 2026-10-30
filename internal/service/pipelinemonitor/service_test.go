@@ -7,12 +7,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -94,7 +96,7 @@ func TestDurableCooldownEscalationRecoveryAndFailedSend(t *testing.T) {
 	}
 	now = now.Add(cfg.Cooldown)
 	refresh()
-	if calls.Load() != 6 {
+	if calls.Load() != 7 {
 		t.Fatal("same fault did not remind after cooldown")
 	}
 	info, e := os.Stat(cfg.StatePath)
@@ -186,7 +188,7 @@ func TestWebhookSignatureAndBusinessResponseValidation(t *testing.T) {
 	}))
 	defer srv.Close()
 	n := notifier{config: Config{WebhookURL: srv.URL, Secret: "test-secret"}, client: srv.Client()}
-	if e := n.send(context.Background(), "test", now); e != nil {
+	if e := n.sendCard(context.Background(), testAlertCard(t, now), now); e != nil {
 		t.Fatal(e)
 	}
 	mac := hmac.New(sha256.New, []byte("1793318400\ntest-secret"))
@@ -194,10 +196,13 @@ func TestWebhookSignatureAndBusinessResponseValidation(t *testing.T) {
 	if got["sign"] != want {
 		t.Fatalf("signature=%v", got["sign"])
 	}
+	if got["msg_type"] != "interactive" || got["card"].(map[string]any)["schema"] != "2.0" {
+		t.Fatal("webhook is not sending an interactive Card 2.0")
+	}
 	for _, body := range []string{`{}`, `{"code":1}`, `not-json`} {
 		srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, body) }))
 		n.config.WebhookURL = srv2.URL
-		if e := n.send(context.Background(), "test", now); e == nil {
+		if e := n.sendCard(context.Background(), testAlertCard(t, now), now); e == nil {
 			t.Fatalf("accepted invalid response %s", body)
 		}
 		srv2.Close()
@@ -220,12 +225,16 @@ func TestAppBotCachesTokenAndUsesChatIdentity(t *testing.T) {
 		if p["receive_id"] != "oc_test" {
 			t.Error("incorrect chat")
 		}
+		var card map[string]any
+		if p["msg_type"] != "interactive" || json.Unmarshal([]byte(p["content"]), &card) != nil || card["schema"] != "2.0" {
+			t.Error("app bot content is not interactive Card 2.0 JSON")
+		}
 		io.WriteString(w, `{"code":0}`)
 	}))
 	defer srv.Close()
 	n := notifier{config: Config{AppID: "cli_test", AppSecret: "test", ChatID: "oc_test"}, client: srv.Client(), apiBase: srv.URL}
 	for range 2 {
-		if e := n.send(context.Background(), "test", time.Now()); e != nil {
+		if e := n.sendCard(context.Background(), testAlertCard(t, time.Now()), time.Now()); e != nil {
 			t.Fatal(e)
 		}
 	}
@@ -306,12 +315,10 @@ func TestSuppressedIsNotRecoveryAndBatchDoesNotFlood(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		var p struct {
-			Content struct {
-				Text string `json:"text"`
-			} `json:"content"`
+			Card json.RawMessage `json:"card"`
 		}
 		json.NewDecoder(r.Body).Decode(&p)
-		message = p.Content.Text
+		message = string(p.Card)
 		io.WriteString(w, `{"code":0}`)
 	}))
 	defer srv.Close()
@@ -376,5 +383,119 @@ func TestNotificationTimeoutDoesNotAdvanceState(t *testing.T) {
 	s.Refresh(context.Background())
 	if time.Since(started) > time.Second || len(s.states) != 0 {
 		t.Fatal("timeout blocked monitor or advanced successful delivery")
+	}
+}
+
+func testAlertCard(t *testing.T, at time.Time) map[string]any {
+	t.Helper()
+	card, err := RenderCard("test", at, []Alert{{Check: Check{ID: "test", Scope: "host", Status: Warning, Summary: "test"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return card
+}
+
+func TestPartialCardDeliveryOnlyAcknowledgesAndPersistsAcceptedLifecycle(t *testing.T) {
+	for _, failAt := range []int64{1, 2} {
+		t.Run(fmt.Sprintf("failed-card-%d", failAt), func(t *testing.T) {
+			now := cardTestAt
+			var calls atomic.Int64
+			var colors []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var p struct {
+					Type string         `json:"msg_type"`
+					Card map[string]any `json:"card"`
+				}
+				json.NewDecoder(r.Body).Decode(&p)
+				if p.Type != "interactive" {
+					t.Error("non-card delivery")
+				}
+				colors = append(colors, p.Card["header"].(map[string]any)["template"].(string))
+				if calls.Add(1) == failAt {
+					io.WriteString(w, `{"code":19000}`)
+				} else {
+					io.WriteString(w, `{"code":0}`)
+				}
+			}))
+			defer srv.Close()
+			cfg := testConfig(t)
+			cfg.WebhookURL = srv.URL
+			s := testService(t, cfg, &now, CollectFunc(func(context.Context, time.Time) ([]Check, error) {
+				return []Check{{ID: "new-fault", Scope: "source", Status: Critical, Summary: "新异常"}, {ID: "old-fault", Scope: "source", Status: Healthy, Summary: "旧异常恢复"}}, nil
+			}))
+			oldKey := "test\x00old-fault\x00source"
+			newKey := "test\x00new-fault\x00source"
+			old := alertState{Level: Critical, Active: true, SentAt: now.Add(-time.Hour)}
+			s.states[oldKey] = old
+			snap, err := s.Refresh(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls.Load() != 2 || !reflect.DeepEqual(colors, []string{"red", "green"}) {
+				t.Fatal("active and recovery were not distinct cards", calls.Load(), colors)
+			}
+			disk, err := readState(cfg.StatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if failAt == 2 {
+				if !disk[newKey].Active || !disk[newKey].SentAt.Equal(now) || disk[oldKey] != old {
+					t.Fatal("failed recovery was acknowledged or accepted fault lost", disk)
+				}
+			} else {
+				if _, exists := disk[newKey]; exists {
+					t.Fatal("failed active card advanced cooldown")
+				}
+				if disk[oldKey].Active || !disk[oldKey].SentAt.Equal(now) {
+					t.Fatal("accepted recovery was not persisted")
+				}
+			}
+			for _, c := range snap.Checks {
+				if c.ID == "monitor.delivery" && c.Status != Unknown {
+					t.Fatal("partial send failure hidden by another card success", c)
+				}
+			}
+			// Reload persisted state exactly as a process restart would: only the
+			// unaccepted lifecycle may be retried inside its successful peer's cooldown.
+			now = now.Add(time.Minute)
+			reloaded := testService(t, cfg, &now, s.collector)
+			reloaded.Refresh(context.Background())
+			if calls.Load() != 3 {
+				t.Fatal("restart retried already accepted peer", calls.Load())
+			}
+			if !reloaded.states[newKey].Active || reloaded.states[oldKey].Active {
+				t.Fatal("failed lifecycle did not complete independently after restart")
+			}
+		})
+	}
+}
+
+func TestGroupedCardKeepsEachWalletCooldownAndRecoveryIndependent(t *testing.T) {
+	now := cardTestAt
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); io.WriteString(w, `{"code":0}`) }))
+	defer srv.Close()
+	cfg := testConfig(t)
+	cfg.WebhookURL = srv.URL
+	checks := []Check{coverageAlert("main", "model").Check, coverageAlert("wallet-6", "model").Check, coverageAlert("wallet-7", "model").Check}
+	s := testService(t, cfg, &now, CollectFunc(func(context.Context, time.Time) ([]Check, error) { return checks, nil }))
+	s.Refresh(context.Background())
+	if calls.Load() != 1 {
+		t.Fatal("same-model wallet group did not send one card")
+	}
+	for _, c := range checks {
+		if !s.states["test\x00"+c.ID+"\x00"+c.Scope].Active {
+			t.Fatal("grouping lost independent cooldown", c.Scope)
+		}
+	}
+	checks[0].Status = Healthy
+	checks[0].Summary = "路由具有有效开仓概率"
+	now = now.Add(time.Minute)
+	s.Refresh(context.Background())
+	if calls.Load() != 2 {
+		t.Fatal("single wallet recovery was not independently notified")
+	}
+	if s.states["test\x00prediction.coverage\x00main/model/multfactor_v1"].Active || !s.states["test\x00prediction.coverage\x00wallet-6/model/multfactor_v1"].Active {
+		t.Fatal("one wallet recovery incorrectly cleared another")
 	}
 }

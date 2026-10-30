@@ -23,12 +23,12 @@ type notifier struct {
 }
 
 func (n *notifier) enabled() bool { return n.config.WebhookURL != "" || n.config.AppID != "" }
-func (n *notifier) send(ctx context.Context, text string, now time.Time) error {
+func (n *notifier) sendCard(ctx context.Context, card map[string]any, now time.Time) error {
 	if !n.enabled() {
 		return nil
 	}
 	if n.config.WebhookURL != "" {
-		p := map[string]any{"msg_type": "text", "content": map[string]string{"text": text}}
+		p := map[string]any{"msg_type": "interactive", "card": card}
 		if n.config.Secret != "" {
 			stamp := strconv.FormatInt(now.Unix(), 10)
 			mac := hmac.New(sha256.New, []byte(stamp+"\n"+n.config.Secret))
@@ -55,8 +55,11 @@ func (n *notifier) send(ctx context.Context, text string, now time.Time) error {
 		n.token = r.Token
 		n.tokenUntil = now.Add(time.Duration(r.Expire-60) * time.Second)
 	}
-	content, _ := json.Marshal(map[string]string{"text": text})
-	err := n.post(ctx, base+"/open-apis/im/v1/messages?receive_id_type=chat_id", n.token, map[string]string{"receive_id": n.config.ChatID, "msg_type": "text", "content": string(content)}, nil)
+	content, err := json.Marshal(card)
+	if err != nil {
+		return fmt.Errorf("encode Feishu card")
+	}
+	err = n.post(ctx, base+"/open-apis/im/v1/messages?receive_id_type=chat_id", n.token, map[string]string{"receive_id": n.config.ChatID, "msg_type": "interactive", "content": string(content)}, nil)
 	if err != nil {
 		n.token = ""
 	}
