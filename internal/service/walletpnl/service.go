@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ var (
 )
 
 type AddressReader interface {
+	// WalletAddress returns the registered, validated Polymarket funding address.
 	WalletAddress(context.Context, string) (string, error)
 }
 
@@ -45,6 +47,17 @@ type Result struct {
 	Fidelity           string    `json:"fidelity"`
 	FetchedAt          time.Time `json:"fetched_at"`
 	Points             []Point   `json:"points"`
+}
+
+// Account exposes curve support without returning an address or signing identity.
+type Account struct {
+	ExecutionAccountID string `json:"execution_account_id"`
+	MarketSource       string `json:"market_source"`
+}
+
+type AccountList struct {
+	Accounts   []Account `json:"accounts"`
+	ObservedAt time.Time `json:"observed_at"`
 }
 
 type Service struct {
@@ -100,6 +113,34 @@ func New(params Params) (*Service, error) {
 		params.Now = time.Now
 	}
 	return &Service{addresses: params.Addresses, source: params.Source, allowed: allowed, now: params.Now, ttl: params.TTL, cache: make(map[string]cacheEntry), inflight: make(map[string]*pending)}, nil
+}
+
+// ListAccounts reads the authoritative registrations for the managed
+// Polymarket set. A broken registration makes support unknown, not an empty
+// or partial successful list. It never calls the external PnL data source.
+func (service *Service) ListAccounts(ctx context.Context) (AccountList, error) {
+	ids := make([]string, 0, len(service.allowed))
+	for accountID := range service.allowed {
+		ids = append(ids, accountID)
+	}
+	sort.Strings(ids)
+	accounts := make([]Account, 0, len(ids))
+	for _, accountID := range ids {
+		if err := ctx.Err(); err != nil {
+			return AccountList{}, err
+		}
+		if _, err := service.addresses.WalletAddress(ctx, accountID); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return AccountList{}, err
+			}
+			return AccountList{}, fmt.Errorf("%w: read managed wallet registration", ErrUnavailable)
+		}
+		accounts = append(accounts, Account{ExecutionAccountID: accountID, MarketSource: "POLYMARKET"})
+	}
+	if err := ctx.Err(); err != nil {
+		return AccountList{}, err
+	}
+	return AccountList{Accounts: accounts, ObservedAt: service.now().UTC()}, nil
 }
 
 func (service *Service) Query(ctx context.Context, query Query) (Result, error) {

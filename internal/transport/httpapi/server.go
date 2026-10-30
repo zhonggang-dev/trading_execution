@@ -182,6 +182,7 @@ func New(params Params) (*Server, error) {
 	// returns a truthful 503 instead of making the BFF infer availability from
 	// a 404 or risking a nil service call.
 	mux.Handle("GET /api/v1/wallet-pnl", server.authenticateReadOnly(http.HandlerFunc(server.walletPnLHandler)))
+	mux.Handle("GET /api/v1/wallet-pnl/accounts", server.authenticateReadOnly(http.HandlerFunc(server.walletPnLAccountsHandler)))
 	if server.liveOperations != nil {
 		mux.Handle("GET /api/v1/live-operations", server.authenticateReadOnly(http.HandlerFunc(server.getLiveOperations)))
 	}
