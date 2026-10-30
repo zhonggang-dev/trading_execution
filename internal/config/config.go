@@ -16,6 +16,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/chaincash"
 	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
+	"github.com/UniPat-AI/trading_execution/internal/service/pipelinemonitor"
 )
 
 // Live ceilings for the local CLOB request token bucket. They follow Polymarket's
@@ -30,14 +31,16 @@ const (
 
 // Config 表示后端使用的 Config 类型。
 type Config struct {
-	App            App
-	HTTP           HTTP
-	Database       Database
-	Execution      Execution
-	Polymarket     Polymarket
-	Kalshi         Kalshi
-	LiveOperations LiveOperations
-	DecisionCycle  DecisionCycle
+	App                  App
+	HTTP                 HTTP
+	Database             Database
+	Execution            Execution
+	Polymarket           Polymarket
+	Kalshi               Kalshi
+	LiveOperations       LiveOperations
+	DecisionCycle        DecisionCycle
+	PipelineMonitor      pipelinemonitor.Config
+	PipelineMonitorError string
 }
 
 // App 表示后端使用的 App 类型。
@@ -501,6 +504,12 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	pipelineMonitor, err := pipelinemonitor.LoadConfig(os.Getenv)
+	pipelineMonitorError := ""
+	if err != nil {
+		pipelineMonitorError = err.Error()
+		pipelineMonitor, _ = pipelinemonitor.LoadConfig(func(string) string { return "" })
+	}
 	config := Config{
 		App: App{
 			Name:     env("APP_NAME", "trading_execution"),
@@ -596,7 +605,9 @@ func Load() (Config, error) {
 			Interval: liveOperationsInterval, RefreshTimeout: liveOperationsRefreshTimeout,
 			MaxSnapshotAge: liveOperationsMaxAge, EventLimit: liveOperationsEventLimit,
 		},
-		DecisionCycle: decisionCycle,
+		DecisionCycle:        decisionCycle,
+		PipelineMonitor:      pipelineMonitor,
+		PipelineMonitorError: pipelineMonitorError,
 	}
 	if err := config.Validate(); err != nil {
 		return Config{}, err

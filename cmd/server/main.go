@@ -135,6 +135,14 @@ func run() error {
 		ReadOnlyToken:    cfg.HTTP.ReadOnlyToken,
 		WriteTimeout:     cfg.HTTP.WriteTimeout,
 	}
+	pipelineMonitor, err := buildPipelineMonitor(cfg, database, live, startedAt, logger)
+	if err != nil {
+		logger.Warn("pipeline monitor unavailable; execution is unaffected")
+		pipelineMonitor, _ = unavailablePipelineMonitor(logger)
+	}
+	if pipelineMonitor != nil {
+		httpParams.PipelineMonitor = pipelineMonitor
+	}
 	if readiness != nil {
 		httpParams.Readiness = readiness
 	}
@@ -162,6 +170,18 @@ func run() error {
 		if err := live.startBackground(rootContext, logger); err != nil {
 			return err
 		}
+	}
+	if pipelineMonitor != nil {
+		if err := pipelineMonitor.Start(); err != nil {
+			logger.Warn("pipeline monitor did not start; execution is unaffected")
+		}
+		defer func() {
+			stopContext, cancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
+			defer cancel()
+			if err := pipelineMonitor.Stop(stopContext); err != nil {
+				logger.Warn("pipeline monitor shutdown failed", "error", err)
+			}
+		}()
 	}
 
 	if database != nil {
