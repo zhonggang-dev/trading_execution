@@ -136,6 +136,10 @@ func (c *Collector) schedule(now time.Time) []pm.Check {
 		check.Status = pm.Warning
 		check.Summary = "最近决策周期存在错误"
 		check.Details = "查看该轮策略、行情、覆盖门禁和投递的具体观测；不将所有账户一概判为不可交易"
+	case s.LastCompletedAt.IsZero() && (s.InFlight || !s.NextDueAt.IsZero()):
+		check.Status = pm.Suppressed
+		check.Summary = "等待当前进程首次计划周期完成"
+		check.Details = "调度循环正常，正在等待允许的首轮启动窗口或处理首轮任务；停止、迟到和超时条件仍优先告警"
 	case s.LastCompletedAt.IsZero():
 		check.Status = pm.Unknown
 		check.Summary = "等待当前进程首次决策周期完成"

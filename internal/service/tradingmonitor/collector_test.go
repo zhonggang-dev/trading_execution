@@ -3,7 +3,13 @@ package tradingmonitor
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -236,6 +242,57 @@ func TestSchedulerChecksMissedWindowAndTimeout(t *testing.T) {
 			p.RunnerSnapshot = func() decisionrunner.Status { return tc.s }
 			if c := find(t, collect(t, p), "decision.schedule", ""); c.Status != pm.Critical {
 				t.Fatal(c)
+			}
+		})
+	}
+}
+
+func TestSchedulerInitialGraceAndActionableFailuresNotifyCorrectly(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		status        decisionrunner.Status
+		want          string
+		notifications int64
+	}{
+		{name: "waiting-first-future-boundary", status: decisionrunner.Status{LoopStarted: true, LoopRunning: true, NextDueAt: testNow.Add(time.Minute)}, want: pm.Suppressed},
+		{name: "within-first-start-lateness-grace", status: decisionrunner.Status{LoopStarted: true, LoopRunning: true, NextDueAt: testNow.Add(-10 * time.Second)}, want: pm.Suppressed},
+		{name: "first-inflight-within-budget", status: decisionrunner.Status{LoopStarted: true, LoopRunning: true, InFlight: true, LastStartedAt: testNow.Add(-time.Minute)}, want: pm.Suppressed},
+		{name: "stopped-with-future-boundary", status: decisionrunner.Status{LoopStarted: true, NextDueAt: testNow.Add(time.Minute)}, want: pm.Critical, notifications: 1},
+		{name: "first-start-overdue", status: decisionrunner.Status{LoopStarted: true, LoopRunning: true, NextDueAt: testNow.Add(-time.Minute)}, want: pm.Critical, notifications: 1},
+		{name: "first-inflight-over-budget", status: decisionrunner.Status{LoopStarted: true, LoopRunning: true, InFlight: true, LastStartedAt: testNow.Add(-9 * time.Minute)}, want: pm.Critical, notifications: 1},
+		{name: "first-cycle-error", status: decisionrunner.Status{LoopStarted: true, LoopRunning: true, NextDueAt: testNow.Add(time.Minute), LastError: "cycle failed"}, want: pm.Warning, notifications: 1},
+		{name: "no-first-schedule-evidence", status: decisionrunner.Status{LoopStarted: true, LoopRunning: true}, want: pm.Unknown, notifications: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := fixtureParams()
+			p.RunnerSnapshot = func() decisionrunner.Status { return tc.status }
+			c, err := New(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); io.WriteString(w, `{"code":0}`) }))
+			defer server.Close()
+			cfg, err := pm.LoadConfig(func(string) string { return "" })
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Enabled = true
+			cfg.WebhookURL = server.URL
+			cfg.StatePath = filepath.Join(t.TempDir(), "alerts.json")
+			monitor, err := pm.Build(pm.BuildParams{Config: cfg, Component: "trading-execution", Now: func() time.Time { return testNow }, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Collector: pm.CollectFunc(func(_ context.Context, now time.Time) ([]pm.Check, error) { return c.schedule(now), nil })})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := monitor.Refresh(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if check := find(t, snapshot.Checks, "decision.schedule", "engine"); check.Status != tc.want {
+				t.Fatalf("check=%+v want=%s", check, tc.want)
+			}
+			if calls.Load() != tc.notifications {
+				t.Fatalf("notifications=%d want=%d", calls.Load(), tc.notifications)
 			}
 		})
 	}
