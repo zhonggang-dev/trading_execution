@@ -40,11 +40,11 @@ Authorization: Bearer <LIVE_OPERATIONS_READ_ONLY_TOKEN>
 
 - `decision.schedule`：直接读取当前 `DecisionRunner.Snapshot`，检查循环停止、超过实际最大迟到时间、运行超过单轮预算和最近周期错误。不使用旧 `live_runtime_status` 代替实际运行事实。当前进程尚未完成首轮，但循环正常、正在等待已发布的首个启动窗口（含配置允许迟到宽限）或首轮正在预算内运行时标记 `suppressed`，不发送启动噪声；停止、迟到、超时和已知周期错误仍优先判断。没有首轮完成记录，也没有运行中或下一次计划证据时才报告 `unknown`。
 - `binding.processing` / `binding.entry`：配置停用策略、提交或新开仓的路由如实标记 `suppressed`，不把 wallet-1 等计划停用报成故障。
-- `prediction.observation` / `prediction.coverage`：每轮最多读取一次已有中台概率快照，使用生产同一来源/时效/版本筛选函数；按活动路由的精确上游模型、SANDBOX/DIRECT 和实际 Kalshi 输入路由判断。有效概率为空只说明 BUY 输入不足，不说明 SELL/Cancel 失效。最后一批有效输入距离全部到期不足 `min(30m, lookback/4)` 时预警。
+- `prediction.observation` / `prediction.coverage`：每轮最多读取一次已有中台概率快照，使用生产同一来源/时效/版本筛选函数；按活动路由的精确上游模型、SANDBOX/DIRECT 和实际 Kalshi 输入路由判断。SANDBOX 按计划批次供给，当前每日凌晨轮次之外没有连续供给承诺；零覆盖和批次自然到期保留真实数量、时效为 `suppressed` 诊断，不群发故障通知。明确的构建、预测执行、回传失败或超预算由中台和 Worker 检查。DIRECT 保留空覆盖告警和最后一批有效输入距离全部到期不足 `min(30m, lookback/4)` 的预警。快照读取、来源配置或版本歧义仍是 `unknown`，不因正常空窗而掩盖。
 - `prediction.venue`：展示来源级数量及最新 Direct manifest 的 pending 数；初期为处理中，等待超过 `min(30m, lookback/4)` 提醒，且该来源没有有效结果时升级为 critical，不让另一来源的有效结果掩盖已知缺失。该预算仅用于观测，不改变预测资格。Sandbox 的来源级期望应从中台 dispatch 观察；没有期望证据时不从结果并集反推“零任务成功”，也不单独制造来源级缺盘告警。
 - `account.heartbeat` / `account.reconciliation`：使用账户局部的运行时检查，不把不相关钱包的全局 readiness 错误当成所有账户故障。该运行时接口用于 Polymarket；Kalshi 不伪装成具有 CLOB dead-man heartbeat。
-- `account.authorization` / `account.cash` / `account.risk_state`：有界只读查询活动账户及已启用的 Kalshi 内部账户，核对数据库绑定、风险政策、账户/策略/全局开关、可用与预占现金、最近完成对账及政策 `max_state_age`。账户风险状态超过政策有效期前 20% 开始预警。零可用余额只作为 BUY 资金提醒，不自动释放预占。
-- `account.reconciliation_issues` / `market.reconciliation_issues`：分别展示账户级与市场/token 级 OPEN issue。市场级问题只影响相同市场，不一概宣布钱包全部交易被阻断。
+- `account.authorization` / `account.cash` / `account.risk_state`：Polymarket 有界只读核对数据库绑定、风险政策、账户/策略/全局开关、可用与预占现金、最近完成对账及政策 `max_state_age`，账户风险状态超过政策有效期前 20% 开始预警。当前 Kalshi 执行链路不经过 Polymarket 数据库授权和对账门禁，这两类检查明确为 `suppressed` 不适用，独立查询原生账户的存在和现金；缺少原生账本仍是异常。零可用余额只作为 BUY 资金提醒，不自动释放预占。
+- `account.reconciliation_issues` / `market.reconciliation_issues`：分别展示 Polymarket 账户级与市场/token 级 OPEN issue；Kalshi 不套用这些门禁。Polymarket 市场级 `EXTERNAL_POSITION_BASELINE_DRIFT` 历史基线差异按运行约定保留为 `suppressed` 诊断，真实计数和身份仍保留，实际交易门禁未改变。同批有其他市场级问题时仍告警，样本优先展示该问题；全账户级问题仍告警。市场级问题只影响相同市场，不一概宣布钱包全部交易被阻断。
 - `strategy.progress`：读取该路由最近的持久化策略周期；输入已写但输出超出周期预算时告警；盘口 `ERROR/MISSING` 与合法 `EMPTY` 分开。合法 SKIP 或无订单本身不触发告警。
 - `intent.delivery` / `order.recovery` / `fill.application`：每账户每类最多读取 101 条未决记录，监控超出单轮周期预算的 PENDING/SUBMITTING/UNKNOWN 意图、长期无更新的 UNKNOWN/MANUAL_REVIEW/CANCEL_PENDING 订单及已确认但未入账的 Fill。PENDING/SUBMITTING 查询使用对应部分索引，不混入全部历史状态；UNKNOWN delivery 限当前账户最新 100 个周期，MANUAL_REVIEW order 限当前账户最近更新的 1,000 单，超出该窗口的历史问题通过 OPEN reconciliation issue 观察。范围明确记录在 evidence 中，不称作全量历史扫描。Kalshi durable 意图仍属于逻辑账户，在执行阶段才投影为内部账户，因此不伪造独立的空 Kalshi 意图队列。超过预算一倍为 warning、两倍为 critical；超过采样上限明确记录计数不完整。监控从不重发 UNKNOWN，不改订单或账本。
 

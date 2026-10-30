@@ -117,19 +117,157 @@ func TestPredictionCoverageUsesProductionSourceAndFreshness(t *testing.T) {
 			p := fixtureParams()
 			p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: []domain.Prediction{tc.p}}}
 			check := find(t, collect(t, p), "prediction.coverage", p.Bindings[0].Scope())
-			if check.Status != pm.Critical || check.Evidence["effective_markets"] != "0" {
+			if check.Status != pm.Suppressed || check.Evidence["effective_markets"] != "0" {
 				t.Fatal(check)
 			}
 		})
 	}
 }
 
-func TestUpcomingInputExpiryWarnsBeforeEntryBlock(t *testing.T) {
+func TestSandboxInputExpiryIsDiagnosticOnly(t *testing.T) {
 	p := fixtureParams()
 	p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: []domain.Prediction{validPrediction("market-a", domain.MarketSourcePolymarket, testNow.Add(-170*time.Minute))}}}
 	check := find(t, collect(t, p), "prediction.coverage", p.Bindings[0].Scope())
-	if check.Status != pm.Warning {
+	if check.Status != pm.Suppressed || check.Evidence["effective_markets"] != "1" || check.Evidence["last_input_expires_at"] == "unknown" {
 		t.Fatal(check)
+	}
+}
+
+func TestDirectCoverageStillAlertsForMissingAndExpiringInputs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		age  time.Duration
+		want string
+	}{
+		{name: "empty", want: pm.Critical},
+		{name: "expired", age: 4 * time.Hour, want: pm.Critical},
+		{name: "expiring", age: 170 * time.Minute, want: pm.Warning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := fixtureParams()
+			p.SourceModes["source-model"] = domain.PredictionSourceModeDirect
+			var predictions []domain.Prediction
+			if tc.age != 0 {
+				prediction := validPrediction("direct-a", domain.MarketSourcePolymarket, testNow.Add(-tc.age))
+				prediction.SandboxID = ""
+				predictions = append(predictions, prediction)
+			}
+			p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: predictions}}
+			if check := find(t, collect(t, p), "prediction.coverage", p.Bindings[0].Scope()); check.Status != tc.want {
+				t.Fatalf("DIRECT coverage=%+v, want=%s", check, tc.want)
+			}
+		})
+	}
+}
+
+func TestSandboxNormalGapsDoNotSendNotifications(t *testing.T) {
+	for _, age := range []time.Duration{0, 170 * time.Minute, 4 * time.Hour} {
+		t.Run(age.String(), func(t *testing.T) {
+			p := fixtureParams()
+			var predictions []domain.Prediction
+			if age != 0 {
+				predictions = append(predictions, validPrediction("sandbox-a", domain.MarketSourcePolymarket, testNow.Add(-age)))
+			}
+			p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: predictions}}
+			collector, err := New(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); io.WriteString(w, `{"code":0}`) }))
+			defer server.Close()
+			cfg, err := pm.LoadConfig(func(string) string { return "" })
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Enabled = true
+			cfg.WebhookURL = server.URL
+			cfg.StatePath = filepath.Join(t.TempDir(), "alerts.json")
+			monitor, err := pm.Build(pm.BuildParams{Config: cfg, Component: "trading-execution", Now: func() time.Time { return testNow }, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Collector: collector})
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := monitor.Refresh(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if check := find(t, snapshot.Checks, "prediction.coverage", p.Bindings[0].Scope()); check.Status != pm.Suppressed {
+				t.Fatal(check)
+			}
+			if calls.Load() != 0 {
+				t.Fatalf("normal SANDBOX batch gap sent %d notifications", calls.Load())
+			}
+		})
+	}
+}
+
+func TestInvalidPredictionSourceModeRemainsAnObservationFailure(t *testing.T) {
+	for _, mode := range []domain.PredictionSourceMode{"", "INVALID"} {
+		t.Run(string(mode), func(t *testing.T) {
+			p := fixtureParams()
+			p.SourceModes["source-model"] = mode
+			p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{}}
+			checks := collect(t, p)
+			if c := find(t, checks, "prediction.observation", "engine"); c.Status != pm.Unknown {
+				t.Fatalf("invalid source was masked by an empty batch: %+v", c)
+			}
+			for _, c := range checks {
+				if c.ID == "prediction.coverage" {
+					t.Fatalf("unknown source became normal empty coverage: %+v", c)
+				}
+			}
+		})
+	}
+}
+
+func TestDiagnosticSuppressionDoesNotSendFalseRecovery(t *testing.T) {
+	p := fixtureParams()
+	p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{}}
+	evidence := []pm.Check{
+		{ID: "account.authorization", Scope: "kalshi:main", Status: pm.Critical, Summary: "账户缺少必需授权或控制记录"},
+		{ID: "account.risk_state", Scope: "kalshi:main", Status: pm.Unknown, Summary: "账户对账有效期政策不可读"},
+		{ID: "market.reconciliation_issues", Scope: "main", Status: pm.Warning, Summary: "部分市场存在未解决对账门禁"},
+	}
+	p.Evidence = evidenceFixture{checks: evidence}
+	collector, err := New(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); io.WriteString(w, `{"code":0}`) }))
+	defer server.Close()
+	cfg, err := pm.LoadConfig(func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Enabled = true
+	cfg.WebhookURL = server.URL
+	cfg.StatePath = filepath.Join(t.TempDir(), "alerts.json")
+	monitor, err := pm.Build(pm.BuildParams{Config: cfg, Component: "trading-execution", Now: func() time.Time { return testNow }, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Collector: collector})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := monitor.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("previously reported faults did not establish delivered state: %d", calls.Load())
+	}
+	for i := range evidence {
+		evidence[i].Status = pm.Suppressed
+		evidence[i].Summary = "仅诊断或不适用"
+	}
+	snapshot, err := monitor.Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("diagnostic suppression sent a false recovery: %d notifications", calls.Load())
+	}
+	for _, previous := range evidence {
+		if c := find(t, snapshot.Checks, previous.ID, previous.Scope); c.Status != pm.Suppressed {
+			t.Fatal(c)
+		}
 	}
 }
 
@@ -158,7 +296,7 @@ func TestKalshiRequiresActualBindingRoute(t *testing.T) {
 	p := fixtureParams()
 	p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: []domain.Prediction{validPrediction("kalshi-a", domain.MarketSourceKalshi, testNow.Add(-time.Hour))}}}
 	p.Bindings[0].KalshiEnabled = false
-	if c := find(t, collect(t, p), "prediction.coverage", p.Bindings[0].Scope()); c.Status != pm.Critical {
+	if c := find(t, collect(t, p), "prediction.coverage", p.Bindings[0].Scope()); c.Status != pm.Suppressed || c.Evidence["effective_markets"] != "0" {
 		t.Fatal(c)
 	}
 	p.Bindings[0].KalshiEnabled = true

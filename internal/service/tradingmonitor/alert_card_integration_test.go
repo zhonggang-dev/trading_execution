@@ -15,8 +15,8 @@ import (
 // Exercise the renderer with the actual trading collector's Check shape,
 // including the source-model alias and multi-wallet scope dimensions. Rendering
 // must never rewrite the diagnostic records or their independent state keys.
-func TestCollectedModelChecksGroupOnlyForPresentation(t *testing.T) {
-	checks, alerts := actualCoverageAlerts(t)
+func TestCollectedDirectModelChecksGroupOnlyForPresentation(t *testing.T) {
+	checks, alerts := actualDirectCoverageAlerts(t)
 	before, err := json.Marshal(checks)
 	if err != nil {
 		t.Fatal(err)
@@ -96,7 +96,7 @@ func TestLegitimateZeroOutcomeProbabilityIsStillAvailablePrediction(t *testing.T
 // Checks through Collect, then remove only that optional field to model the old
 // wire version; never manufacture a model field to make grouping succeed.
 func TestLegacyCollectedCoverageUsesScopeWithoutConflatingModels(t *testing.T) {
-	_, actual := actualCoverageAlerts(t)
+	_, actual := actualDirectCoverageAlerts(t)
 	legacy := func() []pm.Alert {
 		out := make([]pm.Alert, len(actual))
 		for i, a := range actual {
@@ -113,7 +113,7 @@ func TestLegacyCollectedCoverageUsesScopeWithoutConflatingModels(t *testing.T) {
 	}{
 		{name: "same-model-three-wallets", wantGroups: 1},
 		{name: "different-scope-model", wantGroups: 2, change: func(a []pm.Alert) { a[1].Check.Scope = "wallet-6/other-model/multfactor_v1" }},
-		{name: "different-source-mode", wantGroups: 2, change: func(a []pm.Alert) { a[1].Check.Evidence["source_mode"] = "DIRECT" }},
+		{name: "different-source-mode", wantGroups: 2, change: func(a []pm.Alert) { a[1].Check.Evidence["source_mode"] = "SANDBOX" }},
 		{name: "different-reason", wantGroups: 2, change: func(a []pm.Alert) { a[1].Check.Details = "另一条不同的诊断原因" }},
 		{name: "different-level", wantGroups: 2, change: func(a []pm.Alert) { a[1].Check.Status = pm.Warning }},
 		{name: "unproven-model-scope", wantGroups: 2, change: func(a []pm.Alert) { a[1].Check.Scope = "wallet-6" }},
@@ -139,7 +139,7 @@ func TestLegacyCollectedCoverageUsesScopeWithoutConflatingModels(t *testing.T) {
 	}
 }
 
-func actualCoverageAlerts(t *testing.T) ([]pm.Check, []pm.Alert) {
+func actualDirectCoverageAlerts(t *testing.T) ([]pm.Check, []pm.Alert) {
 	t.Helper()
 	p := fixtureParams()
 	snapshot := domain.PredictionSnapshot{SchemaVersion: domain.PredictionSnapshotSchemaVersion, SnapshotID: "empty-input-snapshot", DecisionAt: testNow, CompletedAfter: testNow.Add(-p.PredictionLookback), GeneratedAt: testNow, Predictions: []domain.Prediction{}, ExpectedPredictions: []domain.PredictionExpectation{}}
@@ -147,7 +147,7 @@ func actualCoverageAlerts(t *testing.T) ([]pm.Check, []pm.Alert) {
 		t.Fatal(err)
 	}
 	p.Predictions = predictionFixture{snapshot: snapshot}
-	p.SourceModes = map[string]domain.PredictionSourceMode{"v4.1 flash": domain.PredictionSourceModeSandbox}
+	p.SourceModes = map[string]domain.PredictionSourceMode{"v4.1 flash": domain.PredictionSourceModeDirect}
 	p.Bindings = nil
 	for _, r := range []struct{ account, strategy string }{{"main", "brier_mid_edge_once"}, {"wallet-6", "multfactor_v1"}, {"wallet-7", "multfactor_v2"}} {
 		p.Bindings = append(p.Bindings, Binding{StrategyExecutionBinding: domain.StrategyExecutionBinding{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", ExecutionAccountID: r.account, StrategyID: r.strategy}, KalshiEnabled: true})

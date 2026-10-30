@@ -50,11 +50,18 @@ func (s *PipelineMonitorSource) Observe(ctx context.Context, now time.Time, bind
 				return checks, err
 			}
 			checks = append(checks, accountChecks...)
-			issues, err := s.issues(ctx, tx, accountID)
-			if err != nil {
-				return checks, err
+			if strings.HasPrefix(accountID, "kalshi:") {
+				// Kalshi's current execution path has no Polymarket reconciliation gate.
+				for _, id := range []string{"account.reconciliation_issues", "market.reconciliation_issues"} {
+					checks = append(checks, pm.Check{ID: id, Scope: accountID, Status: pm.Suppressed, Summary: "Kalshi 不适用 Polymarket 对账门禁"})
+				}
+			} else {
+				issues, err := s.issues(ctx, tx, accountID)
+				if err != nil {
+					return checks, err
+				}
+				checks = append(checks, issues...)
 			}
-			checks = append(checks, issues...)
 			progress, err := s.progress(ctx, tx, now, accountID)
 			if err != nil {
 				return checks, err
@@ -140,7 +147,7 @@ func (s *PipelineMonitorSource) issues(ctx context.Context, tx *sql.Tx, accountI
 		return nil, fmt.Errorf("read bounded reconciliation issue evidence: %w", err)
 	}
 	defer rows.Close()
-	accountCount, scopedCount, total := 0, 0, 0
+	accountCount, scopedCount, baselineCount, total := 0, 0, 0, 0
 	accountSample, scopedSample := "", ""
 	sampleType, condition, token := "", "", ""
 	for rows.Next() {
@@ -156,7 +163,12 @@ func (s *PipelineMonitorSource) issues(ctx context.Context, tx *sql.Tx, accountI
 			}
 		} else {
 			scopedCount++
-			if scopedSample == "" {
+			baseline := kind == "EXTERNAL_POSITION_BASELINE_DRIFT"
+			if baseline {
+				baselineCount++
+			}
+			// Prefer an actionable issue over a diagnostic-only baseline sample.
+			if scopedSample == "" || sampleType == "EXTERNAL_POSITION_BASELINE_DRIFT" && !baseline {
 				scopedSample = id
 				sampleType = kind
 				condition = c
@@ -168,20 +180,24 @@ func (s *PipelineMonitorSource) issues(ctx context.Context, tx *sql.Tx, accountI
 		return nil, err
 	}
 	a := pm.Check{ID: "account.reconciliation_issues", Scope: accountID, Status: pm.Healthy, Summary: "未发现账户级未解决对账门禁", Evidence: map[string]string{"sampled_account_issues": strconv.Itoa(accountCount), "sample_issue_id": accountSample}}
-	p := pm.Check{ID: "market.reconciliation_issues", Scope: accountID, Status: pm.Healthy, Summary: "未发现市场级未解决对账门禁", Evidence: map[string]string{"sampled_scoped_issues": strconv.Itoa(scopedCount), "sample_issue_id": scopedSample, "sample_issue_type": sampleType, "sample_condition_id": condition, "sample_token_id": token}}
+	p := pm.Check{ID: "market.reconciliation_issues", Scope: accountID, Status: pm.Healthy, Summary: "未发现市场级未解决对账门禁", Evidence: map[string]string{"sampled_scoped_issues": strconv.Itoa(scopedCount), "sampled_baseline_issues": strconv.Itoa(baselineCount), "sampled_actionable_scoped_issues": strconv.Itoa(scopedCount - baselineCount), "sample_issue_id": scopedSample, "sample_issue_type": sampleType, "sample_condition_id": condition, "sample_token_id": token}}
 	if accountCount > 0 {
 		a.Status = pm.Critical
 		a.Summary = "账户存在未解决的全账户对账门禁"
 	}
-	if scopedCount > 0 {
+	if scopedCount > baselineCount {
 		p.Status = pm.Warning
 		p.Summary = "部分市场存在未解决对账门禁"
 		p.Details = "只阻断相同 token/condition/market，不表示该钱包全部市场或其他钱包被阻断"
+	} else if baselineCount > 0 {
+		p.Status = pm.Suppressed
+		p.Summary = "Polymarket 市场级历史基线差异仅作诊断"
+		p.Details = "按运行约定不群发 EXTERNAL_POSITION_BASELINE_DRIFT；保留真实数量和身份，未改变实际下单门禁"
 	}
 	if total > 100 {
 		for _, c := range []*pm.Check{&a, &p} {
 			c.Evidence["sampling_complete"] = "false"
-			if c.Status == pm.Healthy {
+			if c.Status == pm.Healthy || c.Status == pm.Suppressed {
 				c.Status = pm.Unknown
 			}
 			c.Details += "；本次最多采样101条，计数不是全量"
@@ -191,6 +207,9 @@ func (s *PipelineMonitorSource) issues(ctx context.Context, tx *sql.Tx, accountI
 }
 
 func (s *PipelineMonitorSource) account(ctx context.Context, tx *sql.Tx, now time.Time, b tradingmonitor.Binding, id string) ([]pm.Check, error) {
+	if strings.HasPrefix(id, "kalshi:") {
+		return s.kalshiAccount(ctx, tx, b, id)
+	}
 	var enabled, policy, paused, strategyPaused, kill sql.NullBool
 	var available, reserved string
 	var maxAge sql.NullInt64
@@ -228,21 +247,7 @@ WHERE account.execution_account_id=$1`, id, b.ModelID, b.StrategyID).Scan(&enabl
 		auth.Summary = "账户数据库授权或风控开关阻断 placement"
 	}
 	auth.Details = "按账户及策略检查；不改变开关，不限制 Cancel/Get。计划停用由运行配置另行标注"
-	cash := pm.Check{ID: "account.cash", Scope: id, Status: pm.Healthy, Summary: "账户可用资金观测", Evidence: map[string]string{"available_cash": available, "reserved_cash": reserved}}
-	if b.EntryDisabled {
-		cash.Status = pm.Suppressed
-		cash.Summary = "账户按配置不要求新开仓资金"
-	} else {
-		balance, ok := new(big.Rat).SetString(available)
-		if !ok {
-			cash.Status = pm.Unknown
-			cash.Summary = "账户现金观测格式异常"
-		} else if balance.Sign() <= 0 {
-			cash.Status = pm.Warning
-			cash.Summary = "活动账户没有可用新开仓资金"
-			cash.Details = "仅是开仓资金不足；不宣称 SELL/Cancel 被阻断，不自动释放预占"
-		}
-	}
+	cash := monitorCash(b, id, available, reserved)
 	rec := pm.Check{ID: "account.risk_state", Scope: id, Status: pm.Healthy, Summary: "账户已完成对账仍在政策有效期内"}
 	if !maxAge.Valid || maxAge.Int64 <= 0 {
 		rec.Status = pm.Unknown
@@ -263,6 +268,43 @@ WHERE account.execution_account_id=$1`, id, b.ModelID, b.StrategyID).Scan(&enabl
 		}
 	}
 	return []pm.Check{auth, cash, rec}, nil
+}
+
+func (s *PipelineMonitorSource) kalshiAccount(ctx context.Context, tx *sql.Tx, b tradingmonitor.Binding, id string) ([]pm.Check, error) {
+	auth := pm.Check{ID: "account.authorization", Scope: id, Status: pm.Suppressed, Summary: "Kalshi 不适用 Polymarket 数据库授权检查"}
+	rec := pm.Check{ID: "account.risk_state", Scope: id, Status: pm.Suppressed, Summary: "Kalshi 不适用 Polymarket 对账有效期政策"}
+	var available, reserved string
+	err := tx.QueryRowContext(ctx, `SELECT available_balance::text,reserved_balance::text
+ FROM execution_accounts WHERE execution_account_id=$1`, id).Scan(&available, &reserved)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The native ledger is required even though Polymarket's risk tables are not.
+		auth.Status = pm.Critical
+		auth.Summary = "活动 Kalshi 执行账户没有账本配置"
+		return []pm.Check{auth, rec}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read Kalshi monitor account evidence: %w", err)
+	}
+	return []pm.Check{auth, monitorCash(b, id, available, reserved), rec}, nil
+}
+
+func monitorCash(b tradingmonitor.Binding, id, available, reserved string) pm.Check {
+	cash := pm.Check{ID: "account.cash", Scope: id, Status: pm.Healthy, Summary: "账户可用资金观测", Evidence: map[string]string{"available_cash": available, "reserved_cash": reserved}}
+	if b.EntryDisabled {
+		cash.Status = pm.Suppressed
+		cash.Summary = "账户按配置不要求新开仓资金"
+	} else {
+		balance, ok := new(big.Rat).SetString(available)
+		if !ok {
+			cash.Status = pm.Unknown
+			cash.Summary = "账户现金观测格式异常"
+		} else if balance.Sign() <= 0 {
+			cash.Status = pm.Warning
+			cash.Summary = "活动账户没有可用新开仓资金"
+			cash.Details = "仅是开仓资金不足；不宣称 SELL/Cancel 被阻断，不自动释放预占"
+		}
+	}
+	return cash
 }
 
 func (s *PipelineMonitorSource) cycle(ctx context.Context, tx *sql.Tx, now time.Time, b tradingmonitor.Binding) (pm.Check, error) {

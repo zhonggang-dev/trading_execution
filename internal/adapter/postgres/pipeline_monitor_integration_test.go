@@ -292,3 +292,137 @@ func pipelineCheck(t *testing.T, checks []pm.Check, id string) pm.Check {
 	t.Fatalf("missing %s", id)
 	return pm.Check{}
 }
+
+func TestPipelineMonitorKalshiDoesNotRequirePolymarketRiskPostgresIntegration(t *testing.T) {
+	url := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, url)
+	now := time.Now().UTC().Truncate(time.Second)
+	insertAccount(t, db, "account-a", "0xmonitor-account", "100", "100", "0")
+	provisionLiveRisk(t, db, liveRiskFixture{accountID: "account-a", now: now, binding: true, maxOrder: "100", maxMarket: "100", maxStrategy: "100", maxWallet: "100", maxDaily: "100"})
+	if _, err := db.Exec("UPDATE execution_risk_global_control SET kill_switch=FALSE,version=version+1"); err != nil {
+		t.Fatal(err)
+	}
+	b := tradingmonitor.Binding{StrategyExecutionBinding: domain.StrategyExecutionBinding{ModelID: "model-a", PredictionModelID: "source-model", StrategyID: "multfactor_v1", ExecutionAccountID: "account-a"}, KalshiEnabled: true}
+	source, err := NewPipelineMonitorSource(db, 8*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observe := func() []pm.Check {
+		checks, err := source.Observe(context.Background(), now, []tradingmonitor.Binding{b})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return checks
+	}
+	checks := observe()
+	if c := pipelineScopedCheck(t, checks, "account.authorization", "kalshi:account-a"); c.Status != pm.Critical {
+		t.Fatalf("missing native ledger must still be reported: %+v", c)
+	}
+	insertAccount(t, db, "kalshi:account-a", "kalshi:monitor-account", "100", "100", "0")
+	checks = observe()
+	for _, id := range []string{"account.authorization", "account.risk_state", "account.reconciliation_issues", "market.reconciliation_issues"} {
+		if c := pipelineScopedCheck(t, checks, id, "kalshi:account-a"); c.Status != pm.Suppressed {
+			t.Fatalf("Kalshi incorrectly requires a Polymarket gate: %+v", c)
+		}
+	}
+	if c := pipelineScopedCheck(t, checks, "account.authorization", "account-a"); c.Status != pm.Healthy {
+		t.Fatalf("Polymarket authorization changed: %+v", c)
+	}
+	if c := pipelineScopedCheck(t, checks, "account.cash", "kalshi:account-a"); c.Status != pm.Healthy {
+		t.Fatal(c)
+	}
+	var riskRecords int
+	if err := db.QueryRow("SELECT count(*) FROM execution_risk_policies WHERE execution_account_id='kalshi:account-a'").Scan(&riskRecords); err != nil || riskRecords != 0 {
+		t.Fatalf("unexpected native PM risk records: %d, %v", riskRecords, err)
+	}
+	if _, err := db.Exec("UPDATE execution_accounts SET total_balance=0,available_balance=0 WHERE execution_account_id='kalshi:account-a'"); err != nil {
+		t.Fatal(err)
+	}
+	if c := pipelineScopedCheck(t, observe(), "account.cash", "kalshi:account-a"); c.Status != pm.Warning {
+		t.Fatalf("native funding issue was hidden: %+v", c)
+	}
+	repository, err := NewOrderRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := integrationOrder("monitor-kalshi-auth", "kalshi:account-a", "kalshi:KXMONITOR:YES", domain.SideBuy, "2", "0.5")
+	order.Intent.Venue = "kalshi"
+	order.Intent.MarketSource = domain.MarketSourceKalshi
+	order.Status = domain.OrderStatusRejected
+	order.FailureCode = "KALSHI_AUTH_FAILED"
+	order.CreatedAt = now
+	order.UpdatedAt = now
+	if _, _, err := repository.Create(context.Background(), order); err != nil {
+		t.Fatal(err)
+	}
+	if c := pipelineScopedCheck(t, observe(), "venue.execution_errors", "kalshi:account-a"); c.Status != pm.Critical || c.Evidence["sample_failure_code"] != "KALSHI_AUTH_FAILED" {
+		t.Fatalf("real native API failure was hidden: %+v", c)
+	}
+}
+
+func TestPipelineMonitorHistoricalBaselineOnlyIsDiagnosticPostgresIntegration(t *testing.T) {
+	url := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, url)
+	now := time.Now().UTC().Truncate(time.Second)
+	insertAccount(t, db, "account-a", "0xmonitor-account", "100", "100", "0")
+	provisionLiveRisk(t, db, liveRiskFixture{accountID: "account-a", now: now, binding: true, maxOrder: "100", maxMarket: "100", maxStrategy: "100", maxWallet: "100", maxDaily: "100"})
+	source, err := NewPipelineMonitorSource(db, 8*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addIssue := func(id, kind, scope string, at time.Time) {
+		_, err := db.Exec(`INSERT INTO reconciliation_issues(issue_id,run_id,fingerprint,execution_account_id,issue_type,resolution,status,impact_scope,condition_id,token_id,observed_at)
+ VALUES($1,'risk-run-account-a',$1,'account-a',$2,'MANUAL_REVIEW','OPEN',$3,'condition-'||$1,'token-'||$1,$4)`, id, kind, scope, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	observe := func() []pm.Check {
+		tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		checks, err := source.issues(context.Background(), tx, "account-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return checks
+	}
+	addIssue("baseline-old", "EXTERNAL_POSITION_BASELINE_DRIFT", "TOKEN", now.Add(-time.Hour))
+	addIssue("baseline-new", "EXTERNAL_POSITION_BASELINE_DRIFT", "TOKEN", now)
+	checks := observe()
+	if c := pipelineCheck(t, checks, "market.reconciliation_issues"); c.Status != pm.Suppressed || c.Evidence["sampled_scoped_issues"] != "2" || c.Evidence["sampled_actionable_scoped_issues"] != "0" {
+		t.Fatalf("baseline-only scope should retain evidence without notifying: %+v", c)
+	}
+	addIssue("actual-drift", "POSITION_DRIFT", "TOKEN", now.Add(time.Minute))
+	checks = observe()
+	if c := pipelineCheck(t, checks, "market.reconciliation_issues"); c.Status != pm.Warning || c.Evidence["sampled_scoped_issues"] != "3" || c.Evidence["sampled_baseline_issues"] != "2" || c.Evidence["sampled_actionable_scoped_issues"] != "1" || c.Evidence["sample_issue_id"] != "actual-drift" {
+		t.Fatalf("baseline sample hid an actionable market issue: %+v", c)
+	}
+	addIssue("account-drift", "EXTERNAL_POSITION_BASELINE_DRIFT", "ACCOUNT", now)
+	if c := pipelineCheck(t, observe(), "account.reconciliation_issues"); c.Status != pm.Critical {
+		t.Fatalf("account-wide issue was incorrectly suppressed: %+v", c)
+	}
+	var open int
+	if err := db.QueryRow("SELECT count(*) FROM reconciliation_issues WHERE status='OPEN'").Scan(&open); err != nil || open != 4 {
+		t.Fatalf("monitor changed real reconciliation issues: %d, %v", open, err)
+	}
+}
+
+func pipelineScopedCheck(t *testing.T, checks []pm.Check, id, scope string) pm.Check {
+	t.Helper()
+	for _, c := range checks {
+		if c.ID == id && c.Scope == scope {
+			return c
+		}
+	}
+	t.Fatalf("missing %s %s", id, scope)
+	return pm.Check{}
+}
