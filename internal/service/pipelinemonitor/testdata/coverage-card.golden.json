@@ -1,0 +1,88 @@
+{
+  "body": {
+    "direction": "vertical",
+    "elements": [
+      {
+        "columns": [
+          {
+            "background_style": "red-50",
+            "elements": [
+              {
+                "content": "**\u003cfont color='red'\u003e没有可用预测结果\u003c/font\u003e**",
+                "margin": "0px",
+                "tag": "markdown",
+                "text_size": "heading-4"
+              },
+              {
+                "content": "**影响：主钱包、钱包 6、钱包 7当前无法新开仓；平仓、撤单按原规则处理。**",
+                "margin": "0px",
+                "tag": "markdown",
+                "text_size": "normal"
+              },
+              {
+                "content": "\u003cfont color='grey'\u003ev4.1 flash · 脱敏包预测 · 可用预测市场 0\u003c/font\u003e",
+                "margin": "0px",
+                "tag": "markdown",
+                "text_size": "notation"
+              }
+            ],
+            "padding": "12px",
+            "tag": "column",
+            "vertical_spacing": "4px",
+            "weight": 1,
+            "width": "weighted"
+          }
+        ],
+        "flex_mode": "none",
+        "horizontal_spacing": "8px",
+        "margin": "0px 0px 12px 0px",
+        "tag": "column_set"
+      },
+      {
+        "elements": [
+          {
+            "content": "**1. 没有可用预测结果**\n**影响：主钱包、钱包 6、钱包 7当前无法新开仓；平仓、撤单按原规则处理。**\n范围：v4.1 flash · 脱敏包预测\n\n检查：prediction.coverage\n完整范围：main/v4.1 flash/multfactor\u0026#95;v1\n状态：critical\n原始说明：活动路由缺少可交易概率\n详细解释：按精确源模型、DIRECT/SANDBOX、PIT 和有效期过滤后为空；只说明开仓输入不足，不说明 SELL/撤单失效\neffective\u0026#95;markets：0\nkalshi\u0026#95;markets：0\npolymarket\u0026#95;markets：0\nsnapshot\u0026#95;id：predsnap-long-debug-id\nsource\u0026#95;mode：SANDBOX\nwrong\u0026#95;source\u0026#95;rows：0\n\n检查：prediction.coverage\n完整范围：wallet-6/v4.1 flash/multfactor\u0026#95;v1\n状态：critical\n原始说明：活动路由缺少可交易概率\n详细解释：按精确源模型、DIRECT/SANDBOX、PIT 和有效期过滤后为空；只说明开仓输入不足，不说明 SELL/撤单失效\neffective\u0026#95;markets：0\nkalshi\u0026#95;markets：0\npolymarket\u0026#95;markets：0\nsnapshot\u0026#95;id：predsnap-long-debug-id\nsource\u0026#95;mode：SANDBOX\nwrong\u0026#95;source\u0026#95;rows：0\n\n检查：prediction.coverage\n完整范围：wallet-7/v4.1 flash/multfactor\u0026#95;v1\n状态：critical\n原始说明：活动路由缺少可交易概率\n详细解释：按精确源模型、DIRECT/SANDBOX、PIT 和有效期过滤后为空；只说明开仓输入不足，不说明 SELL/撤单失效\neffective\u0026#95;markets：0\nkalshi\u0026#95;markets：0\npolymarket\u0026#95;markets：0\nsnapshot\u0026#95;id：predsnap-long-debug-id\nsource\u0026#95;mode：SANDBOX\nwrong\u0026#95;source\u0026#95;rows：0",
+            "margin": "0px",
+            "tag": "markdown",
+            "text_size": "notation"
+          }
+        ],
+        "expanded": false,
+        "header": {
+          "title": {
+            "content": "诊断详情 · 3 项检查",
+            "tag": "plain_text"
+          }
+        },
+        "margin": "0px",
+        "padding": "8px",
+        "tag": "collapsible_panel",
+        "vertical_spacing": "8px"
+      }
+    ],
+    "padding": "12px 12px 20px 12px"
+  },
+  "config": {
+    "summary": {
+      "content": "实盘链路异常 · 没有可用预测结果"
+    },
+    "update_multi": true,
+    "width_mode": "default"
+  },
+  "header": {
+    "icon": {
+      "tag": "standard_icon",
+      "token": "lark-logo_colorful"
+    },
+    "subtitle": {
+      "content": "交易执行 · 10-30 14:30:00 北京时间",
+      "tag": "plain_text"
+    },
+    "template": "red",
+    "title": {
+      "content": "实盘链路异常",
+      "tag": "plain_text"
+    }
+  },
+  "schema": "2.0"
+}

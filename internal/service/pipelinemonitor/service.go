@@ -249,57 +249,50 @@ func (s *Service) notify(ctx context.Context, snapshot Snapshot) {
 	if len(selected) == 0 {
 		return
 	}
-	var body strings.Builder
-	fmt.Fprintf(&body, "【实盘链路状态｜%s】\n采样：%s\n本条合并 %d 项变化；相同检查独立去重。", s.component, snapshot.SampledAt.In(time.FixedZone("CST", 8*3600)).Format(time.RFC3339), len(selected))
-	for _, item := range selected {
-		c := item.check
-		kind := "预警"
-		if item.recovery {
-			kind = "恢复"
-		}
-		fmt.Fprintf(&body, "\n\n[%s/%s] %s\n范围：%s\n%s", kind, c.Status, clip(c.Summary, 150), clip(c.Scope, 200), clip(c.Details, 400))
-		keys := make([]string, 0, len(c.Evidence))
-		for k := range c.Evidence {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for i, k := range keys {
-			if i >= 8 {
-				break
+	// Active faults and recoveries are independent deliveries. Persist accepted
+	// Checks before sending the next card so a later failure cannot acknowledge it.
+	var deliveryError error
+	for _, recovery := range []bool{false, true} {
+		var alerts []Alert
+		var group []pending
+		for _, item := range selected {
+			if item.recovery == recovery {
+				alerts = append(alerts, Alert{Check: item.check, Recovery: recovery})
+				group = append(group, item)
 			}
-			fmt.Fprintf(&body, "\n%s：%s", clip(k, 60), clip(c.Evidence[k], 180))
+		}
+		if len(group) == 0 {
+			continue
+		}
+		card, err := RenderCard(s.component, snapshot.SampledAt, alerts)
+		if err == nil {
+			sendCtx, cancel := context.WithTimeout(ctx, s.config.HTTPTimeout)
+			err = s.notifier.sendCard(sendCtx, card, snapshot.SampledAt)
+			cancel()
+		}
+		if err != nil {
+			deliveryError = err
+			s.deliveryFailure = err.Error()
+			s.lastDeliveryFailure = snapshot.SampledAt
+			s.logger.Warn("pipeline monitor notification failed", "error", err)
+			continue
+		}
+		s.lastDeliverySuccess = snapshot.SampledAt
+		for _, item := range group {
+			s.states[item.key] = alertState{Level: item.check.Status, SentAt: snapshot.SampledAt, Active: !item.recovery}
+		}
+		if err := s.persist(); err != nil {
+			s.persistError = true
+			s.logger.Error("pipeline monitor state persistence failed", "error", err)
+			s.mu.Lock()
+			s.snapshot.Checks = append(s.snapshot.Checks, Check{ID: "monitor.persistence", Scope: s.component, Status: Unknown, Summary: "告警去重状态持久化失败", Details: "本进程仍保留发送记录；重启后可能重复提醒"})
+			s.mu.Unlock()
 		}
 	}
-	sendCtx, cancel := context.WithTimeout(ctx, s.config.HTTPTimeout)
-	err := s.notifier.send(sendCtx, body.String(), snapshot.SampledAt)
-	cancel()
-	if err != nil {
-		s.deliveryFailure = err.Error()
-		s.lastDeliveryFailure = snapshot.SampledAt
-		s.updateDeliveryObservation()
-		s.logger.Warn("pipeline monitor notification failed", "error", err)
-		return
+	if deliveryError == nil {
+		s.deliveryFailure = ""
 	}
-	s.deliveryFailure = ""
-	s.lastDeliverySuccess = snapshot.SampledAt
 	s.updateDeliveryObservation()
-	for _, item := range selected {
-		s.states[item.key] = alertState{Level: item.check.Status, SentAt: snapshot.SampledAt, Active: !item.recovery}
-	}
-	if err := s.persist(); err != nil {
-		s.persistError = true
-		s.logger.Error("pipeline monitor state persistence failed", "error", err)
-		s.mu.Lock()
-		s.snapshot.Checks = append(s.snapshot.Checks, Check{ID: "monitor.persistence", Scope: s.component, Status: Unknown, Summary: "告警去重状态持久化失败", Details: "本进程仍保留发送记录；重启后可能重复提醒"})
-		s.mu.Unlock()
-	}
-}
-func clip(text string, limit int) string {
-	r := []rune(text)
-	if len(r) > limit {
-		return string(r[:limit]) + "…"
-	}
-	return text
 }
 func readState(path string) (map[string]alertState, error) {
 	states := map[string]alertState{}
