@@ -321,7 +321,16 @@ SELECT client_order_id,status,since FROM (
  UNION ALL
  (SELECT d.client_order_id,d.status,d.created_at AS since FROM recent_cycles r
   JOIN strategy_order_intent_deliveries d ON d.cycle_id=r.cycle_id
-  WHERE d.status='UNKNOWN' ORDER BY d.created_at LIMIT 101)
+  WHERE d.status='UNKNOWN' AND NOT EXISTS (
+    SELECT 1 FROM execution_orders resolved
+    WHERE resolved.client_order_id=d.client_order_id
+      AND d.intent_payload->>'execution_account_id'=$1
+      AND resolved.execution_account_id=CASE
+        WHEN upper(btrim(COALESCE(d.intent_payload->>'market_source','')))='KALSHI' THEN 'kalshi:'||$1
+        ELSE $1
+      END
+      AND resolved.status IN ('FILLED','CANCELLED','REJECTED')
+  ) ORDER BY d.created_at LIMIT 101)
 ) observed ORDER BY since LIMIT 101`},
 		{"order.recovery", "未知订单与撤单恢复", `SELECT order_id,status,updated_at FROM (
  (SELECT order_id,status,updated_at FROM execution_orders
@@ -376,6 +385,7 @@ SELECT client_order_id,status,since FROM (
 		check := pm.Check{ID: kind.id, Scope: accountID, Status: pm.Healthy, Summary: kind.summary + "观测正常", Evidence: map[string]string{"sampled_rows": strconv.Itoa(count), "stalled_sample_rows": strconv.Itoa(stalled), "sample_id": sample, "sample_state": sampleState, "stall_limit": s.stallAfter.String()}}
 		if kind.id == "intent.delivery" {
 			check.Evidence["unknown_cycle_window"] = "latest_100_account_cycles"
+			check.Evidence["resolved_unknown_policy"] = "same_client_id_expected_venue_account_terminal_order"
 		}
 		if kind.id == "order.recovery" {
 			check.Evidence["manual_review_window"] = "latest_1000_updated_account_orders"

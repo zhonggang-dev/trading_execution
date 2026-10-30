@@ -38,7 +38,7 @@ Authorization: Bearer <LIVE_OPERATIONS_READ_ONLY_TOKEN>
 
 ## 观测口径
 
-- `decision.schedule`：直接读取当前 `DecisionRunner.Snapshot`，检查循环停止、超过实际最大迟到时间、运行超过单轮预算和最近周期错误。不使用旧 `live_runtime_status` 代替实际运行事实。
+- `decision.schedule`：直接读取当前 `DecisionRunner.Snapshot`，检查循环停止、超过实际最大迟到时间、运行超过单轮预算和最近周期错误。不使用旧 `live_runtime_status` 代替实际运行事实。当前进程尚未完成首轮，但循环正常、正在等待已发布的首个启动窗口（含配置允许迟到宽限）或首轮正在预算内运行时标记 `suppressed`，不发送启动噪声；停止、迟到、超时和已知周期错误仍优先判断。没有首轮完成记录，也没有运行中或下一次计划证据时才报告 `unknown`。
 - `binding.processing` / `binding.entry`：配置停用策略、提交或新开仓的路由如实标记 `suppressed`，不把 wallet-1 等计划停用报成故障。
 - `prediction.observation` / `prediction.coverage`：每轮最多读取一次已有中台概率快照，使用生产同一来源/时效/版本筛选函数；按活动路由的精确上游模型、SANDBOX/DIRECT 和实际 Kalshi 输入路由判断。有效概率为空只说明 BUY 输入不足，不说明 SELL/Cancel 失效。最后一批有效输入距离全部到期不足 `min(30m, lookback/4)` 时预警。
 - `prediction.venue`：展示来源级数量及最新 Direct manifest 的 pending 数；初期为处理中，等待超过 `min(30m, lookback/4)` 提醒，且该来源没有有效结果时升级为 critical，不让另一来源的有效结果掩盖已知缺失。该预算仅用于观测，不改变预测资格。Sandbox 的来源级期望应从中台 dispatch 观察；没有期望证据时不从结果并集反推“零任务成功”，也不单独制造来源级缺盘告警。
@@ -47,6 +47,8 @@ Authorization: Bearer <LIVE_OPERATIONS_READ_ONLY_TOKEN>
 - `account.reconciliation_issues` / `market.reconciliation_issues`：分别展示账户级与市场/token 级 OPEN issue。市场级问题只影响相同市场，不一概宣布钱包全部交易被阻断。
 - `strategy.progress`：读取该路由最近的持久化策略周期；输入已写但输出超出周期预算时告警；盘口 `ERROR/MISSING` 与合法 `EMPTY` 分开。合法 SKIP 或无订单本身不触发告警。
 - `intent.delivery` / `order.recovery` / `fill.application`：每账户每类最多读取 101 条未决记录，监控超出单轮周期预算的 PENDING/SUBMITTING/UNKNOWN 意图、长期无更新的 UNKNOWN/MANUAL_REVIEW/CANCEL_PENDING 订单及已确认但未入账的 Fill。PENDING/SUBMITTING 查询使用对应部分索引，不混入全部历史状态；UNKNOWN delivery 限当前账户最新 100 个周期，MANUAL_REVIEW order 限当前账户最近更新的 1,000 单，超出该窗口的历史问题通过 OPEN reconciliation issue 观察。范围明确记录在 evidence 中，不称作全量历史扫描。Kalshi durable 意图仍属于逻辑账户，在执行阶段才投影为内部账户，因此不伪造独立的空 Kalshi 意图队列。超过预算一倍为 warning、两倍为 critical；超过采样上限明确记录计数不完整。监控从不重发 UNKNOWN，不改订单或账本。
+
+`strategy_order_intent_deliveries.status=UNKNOWN` 保存的是首次执行结果，对账后来确认订单成交或取消时不会改写这条历史交付记录。因此不能仅凭该状态一直报投递卡住：监控会按全局唯一 `client_order_id` 查询当前权威订单，只在该订单为 `FILLED/CANCELLED/REJECTED`，且执行账户与原意图匹配时排除历史 UNKNOWN。普通意图必须匹配原逻辑账户；明确 `market_source=KALSHI` 的意图必须匹配生产路由实际投影出的 `kalshi:<逻辑账户>`。错账户、错 client ID、没有订单、非终态订单仍保留告警；`MANUAL_REVIEW` 需要处理，不视为已解决终态。该判断只读取事实，不改写 delivery、订单、成交或预占。
 - `venue.execution_errors`：每账户最多读取 101 条最近 15 分钟具名基础错误。认证、签名、allowance/余额与交易所暂停直接提醒，限流/服务错误累计三条提醒；正常 FOK/IOC 未成交、市场关闭等不列入系统错误。此项是实际执行失败的补充证据，不宣称在无请求时已证明交易所认证健康。
 
 SQL 使用只读事务、每句 2 秒 statement timeout，并受本轮采集总预算限制。读取失败返回 `unknown`，不伪装成空数据。通知中不包含上游原始错误、URL、Token、钱包私钥或 API 响应正文。
