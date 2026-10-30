@@ -248,10 +248,10 @@ func run() error {
 }
 
 // buildWalletPnLService wires the public Data API to the authoritative
-// execution_accounts identity for the four live wallets. It is read-only and
+// execution_accounts identity for the managed Polymarket wallets. It is read-only and
 // deliberately absent from paper-mode servers.
 func buildWalletPnLService(database *sql.DB, cfg config.Config, live *liveRuntime) (*walletpnl.Service, error) {
-	if database == nil || live == nil || len(live.activeAccounts) == 0 {
+	if database == nil || live == nil || len(live.polymarketAccounts) == 0 {
 		return nil, nil
 	}
 	addresses, err := postgresadapter.NewWalletAddressRepository(database)
@@ -265,7 +265,7 @@ func buildWalletPnLService(database *sql.DB, cfg config.Config, live *liveRuntim
 	if err != nil {
 		return nil, err
 	}
-	return walletpnl.New(walletpnl.Params{Addresses: addresses, Source: source, Accounts: live.activeAccounts, TTL: 5 * time.Minute})
+	return walletpnl.New(walletpnl.Params{Addresses: addresses, Source: source, Accounts: live.polymarketAccounts, TTL: 5 * time.Minute})
 }
 
 // consoleV2RuntimeConfig builds the browser-safe runtime projection. It keeps
