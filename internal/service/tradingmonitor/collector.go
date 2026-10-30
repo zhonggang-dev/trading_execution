@@ -240,14 +240,24 @@ func (c *Collector) predictionChecks(snapshot domain.PredictionSnapshot, binding
 		case b.EntryDisabled || !c.params.SubmissionEnabled:
 			check.Status = pm.Suppressed
 			check.Summary = "路由按配置不要求新开仓概率"
+		case c.params.SourceModes[b.PredictionModelID] == domain.PredictionSourceModeSandbox && count == 0:
+			check.Status = pm.Suppressed
+			check.Summary = "Sandbox 批次当前没有有效开仓概率"
+			check.Details = "Sandbox 按预测计划批次供给，不要求全天连续有概率；零覆盖仅作诊断，具体任务失败与超预算由上游和 Worker 检查"
 		case count == 0:
 			check.Status = pm.Critical
 			check.Summary = "活动路由缺少可交易概率"
 			check.Details = "按精确源模型、DIRECT/SANDBOX、PIT 和有效期过滤后为空；只说明开仓输入不足，不说明 SELL/撤单失效"
 		case expiresAt.Sub(now) <= min(30*time.Minute, c.params.PredictionLookback/4):
-			check.Status = pm.Warning
-			check.Summary = "当前有效概率即将全部过期"
-			check.Details = "若下一批没有及时回传，该路由将缺少开仓输入"
+			if c.params.SourceModes[b.PredictionModelID] == domain.PredictionSourceModeSandbox {
+				check.Status = pm.Suppressed
+				check.Summary = "Sandbox 批次概率即将自然到期"
+				check.Details = "保留生产有效期和真实覆盖数量；不将批次之间的正常空窗解释为预测故障"
+			} else {
+				check.Status = pm.Warning
+				check.Summary = "当前有效概率即将全部过期"
+				check.Details = "若下一批没有及时回传，该路由将缺少开仓输入"
+			}
 		}
 		checks = append(checks, check)
 		for _, venue := range []domain.MarketSource{domain.MarketSourcePolymarket, domain.MarketSourceKalshi} {
