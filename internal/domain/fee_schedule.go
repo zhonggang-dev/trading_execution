@@ -8,12 +8,15 @@ import (
 )
 
 // MarketFeeSchedule 是 venue 公布的某个 token 的官方手续费曲线。
-// Polymarket V2 的 taker 每股费用为 rate * (price * (1 - price))^exponent。
+// Polymarket V2 与 Kalshi 的 taker 每股费用都是 rate * (price * (1 - price))^exponent。
+// RoundingAllowancePerShare 是 venue 按订单把手续费向上取整时，每股额外预留的上限；
+// Polymarket 不按订单取整，留空表示 0。
 type MarketFeeSchedule struct {
-	PlatformFeeRate Decimal
-	FeeExponent     Decimal
-	TakerOnly       bool
-	FetchedAt       time.Time
+	PlatformFeeRate           Decimal
+	FeeExponent               Decimal
+	RoundingAllowancePerShare Decimal
+	TakerOnly                 bool
+	FetchedAt                 time.Time
 }
 
 const (
@@ -29,12 +32,14 @@ const (
 
 // BuyFeeReserve 记录 BUY 预占所使用的手续费依据，随 MarketValidation 持久化供审计。
 type BuyFeeReserve struct {
-	Source            string     `json:"source"`
-	PlatformFeeRate   Decimal    `json:"platform_fee_rate,omitempty"`
-	FeeExponent       Decimal    `json:"fee_exponent,omitempty"`
-	MaxFeePerShare    Decimal    `json:"max_fee_per_share,omitempty"`
-	ScheduleFetchedAt *time.Time `json:"schedule_fetched_at,omitempty"`
-	Reason            string     `json:"reason,omitempty"`
+	Source          string  `json:"source"`
+	PlatformFeeRate Decimal `json:"platform_fee_rate,omitempty"`
+	FeeExponent     Decimal `json:"fee_exponent,omitempty"`
+	MaxFeePerShare  Decimal `json:"max_fee_per_share,omitempty"`
+	// RoundingAllowancePerShare 已计入 MaxFeePerShare，单独记录供审计。
+	RoundingAllowancePerShare Decimal    `json:"rounding_allowance_per_share,omitempty"`
+	ScheduleFetchedAt         *time.Time `json:"schedule_fetched_at,omitempty"`
+	Reason                    string     `json:"reason,omitempty"`
 }
 
 // Validate 校验手续费预占依据的内部一致性。
@@ -49,6 +54,11 @@ func (reserve BuyFeeReserve) Validate() error {
 		}
 		if err := validateFeeExponentDecimal(reserve.FeeExponent); err != nil {
 			return err
+		}
+		if !reserve.RoundingAllowancePerShare.IsEmpty() {
+			if sign, err := reserve.RoundingAllowancePerShare.Sign(); err != nil || sign < 0 {
+				return fmt.Errorf("venue fee schedule reserve requires a non-negative rounding_allowance_per_share")
+			}
 		}
 	case BuyFeeReserveSourceConfigCap:
 		if !reserve.MaxFeePerShare.IsEmpty() {
@@ -70,9 +80,34 @@ func (reserve *BuyFeeReserve) VenueMaxFeePerShare() (Decimal, bool) {
 	return reserve.MaxFeePerShare, true
 }
 
+// ResolveBuyFeeReserve 根据费率读取结果决定 BUY 预占的手续费依据，从不拒单：
+// 费率已确认时取 worst_price 内的每股最坏手续费；读取失败或曲线无效时退回配置上限，
+// 并记录原因供审计。
+func ResolveBuyFeeReserve(worstPrice Decimal, schedule MarketFeeSchedule, scheduleErr error) *BuyFeeReserve {
+	if scheduleErr != nil {
+		return &BuyFeeReserve{Source: BuyFeeReserveSourceConfigCap, Reason: scheduleErr.Error()}
+	}
+	maxFeePerShare, err := MaxBuyFeePerShare(worstPrice, schedule)
+	if err != nil {
+		return &BuyFeeReserve{Source: BuyFeeReserveSourceConfigCap, Reason: err.Error()}
+	}
+	reserve := &BuyFeeReserve{
+		Source:                    BuyFeeReserveSourceVenueFeeSchedule,
+		PlatformFeeRate:           schedule.PlatformFeeRate,
+		FeeExponent:               schedule.FeeExponent,
+		MaxFeePerShare:            maxFeePerShare,
+		RoundingAllowancePerShare: schedule.RoundingAllowancePerShare,
+	}
+	if fetchedAt := schedule.FetchedAt.UTC(); !schedule.FetchedAt.IsZero() {
+		reserve.ScheduleFetchedAt = &fetchedAt
+	}
+	return reserve
+}
+
 // MaxBuyFeePerShare 计算一个 BUY 在 worst_price 保护下可能支付的每股最坏手续费。
 // 成交价只能落在 (0, worst_price]，而费率曲线 (p(1-p))^e 在 0.5 处取最大值，因此
 // 最坏点是 min(worst_price, 0.5)，不是 worst_price 本身。exponent 为 0 时费用与价格无关。
+// 结果另加 schedule 的每股取整余量。
 func MaxBuyFeePerShare(worstPrice Decimal, schedule MarketFeeSchedule) (Decimal, error) {
 	price, err := worstPrice.rat()
 	if err != nil || price.Sign() <= 0 {
@@ -96,6 +131,13 @@ func MaxBuyFeePerShare(worstPrice Decimal, schedule MarketFeeSchedule) (Decimal,
 		powered.Mul(powered, curve)
 	}
 	fee := new(big.Rat).Mul(rate, powered)
+	if !schedule.RoundingAllowancePerShare.IsEmpty() {
+		allowance, err := schedule.RoundingAllowancePerShare.rat()
+		if err != nil || allowance.Sign() < 0 {
+			return "", fmt.Errorf("rounding_allowance_per_share must be a non-negative decimal")
+		}
+		fee.Add(fee, allowance)
+	}
 	return ratDecimalRoundedUp(fee, 18), nil
 }
 

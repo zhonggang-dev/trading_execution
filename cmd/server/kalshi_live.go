@@ -147,7 +147,11 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, binding config
 	if err != nil {
 		return builtKalshiLiveRoute{}, err
 	}
-	validator, err := kalshi.NewMarketValidator(books)
+	fees, err := kalshi.NewFeeScheduleSource(kalshi.FeeScheduleParams{Client: client})
+	if err != nil {
+		return builtKalshiLiveRoute{}, err
+	}
+	validator, err := kalshi.NewMarketValidator(books, fees)
 	if err != nil {
 		return builtKalshiLiveRoute{}, err
 	}

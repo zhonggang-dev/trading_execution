@@ -1,8 +1,10 @@
 package domain
 
 import (
+	"errors"
 	"math/big"
 	"testing"
+	"time"
 )
 
 // TestMaxBuyFeePerShareUsesCurveMaximumInsideWorstPrice 验证最坏手续费取的是
@@ -90,6 +92,55 @@ func TestBuyFeeReserveVenueMaxFeePerShare(t *testing.T) {
 	}
 	if err := (BuyFeeReserve{Source: "GUESS"}).Validate(); err == nil {
 		t.Fatal("unknown source must fail validation")
+	}
+}
+
+// TestMaxBuyFeePerShareAddsRoundingAllowance 验证按订单取整的 venue（Kalshi）
+// 在曲线最大值之外再加每股取整余量，负余量 fail closed。
+func TestMaxBuyFeePerShareAddsRoundingAllowance(t *testing.T) {
+	schedule := MarketFeeSchedule{PlatformFeeRate: "0.07", FeeExponent: "1", RoundingAllowancePerShare: "0.01"}
+	// 0.07 * 0.42 * 0.58 + 0.01 = 0.027052
+	got, err := MaxBuyFeePerShare("0.42", schedule)
+	if err != nil || !got.Equal("0.027052") {
+		t.Fatalf("MaxBuyFeePerShare(0.42) = %s, %v", got, err)
+	}
+	// worst 0.54 允许成交到 0.5：0.07 * 0.25 + 0.01 = 0.0275
+	got, err = MaxBuyFeePerShare("0.54", schedule)
+	if err != nil || !got.Equal("0.0275") {
+		t.Fatalf("MaxBuyFeePerShare(0.54) = %s, %v", got, err)
+	}
+	schedule.RoundingAllowancePerShare = "-0.01"
+	if _, err := MaxBuyFeePerShare("0.42", schedule); err == nil {
+		t.Fatal("negative rounding allowance must fail closed")
+	}
+}
+
+// TestResolveBuyFeeReserve 验证费率确认时记录官方曲线依据，读取失败或曲线无效时
+// 退回配置上限并记录原因。
+func TestResolveBuyFeeReserve(t *testing.T) {
+	fetchedAt := time.Date(2026, 11, 2, 1, 2, 3, 0, time.UTC)
+	reserve := ResolveBuyFeeReserve("0.49", MarketFeeSchedule{
+		PlatformFeeRate: "0.07", FeeExponent: "1", RoundingAllowancePerShare: "0.01", FetchedAt: fetchedAt,
+	}, nil)
+	if err := reserve.Validate(); err != nil {
+		t.Fatalf("venue reserve Validate() error = %v", err)
+	}
+	// 0.07 * 0.49 * 0.51 + 0.01 = 0.027493
+	if fee, ok := reserve.VenueMaxFeePerShare(); !ok || !fee.Equal("0.027493") ||
+		!reserve.RoundingAllowancePerShare.Equal("0.01") || reserve.ScheduleFetchedAt == nil || !reserve.ScheduleFetchedAt.Equal(fetchedAt) {
+		t.Fatalf("venue reserve = %#v", reserve)
+	}
+	unavailable := ResolveBuyFeeReserve("0.49", MarketFeeSchedule{}, errors.New("schedule unavailable"))
+	if unavailable.Source != BuyFeeReserveSourceConfigCap || unavailable.Reason != "schedule unavailable" {
+		t.Fatalf("unavailable reserve = %#v", unavailable)
+	}
+	invalid := ResolveBuyFeeReserve("0.49", MarketFeeSchedule{PlatformFeeRate: "-1", FeeExponent: "1"}, nil)
+	if invalid.Source != BuyFeeReserveSourceConfigCap || invalid.Reason == "" {
+		t.Fatalf("invalid reserve = %#v", invalid)
+	}
+	if err := (BuyFeeReserve{Source: BuyFeeReserveSourceVenueFeeSchedule, PlatformFeeRate: "0.07", FeeExponent: "1",
+		MaxFeePerShare: "0.03", RoundingAllowancePerShare: "-0.01"}).Validate(); err == nil {
+		t.Fatal("negative rounding allowance must fail validation")
 	}
 }
 
