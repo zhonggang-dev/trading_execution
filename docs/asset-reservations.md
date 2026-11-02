@@ -87,9 +87,18 @@ SELL 使用同一个账户锁并额外锁 token position，因此两笔 SELL 也
    曲线在 0.5 处最大，因此 `max_fee_per_share = rate * (q * (1 - q))^exponent`，其中 `q = min(worst_price, 0.5)`；
    `exponent = 0` 时费用与价格无关，直接取 `rate`。费率来自 `/clob-markets`，缓存 `POLYMARKET_FEE_SCHEDULE_TTL`
    （默认 15 分钟）后重新读取；接口返回无 fee details 视为确认零费。
-2. 费率无法确认（接口失败、token 不在返回中、配置了 builder code 等）：
-   `max_fee_per_share = worst_price * max_buy_fee_rate_bps / 10000`，证据记录 `CONFIG_MAX_FEE_RATE_CAP`
-   和原因。费率不确定时绝不按零预占，也不因此拒单。Kalshi 和 paper 始终走这条路径。
+   Kalshi taker 每股费用为 `fee_multiplier * 0.07 * p * (1 - p)`（官方 fee schedule 的通用公式），即
+   `rate = 0.07 * fee_multiplier`、`exponent = 1`，同样取 `q = min(worst_price, 0.5)`。`fee_multiplier` 和
+   `fee_type` 按 `GET /markets/{ticker}` → `GET /events/{event_ticker}` → `GET /series/{series_ticker}` 读取，
+   事件上的 `fee_type_override` / `fee_multiplier_override` 优先于系列；按市场缓存 15 分钟。
+   Kalshi 按订单把余额变动取整到会员精度（Direct $0.0001、非 Direct $0.01），因此另加每股
+   `rounding_allowance_per_share = 0.01`，已计入 `max_fee_per_share`。执行侧只下 IOC，成交一定是 taker；
+   `quadratic_with_maker_fees` 等类型的 maker 费不超过 taker 费，仍按 taker 曲线预占。
+2. 费率无法确认（接口失败、token 不在返回中、配置了 builder code、Kalshi `fee_type = flat` 或未知类型、
+   倍数缺失等）：`max_fee_per_share = worst_price * max_buy_fee_rate_bps / 10000`，证据记录
+   `CONFIG_MAX_FEE_RATE_CAP` 和原因。费率不确定时绝不按零预占，也不因此拒单。paper 始终走这条路径。
+   Kalshi 与 Polymarket 共用 `POLYMARKET_MAX_BUY_FEE_RATE_BPS` 作为该上限（线上为 10000，即预占为
+   2 倍最差价名义额）。
 
 `MaxBuyFeeRateBPS` 仍必须显式配置；即使已确认零费，也要显式配置 `0`，防止 live 因漏配而
 静默回到无手续费保护。

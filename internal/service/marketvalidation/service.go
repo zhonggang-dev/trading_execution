@@ -229,24 +229,7 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 // configured cap with the reason recorded for audit.
 func (service *Service) buyFeeReserve(ctx context.Context, intent domain.OrderIntent) *domain.BuyFeeReserve {
 	schedule, err := service.feeSchedules.MarketFeeSchedule(ctx, intent.ConditionID, intent.TokenID)
-	if err != nil {
-		return &domain.BuyFeeReserve{Source: domain.BuyFeeReserveSourceConfigCap, Reason: err.Error()}
-	}
-	maxFeePerShare, err := domain.MaxBuyFeePerShare(intent.WorstPrice, schedule)
-	if err != nil {
-		return &domain.BuyFeeReserve{Source: domain.BuyFeeReserveSourceConfigCap, Reason: err.Error()}
-	}
-	fetchedAt := schedule.FetchedAt.UTC()
-	reserve := &domain.BuyFeeReserve{
-		Source:          domain.BuyFeeReserveSourceVenueFeeSchedule,
-		PlatformFeeRate: schedule.PlatformFeeRate,
-		FeeExponent:     schedule.FeeExponent,
-		MaxFeePerShare:  maxFeePerShare,
-	}
-	if !fetchedAt.IsZero() {
-		reserve.ScheduleFetchedAt = &fetchedAt
-	}
-	return reserve
+	return domain.ResolveBuyFeeReserve(intent.WorstPrice, schedule, err)
 }
 
 // protectedExecutableSize measures what an IOC can take right now: the visible

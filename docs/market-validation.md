@@ -166,7 +166,8 @@ Venue。`observed_at` 是这份市场元数据的观察时间，不应拿业务�
 
 BUY 校验还会读取 Polymarket `/clob-markets` 的官方费率曲线并写入 `buy_fee_reserve` 证据，供资金预占
 按真实最坏手续费计算；费率读取失败时证据记录 `CONFIG_MAX_FEE_RATE_CAP` 和原因，不拒单，预占退回
-配置上限。详见 [`asset-reservations.md`](asset-reservations.md)。
+配置上限。Kalshi BUY 校验按市场所属事件和系列的 `fee_type` / `fee_multiplier` 生成同样的证据，
+并在每股最坏手续费上另加 Kalshi 按订单取整的余量。详见 [`asset-reservations.md`](asset-reservations.md)。
 
 paper 使用显式 `PAPER_BYPASS` validator。live composition 会注入 Gamma Market Universe、
 CLOB OrderBookSource 和 `marketvalidation.Service`，并生成 `LIVE_CHECK` 证据；缺少、过期或冲突的
