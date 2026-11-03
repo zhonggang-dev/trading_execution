@@ -52,3 +52,15 @@ func TestConsoleV2RuntimeConfigProjectsBindingsAndRunnerSnapshot(t *testing.T) {
 		t.Fatalf("runtime projection = %#v", value)
 	}
 }
+
+func TestConsoleV2AccountsUseValidatedVenueMembership(t *testing.T) {
+	cfg := config.Config{Kalshi: config.Kalshi{LiveBindings: []config.KalshiLiveBinding{{ExecutionAccountID: "main", APIKeyID: "never-export-key"}, {ExecutionAccountID: "unregistered-route"}}}}
+	live := &liveRuntime{polymarketAccounts: []string{"main"}, kalshiAccounts: []string{"kalshi:main"}, activeAccounts: []string{"main", "kalshi:main"}}
+	projected := consoleV2RuntimeConfig(cfg, live, time.Now())
+	if len(projected.ManagedAccounts) != 2 || projected.ManagedAccounts[0].MarketSource != "POLYMARKET" || projected.ManagedAccounts[1].MarketSource != "KALSHI" || projected.ManagedAccounts[1].ExecutionAccountID != "kalshi:main" {
+		t.Fatalf("venue membership %#v", projected.ManagedAccounts)
+	}
+	if empty := consoleV2RuntimeConfig(cfg, nil, time.Now()); len(empty.ManagedAccounts) != 0 {
+		t.Fatal("unvalidated config exposed as account directory")
+	}
+}

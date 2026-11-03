@@ -60,6 +60,7 @@ func New(db *sql.DB, config RuntimeConfig) *Reader {
 		config.RunnerSnapshot = func() RunnerSnapshot { return RunnerSnapshot{} }
 	}
 	config.StartedAt = config.StartedAt.UTC()
+	config.ManagedAccounts = append([]ManagedAccount(nil), config.ManagedAccounts...)
 	config.Bindings = append([]Binding(nil), config.Bindings...)
 	config.SubmissionDisabledAccounts = append([]string(nil), config.SubmissionDisabledAccounts...)
 	config.EntryDisabledAccounts = append([]string(nil), config.EntryDisabledAccounts...)
@@ -440,7 +441,7 @@ func normalizeFilter(filter ListFilter) (ListFilter, error) {
 	for name, value := range map[string]string{
 		"q": filter.Query, "model_id": filter.ModelID, "strategy_id": filter.StrategyID,
 		"execution_account_id": filter.ExecutionAccountID, "market_source": filter.MarketSource,
-		"status": filter.Status, "side": filter.Side,
+		"status": filter.Status, "side": filter.Side, "activity_type": filter.ActivityType,
 	} {
 		if len(value) > maxQueryLen || strings.ContainsAny(value, "\x00\r\n") {
 			return ListFilter{}, fmt.Errorf("%s is invalid", name)
