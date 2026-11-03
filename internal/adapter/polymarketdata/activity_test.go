@@ -15,12 +15,12 @@ func TestListRedeemActivitiesFiltersAndNormalizes(t *testing.T) {
 	txHash := "0x" + fmt.Sprintf("%064x", 3)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		query := request.URL.Query()
-		if request.URL.Path != "/activity" || query.Get("user") != wallet || query.Get("market") != condition ||
-			query.Get("type") != "REDEEM" || query.Get("start") != "1788307200" || query.Get("sortDirection") != "ASC" {
+		if request.URL.Path != "/v2/activity" || query.Get("user") != wallet || query.Get("condition") != condition ||
+			query.Get("type") != "REDEEM" || query.Get("start") != "1788307200" || query.Get("sort_direction") != "ASC" {
 			t.Fatalf("unexpected request %s?%s", request.URL.Path, request.URL.RawQuery)
 		}
 		writer.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(writer, `[{"proxyWallet":%q,"timestamp":1788307201,"conditionId":%q,"type":"REDEEM","transactionHash":%q,"future":"ignored"}]`, wallet, condition, txHash)
+		fmt.Fprintf(writer, `{"data":[{"proxy_wallet":%q,"timestamp":1788307201,"condition_id":%q,"type":"REDEEM","transaction_hash":%q,"future":"ignored"}],"pagination":{"has_more":false,"next_cursor":null}}`, wallet, condition, txHash)
 	}))
 	defer server.Close()
 	client, err := NewPositionClient(PositionClientParams{BaseURL: server.URL, HTTPClient: server.Client(), RequestsPerSecond: 15})

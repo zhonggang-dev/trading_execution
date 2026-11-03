@@ -1,10 +1,8 @@
 package polymarketdata
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -19,12 +17,13 @@ import (
 
 var _ port.RedeemActivitySource = (*PositionClient)(nil)
 
+// wireActivity is one Data API v2 /v2/activity row.
 type wireActivity struct {
-	WalletAddress   string `json:"proxyWallet"`
+	WalletAddress   string `json:"proxy_wallet"`
 	Timestamp       int64  `json:"timestamp"`
-	ConditionID     string `json:"conditionId"`
+	ConditionID     string `json:"condition_id"`
 	Type            string `json:"type"`
-	TransactionHash string `json:"transactionHash"`
+	TransactionHash string `json:"transaction_hash"`
 }
 
 // ListRedeemActivities discovers candidate transaction hashes. The Data API is
@@ -50,17 +49,21 @@ func (client *PositionClient) ListRedeemActivities(
 	const pageSize = 500
 	activities := make([]domain.RedeemActivity, 0)
 	seen := make(map[string]struct{})
-	for page := 0; page < 20; page++ {
-		endpoint := client.baseURL.ResolveReference(&url.URL{Path: "/activity"})
+	cursor := ""
+	for page := 0; page < maxDataAPIPages; page++ {
+		endpoint := client.baseURL.ResolveReference(&url.URL{Path: "/v2/activity"})
 		query := endpoint.Query()
+		// v2 feed cursors carry only the seek anchor; every page restates the filters.
 		query.Set("user", wallet)
-		query.Set("market", condition)
+		query.Set("condition", condition)
 		query.Set("type", "REDEEM")
 		query.Set("start", strconv.FormatInt(start.UTC().Unix(), 10))
-		query.Set("sortBy", "TIMESTAMP")
-		query.Set("sortDirection", "ASC")
+		query.Set("sort_by", "TIMESTAMP")
+		query.Set("sort_direction", "ASC")
 		query.Set("limit", strconv.Itoa(pageSize))
-		query.Set("offset", strconv.Itoa(page*pageSize))
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
 		endpoint.RawQuery = query.Encode()
 
 		request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
@@ -71,13 +74,9 @@ func (client *PositionClient) ListRedeemActivities(
 		if requestErr != nil {
 			return nil, requestErr
 		}
-		var values []wireActivity
-		decoder := json.NewDecoder(bytes.NewReader(body))
-		decoder.DisallowUnknownFields()
-		if decodeErr := decoder.Decode(&values); decodeErr != nil {
-			if decodeErr := json.Unmarshal(body, &values); decodeErr != nil {
-				return nil, fmt.Errorf("decode Data API redemption activity: %w", decodeErr)
-			}
+		values, next, decodeErr := decodeDataAPIPage[wireActivity](body, "redemption activity")
+		if decodeErr != nil {
+			return nil, decodeErr
 		}
 		for index, value := range values {
 			activityWallet, normalizeErr := normalizedActivityAddress(value.WalletAddress)
@@ -106,7 +105,7 @@ func (client *PositionClient) ListRedeemActivities(
 				TransactionHash: transactionHash, OccurredAt: occurredAt,
 			})
 		}
-		if len(values) < pageSize {
+		if next == "" {
 			sort.Slice(activities, func(i, j int) bool {
 				if activities[i].OccurredAt.Equal(activities[j].OccurredAt) {
 					return activities[i].TransactionHash < activities[j].TransactionHash
@@ -115,8 +114,9 @@ func (client *PositionClient) ListRedeemActivities(
 			})
 			return activities, nil
 		}
+		cursor = next
 	}
-	return nil, fmt.Errorf("Data API redemption activity pagination exceeded 20 pages")
+	return nil, fmt.Errorf("Data API redemption activity pagination exceeded %d pages", maxDataAPIPages)
 }
 
 func normalizedActivityAddress(value string) (string, error) {
