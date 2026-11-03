@@ -102,3 +102,26 @@ func TestAvailableBalanceReturnsDollars(t *testing.T) {
 		t.Fatalf("AvailableBalance() = %q, %v, want 98.02", balance, err)
 	}
 }
+
+func TestListAllSettlementsReadsTheAccountWithoutTickerFilter(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.RawQuery)
+		if r.URL.Query().Get("cursor") == "" {
+			_, _ = w.Write([]byte(`{"cursor":"next","settlements":[{"ticker":"KX-A","market_result":"yes","yes_count_fp":"1.00","no_count_fp":"0.00","revenue":100,"value":100}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"cursor":"","settlements":[{"ticker":"KX-B","market_result":"no","yes_count_fp":"1.00","no_count_fp":"0.00","revenue":0,"value":0}]}`))
+	}))
+	defer server.Close()
+	client := testClient(t, server.URL, "key", testPrivateKey(t), false)
+	records, err := client.ListAllSettlements(context.Background())
+	if err != nil || len(records) != 2 || records[0].Ticker != "KX-A" || records[1].Ticker != "KX-B" {
+		t.Fatalf("ListAllSettlements() = %v, %v", records, err)
+	}
+	for _, query := range queries {
+		if strings.Contains(query, "ticker=") || !strings.Contains(query, "subaccount=0") {
+			t.Errorf("query %q must cover the whole primary subaccount", query)
+		}
+	}
+}

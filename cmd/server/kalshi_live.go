@@ -118,10 +118,8 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 				}
 				return balance.AvailableDollars(), nil
 			},
-			func(ticker string) ([]domain.KalshiSettlement, error) {
-				return retryKalshiRateLimit(ctx, sleepContext, func(ctx context.Context) ([]domain.KalshiSettlement, error) {
-					return client.ListSettlements(ctx, ticker)
-				})
+			func() ([]domain.KalshiSettlement, error) {
+				return retryKalshiRateLimit(ctx, sleepContext, client.ListAllSettlements)
 			},
 		)
 	}

@@ -36,17 +36,31 @@ type settlementRecord struct {
 // ListSettlements returns the settlement records of one market ticker for the
 // primary subaccount. An unsettled market has no record.
 func (client *Client) ListSettlements(ctx context.Context, ticker string) ([]domain.KalshiSettlement, error) {
-	ticker, cursor := strings.TrimSpace(ticker), ""
+	ticker = strings.TrimSpace(ticker)
 	if ticker == "" {
 		return nil, fmt.Errorf("Kalshi settlement ticker is required")
 	}
+	return client.listSettlements(ctx, url.Values{"ticker": []string{ticker}})
+}
+
+// ListAllSettlements returns every settlement record of the primary
+// subaccount, so startup can check all held markets with one paginated read.
+func (client *Client) ListAllSettlements(ctx context.Context) ([]domain.KalshiSettlement, error) {
+	return client.listSettlements(ctx, url.Values{})
+}
+
+func (client *Client) listSettlements(ctx context.Context, filter url.Values) ([]domain.KalshiSettlement, error) {
+	cursor := ""
 	result := make([]domain.KalshiSettlement, 0, 1)
 	for page := 0; page < 20; page++ {
 		var envelope struct {
 			Settlements *[]json.RawMessage `json:"settlements"`
 			Cursor      *string            `json:"cursor"`
 		}
-		query := url.Values{"ticker": []string{ticker}, "subaccount": []string{"0"}, "limit": []string{"100"}}
+		query := url.Values{"subaccount": []string{"0"}, "limit": []string{"100"}}
+		for key, values := range filter {
+			query[key] = values
+		}
 		if cursor != "" {
 			query.Set("cursor", cursor)
 		}

@@ -20,13 +20,14 @@ import (
 //     not applied (no settlement row, or one held for review): the exchange has
 //     already paid it, and the settlement sweep would credit it again.
 //
-// listSettlements reads the exchange's settlement records for one ticker.
+// listSettlements reads all of the account's exchange settlement records; it
+// is called at most once, and only when a held market has no local row.
 func SyncKalshiExecutionAccount(
 	ctx context.Context,
 	database *sql.DB,
 	accountID, apiKeyID string,
 	readBalance func() (domain.Decimal, error),
-	listSettlements func(ticker string) ([]domain.KalshiSettlement, error),
+	listSettlements func() ([]domain.KalshiSettlement, error),
 ) (deferred bool, balance domain.Decimal, err error) {
 	if database == nil || readBalance == nil || listSettlements == nil {
 		return false, "", fmt.Errorf("Kalshi account balance source is unavailable")
@@ -144,7 +145,7 @@ func SyncKalshiExecutionAccount(
 // market whose settlement the exchange has paid but the ledger has not applied.
 func kalshiUnappliedSettlement(
 	ctx context.Context, tx *sql.Tx, accountID string,
-	listSettlements func(ticker string) ([]domain.KalshiSettlement, error),
+	listSettlements func() ([]domain.KalshiSettlement, error),
 ) (bool, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT DISTINCT SUBSTRING(position.token_id FROM '^kalshi:(.+):(?:YES|NO)$') AS ticker,
@@ -185,12 +186,19 @@ func kalshiUnappliedSettlement(
 	if pending {
 		return true, nil
 	}
+	if len(unsettled) == 0 {
+		return false, nil
+	}
+	records, err := listSettlements()
+	if err != nil {
+		return false, fmt.Errorf("read Kalshi settlements before balance sync: %w", err)
+	}
+	settled := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		settled[strings.TrimSpace(record.Ticker)] = struct{}{}
+	}
 	for _, ticker := range unsettled {
-		records, err := listSettlements(ticker)
-		if err != nil {
-			return false, fmt.Errorf("read Kalshi settlement for %s before balance sync: %w", ticker, err)
-		}
-		if len(records) > 0 {
+		if _, ok := settled[ticker]; ok {
 			return true, nil
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ type fakeKalshiExchange struct {
 	balance     domain.Decimal
 	settlements map[string][]domain.KalshiSettlement
 	listErr     error
+	allReads    int
 }
 
 func (exchange *fakeKalshiExchange) ListSettlements(_ context.Context, ticker string) ([]domain.KalshiSettlement, error) {
@@ -33,7 +35,17 @@ func (exchange *fakeKalshiExchange) AvailableBalance(context.Context) (domain.De
 func (exchange *fakeKalshiExchange) sync(ctx context.Context, database *sql.DB, accountID string) (bool, domain.Decimal, error) {
 	return SyncKalshiExecutionAccount(ctx, database, accountID, "key-"+accountID,
 		func() (domain.Decimal, error) { return exchange.balance, nil },
-		func(ticker string) ([]domain.KalshiSettlement, error) { return exchange.ListSettlements(ctx, ticker) })
+		func() ([]domain.KalshiSettlement, error) {
+			exchange.allReads++
+			if exchange.listErr != nil {
+				return nil, exchange.listErr
+			}
+			all := []domain.KalshiSettlement{}
+			for _, records := range exchange.settlements {
+				all = append(all, records...)
+			}
+			return all, nil
+		})
 }
 
 func newKalshiSettlementService(t *testing.T, database *sql.DB, accountID string, exchange *fakeKalshiExchange) *kalshisettlement.Service {
@@ -151,6 +163,16 @@ func TestKalshiBalanceSyncStillAlignsUnsettledHoldingsPostgresIntegration(t *tes
 	if got := scalar(t, database, `SELECT total_balance_delta::text FROM execution_account_events
 		WHERE execution_account_id=$1 AND event_type='KALSHI_BALANCE_SYNC'`, account); !sameNumeric(got, "4") {
 		t.Fatalf("balance sync delta = %s, want 4", got)
+	}
+
+	// However many markets are held, startup reads the exchange settlements once;
+	// with every held market already settled locally it does not read at all.
+	for index := 3; index <= 8; index++ {
+		seedKalshiHolding(t, database, account, fmt.Sprintf("KXSYNC-%d", index), "YES", "1", "0.5")
+	}
+	exchange.allReads = 0
+	if deferred, _, err := exchange.sync(ctx, database, account); err != nil || deferred || exchange.allReads != 1 {
+		t.Fatalf("sync with 7 held markets = deferred %v reads %d err %v, want one read", deferred, exchange.allReads, err)
 	}
 
 	const fresh = "kalshi:sync-new"

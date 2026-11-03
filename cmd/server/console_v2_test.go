@@ -64,7 +64,7 @@ func TestConsoleV2RuntimeConfigProjectsBindingsAndRunnerSnapshot(t *testing.T) {
 }
 
 func TestConsoleV2AccountsUseValidatedVenueMembership(t *testing.T) {
-	cfg := config.Config{Kalshi: config.Kalshi{LiveBindings: []config.KalshiLiveBinding{{ExecutionAccountID: "main", APIKeyID: "never-export-key"}, {ExecutionAccountID: "unregistered-route"}}}}
+	cfg := config.Config{Kalshi: config.Kalshi{LiveAccounts: []config.KalshiLiveAccount{{ExecutionAccountID: "kalshi:main", APIKeyID: "never-export-key"}, {ExecutionAccountID: "kalshi:unregistered-route"}}}}
 	live := &liveRuntime{polymarketAccounts: []string{"main"}, kalshiAccounts: []string{"kalshi:main"}, activeAccounts: []string{"main", "kalshi:main"}}
 	projected := consoleV2RuntimeConfig(cfg, live, time.Now())
 	if len(projected.ManagedAccounts) != 2 || projected.ManagedAccounts[0].MarketSource != "POLYMARKET" || projected.ManagedAccounts[1].MarketSource != "KALSHI" || projected.ManagedAccounts[1].ExecutionAccountID != "kalshi:main" {

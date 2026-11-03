@@ -150,7 +150,7 @@ func actualDirectCoverageAlerts(t *testing.T) ([]pm.Check, []pm.Alert) {
 	p.SourceModes = map[string]domain.PredictionSourceMode{"v4.1 flash": domain.PredictionSourceModeDirect}
 	p.Bindings = nil
 	for _, r := range []struct{ account, strategy string }{{"main", "brier_mid_edge_once"}, {"wallet-6", "multfactor_v1"}, {"wallet-7", "multfactor_v2"}} {
-		p.Bindings = append(p.Bindings, Binding{StrategyExecutionBinding: domain.StrategyExecutionBinding{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", ExecutionAccountID: r.account, StrategyID: r.strategy}, KalshiEnabled: true})
+		p.Bindings = append(p.Bindings, Binding{StrategyExecutionBinding: domain.StrategyExecutionBinding{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", ExecutionAccountID: r.account, StrategyID: r.strategy}})
 	}
 	checks := collect(t, p)
 	alerts := []pm.Alert{}
