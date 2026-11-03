@@ -1,6 +1,6 @@
 # 账户即组合（account-portfolio routing）上线与回滚手册
 
-> 只是手册，未执行。上线需要：PR 合并到 master → 从 master 构建 → 按本手册切换。
+> 11-03 按本手册执行。上线需要：PR 合并到 master → 从 master 构建 → 按本手册切换。
 > 生产 release 在切换前必须确认是 master 的祖先，且只从合并后的 master 构建。
 
 ## 0. 这次发布改变了什么（线上可见）
@@ -18,7 +18,13 @@
 策略服务影响（已核实 10-29）：
 
 - `brier_mid_edge_once` 线上 `bindings: []`，接受任意（模型, 账户）。
-- 它的"单次建仓"按（账户, 策略, 市场）去重。`main` 名下只交易过 1 个 Kalshi 市场，拆成 `kalshi:main` 后这 1 个市场可能被再买一次。
+- 它的选题记录（`market_selection`、`prediction_selections`）、占位、订单尝试都按账户存。11-03 `main` 名下已有
+  94 个 Kalshi 市场的选题记录、42 条 Kalshi 订单尝试。**切换时必须用 §3.5 把这些记录迁到 `kalshi:main`**：
+  - 不迁移：11-03 在 216 上用隔离实例回放 `main:20261102T191000Z` 的 Kalshi 输入，`kalshi:main` 会对 27 个已持有的
+    市场再下买单；
+  - 迁移后：同一输入下 `kalshi:main` 的 156 条评估与原 `main` 逐条一致（全部 SKIP）。
+- 旧版本从未把 Kalshi 订单回报发给策略服务（回报账户集合不含 `kalshi:main`）；迁移后订单尝试的账户是 `kalshi:main`，
+  新版本发出的回报（账户 `kalshi:main`、模型 `deepseek_masked`）与之匹配。
 - multfactor（wallet-6/7）只回显 `model_id`。
 
 ## 1. 切换前只读检查
@@ -93,6 +99,21 @@ DECISION_CYCLE_ACCOUNTS_JSON='[{"execution_account_id":"main","market_source":"P
 - `DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON='["brier_mid_edge_once"]'` 保持不变。之后 `main` 和 `kalshi:main` 两个账户的订单都会回报给策略服务。
 - 数据库不需要改：现有 4 条启用绑定行（`model_id=deepseek_masked`）按（策略, 账户）匹配新配置。
 
+## 3.5 策略服务记录迁移（停 Trading 之后、启动新版本之前）
+
+脚本 `deploy/strategy_kalshi_account_migration.py`（只用标准库）。策略服务不用停：它只在收到请求时读写库，
+Trading 停着就没有请求。以文件属主身份运行，备份放在库旁边：
+
+```bash
+DB=/home/gongchengyu/pm/data/live/brier_mid_edge_once.sqlite3
+sudo -u gongchengyu python3 deploy/strategy_kalshi_account_migration.py --db $DB            # 演练，打印各表行数
+sudo -u gongchengyu python3 deploy/strategy_kalshi_account_migration.py --db $DB --apply \
+  --backup $DB.bak-before-kalshi-account-<ts>
+```
+
+期望（11-03 数据）：`market_selection 94`、`order_attempts 42`、`prediction_claims 42`、`prediction_selections 131`
+（只许插入的表，复制一份）、`prediction_observations 1917`。`decision_snapshots` 只按 decision_id 查，不动。
+
 ## 4. 切换 release
 
 按 deploy-service 的 trading-execution 流程：
@@ -159,6 +180,15 @@ WHERE intent_payload->>'execution_account_id' LIKE 'kalshi:%' AND status IN ('PE
 ```
 
 a) 不为 0：等预占释放（晚到成交确认，或宽限期过后由对账释放）再查；长时间不释放先按对账手册处理，不能直接回滚。
+
+策略服务记录也要迁回（Trading 停着时）：
+
+```bash
+sudo -u gongchengyu python3 deploy/strategy_kalshi_account_migration.py --db $DB --source kalshi:main --target main \
+  --apply --backup $DB.bak-before-kalshi-rollback-<ts>
+```
+
+`prediction_selections` 只许插入，复制到 `kalshi:main` 的行会留下；旧版本不按 `kalshi:main` 查，不受影响。
 
 回滚是**有损**的：新版本期间开出的 lot（`model_id='v4.1 flash'`），旧二进制不会把它们发给策略（旧版按模型筛选 lot），
 策略不会卖出它们，直到再次前滚。它们仍在账本、对账、结算与赎回里。回滚前评估这些 lot 是否需要人工退出，能前滚修复就优先前滚。
