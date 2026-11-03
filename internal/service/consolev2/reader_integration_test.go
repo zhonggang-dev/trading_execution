@@ -144,6 +144,36 @@ func TestReaderAgainstMigratedTradingSchema(t *testing.T) {
 		runtime.Accounts[0].OpenIssueCount != 1 || runtime.Accounts[0].OpenOrderCount != 1 {
 		t.Fatalf("runtime accounts=%#v err=%v", runtime, err)
 	}
+	// Authorization is (strategy, account): a configured model that differs
+	// from the binding row's audit model still reads the row.
+	if _, err := db.ExecContext(ctx, `
+		UPDATE execution_strategy_bindings SET enabled=TRUE, version=version+1
+		WHERE execution_account_id=$1`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	for strategy, want := range map[string]*bool{"multfactor_v2": func() *bool { v := true; return &v }(), "brier_mid_edge_once": nil} {
+		renamed := New(db, RuntimeConfig{
+			StartedAt: decisionAt, Now: func() time.Time { return now },
+			Bindings: []Binding{{ModelID: "v4.1 flash", StrategyID: strategy, ExecutionAccountID: accountID, SourceMode: "SANDBOX"}},
+		})
+		value, err := renamed.Runtime(ctx)
+		if err != nil || len(value.Accounts) != 1 {
+			t.Fatalf("renamed-model runtime=%#v err=%v", value, err)
+		}
+		got := value.Accounts[0].DatabaseBindingEnabled
+		if (want == nil) != (got == nil) || (want != nil && *got != *want) {
+			t.Fatalf("strategy %s binding enabled = %v, want %v", strategy, got, want)
+		}
+		// The account's latest cycle is shown whatever model/strategy ran it.
+		if value.Accounts[0].LastCycleAt == nil {
+			t.Fatalf("strategy %s: latest account cycle hidden after a model change: %#v", strategy, value.Accounts[0])
+		}
+	}
+	if _, err := db.ExecContext(ctx, `
+		UPDATE execution_strategy_bindings SET enabled=FALSE, version=version+1
+		WHERE execution_account_id=$1`, accountID); err != nil {
+		t.Fatal(err)
+	}
 	cycles, err := reader.DecisionCycles(ctx, ListFilter{Limit: 5})
 	if err != nil || cycles.Total != 1 || len(cycles.Items) != 1 || cycles.Items[0].PredictionSnapshotID != "snapshot-1" ||
 		cycles.Items[0].PredictionModelID != nil || cycles.Items[0].OrderSubmissionEnabled == nil ||

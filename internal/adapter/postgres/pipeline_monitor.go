@@ -40,39 +40,34 @@ func (s *PipelineMonitorSource) Observe(ctx context.Context, now time.Time, bind
 	}
 	checks := []pm.Check{}
 	for _, b := range bindings {
-		ids := []string{b.ExecutionAccountID}
-		if b.KalshiEnabled {
-			ids = append(ids, "kalshi:"+b.ExecutionAccountID)
+		accountID := b.ExecutionAccountID
+		accountChecks, err := s.account(ctx, tx, now, b, accountID)
+		if err != nil {
+			return checks, err
 		}
-		for _, accountID := range ids {
-			accountChecks, err := s.account(ctx, tx, now, b, accountID)
+		checks = append(checks, accountChecks...)
+		if strings.HasPrefix(accountID, "kalshi:") {
+			// Kalshi's current execution path has no Polymarket reconciliation gate.
+			for _, id := range []string{"account.reconciliation_issues", "market.reconciliation_issues"} {
+				checks = append(checks, pm.Check{ID: id, Scope: accountID, Status: pm.Suppressed, Summary: "Kalshi 不适用 Polymarket 对账门禁"})
+			}
+		} else {
+			issues, err := s.issues(ctx, tx, accountID)
 			if err != nil {
 				return checks, err
 			}
-			checks = append(checks, accountChecks...)
-			if strings.HasPrefix(accountID, "kalshi:") {
-				// Kalshi's current execution path has no Polymarket reconciliation gate.
-				for _, id := range []string{"account.reconciliation_issues", "market.reconciliation_issues"} {
-					checks = append(checks, pm.Check{ID: id, Scope: accountID, Status: pm.Suppressed, Summary: "Kalshi 不适用 Polymarket 对账门禁"})
-				}
-			} else {
-				issues, err := s.issues(ctx, tx, accountID)
-				if err != nil {
-					return checks, err
-				}
-				checks = append(checks, issues...)
-			}
-			progress, err := s.progress(ctx, tx, now, accountID)
-			if err != nil {
-				return checks, err
-			}
-			checks = append(checks, progress...)
-			venueFailure, err := s.venueFailures(ctx, tx, now, accountID)
-			if err != nil {
-				return checks, err
-			}
-			checks = append(checks, venueFailure)
+			checks = append(checks, issues...)
 		}
+		progress, err := s.progress(ctx, tx, now, accountID)
+		if err != nil {
+			return checks, err
+		}
+		checks = append(checks, progress...)
+		venueFailure, err := s.venueFailures(ctx, tx, now, accountID)
+		if err != nil {
+			return checks, err
+		}
+		checks = append(checks, venueFailure)
 		cycle, err := s.cycle(ctx, tx, now, b)
 		if err != nil {
 			return checks, err
@@ -222,15 +217,20 @@ SELECT binding.enabled,policy.enabled,account_control.paused,strategy_control.pa
           AND r.status IN ('COMPLETED','ATTENTION_REQUIRED') AND r.completed_at IS NOT NULL
         ORDER BY r.completed_at DESC,r.run_id DESC LIMIT 1)
 FROM execution_accounts account
-LEFT JOIN execution_strategy_bindings binding ON binding.execution_account_id=account.execution_account_id
- AND binding.model_id=$2 AND binding.strategy_id=$3
+-- Authorization is (strategy, account), as the submit trigger (migration 0041);
+-- the binding row's model_id is not compared.
+LEFT JOIN LATERAL (
+ SELECT bool_or(row.enabled) AS enabled FROM execution_strategy_bindings row
+ WHERE row.execution_account_id=account.execution_account_id
+   AND execution_canonical_strategy_id(row.strategy_id)=execution_canonical_strategy_id($2)
+) binding ON TRUE
 LEFT JOIN execution_risk_policies policy ON policy.execution_account_id=account.execution_account_id
 LEFT JOIN execution_risk_controls account_control ON account_control.execution_account_id=account.execution_account_id
  AND account_control.control_scope='ACCOUNT' AND account_control.control_key=''
 LEFT JOIN execution_risk_controls strategy_control ON strategy_control.execution_account_id=account.execution_account_id
- AND strategy_control.control_scope='STRATEGY' AND strategy_control.control_key=$3
+ AND strategy_control.control_scope='STRATEGY' AND strategy_control.control_key=$2
 LEFT JOIN execution_risk_global_control global_control ON global_control.singleton=TRUE
-WHERE account.execution_account_id=$1`, id, b.ModelID, b.StrategyID).Scan(&enabled, &policy, &paused, &strategyPaused, &kill, &available, &reserved, &maxAge, &reconciled)
+WHERE account.execution_account_id=$1`, id, b.StrategyID).Scan(&enabled, &policy, &paused, &strategyPaused, &kill, &available, &reserved, &maxAge, &reconciled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return []pm.Check{{ID: "account.authorization", Scope: id, Status: pm.Critical, Summary: "活动执行账户没有账本配置"}}, nil
 	}
@@ -320,8 +320,8 @@ SELECT r.cycle_id,r.created_at,r.decision_at,r.output_payload IS NOT NULL,
                  WHERE book->>'status' IN ('ERROR','MISSING')),0),
        COALESCE(r.output_payload->'entry_policy'->>'block_reason','')
 FROM strategy_decision_runs r
-WHERE r.execution_account_id=$1 AND r.model_id=$2 AND r.strategy_id=$3
-ORDER BY r.decision_at DESC,r.cycle_id DESC LIMIT 1`, b.ExecutionAccountID, b.ModelID, b.StrategyID).Scan(&cycleID, &created, &decision, &output, &badBooks, &block)
+WHERE r.execution_account_id=$1
+ORDER BY r.decision_at DESC,r.cycle_id DESC LIMIT 1`, b.ExecutionAccountID).Scan(&cycleID, &created, &decision, &output, &badBooks, &block)
 	if errors.Is(err, sql.ErrNoRows) {
 		check.Status = pm.Unknown
 		check.Summary = "尚无该路由的持久化策略周期"
@@ -368,7 +368,9 @@ SELECT client_order_id,status,since FROM (
     WHERE resolved.client_order_id=d.client_order_id
       AND d.intent_payload->>'execution_account_id'=$1
       AND resolved.execution_account_id=CASE
-        WHEN upper(btrim(COALESCE(d.intent_payload->>'market_source','')))='KALSHI' THEN 'kalshi:'||$1
+        -- Intents written before the account-portfolio cutover carried the
+        -- Polymarket wallet name and were placed under kalshi:<wallet>.
+        WHEN upper(btrim(COALESCE(d.intent_payload->>'market_source','')))='KALSHI' AND $1 NOT LIKE 'kalshi:%' THEN 'kalshi:'||$1
         ELSE $1
       END
       AND resolved.status IN ('FILLED','CANCELLED','REJECTED')
@@ -387,13 +389,6 @@ SELECT client_order_id,status,since FROM (
 	}
 	checks := []pm.Check{}
 	for _, kind := range types {
-		// Durable strategy intents retain the logical account; executionrouter
-		// projects Kalshi placements to kalshi:<account> only at execution time.
-		// The logical account was already observed above, so do not invent a
-		// healthy empty Kalshi-specific intent queue.
-		if kind.id == "intent.delivery" && strings.HasPrefix(accountID, "kalshi:") {
-			continue
-		}
 		rows, err := tx.QueryContext(ctx, kind.query, accountID)
 		if err != nil {
 			return checks, fmt.Errorf("read bounded trading progress: %w", err)

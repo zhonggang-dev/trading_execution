@@ -95,20 +95,22 @@ func TestKalshiLogicalAccountIDIsExplicitAndUnambiguous(t *testing.T) {
 
 func TestSelectBindingRequiresOneCompleteExactAccount(t *testing.T) {
 	encoded := `[
-		{"execution_account_id":"wallet-6","api_key_id":"key-6","private_key_path":"/run/key-6.pem"},
-		{"execution_account_id":"wallet-7","api_key_id":"key-7","private_key_path":"/run/key-7.pem"}
+		{"execution_account_id":"kalshi:wallet-6","api_key_id":"key-6","private_key_path":"/run/key-6.pem"},
+		{"execution_account_id":"kalshi:wallet-7","api_key_id":"key-7","private_key_path":"/run/key-7.pem"}
 	]`
-	selected, err := selectBinding(encoded, "wallet-7")
+	selected, err := selectBinding(encoded, "kalshi:wallet-7")
 	if err != nil || selected.APIKeyID != "key-7" || selected.PrivateKeyPath != "/run/key-7.pem" {
 		t.Fatalf("selected=%#v error=%v", selected, err)
 	}
-	if _, err := selectBinding(encoded, "wallet-8"); err == nil {
-		t.Fatal("missing exact account binding must fail")
+	for _, missing := range []string{"kalshi:wallet-8", "wallet-7"} {
+		if _, err := selectBinding(encoded, missing); err == nil {
+			t.Fatalf("account %q without an exact credential must fail", missing)
+		}
 	}
 	if _, err := selectBinding(`[
-		{"execution_account_id":"wallet-7","api_key_id":"one","private_key_path":"/run/one"},
-		{"execution_account_id":"wallet-7","api_key_id":"two","private_key_path":"/run/two"}
-	]`, "wallet-7"); err == nil {
-		t.Fatal("ambiguous account binding must fail")
+		{"execution_account_id":"kalshi:wallet-7","api_key_id":"one","private_key_path":"/run/one"},
+		{"execution_account_id":"kalshi:wallet-7","api_key_id":"two","private_key_path":"/run/two"}
+	]`, "kalshi:wallet-7"); err == nil {
+		t.Fatal("ambiguous account credential must fail")
 	}
 }

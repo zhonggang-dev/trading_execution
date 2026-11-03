@@ -145,7 +145,10 @@ func TestPipelineMonitorUnknownDeliveryResolutionPostgresIntegration(t *testing.
 		orderAccount    string
 		orderStatus     domain.OrderStatus
 		differentClient bool
-		wantStalled     bool
+		// nativeAccount: the intent is written under kalshi:account-a itself,
+		// as every Kalshi intent is after the account-portfolio cutover.
+		nativeAccount bool
+		wantStalled   bool
 	}{
 		{name: "logical-filled", orderAccount: "account-a", orderStatus: domain.OrderStatusFilled},
 		{name: "logical-cancelled", orderAccount: "account-a", orderStatus: domain.OrderStatusCancelled},
@@ -161,6 +164,9 @@ func TestPipelineMonitorUnknownDeliveryResolutionPostgresIntegration(t *testing.
 		{name: "polymarket-cannot-use-native-account", orderAccount: "kalshi:account-a", orderStatus: domain.OrderStatusFilled, wantStalled: true},
 		{name: "kalshi-cannot-use-logical-account", source: domain.MarketSourceKalshi, orderAccount: "account-a", orderStatus: domain.OrderStatusFilled, wantStalled: true},
 		{name: "different-client-order-id", orderAccount: "account-a", orderStatus: domain.OrderStatusFilled, differentClient: true, wantStalled: true},
+		{name: "account-native-filled", source: domain.MarketSourceKalshi, nativeAccount: true, orderAccount: "kalshi:account-a", orderStatus: domain.OrderStatusFilled},
+		{name: "account-native-missing-order", source: domain.MarketSourceKalshi, nativeAccount: true, wantStalled: true},
+		{name: "account-native-foreign-account", source: domain.MarketSourceKalshi, nativeAccount: true, orderAccount: "kalshi:account-b", orderStatus: domain.OrderStatusFilled, wantStalled: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -174,7 +180,11 @@ func TestPipelineMonitorUnknownDeliveryResolutionPostgresIntegration(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			request := integrationDecisionRequest(t, at, "monitor-resolution", at.Add(time.Second))
+			observedAccount := "account-a"
+			if tc.nativeAccount {
+				observedAccount = "kalshi:account-a"
+			}
+			request := integrationDecisionRequestForAccount(t, at, "monitor-resolution", at.Add(time.Second), observedAccount)
 			if _, _, err := recorder.ClaimInput(context.Background(), request); err != nil {
 				t.Fatal(err)
 			}
@@ -200,7 +210,7 @@ func TestPipelineMonitorUnknownDeliveryResolutionPostgresIntegration(t *testing.
 				t.Fatal(err)
 			}
 			primary, native := &monitorRouteExecution{}, &monitorRouteExecution{}
-			router, err := executionrouter.New(repository, primary, []executionrouter.Route{{ModelID: intent.ModelID, StrategyID: intent.StrategyID, LogicalAccountID: "account-a", InternalAccountID: "kalshi:account-a", Execution: native}})
+			router, err := executionrouter.New(repository, primary, []executionrouter.Route{{AccountID: "kalshi:account-a", StrategyID: domain.CanonicalStrategyID(intent.StrategyID), Execution: native}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -245,7 +255,7 @@ func TestPipelineMonitorUnknownDeliveryResolutionPostgresIntegration(t *testing.
 				t.Fatal(err)
 			}
 			defer tx.Rollback()
-			checks, err := source.progress(context.Background(), tx, now, "account-a")
+			checks, err := source.progress(context.Background(), tx, now, observedAccount)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -305,13 +315,17 @@ func TestPipelineMonitorKalshiDoesNotRequirePolymarketRiskPostgresIntegration(t 
 	if _, err := db.Exec("UPDATE execution_risk_global_control SET kill_switch=FALSE,version=version+1"); err != nil {
 		t.Fatal(err)
 	}
-	b := tradingmonitor.Binding{StrategyExecutionBinding: domain.StrategyExecutionBinding{ModelID: "model-a", PredictionModelID: "source-model", StrategyID: "multfactor_v1", ExecutionAccountID: "account-a"}, KalshiEnabled: true}
+	bindings := []tradingmonitor.Binding{
+		{StrategyExecutionBinding: domain.StrategyExecutionBinding{ModelID: "model-a", PredictionModelID: "source-model", StrategyID: "multfactor_v1", ExecutionAccountID: "account-a"}},
+		{StrategyExecutionBinding: domain.StrategyExecutionBinding{ModelID: "model-a", PredictionModelID: "source-model", StrategyID: "brier_mid_edge_once",
+			ExecutionAccountID: "kalshi:account-a", MarketSource: domain.MarketSourceKalshi}},
+	}
 	source, err := NewPipelineMonitorSource(db, 8*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	observe := func() []pm.Check {
-		checks, err := source.Observe(context.Background(), now, []tradingmonitor.Binding{b})
+		checks, err := source.Observe(context.Background(), now, bindings)
 		if err != nil {
 			t.Fatal(err)
 		}

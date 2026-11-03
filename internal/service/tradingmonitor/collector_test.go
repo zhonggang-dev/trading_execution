@@ -44,7 +44,7 @@ var testNow = time.Date(2026, 10, 30, 0, 30, 0, 0, time.UTC)
 
 func fixtureParams() Params {
 	return Params{Enabled: true, SubmissionEnabled: true, StartedAt: testNow.Add(-time.Hour), Interval: 10 * time.Minute, MaxStartLateness: 30 * time.Second, CycleTimeout: 8 * time.Minute, PredictionLookback: 3 * time.Hour,
-		Bindings:    []Binding{{StrategyExecutionBinding: domain.StrategyExecutionBinding{PredictionModelID: "source-model", ModelID: "logical-model", StrategyID: "strategy-a", ExecutionAccountID: "account-a"}, KalshiEnabled: true}},
+		Bindings:    []Binding{{StrategyExecutionBinding: domain.StrategyExecutionBinding{PredictionModelID: "source-model", ModelID: "logical-model", StrategyID: "strategy-a", ExecutionAccountID: "account-a"}}},
 		SourceModes: map[string]domain.PredictionSourceMode{"source-model": domain.PredictionSourceModeSandbox},
 		RunnerSnapshot: func() decisionrunner.Status {
 			return decisionrunner.Status{LoopStarted: true, LoopRunning: true, NextDueAt: testNow.Add(10 * time.Minute), LastStartedAt: testNow.Add(-time.Minute), LastCompletedAt: testNow.Add(-30 * time.Second), LastSucceededAt: testNow.Add(-30 * time.Second)}
@@ -271,8 +271,14 @@ func TestDiagnosticSuppressionDoesNotSendFalseRecovery(t *testing.T) {
 	}
 }
 
+func kalshiBinding() Binding {
+	return Binding{StrategyExecutionBinding: domain.StrategyExecutionBinding{PredictionModelID: "source-model", ModelID: "source-model",
+		StrategyID: "strategy-a", ExecutionAccountID: "kalshi:account-a", MarketSource: domain.MarketSourceKalshi}}
+}
+
 func TestExpectedMissingVenueIsNotHiddenByOtherVenue(t *testing.T) {
 	p := fixtureParams()
+	p.Bindings = append(p.Bindings, kalshiBinding())
 	p.SourceModes["source-model"] = domain.PredictionSourceModeDirect
 	poly := validPrediction("market-a", domain.MarketSourcePolymarket, testNow.Add(-time.Hour))
 	poly.SandboxID = ""
@@ -282,26 +288,52 @@ func TestExpectedMissingVenueIsNotHiddenByOtherVenue(t *testing.T) {
 	if check := find(t, checks, "prediction.coverage", p.Bindings[0].Scope()); check.Status != pm.Healthy {
 		t.Fatal(check)
 	}
-	if check := find(t, checks, "prediction.venue", "KALSHI/"+p.Bindings[0].Scope()); check.Status != pm.Critical || check.Evidence["pending_direct_tasks"] != "1" {
+	if check := find(t, checks, "prediction.venue", "KALSHI/"+p.Bindings[1].Scope()); check.Status != pm.Critical || check.Evidence["pending_direct_tasks"] != "1" {
+		t.Fatal(check)
+	}
+	// The Polymarket account does not trade Kalshi, so Kalshi tasks are not its concern.
+	if check := find(t, checks, "prediction.venue", "KALSHI/"+p.Bindings[0].Scope()); check.Status != pm.Suppressed {
 		t.Fatal(check)
 	}
 	pending.TaskAvailableAt = testNow.Add(-time.Minute)
 	p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: []domain.Prediction{poly}, ExpectedPredictions: []domain.PredictionExpectation{pending}}}
-	if check := find(t, collect(t, p), "prediction.venue", "KALSHI/"+p.Bindings[0].Scope()); check.Status != pm.Suppressed {
+	if check := find(t, collect(t, p), "prediction.venue", "KALSHI/"+p.Bindings[1].Scope()); check.Status != pm.Suppressed {
 		t.Fatal(check)
 	}
 }
 
-func TestKalshiRequiresActualBindingRoute(t *testing.T) {
+// TestBindingCountsOnlyItsOwnVenue: each execution account trades one venue,
+// so its coverage counts only that venue's predictions.
+func TestBindingCountsOnlyItsOwnVenue(t *testing.T) {
 	p := fixtureParams()
-	p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: []domain.Prediction{validPrediction("kalshi-a", domain.MarketSourceKalshi, testNow.Add(-time.Hour))}}}
-	p.Bindings[0].KalshiEnabled = false
-	if c := find(t, collect(t, p), "prediction.coverage", p.Bindings[0].Scope()); c.Status != pm.Suppressed || c.Evidence["effective_markets"] != "0" {
+	p.Bindings = append(p.Bindings, kalshiBinding())
+	p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: []domain.Prediction{
+		validPrediction("kalshi-a", domain.MarketSourceKalshi, testNow.Add(-time.Hour)),
+		validPrediction("market-a", domain.MarketSourcePolymarket, testNow.Add(-time.Hour)),
+	}}}
+	checks := collect(t, p)
+	if c := find(t, checks, "prediction.coverage", p.Bindings[0].Scope()); c.Status != pm.Healthy ||
+		c.Evidence["polymarket_markets"] != "1" || c.Evidence["kalshi_markets"] != "0" {
 		t.Fatal(c)
 	}
-	p.Bindings[0].KalshiEnabled = true
-	if c := find(t, collect(t, p), "prediction.coverage", p.Bindings[0].Scope()); c.Status != pm.Healthy || c.Evidence["kalshi_markets"] != "1" {
+	if c := find(t, checks, "prediction.coverage", p.Bindings[1].Scope()); c.Status != pm.Healthy ||
+		c.Evidence["polymarket_markets"] != "0" || c.Evidence["kalshi_markets"] != "1" {
 		t.Fatal(c)
+	}
+}
+
+// TestKalshiAccountSkipsPolymarketRuntimeGates: the reconciliation runner and
+// CLOB heartbeat are Polymarket-only and must not be asked about kalshi:*.
+func TestKalshiAccountSkipsPolymarketRuntimeGates(t *testing.T) {
+	p := fixtureParams()
+	p.Bindings = []Binding{kalshiBinding()}
+	p.HeartbeatCheck = func(context.Context, string) error { return errors.New("unknown Polymarket account") }
+	p.ReconciliationCheck = p.HeartbeatCheck
+	checks := collect(t, p)
+	for _, id := range []string{"account.reconciliation", "account.heartbeat"} {
+		if c := find(t, checks, id, "KALSHI/"+p.Bindings[0].Scope()); c.Status != pm.Suppressed {
+			t.Fatal(c)
+		}
 	}
 }
 

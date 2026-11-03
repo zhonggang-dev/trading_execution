@@ -113,23 +113,16 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	for _, account := range accounts {
 		accountIDs = append(accountIDs, account.ExecutionAccountID)
 	}
-	if err := validateCurrentLiveWallet67Release(
-		accountIDs, cfg.DecisionCycle.SubmissionDisabledAccounts,
-	); err != nil {
+	// The wallet file must hold exactly the configured Polymarket accounts.
+	// This set equality must be proven before the first authenticated venue
+	// read. A retired wallet left in the secret must never be recovered,
+	// reconciled, or enrolled in a heartbeat.
+	if err := validateDecisionAccounts(cfg.DecisionCycle, accountIDs); err != nil {
 		return nil, err
 	}
-	if cfg.DecisionCycle.Enabled {
-		// This set equality must be proven before the first authenticated venue
-		// read. A retired wallet left in the secret must never be recovered,
-		// reconciled, or enrolled in a heartbeat by a shadow-mode process.
-		if err := validateDecisionAccounts(cfg.DecisionCycle, accountIDs); err != nil {
-			return nil, err
-		}
-	}
-	reconciliationAccountIDs, quarantinedAccountIDs, err := partitionReconciliationAccounts(
-		accountIDs,
-		cfg.DecisionCycle.SubmissionDisabledAccounts,
-	)
+	// Account quarantine is no longer configurable: an account that must stop
+	// trading is PAUSED or removed. The quarantine code path stays inert.
+	reconciliationAccountIDs, quarantinedAccountIDs, err := partitionReconciliationAccounts(accountIDs, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -156,8 +149,11 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure live execution account scope: %w", err)
 	}
-	activeAuthorizations, err := currentLiveWallet67Authorizations(reconciliationAccountIDs, cfg.DecisionCycle.Bindings)
+	activeAuthorizations, err := liveAccountAuthorizations(reconciliationAccountIDs, cfg.DecisionCycle.Bindings())
 	if err != nil {
+		return nil, err
+	}
+	if err := postgresadapter.CheckBindingAuthorizationMigration(ctx, database); err != nil {
 		return nil, err
 	}
 	if err := postgresadapter.CheckLiveActiveAccountAuthorization(
@@ -223,8 +219,9 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, err
 	}
 
-	entryDisabledSet := make(map[string]struct{}, len(cfg.DecisionCycle.EntryDisabledAccounts))
-	for _, accountID := range cfg.DecisionCycle.EntryDisabledAccounts {
+	entryDisabledAccounts := cfg.DecisionCycle.EntryDisabledAccounts()
+	entryDisabledSet := make(map[string]struct{}, len(entryDisabledAccounts))
+	for _, accountID := range entryDisabledAccounts {
 		entryDisabledSet[accountID] = struct{}{}
 	}
 	expectedBindings := make([]postgresadapter.ExpectedExecutionAccount, 0, len(accounts))
@@ -374,13 +371,13 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		AccountScope:             executionAccountScope,
 		RequirePreparedPlacement: true,
 		EntrySubmissionDisabled:  cfg.DecisionCycle.EntrySubmissionDisabled,
-		EntryDisabledAccounts:    cfg.DecisionCycle.EntryDisabledAccounts,
+		EntryDisabledAccounts:    entryDisabledAccounts,
 	})
 	if err != nil {
 		return nil, err
 	}
 	kalshiRuntime, err := composeKalshiExecution(ctx, cfg, database, repository, guard, fillLedger,
-		executionService, fillLedger, logger)
+		executionService, logger)
 	if err != nil {
 		return nil, fmt.Errorf("compose Kalshi live execution: %w", err)
 	}
@@ -555,10 +552,19 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err := operations.Refresh(ctx); err != nil {
 		return nil, fmt.Errorf("build initial live operations snapshot: %w", err)
 	}
+	// Every configured Kalshi account gets a delivery slot, including one whose
+	// preflight failed: its persisted intents are then claimed and held back by
+	// the submission policy instead of failing delivery for every account.
+	decisionAccountGate, err := newVenueAccountGate(runner, configuredKalshiAccountIDs(cfg.DecisionCycle))
+	if err != nil {
+		return nil, err
+	}
+	// Every account, Polymarket or Kalshi, reads its own lots straight from the
+	// ledger: a Kalshi account is no longer merged into a Polymarket wallet.
 	decisionRunner, err := buildDecisionRunner(buildDecisionRunnerParams{
-		cfg: cfg, database: database, positionSource: kalshiRuntime.positionSource, orderBooks: orderBooks,
+		cfg: cfg, database: database, positionSource: fillLedger, orderBooks: orderBooks,
 		executor: kalshiRuntime.execution, accountIDs: accountIDs, logger: logger,
-		submissionPolicy: kalshiRuntime.execution, kalshiInputPolicy: kalshiRuntime.execution, accountGate: runner,
+		submissionPolicy: kalshiRuntime.execution, routeInputPolicy: kalshiRuntime.execution, accountGate: decisionAccountGate,
 	})
 	if err != nil {
 		return nil, err
@@ -622,61 +628,22 @@ func optionalQuarantineReadiness(
 	return checker
 }
 
-func validateCurrentLiveWallet67Release(configured, quarantined []string) error {
-	if err := requireExactLiveAccountSet(
-		"wallet file", configured, []string{"main", "wallet-1", "wallet-6", "wallet-7"},
-	); err != nil {
-		return err
-	}
-	if len(quarantined) != 0 {
-		return fmt.Errorf("this release requires an empty submission-disabled account list")
-	}
-	return nil
-}
-
-func currentLiveWallet67Authorizations(
+// liveAccountAuthorizations returns the database authorization every active
+// Polymarket account must hold: an enabled binding for its configured
+// strategy. The model is not part of the authorization.
+func liveAccountAuthorizations(
 	activeAccountIDs []string,
 	bindings []domain.StrategyExecutionBinding,
 ) ([]postgresadapter.ExpectedActiveExecutionAccount, error) {
-	maskedModelID := ""
+	routes := make(map[string]postgresadapter.ExpectedActiveExecutionAccount, len(bindings))
 	for _, rawBinding := range bindings {
 		binding := rawBinding.Normalize()
-		if binding.ExecutionAccountID != "wallet-6" && binding.ExecutionAccountID != "wallet-7" {
+		if binding.MarketSource != domain.MarketSourcePolymarket {
 			continue
 		}
-		if binding.ModelID != "gemini_masked" && binding.ModelID != "qwen_masked" && binding.ModelID != "deepseek_masked" {
-			return nil, fmt.Errorf("wallet-6/wallet-7 require a supported masked model route")
-		}
-		if maskedModelID != "" && maskedModelID != binding.ModelID {
-			return nil, fmt.Errorf("wallet-6/wallet-7 cannot mix masked model routes")
-		}
-		maskedModelID = binding.ModelID
-	}
-	if maskedModelID == "" {
-		return nil, fmt.Errorf("wallet-6/wallet-7 masked model route is required")
-	}
-	// main/wallet-1 take their strategy IDs from the bindings (already shape-
-	// validated at config load); wallet-6/wallet-7 stay on the fixed IDs.
-	routes := map[string]postgresadapter.ExpectedActiveExecutionAccount{
-		"wallet-6": {
-			ExecutionAccountID: "wallet-6",
-			ModelID:            maskedModelID,
-			StrategyID:         domain.StrategyIDMultfactorV1,
-		},
-		"wallet-7": {
-			ExecutionAccountID: "wallet-7",
-			ModelID:            maskedModelID,
-			StrategyID:         domain.StrategyIDMultfactorV2,
-		},
-	}
-	for _, rawBinding := range bindings {
-		binding := rawBinding.Normalize()
-		if binding.ExecutionAccountID == "main" || binding.ExecutionAccountID == "wallet-1" {
-			routes[binding.ExecutionAccountID] = postgresadapter.ExpectedActiveExecutionAccount{
-				ExecutionAccountID: binding.ExecutionAccountID,
-				ModelID:            maskedModelID,
-				StrategyID:         binding.StrategyID,
-			}
+		routes[binding.ExecutionAccountID] = postgresadapter.ExpectedActiveExecutionAccount{
+			ExecutionAccountID: binding.ExecutionAccountID,
+			StrategyID:         binding.StrategyID,
 		}
 	}
 	result := make([]postgresadapter.ExpectedActiveExecutionAccount, 0, len(activeAccountIDs))
@@ -685,7 +652,7 @@ func currentLiveWallet67Authorizations(
 		accountID := strings.TrimSpace(raw)
 		route, exists := routes[accountID]
 		if !exists {
-			return nil, fmt.Errorf("execution account %q has no current live route", accountID)
+			return nil, fmt.Errorf("execution account %q has no configured Polymarket account row", accountID)
 		}
 		if _, duplicate := seen[accountID]; duplicate {
 			return nil, fmt.Errorf("active execution account %q is duplicated", accountID)
@@ -694,7 +661,7 @@ func currentLiveWallet67Authorizations(
 		result = append(result, route)
 	}
 	if len(result) == 0 {
-		return nil, fmt.Errorf("current live release requires at least one active execution account")
+		return nil, fmt.Errorf("live execution requires at least one active execution account")
 	}
 	return result, nil
 }

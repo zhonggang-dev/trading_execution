@@ -62,8 +62,7 @@ func run(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	logicalAccountID, err := kalshiLogicalAccountID(opts.account)
-	if err != nil {
+	if _, err := kalshiLogicalAccountID(opts.account); err != nil {
 		return err
 	}
 	databaseURL := strings.TrimSpace(os.Getenv("TRADING_EXECUTION_DATABASE_URL"))
@@ -74,7 +73,7 @@ func run(arguments []string) error {
 	if err := validateKalshiAPIURL(apiURL, opts.apply); err != nil {
 		return err
 	}
-	selected, err := selectBinding(os.Getenv("KALSHI_LIVE_BINDINGS_JSON"), logicalAccountID)
+	selected, err := selectBinding(os.Getenv("KALSHI_LIVE_ACCOUNTS_JSON"), strings.TrimSpace(opts.account))
 	if err != nil {
 		return err
 	}
@@ -226,10 +225,12 @@ func kalshiLogicalAccountID(internalAccountID string) (string, error) {
 	return logical, nil
 }
 
+// selectBinding picks the credential of one Kalshi execution account from
+// KALSHI_LIVE_ACCOUNTS_JSON. accountID is the full kalshi:<name> account.
 func selectBinding(encoded, accountID string) (binding, error) {
 	var bindings []binding
 	if err := json.Unmarshal([]byte(strings.TrimSpace(encoded)), &bindings); err != nil {
-		return binding{}, fmt.Errorf("decode KALSHI_LIVE_BINDINGS_JSON: %w", err)
+		return binding{}, fmt.Errorf("decode KALSHI_LIVE_ACCOUNTS_JSON: %w", err)
 	}
 	var selected binding
 	for _, candidate := range bindings {
@@ -245,7 +246,7 @@ func selectBinding(encoded, accountID string) (binding, error) {
 	selected.APIKeyID = strings.TrimSpace(selected.APIKeyID)
 	selected.PrivateKeyPath = strings.TrimSpace(selected.PrivateKeyPath)
 	if selected.ExecutionAccountID == "" || selected.APIKeyID == "" || selected.PrivateKeyPath == "" {
-		return binding{}, fmt.Errorf("no complete Kalshi live binding exists for execution account %q", accountID)
+		return binding{}, fmt.Errorf("no complete Kalshi live credential exists for execution account %q", accountID)
 	}
 	return selected, nil
 }

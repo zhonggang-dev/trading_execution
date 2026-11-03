@@ -270,13 +270,6 @@ func (runner *Runner) logResult(boundary time.Time, result decisioncycle.RunResu
 		"failed_intents", failed,
 		"binding_runs", bindingRunSummaries(result),
 	}
-	if result.KalshiStrategyInputDisabled {
-		attributes = append(attributes,
-			"kalshi_strategy_input_disabled", true,
-			"kalshi_predictions_withheld", result.KalshiPredictionsWithheld,
-			"kalshi_position_lots_withheld", result.KalshiPositionLotsWithheld,
-		)
-	}
 	if runErr != nil {
 		runner.logger.Error("decision cycle completed with errors", append(attributes, "error", runErr)...)
 		return
@@ -297,9 +290,7 @@ type bindingRunSummary struct {
 	AccountStrategyDisabled   bool   `json:"account_strategy_disabled"`
 	EntrySubmissionEnabled    bool   `json:"entry_submission_enabled"`
 	EntryBlockReason          string `json:"entry_block_reason,omitempty"`
-	KalshiInputWithheld       bool   `json:"kalshi_input_withheld"`
-	KalshiPredictionsWithheld int    `json:"kalshi_predictions_withheld,omitempty"`
-	KalshiLotsWithheld        int    `json:"kalshi_position_lots_withheld,omitempty"`
+	RouteUnavailable          bool   `json:"route_unavailable,omitempty"`
 	Failed                    bool   `json:"failed"`
 }
 
@@ -319,9 +310,7 @@ func bindingRunSummaries(result decisioncycle.RunResult) []bindingRunSummary {
 			AccountStrategyDisabled:   run.AccountStrategyDisabled,
 			EntrySubmissionEnabled:    run.EntrySubmissionEnabled,
 			EntryBlockReason:          run.EntryBlockReason,
-			KalshiInputWithheld:       run.KalshiInputWithheld,
-			KalshiPredictionsWithheld: run.KalshiPredictionsWithheld,
-			KalshiLotsWithheld:        run.KalshiPositionLotsWithheld,
+			RouteUnavailable:          run.RouteUnavailable,
 			Failed:                    run.Error != nil || run.EntryBlockReason != "",
 		})
 	}

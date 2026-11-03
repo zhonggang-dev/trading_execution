@@ -204,3 +204,41 @@ func TestMidPriceHistoryValidate(t *testing.T) {
 		t.Fatal("Validate() error = nil, want out-of-range midpoint rejection")
 	}
 }
+
+func TestStrategyExecutionBindingMarketSourceMatchesAccountIdentity(t *testing.T) {
+	polymarket := StrategyExecutionBinding{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main"}.Normalize()
+	if polymarket.MarketSource != MarketSourcePolymarket {
+		t.Fatalf("empty market source normalized to %q", polymarket.MarketSource)
+	}
+	if err := polymarket.Validate(); err != nil {
+		t.Fatalf("Polymarket binding: %v", err)
+	}
+	kalshi := StrategyExecutionBinding{
+		ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: " kalshi:main ", MarketSource: " kalshi ",
+	}.Normalize()
+	if kalshi.MarketSource != MarketSourceKalshi || kalshi.ExecutionAccountID != "kalshi:main" {
+		t.Fatalf("normalized Kalshi binding = %#v", kalshi)
+	}
+	if err := kalshi.Validate(); err != nil {
+		t.Fatalf("Kalshi binding: %v", err)
+	}
+	payload, err := json.Marshal(kalshi.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "market_source") {
+		t.Fatalf("strategy context must not carry the account venue: %s", payload)
+	}
+	for name, binding := range map[string]StrategyExecutionBinding{
+		"Kalshi account without prefix":  {ModelID: "m", StrategyID: "s", ExecutionAccountID: "main", MarketSource: MarketSourceKalshi},
+		"Polymarket account with prefix": {ModelID: "m", StrategyID: "s", ExecutionAccountID: "kalshi:main"},
+		"unknown venue":                  {ModelID: "m", StrategyID: "s", ExecutionAccountID: "main", MarketSource: "MANIFOLD"},
+	} {
+		if err := binding.Validate(); err == nil {
+			t.Fatalf("%s: Validate() accepted %#v", name, binding)
+		}
+	}
+	if !IsKalshiExecutionAccount(" kalshi:wallet-7") || IsKalshiExecutionAccount("main") {
+		t.Fatal("IsKalshiExecutionAccount misclassified an account")
+	}
+}

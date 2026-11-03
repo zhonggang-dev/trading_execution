@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,12 +32,12 @@ func TestConsoleV2RuntimeConfigProjectsBindingsAndRunnerSnapshot(t *testing.T) {
 	cfg := config.Config{DecisionCycle: config.DecisionCycle{
 		Enabled: true, Interval: decisionrunner.RequiredInterval,
 		OrderSubmissionEnabled: true,
-		Bindings: []domain.StrategyExecutionBinding{{
-			PredictionModelID: "source-model", ModelID: "logical-model",
-			StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-1",
-		}},
-		PredictionSourceModes: map[string]domain.PredictionSourceMode{
-			"source-model": domain.PredictionSourceModeSandbox,
+		PredictionModelID:      "source-model", PredictionSourceMode: domain.PredictionSourceModeSandbox,
+		Accounts: []config.DecisionAccount{
+			{ExecutionAccountID: "wallet-1", MarketSource: domain.MarketSourcePolymarket,
+				StrategyID: domain.StrategyIDMultfactorV2, Mode: config.DecisionAccountPaused},
+			{ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi,
+				StrategyID: "brier_mid_edge_once", Mode: config.DecisionAccountActive},
 		},
 	}}
 	live := &liveRuntime{decisionRunner: runner}
@@ -46,15 +47,24 @@ func TestConsoleV2RuntimeConfigProjectsBindingsAndRunnerSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !value.Runner.Enabled || value.Runner.State != "not_started" || value.Runner.IntervalSeconds != 600 ||
-		len(value.Bindings) != 1 || value.Bindings[0].PredictionModelID != "source-model" ||
-		value.Bindings[0].ModelID != "logical-model" || value.Bindings[0].SourceMode != "SANDBOX" ||
-		!value.Submission.OrderSubmissionEnabled {
+		len(value.Bindings) != 2 || value.Bindings[0].PredictionModelID != "source-model" ||
+		value.Bindings[0].ModelID != "source-model" || value.Bindings[0].SourceMode != "SANDBOX" ||
+		value.Bindings[0].MarketSource != "POLYMARKET" || value.Bindings[0].Mode != "PAUSED" ||
+		value.Bindings[1].ExecutionAccountID != "kalshi:main" || value.Bindings[1].MarketSource != "KALSHI" ||
+		value.Bindings[1].Mode != "ACTIVE" || !value.Submission.OrderSubmissionEnabled {
 		t.Fatalf("runtime projection = %#v", value)
+	}
+	// The retired switches keep their neutral values in the console contract.
+	submission := value.Submission
+	if len(submission.SubmissionDisabledAccounts) != 0 || !submission.KalshiStrategyInputEnabled ||
+		strings.Join(submission.EntryDisabledAccounts, ",") != "wallet-1" ||
+		strings.Join(submission.StrategyDisabledAccounts, ",") != "wallet-1" {
+		t.Fatalf("submission projection = %#v", submission)
 	}
 }
 
 func TestConsoleV2AccountsUseValidatedVenueMembership(t *testing.T) {
-	cfg := config.Config{Kalshi: config.Kalshi{LiveBindings: []config.KalshiLiveBinding{{ExecutionAccountID: "main", APIKeyID: "never-export-key"}, {ExecutionAccountID: "unregistered-route"}}}}
+	cfg := config.Config{Kalshi: config.Kalshi{LiveAccounts: []config.KalshiLiveAccount{{ExecutionAccountID: "kalshi:main", APIKeyID: "never-export-key"}, {ExecutionAccountID: "kalshi:unregistered-route"}}}}
 	live := &liveRuntime{polymarketAccounts: []string{"main"}, kalshiAccounts: []string{"kalshi:main"}, activeAccounts: []string{"main", "kalshi:main"}}
 	projected := consoleV2RuntimeConfig(cfg, live, time.Now())
 	if len(projected.ManagedAccounts) != 2 || projected.ManagedAccounts[0].MarketSource != "POLYMARKET" || projected.ManagedAccounts[1].MarketSource != "KALSHI" || projected.ManagedAccounts[1].ExecutionAccountID != "kalshi:main" {

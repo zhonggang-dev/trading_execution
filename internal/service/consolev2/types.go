@@ -109,6 +109,10 @@ type Binding struct {
 	StrategyID         string `json:"strategy_id"`
 	ExecutionAccountID string `json:"execution_account_id"`
 	SourceMode         string `json:"source_mode"`
+	// MarketSource and Mode are additive: the venue the account trades and its
+	// operator mode (ACTIVE, SELL_ONLY or PAUSED).
+	MarketSource string `json:"market_source,omitempty"`
+	Mode         string `json:"mode,omitempty"`
 }
 
 type Runtime struct {

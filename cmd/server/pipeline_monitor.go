@@ -9,7 +9,6 @@ import (
 	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/predictioninfra"
 	"github.com/UniPat-AI/trading_execution/internal/config"
-	"github.com/UniPat-AI/trading_execution/internal/domain"
 	pm "github.com/UniPat-AI/trading_execution/internal/service/pipelinemonitor"
 	"github.com/UniPat-AI/trading_execution/internal/service/tradingmonitor"
 )
@@ -28,7 +27,7 @@ func buildPipelineMonitor(cfg config.Config, db *sql.DB, live *liveRuntime, star
 		Enabled: cfg.DecisionCycle.Enabled, SubmissionEnabled: cfg.DecisionCycle.OrderSubmissionEnabled,
 		StartedAt: started, Interval: cfg.DecisionCycle.Interval, MaxStartLateness: cfg.DecisionCycle.MaxStartLateness,
 		CycleTimeout: cfg.DecisionCycle.Timeout, PredictionLookback: cfg.DecisionCycle.PredictionLookback,
-		SourceModes: cfg.DecisionCycle.PredictionSourceModes,
+		SourceModes: cfg.DecisionCycle.PredictionSourceModes(),
 	}
 	if p.Interval <= 0 {
 		p.Interval = 10 * time.Minute
@@ -42,21 +41,14 @@ func buildPipelineMonitor(cfg config.Config, db *sql.DB, live *liveRuntime, star
 	if p.PredictionLookback <= 0 {
 		p.PredictionLookback = 3 * time.Hour
 	}
-	for _, raw := range cfg.DecisionCycle.Bindings {
+	// One binding per execution account; a Kalshi account is its own binding
+	// (market_source KALSHI), not an input switch of a Polymarket wallet.
+	for _, raw := range cfg.DecisionCycle.Bindings() {
 		b := raw.Normalize()
-		item := tradingmonitor.Binding{StrategyExecutionBinding: b,
-			SubmissionDisabled: containsMonitorAccount(cfg.DecisionCycle.SubmissionDisabledAccounts, b.ExecutionAccountID),
-			EntryDisabled:      cfg.DecisionCycle.EntrySubmissionDisabled || containsMonitorAccount(cfg.DecisionCycle.EntryDisabledAccounts, b.ExecutionAccountID),
-			StrategyDisabled:   containsMonitorAccount(cfg.DecisionCycle.StrategyDisabledAccounts, b.ExecutionAccountID),
-		}
-		if live != nil && cfg.DecisionCycle.KalshiStrategyInputEnabled {
-			if route, ok := live.execution.(interface {
-				KalshiInputEnabled(domain.StrategyExecutionContext) bool
-			}); ok {
-				item.KalshiEnabled = route.KalshiInputEnabled(domain.StrategyExecutionContext{ModelID: b.ModelID, StrategyID: b.StrategyID, ExecutionAccountID: b.ExecutionAccountID})
-			}
-		}
-		p.Bindings = append(p.Bindings, item)
+		p.Bindings = append(p.Bindings, tradingmonitor.Binding{StrategyExecutionBinding: b,
+			EntryDisabled:    cfg.DecisionCycle.EntrySubmissionDisabled || containsMonitorAccount(cfg.DecisionCycle.EntryDisabledAccounts(), b.ExecutionAccountID),
+			StrategyDisabled: containsMonitorAccount(cfg.DecisionCycle.StrategyDisabledAccounts(), b.ExecutionAccountID),
+		})
 	}
 	if live != nil {
 		if live.decisionRunner != nil {

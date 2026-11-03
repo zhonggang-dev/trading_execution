@@ -1,5 +1,12 @@
 # Four-wallet decision-cycle rollout
 
+> **Historical (superseded).** This kit targets the pre-2026-10-29 configuration
+> (`DECISION_CYCLE_BINDINGS_JSON`, account switch lists, `KALSHI_LIVE_BINDINGS_JSON`).
+> The current release rejects those variables at startup and is configured with
+> `DECISION_CYCLE_PREDICTION_MODEL_ID`, `DECISION_CYCLE_ACCOUNTS_JSON` and
+> `KALSHI_LIVE_ACCOUNTS_JSON`; see `docs/decision-cycle.md`. Do not apply this
+> fragment or run `four_wallet_preflight.py` against the current release.
+
 The four routes are one configuration unit: one upstream prediction model
 (`deepseek_masked`, Sandbox source), four strategies and four distinct execution
 accounts. wallet-6/wallet-7 are fixed to `multfactor_v1/v2`; main/wallet-1 take

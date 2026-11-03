@@ -164,110 +164,46 @@ func TestPartitionReconciliationAccountsQuarantinesOneOfFour(t *testing.T) {
 	}
 }
 
-func TestCurrentLiveReleaseRejectsRetiredWalletOrUnsupportedQuarantineBeforePreflight(t *testing.T) {
-	tests := []struct {
-		name        string
-		configured  []string
-		quarantined []string
-		want        string
-	}{
-		{
-			name:        "decision cycle disabled with retired wallets",
-			configured:  []string{"main", "wallet-1", "wallet-2", "wallet-3"},
-			quarantined: []string{"wallet-6", "wallet-7"},
-			want:        "wallet file must contain exactly",
-		},
-		{
-			name:        "wallet remains quarantined",
-			configured:  []string{"main", "wallet-1", "wallet-6", "wallet-7"},
-			quarantined: []string{"wallet-6"},
-			want:        "empty submission-disabled account list",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			client := &livePreflightProbeClient{}
-			err := validateCurrentLiveWallet67Release(test.configured, test.quarantined)
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("validateCurrentLiveWallet67Release() error = %v, want %q", err, test.want)
-			}
-			if len(client.accountCalls) != 0 || len(client.fundingCalls) != 0 {
-				t.Fatalf("release validation reached venue probes: %#v/%#v", client.accountCalls, client.fundingCalls)
-			}
-		})
-	}
-}
-
-func TestCurrentLiveReleaseAcceptsOnlyEmptyQuarantine(t *testing.T) {
-	configured := []string{"main", "wallet-1", "wallet-6", "wallet-7"}
-	if err := validateCurrentLiveWallet67Release(configured, nil); err != nil {
-		t.Fatalf("validateCurrentLiveWallet67Release() error = %v", err)
-	}
-}
-
-func TestCurrentLiveWallet67AuthorizationsExcludeRetiredAccounts(t *testing.T) {
+func TestLiveAccountAuthorizationsFollowConfiguredPolymarketAccounts(t *testing.T) {
 	bindings := []domain.StrategyExecutionBinding{
-		{ModelID: "deepseek_masked", StrategyID: "strategy_pending_a", ExecutionAccountID: "main"},
-		{ModelID: "deepseek_masked", StrategyID: "strategy_pending_b", ExecutionAccountID: "wallet-1"},
-		{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
-		{ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+		{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main"},
+		{ModelID: "v4.1 flash", StrategyID: "strategy_pending_b", ExecutionAccountID: "wallet-1"},
+		{ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
+		{ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+		{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi},
 	}
-	authorizations, err := currentLiveWallet67Authorizations(
-		[]string{"main", "wallet-1", "wallet-6", "wallet-7"},
-		bindings,
-	)
+	authorizations, err := liveAccountAuthorizations([]string{"main", "wallet-1", "wallet-6", "wallet-7"}, bindings)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(authorizations) != 4 ||
-		authorizations[0].ExecutionAccountID != "main" ||
-		authorizations[0].ModelID != "deepseek_masked" ||
-		authorizations[0].StrategyID != "strategy_pending_a" ||
-		authorizations[1].ExecutionAccountID != "wallet-1" ||
-		authorizations[1].StrategyID != "strategy_pending_b" ||
-		authorizations[2].ExecutionAccountID != "wallet-6" ||
-		authorizations[2].ModelID != "deepseek_masked" ||
-		authorizations[2].StrategyID != domain.StrategyIDMultfactorV1 ||
-		authorizations[3].ExecutionAccountID != "wallet-7" ||
-		authorizations[3].StrategyID != domain.StrategyIDMultfactorV2 {
-		t.Fatalf("active authorizations = %#v", authorizations)
+	want := []postgresadapter.ExpectedActiveExecutionAccount{
+		{ExecutionAccountID: "main", StrategyID: "brier_mid_edge_once"},
+		{ExecutionAccountID: "wallet-1", StrategyID: "strategy_pending_b"},
+		{ExecutionAccountID: "wallet-6", StrategyID: domain.StrategyIDMultfactorV1},
+		{ExecutionAccountID: "wallet-7", StrategyID: domain.StrategyIDMultfactorV2},
 	}
-	if _, err := currentLiveWallet67Authorizations([]string{"wallet-2"}, bindings); err == nil ||
-		!strings.Contains(err.Error(), "no current live route") {
+	if !reflect.DeepEqual(authorizations, want) {
+		t.Fatalf("active authorizations = %#v, want %#v", authorizations, want)
+	}
+	// Any model and any account set: no masked whitelist, no fixed wallets.
+	for i := range bindings {
+		bindings[i].ModelID = "kimi-k2"
+	}
+	if _, err := liveAccountAuthorizations([]string{"wallet-6"}, bindings); err != nil {
+		t.Fatalf("model change broke authorization: %v", err)
+	}
+	if _, err := liveAccountAuthorizations([]string{"wallet-2"}, bindings); err == nil ||
+		!strings.Contains(err.Error(), "no configured Polymarket account row") {
 		t.Fatalf("retired authorization error = %v", err)
 	}
-	for i := range bindings {
-		bindings[i].ModelID = "gemini_masked"
+	if _, err := liveAccountAuthorizations([]string{"kalshi:main"}, bindings); err == nil {
+		t.Fatal("a Kalshi account must never be authorized as a Polymarket wallet")
 	}
-	legacy, err := currentLiveWallet67Authorizations([]string{"main", "wallet-1", "wallet-6", "wallet-7"}, bindings)
-	if err != nil || len(legacy) != 4 || legacy[2].ModelID != "gemini_masked" || legacy[3].ModelID != "gemini_masked" {
-		t.Fatalf("legacy authorizations = %#v, error = %v", legacy, err)
+	if _, err := liveAccountAuthorizations([]string{"main", "main"}, bindings); err == nil {
+		t.Fatal("duplicated active account accepted")
 	}
-	for i := range bindings {
-		bindings[i].ModelID = "qwen_masked"
-	}
-	if _, err := currentLiveWallet67Authorizations([]string{"wallet-6", "wallet-7"}, bindings); err != nil {
-		t.Fatalf("temporary Qwen route is needed for disabled deployment: %v", err)
-	}
-	bindings[2].ModelID = "gemini_masked"
-	bindings[3].ModelID = "qwen_masked"
-	if _, err := currentLiveWallet67Authorizations([]string{"wallet-6", "wallet-7"}, bindings); err == nil {
-		t.Fatal("mixed Gemini/Qwen wallet routes were accepted")
-	}
-}
-
-func TestCurrentLiveReleaseKeepsAllFourAccountsActive(t *testing.T) {
-	configured := []string{"main", "wallet-1", "wallet-6", "wallet-7"}
-	var quarantined []string
-	if err := validateCurrentLiveWallet67Release(configured, quarantined); err != nil {
-		t.Fatal(err)
-	}
-	active, _, err := partitionReconciliationAccounts(configured, quarantined)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"main", "wallet-1", "wallet-6", "wallet-7"}; !reflect.DeepEqual(active, want) {
-		t.Fatalf("automatic operations accounts = %#v, want %#v", active, want)
+	if _, err := liveAccountAuthorizations(nil, bindings); err == nil {
+		t.Fatal("empty active account set accepted")
 	}
 }
 

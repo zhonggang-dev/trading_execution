@@ -1732,24 +1732,6 @@ func TestNewRejectsDuplicateAccountBinding(t *testing.T) {
 	}
 }
 
-func TestNewRejectsPredictionModelRoutedToMultipleLogicalModels(t *testing.T) {
-	_, err := newTestService(Params{
-		PredictionSource: fakePredictionSource{},
-		PositionSource:   fakePositionSource{},
-		OrderBookSource:  &fakeOrderBookSource{},
-		Strategy:         &fakeStrategy{},
-		Recorder:         &fakeRecorder{},
-		Bindings: []domain.StrategyExecutionBinding{
-			{PredictionModelID: "producer-a", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main"},
-			{PredictionModelID: "producer-a", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2"},
-		},
-		Venue: "polymarket-paper",
-	})
-	if err == nil || !strings.Contains(err.Error(), "multiple logical models") {
-		t.Fatalf("New() error = %v", err)
-	}
-}
-
 func TestNewRejectsSubmissionWithoutCompleteModelCoverage(t *testing.T) {
 	_, err := newTestService(Params{
 		PredictionSource: fakePredictionSource{},
@@ -2899,34 +2881,6 @@ func mixedVenueSkipEvaluations(predictions ...domain.Prediction) []domain.Strate
 	return evaluations
 }
 
-// mixedVenuePositions returns one open Polymarket lot and one open Kalshi lot
-// owned by the single test binding.
-func mixedVenuePositions(decisionAt time.Time, polymarket domain.Prediction) accountPositionSource {
-	outcomeIndex := 0
-	negRisk := false
-	binding := testBinding()
-	return accountPositionSource{
-		binding.ExecutionAccountID: {
-			{
-				LotID: "lot-poly", ExecutionAccountID: binding.ExecutionAccountID, MarketID: polymarket.MarketID,
-				ConditionID: polymarket.ConditionID, TokenID: polymarket.Outcomes[0].TokenID,
-				OutcomeIndex: &outcomeIndex, OutcomeName: polymarket.Outcomes[0].Name, NegRisk: &negRisk,
-				ModelID: binding.ModelID, StrategyID: domain.StrategyIDMultfactorV2,
-				RemainingShares: "10", AverageEntryPrice: "0.40", Status: domain.PositionLotOpen,
-				OpenedAt: decisionAt.Add(-49 * time.Hour),
-			},
-			{
-				LotID: "lot-kalshi", ExecutionAccountID: binding.ExecutionAccountID, MarketSource: domain.MarketSourceKalshi,
-				MarketID: "KXLOT", ConditionID: "kalshi:KXLOT", TokenID: "kalshi:KXLOT:YES",
-				OutcomeIndex: &outcomeIndex, OutcomeName: "Yes", NegRisk: &negRisk,
-				ModelID: binding.ModelID, StrategyID: domain.StrategyIDMultfactorV2,
-				RemainingShares: "12", AverageEntryPrice: "0.35", Status: domain.PositionLotOpen,
-				OpenedAt: decisionAt.Add(-49 * time.Hour),
-			},
-		},
-	}
-}
-
 func polymarketBooks(decisionAt time.Time, prediction domain.Prediction) []domain.OrderBookSnapshot {
 	books := make([]domain.OrderBookSnapshot, 0, len(prediction.Outcomes))
 	for _, outcome := range prediction.Outcomes {
@@ -2948,158 +2902,6 @@ func mixedVenueSnapshot(decisionAt time.Time, predictions ...domain.Prediction) 
 		DecisionAt: decisionAt, CompletedAfter: decisionAt.Add(-3 * time.Hour), GeneratedAt: decisionAt.Add(time.Second),
 		Predictions:         predictions,
 		ExpectedPredictions: completedPredictionExpectations(predictions, 1, 1),
-	}
-}
-
-// TestRunWithholdsKalshiInputFromStrategyWhenSwitchIsOff verifies the venue
-// switch: with Kalshi strategy input disabled, the Kalshi prediction and the
-// Kalshi lot never reach the strategy request, no Kalshi orderbook target is
-// captured, and the Polymarket prediction and lot still flow normally.
-func TestRunWithholdsKalshiInputFromStrategyWhenSwitchIsOff(t *testing.T) {
-	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
-	polymarket := validPrediction(decisionAt)
-	kalshi := kalshiPrediction(decisionAt)
-	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
-	strategy := &fakeStrategy{response: domain.StrategyDecisionResponse{
-		SchemaVersion: domain.StrategyOutputSchemaVersion, DecidedAt: decisionAt.Add(4 * time.Second),
-		Evaluations: mixedVenueSkipEvaluations(polymarket),
-	}}
-	recorder := &fakeRecorder{}
-	service, err := newTestService(Params{
-		PredictionSource:            fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
-		PositionSource:              mixedVenuePositions(decisionAt, polymarket),
-		OrderBookSource:             bookSource,
-		Strategy:                    strategy,
-		Recorder:                    recorder,
-		KalshiStrategyInputDisabled: true,
-		Bindings:                    []domain.StrategyExecutionBinding{testExecutionBinding()},
-		Venue:                       "polymarket-paper",
-		Now:                         func() time.Time { return decisionAt.Add(5 * time.Second) },
-	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	result, err := service.Run(context.Background(), decisionAt)
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if !result.KalshiStrategyInputDisabled || result.KalshiPredictionsWithheld != 1 || result.KalshiPositionLotsWithheld != 1 {
-		t.Fatalf("kalshi switch summary = disabled:%v predictions:%d lots:%d, want disabled with one of each withheld",
-			result.KalshiStrategyInputDisabled, result.KalshiPredictionsWithheld, result.KalshiPositionLotsWithheld)
-	}
-	if len(bookSource.targets) != 2 {
-		t.Fatalf("book targets = %#v, want only the two Polymarket outcomes", bookSource.targets)
-	}
-	for _, target := range bookSource.targets {
-		if target.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(target.TokenID, "kalshi:") {
-			t.Fatalf("book target %#v reached the venue router while Kalshi strategy input is disabled", target)
-		}
-	}
-	request := strategy.request
-	if len(request.Predictions) != 1 || request.Predictions[0].PredictionID != polymarket.PredictionID {
-		t.Fatalf("strategy predictions = %#v, want only the Polymarket prediction", request.Predictions)
-	}
-	if len(request.Positions) != 1 || request.Positions[0].LotID != "lot-poly" {
-		t.Fatalf("strategy positions = %#v, want only the Polymarket lot", request.Positions)
-	}
-	for _, book := range request.OrderBooks {
-		if book.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(book.TokenID, "kalshi:") {
-			t.Fatalf("strategy orderbook %#v carries Kalshi data while the switch is off", book)
-		}
-	}
-	if len(result.Runs) != 1 || result.Runs[0].PredictionCount != 1 || result.Runs[0].PositionCount != 1 || result.Runs[0].Error != nil {
-		t.Fatalf("binding run = %#v, want one Polymarket prediction and lot without error", result.Runs)
-	}
-	if !recorder.inputRecorded || !recorder.outputRecorded {
-		t.Fatalf("recorded input/output = %v/%v, want the Polymarket-only cycle audited", recorder.inputRecorded, recorder.outputRecorded)
-	}
-}
-
-// TestRunKeepsSendingKalshiInputToStrategyByDefault is the control for the
-// switch: the zero-value Params keep today's behavior, so the Kalshi
-// prediction reaches the strategy and the venue router next to the Polymarket
-// prediction and lot. The Kalshi lot is left out of this fixture because a
-// Kalshi position lot cannot build an orderbook target today (it carries no
-// outcome id); that pre-existing limitation is independent of the switch.
-func TestRunKeepsSendingKalshiInputToStrategyByDefault(t *testing.T) {
-	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
-	polymarket := validPrediction(decisionAt)
-	kalshi := kalshiPrediction(decisionAt)
-	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
-	strategy := &fakeStrategy{response: domain.StrategyDecisionResponse{
-		SchemaVersion: domain.StrategyOutputSchemaVersion, DecidedAt: decisionAt.Add(4 * time.Second),
-		Evaluations: mixedVenueSkipEvaluations(polymarket, kalshi),
-	}}
-	positions := mixedVenuePositions(decisionAt, polymarket)
-	positions[testBinding().ExecutionAccountID] = positions[testBinding().ExecutionAccountID][:1]
-	service, err := newTestService(Params{
-		PredictionSource: fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
-		PositionSource:   positions,
-		OrderBookSource:  bookSource,
-		Strategy:         strategy,
-		Recorder:         &fakeRecorder{},
-		Bindings:         []domain.StrategyExecutionBinding{testExecutionBinding()},
-		Venue:            "polymarket-paper",
-		Now:              func() time.Time { return decisionAt.Add(5 * time.Second) },
-	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	result, err := service.Run(context.Background(), decisionAt)
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if result.KalshiStrategyInputDisabled || result.KalshiPredictionsWithheld != 0 || result.KalshiPositionLotsWithheld != 0 {
-		t.Fatalf("kalshi switch summary = %#v, want nothing withheld by default", result)
-	}
-	kalshiTargets := 0
-	for _, target := range bookSource.targets {
-		if target.MarketSource.Normalize() == domain.MarketSourceKalshi {
-			kalshiTargets++
-		}
-	}
-	// Two Polymarket outcomes (the Polymarket lot shares one token) plus the
-	// two Kalshi outcomes.
-	if len(bookSource.targets) != 4 || kalshiTargets != 2 {
-		t.Fatalf("book targets = %#v, want four targets with two Kalshi instruments", bookSource.targets)
-	}
-	request := strategy.request
-	if len(request.Predictions) != 2 || len(request.Positions) != 1 || request.Positions[0].LotID != "lot-poly" {
-		t.Fatalf("strategy request predictions/positions = %#v/%#v, want both venue predictions and the Polymarket lot", request.Predictions, request.Positions)
-	}
-	kalshiBooks := 0
-	for _, book := range request.OrderBooks {
-		if book.MarketSource.Normalize() == domain.MarketSourceKalshi {
-			kalshiBooks++
-		}
-	}
-	if kalshiBooks != 2 {
-		t.Fatalf("strategy orderbooks = %#v, want the two Kalshi outcomes present", request.OrderBooks)
-	}
-	if len(result.Runs) != 1 || result.Runs[0].PredictionCount != 2 || result.Runs[0].PositionCount != 1 || result.Runs[0].Error != nil {
-		t.Fatalf("binding run = %#v, want both venues without error", result.Runs)
-	}
-}
-
-func TestWithholdKalshiPredictionsNormalizesSourceAndKeepsInputIntact(t *testing.T) {
-	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
-	legacyPolymarket := validPrediction(decisionAt)
-	explicitPolymarket := validPrediction(decisionAt)
-	explicitPolymarket.PredictionID = "pred-2"
-	explicitPolymarket.MarketSource = domain.MarketSourcePolymarket
-	lowercaseKalshi := kalshiPrediction(decisionAt)
-	lowercaseKalshi.MarketSource = domain.MarketSource("kalshi")
-	input := []domain.Prediction{legacyPolymarket, lowercaseKalshi, explicitPolymarket}
-	kept, withheld := withholdKalshiPredictions(input)
-	if withheld != 1 || len(kept) != 2 || kept[0].PredictionID != "pred-1" || kept[1].PredictionID != "pred-2" {
-		t.Fatalf("withholdKalshiPredictions() = %#v, %d", kept, withheld)
-	}
-	if len(input) != 3 || input[1].PredictionID != "pred-kalshi" {
-		t.Fatalf("input slice was mutated: %#v", input)
-	}
-	kept, withheld = withholdKalshiPredictions(nil)
-	if withheld != 0 || len(kept) != 0 {
-		t.Fatalf("withholdKalshiPredictions(nil) = %#v, %d", kept, withheld)
 	}
 }
 
@@ -3225,159 +3027,6 @@ func TestValidateResponseStillRejectsMalformedExit(t *testing.T) {
 	}
 }
 
-type kalshiInputAllowlist map[string]bool
-
-func (allowlist kalshiInputAllowlist) KalshiInputEnabled(binding domain.StrategyExecutionContext) bool {
-	return allowlist[binding.ExecutionAccountID]
-}
-
-// kalshiRoutedBindings returns two bindings fed by the same prediction model;
-// only the first is meant to have a tradable Kalshi route.
-func kalshiRoutedBindings() []domain.StrategyExecutionBinding {
-	return []domain.StrategyExecutionBinding{
-		testExecutionBinding(),
-		{ModelID: testBinding().ModelID, StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "account-no-kalshi"},
-	}
-}
-
-// kalshiRoutedPositions gives the routed binding a Polymarket lot and the
-// unrouted binding a Polymarket lot plus a Kalshi lot.
-func kalshiRoutedPositions(decisionAt time.Time, polymarket domain.Prediction) accountPositionSource {
-	positions := mixedVenuePositions(decisionAt, polymarket)
-	routed := testBinding().ExecutionAccountID
-	unrouted := make([]domain.PositionLot, 0, 2)
-	for _, lot := range positions[routed] {
-		lot.LotID += "-unrouted"
-		lot.ExecutionAccountID = "account-no-kalshi"
-		lot.StrategyID = domain.StrategyIDMultfactorV1
-		unrouted = append(unrouted, lot)
-	}
-	positions[routed] = positions[routed][:1]
-	positions["account-no-kalshi"] = unrouted
-	return positions
-}
-
-func TestRunSendsKalshiInputOnlyToBindingsWithTradableRoute(t *testing.T) {
-	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
-	polymarket := validPrediction(decisionAt)
-	kalshi := kalshiPrediction(decisionAt)
-	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
-	strategy := &matrixStrategy{}
-	service, err := newTestService(Params{
-		PredictionSource:  fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
-		PositionSource:    kalshiRoutedPositions(decisionAt, polymarket),
-		OrderBookSource:   bookSource,
-		Strategy:          strategy,
-		Recorder:          &fakeRecorder{},
-		KalshiInputPolicy: kalshiInputAllowlist{testBinding().ExecutionAccountID: true},
-		Bindings:          kalshiRoutedBindings(),
-		Venue:             "polymarket-paper",
-		Now:               func() time.Time { return decisionAt.Add(5 * time.Second) },
-	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	result, err := service.Run(context.Background(), decisionAt)
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if result.KalshiStrategyInputDisabled || result.KalshiPredictionsWithheld != 0 || result.KalshiPositionLotsWithheld != 1 {
-		t.Fatalf("cycle kalshi summary = disabled:%v predictions:%d lots:%d, want only the unrouted Kalshi lot withheld",
-			result.KalshiStrategyInputDisabled, result.KalshiPredictionsWithheld, result.KalshiPositionLotsWithheld)
-	}
-	kalshiTargets := 0
-	for _, target := range bookSource.targets {
-		if target.MarketSource.Normalize() == domain.MarketSourceKalshi {
-			kalshiTargets++
-		}
-	}
-	if kalshiTargets != 2 {
-		t.Fatalf("book targets = %#v, want the two Kalshi outcomes captured for the routed binding", bookSource.targets)
-	}
-	requests := make(map[string]domain.StrategyDecisionRequest, len(strategy.requests))
-	for _, request := range strategy.requests {
-		requests[request.Context.ExecutionAccountID] = request
-	}
-	routed, unrouted := requests[testBinding().ExecutionAccountID], requests["account-no-kalshi"]
-	if len(routed.Predictions) != 2 || len(routed.Positions) != 1 {
-		t.Fatalf("routed request predictions=%d positions=%d, want both venues and its Polymarket lot",
-			len(routed.Predictions), len(routed.Positions))
-	}
-	if len(unrouted.Predictions) != 1 || unrouted.Predictions[0].PredictionID != polymarket.PredictionID {
-		t.Fatalf("unrouted request predictions = %#v, want only the Polymarket prediction", unrouted.Predictions)
-	}
-	if len(unrouted.Positions) != 1 || unrouted.Positions[0].MarketSource.Normalize() == domain.MarketSourceKalshi {
-		t.Fatalf("unrouted request positions = %#v, want only the Polymarket lot", unrouted.Positions)
-	}
-	for _, book := range unrouted.OrderBooks {
-		if book.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(book.TokenID, "kalshi:") {
-			t.Fatalf("unrouted request carries Kalshi orderbook %#v", book)
-		}
-	}
-	for _, run := range result.Runs {
-		switch run.Context.ExecutionAccountID {
-		case testBinding().ExecutionAccountID:
-			if run.KalshiInputWithheld || run.KalshiPredictionsWithheld != 0 || run.KalshiPositionLotsWithheld != 0 || run.Error != nil {
-				t.Fatalf("routed binding run = %#v, want Kalshi input delivered", run)
-			}
-		case "account-no-kalshi":
-			if !run.KalshiInputWithheld || run.KalshiPredictionsWithheld != 1 || run.KalshiPositionLotsWithheld != 1 || run.Error != nil {
-				t.Fatalf("unrouted binding run = %#v, want one Kalshi prediction and one Kalshi lot withheld", run)
-			}
-		default:
-			t.Fatalf("unexpected binding run %#v", run)
-		}
-	}
-}
-
-// TestRunBuildsBookTargetsForKalshiLotsHeldByRoutedBinding is the regression
-// for the 2026-10-29 outage: the first filled Kalshi order became an open lot
-// whose book target carried no outcome_id, so every later cycle failed with
-// "book target venue identity is invalid" for all venues and wallets.
-func TestRunBuildsBookTargetsForKalshiLotsHeldByRoutedBinding(t *testing.T) {
-	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
-	polymarket := validPrediction(decisionAt)
-	kalshi := kalshiPrediction(decisionAt)
-	positions := mixedVenuePositions(decisionAt, polymarket)
-	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
-	strategy := &matrixStrategy{}
-	service, err := newTestService(Params{
-		PredictionSource:  fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
-		PositionSource:    positions,
-		OrderBookSource:   bookSource,
-		Strategy:          strategy,
-		Recorder:          &fakeRecorder{},
-		KalshiInputPolicy: kalshiInputAllowlist{testBinding().ExecutionAccountID: true},
-		Bindings:          []domain.StrategyExecutionBinding{testExecutionBinding()},
-		Venue:             "polymarket-paper",
-		Now:               func() time.Time { return decisionAt.Add(5 * time.Second) },
-	})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	result, err := service.Run(context.Background(), decisionAt)
-	if err != nil {
-		t.Fatalf("Run() error = %v, want a Kalshi lot to produce a valid book target", err)
-	}
-	var lotTarget *domain.BookTarget
-	for index := range bookSource.targets {
-		if bookSource.targets[index].TokenID == "kalshi:KXLOT:YES" {
-			lotTarget = &bookSource.targets[index]
-		}
-	}
-	if lotTarget == nil || lotTarget.OutcomeID != "YES" || lotTarget.MarketSource.Normalize() != domain.MarketSourceKalshi {
-		t.Fatalf("book targets = %#v, want the Kalshi lot token captured with outcome_id YES", bookSource.targets)
-	}
-	if len(strategy.requests) != 1 || len(strategy.requests[0].Positions) != 2 {
-		t.Fatalf("strategy requests = %#v, want one request carrying both lots", strategy.requests)
-	}
-	for _, run := range result.Runs {
-		if run.Error != nil {
-			t.Fatalf("binding run error = %v", run.Error)
-		}
-	}
-}
-
 // TestBuildInputTargetsAcceptsKalshiLotOnPredictedToken checks that a Kalshi
 // lot on a token that also has a prediction resolves to the identical target.
 func TestBuildInputTargetsAcceptsKalshiLotOnPredictedToken(t *testing.T) {
@@ -3398,22 +3047,78 @@ func TestBuildInputTargetsAcceptsKalshiLotOnPredictedToken(t *testing.T) {
 	}
 }
 
-func TestRunCapturesNoKalshiBookWhenNoBindingHasTradableRoute(t *testing.T) {
+const testKalshiAccount = "kalshi:account-test-v2"
+
+// venueAccountBindings returns one Polymarket account and one Kalshi account
+// that share the model and the strategy.
+func venueAccountBindings() []domain.StrategyExecutionBinding {
+	polymarket := testExecutionBinding()
+	kalshi := polymarket
+	kalshi.ExecutionAccountID = testKalshiAccount
+	kalshi.MarketSource = domain.MarketSourceKalshi
+	return []domain.StrategyExecutionBinding{polymarket, kalshi}
+}
+
+// venueAccountPositions gives each account one lot of its own venue. The
+// lots were opened by another model and strategy: ownership is the account.
+func venueAccountPositions(decisionAt time.Time, polymarket domain.Prediction) accountPositionSource {
+	outcomeIndex := 0
+	negRisk := false
+	return accountPositionSource{
+		testBinding().ExecutionAccountID: {{
+			LotID: "lot-poly", ExecutionAccountID: testBinding().ExecutionAccountID, MarketID: polymarket.MarketID,
+			ConditionID: polymarket.ConditionID, TokenID: polymarket.Outcomes[0].TokenID,
+			OutcomeIndex: &outcomeIndex, OutcomeName: polymarket.Outcomes[0].Name, NegRisk: &negRisk,
+			ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1,
+			RemainingShares: "10", AverageEntryPrice: "0.40", Status: domain.PositionLotOpen,
+			OpenedAt: decisionAt.Add(-49 * time.Hour),
+		}},
+		testKalshiAccount: {{
+			LotID: "lot-kalshi", ExecutionAccountID: testKalshiAccount,
+			MarketID: "KXLOT", ConditionID: "kalshi:KXLOT", TokenID: "kalshi:KXLOT:YES",
+			OutcomeIndex: &outcomeIndex, OutcomeName: "Yes", NegRisk: &negRisk,
+			ModelID: "gemini_masked", StrategyID: "brier_mid_edge_once",
+			RemainingShares: "12", AverageEntryPrice: "0.35", Status: domain.PositionLotOpen,
+			OpenedAt: decisionAt.Add(-49 * time.Hour),
+		}},
+	}
+}
+
+type routeAllowlist map[string]bool
+
+func (allowlist routeAllowlist) StrategyInputEnabled(binding domain.StrategyExecutionBinding) bool {
+	return allowlist[binding.ExecutionAccountID]
+}
+
+func requestsByAccount(strategy *matrixStrategy) map[string]domain.StrategyDecisionRequest {
+	requests := make(map[string]domain.StrategyDecisionRequest, len(strategy.requests))
+	for _, request := range strategy.requests {
+		requests[request.Context.ExecutionAccountID] = request
+	}
+	return requests
+}
+
+// TestRunGivesEachAccountOnlyItsOwnVenue is the core contract of first-class
+// Kalshi accounts: the Polymarket account and the Kalshi account each get one
+// strategy request with only their venue's predictions, lots and books, under
+// distinct cycle ids, and lots opened by another model or strategy are still
+// handed to the account's current strategy.
+func TestRunGivesEachAccountOnlyItsOwnVenue(t *testing.T) {
 	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
 	polymarket := validPrediction(decisionAt)
 	kalshi := kalshiPrediction(decisionAt)
 	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
 	strategy := &matrixStrategy{}
 	service, err := newTestService(Params{
-		PredictionSource:  fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
-		PositionSource:    kalshiRoutedPositions(decisionAt, polymarket),
-		OrderBookSource:   bookSource,
-		Strategy:          strategy,
-		Recorder:          &fakeRecorder{},
-		KalshiInputPolicy: kalshiInputAllowlist{},
-		Bindings:          kalshiRoutedBindings(),
-		Venue:             "polymarket-paper",
-		Now:               func() time.Time { return decisionAt.Add(5 * time.Second) },
+		PredictionSource: fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
+		PositionSource:   venueAccountPositions(decisionAt, polymarket),
+		OrderBookSource:  bookSource,
+		Strategy:         strategy,
+		Recorder:         &fakeRecorder{},
+		RouteInputPolicy: routeAllowlist{testBinding().ExecutionAccountID: true, testKalshiAccount: true},
+		Bindings:         venueAccountBindings(),
+		Venue:            "polymarket-paper",
+		Now:              func() time.Time { return decisionAt.Add(5 * time.Second) },
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -3422,25 +3127,239 @@ func TestRunCapturesNoKalshiBookWhenNoBindingHasTradableRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if result.KalshiStrategyInputDisabled || result.KalshiPredictionsWithheld != 1 || result.KalshiPositionLotsWithheld != 1 {
-		t.Fatalf("cycle kalshi summary = disabled:%v predictions:%d lots:%d, want the Kalshi prediction and lot withheld",
-			result.KalshiStrategyInputDisabled, result.KalshiPredictionsWithheld, result.KalshiPositionLotsWithheld)
+	requests := requestsByAccount(strategy)
+	if len(strategy.requests) != 2 || len(requests) != 2 {
+		t.Fatalf("strategy requests = %d, want one per account", len(strategy.requests))
 	}
-	for _, target := range bookSource.targets {
-		if target.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(target.TokenID, "kalshi:") {
-			t.Fatalf("book target %#v captured although no binding accepts Kalshi input", target)
+	pm, ks := requests[testBinding().ExecutionAccountID], requests[testKalshiAccount]
+	if pm.CycleID == ks.CycleID {
+		t.Fatalf("both accounts share cycle id %q", pm.CycleID)
+	}
+	if len(pm.Predictions) != 1 || pm.Predictions[0].PredictionID != polymarket.PredictionID {
+		t.Fatalf("Polymarket request predictions = %#v", pm.Predictions)
+	}
+	if len(pm.Positions) != 1 || pm.Positions[0].LotID != "lot-poly" || pm.Positions[0].MarketSource != "" {
+		t.Fatalf("Polymarket request positions = %#v, want lot-poly with the legacy empty market_source", pm.Positions)
+	}
+	for _, book := range pm.OrderBooks {
+		if book.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(book.TokenID, "kalshi:") {
+			t.Fatalf("Polymarket request carries Kalshi book %#v", book)
 		}
 	}
-	for _, request := range strategy.requests {
+	if len(ks.Predictions) != 1 || ks.Predictions[0].PredictionID != kalshi.PredictionID {
+		t.Fatalf("Kalshi request predictions = %#v", ks.Predictions)
+	}
+	if len(ks.Positions) != 1 || ks.Positions[0].LotID != "lot-kalshi" || ks.Positions[0].MarketSource != domain.MarketSourceKalshi {
+		t.Fatalf("Kalshi request positions = %#v", ks.Positions)
+	}
+	for _, book := range ks.OrderBooks {
+		if book.MarketSource.Normalize() != domain.MarketSourceKalshi {
+			t.Fatalf("Kalshi request carries non-Kalshi book %#v", book)
+		}
+	}
+	for _, request := range []domain.StrategyDecisionRequest{pm, ks} {
 		for _, prediction := range request.Predictions {
-			if prediction.MarketSource.Normalize() == domain.MarketSourceKalshi {
-				t.Fatalf("request for %s carries Kalshi prediction %#v", request.Context.ExecutionAccountID, prediction)
+			if prediction.Model.Name != testBinding().ModelID {
+				t.Fatalf("prediction model = %q, want the binding model", prediction.Model.Name)
 			}
 		}
 	}
-	for _, run := range result.Runs {
-		if !run.KalshiInputWithheld || run.Error != nil {
-			t.Fatalf("binding run = %#v, want Kalshi input withheld without error", run)
+	var kalshiLotTarget bool
+	kalshiTargets := 0
+	for _, target := range bookSource.targets {
+		if target.MarketSource.Normalize() == domain.MarketSourceKalshi {
+			kalshiTargets++
 		}
+		if target.TokenID == "kalshi:KXLOT:YES" && target.OutcomeID == "YES" {
+			kalshiLotTarget = true
+		}
+	}
+	if kalshiTargets != 3 || !kalshiLotTarget {
+		t.Fatalf("book targets = %#v, want both Kalshi outcomes and the Kalshi lot token", bookSource.targets)
+	}
+	if len(result.Runs) != 2 {
+		t.Fatalf("runs = %#v", result.Runs)
+	}
+	for _, run := range result.Runs {
+		if run.Error != nil || run.RouteUnavailable || run.PredictionCount != 1 || run.PositionCount != 1 {
+			t.Fatalf("run = %#v, want one prediction and one lot without error", run)
+		}
+	}
+}
+
+func TestRunSkipsKalshiAccountWithoutTradableRoute(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	polymarket := validPrediction(decisionAt)
+	kalshi := kalshiPrediction(decisionAt)
+	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
+	strategy := &matrixStrategy{}
+	service, err := newTestService(Params{
+		PredictionSource: fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
+		PositionSource:   venueAccountPositions(decisionAt, polymarket),
+		OrderBookSource:  bookSource,
+		Strategy:         strategy,
+		Recorder:         &fakeRecorder{},
+		RouteInputPolicy: routeAllowlist{testBinding().ExecutionAccountID: true},
+		Bindings:         venueAccountBindings(),
+		Venue:            "polymarket-paper",
+		Now:              func() time.Time { return decisionAt.Add(5 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := service.Run(context.Background(), decisionAt)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(strategy.requests) != 1 || strategy.requests[0].Context.ExecutionAccountID != testBinding().ExecutionAccountID {
+		t.Fatalf("strategy requests = %#v, want only the Polymarket account", strategy.requests)
+	}
+	for _, target := range bookSource.targets {
+		if target.MarketSource.Normalize() == domain.MarketSourceKalshi || strings.HasPrefix(target.TokenID, "kalshi:") {
+			t.Fatalf("book target %#v captured for an account without a tradable route", target)
+		}
+	}
+	for _, run := range result.Runs {
+		switch run.Context.ExecutionAccountID {
+		case testKalshiAccount:
+			if !run.RouteUnavailable || run.Error != nil || run.PredictionCount != 1 {
+				t.Fatalf("Kalshi run = %#v, want route unavailable with its one prediction counted", run)
+			}
+		case testBinding().ExecutionAccountID:
+			if run.RouteUnavailable || run.Error != nil {
+				t.Fatalf("Polymarket run = %#v", run)
+			}
+		default:
+			t.Fatalf("unexpected run %#v", run)
+		}
+	}
+}
+
+func TestRunCapturesNoKalshiBookWithoutKalshiAccount(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	polymarket := validPrediction(decisionAt)
+	kalshi := kalshiPrediction(decisionAt)
+	positions := venueAccountPositions(decisionAt, polymarket)
+	delete(positions, testKalshiAccount)
+	bookSource := &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)}
+	strategy := &matrixStrategy{}
+	service, err := newTestService(Params{
+		PredictionSource: fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket, kalshi)},
+		PositionSource:   positions,
+		OrderBookSource:  bookSource,
+		Strategy:         strategy,
+		Recorder:         &fakeRecorder{},
+		Bindings:         []domain.StrategyExecutionBinding{testExecutionBinding()},
+		Venue:            "polymarket-paper",
+		Now:              func() time.Time { return decisionAt.Add(5 * time.Second) },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := service.Run(context.Background(), decisionAt); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(bookSource.targets) != 2 {
+		t.Fatalf("book targets = %#v, want only the two Polymarket outcomes", bookSource.targets)
+	}
+	if len(strategy.requests) != 1 || len(strategy.requests[0].Predictions) != 1 ||
+		strategy.requests[0].Predictions[0].PredictionID != polymarket.PredictionID {
+		t.Fatalf("strategy requests = %#v, want only the Polymarket prediction", strategy.requests)
+	}
+}
+
+func TestRunRejectsLotOfAnotherVenue(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
+	polymarket := validPrediction(decisionAt)
+	for name, mutate := range map[string]func(accountPositionSource){
+		"Kalshi lot on a Polymarket account": func(positions accountPositionSource) {
+			lot := positions[testKalshiAccount][0]
+			lot.ExecutionAccountID = testBinding().ExecutionAccountID
+			positions[testBinding().ExecutionAccountID] = append(positions[testBinding().ExecutionAccountID], lot)
+		},
+		"Polymarket lot on a Kalshi account": func(positions accountPositionSource) {
+			lot := positions[testBinding().ExecutionAccountID][0]
+			lot.ExecutionAccountID = testKalshiAccount
+			positions[testKalshiAccount] = append(positions[testKalshiAccount], lot)
+		},
+		"lot of another account": func(positions accountPositionSource) {
+			positions[testBinding().ExecutionAccountID][0].ExecutionAccountID = "someone-else"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			positions := venueAccountPositions(decisionAt, polymarket)
+			mutate(positions)
+			strategy := &matrixStrategy{}
+			service, err := newTestService(Params{
+				PredictionSource: fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket)},
+				PositionSource:   positions,
+				OrderBookSource:  &fakeOrderBookSource{books: polymarketBooks(decisionAt, polymarket)},
+				Strategy:         strategy,
+				Recorder:         &fakeRecorder{},
+				Bindings:         venueAccountBindings(),
+				Venue:            "polymarket-paper",
+				Now:              func() time.Time { return decisionAt.Add(5 * time.Second) },
+			})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			if _, err := service.Run(context.Background(), decisionAt); err == nil {
+				t.Fatal("Run() accepted a lot that does not belong to the account's venue")
+			}
+			if len(strategy.requests) != 0 {
+				t.Fatalf("strategy was called with an inconsistent ledger: %#v", strategy.requests)
+			}
+		})
+	}
+}
+
+func TestNewAllowsAccountsToShareModelAndStrategy(t *testing.T) {
+	service, err := newTestService(Params{
+		PredictionSource: fakePredictionSource{}, PositionSource: accountPositionSource{},
+		OrderBookSource: &fakeOrderBookSource{}, Strategy: &matrixStrategy{}, Recorder: &fakeRecorder{},
+		Bindings: []domain.StrategyExecutionBinding{
+			{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main"},
+			{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "wallet-8"},
+			{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi},
+		},
+		Venue: "polymarket-paper",
+	})
+	if err != nil || service == nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := newTestService(Params{
+		PredictionSource: fakePredictionSource{}, PositionSource: accountPositionSource{},
+		OrderBookSource: &fakeOrderBookSource{}, Strategy: &matrixStrategy{}, Recorder: &fakeRecorder{},
+		Bindings: []domain.StrategyExecutionBinding{
+			{ModelID: "m", StrategyID: "s", ExecutionAccountID: "main", MarketSource: domain.MarketSourceKalshi},
+		},
+		Venue: "polymarket-paper",
+	}); err == nil {
+		t.Fatal("New() accepted a Kalshi binding on a Polymarket account identity")
+	}
+}
+
+// TestPolymarketAccountsRunAndDeliverBeforeKalshiAccounts keeps a slow Kalshi
+// call from delaying Polymarket: "kalshi:main" sorts before "main" by name,
+// but every Polymarket account runs and delivers first.
+func TestPolymarketAccountsRunAndDeliverBeforeKalshiAccounts(t *testing.T) {
+	bindings, err := normalizeBindings([]domain.StrategyExecutionBinding{
+		{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi},
+		{ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+		{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main"},
+		{ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		order = append(order, binding.ExecutionAccountID)
+	}
+	if got := strings.Join(order, ","); got != "main,wallet-6,wallet-7,kalshi:main" {
+		t.Fatalf("binding order = %s", got)
+	}
+	if got := strings.Join(executionAccountIDs(bindings), ","); got != "main,wallet-6,wallet-7,kalshi:main" {
+		t.Fatalf("delivery account order = %s", got)
 	}
 }

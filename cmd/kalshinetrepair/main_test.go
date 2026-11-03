@@ -92,12 +92,16 @@ func TestValidateKalshiAPIURLRestrictsApplyToProduction(t *testing.T) {
 }
 
 func TestSelectBindingRequiresOneCompleteExactAccount(t *testing.T) {
-	encoded := `[{"execution_account_id":"main","api_key_id":"key","private_key_path":"/run/key.pem"}]`
-	selected, err := selectBinding(encoded, "main")
+	encoded := `[{"execution_account_id":"kalshi:main","api_key_id":"key","private_key_path":"/run/key.pem"}]`
+	selected, err := selectBinding(encoded, "kalshi:main")
 	if err != nil || selected.APIKeyID != "key" {
 		t.Fatalf("selected=%#v error=%v", selected, err)
 	}
-	if _, err := selectBinding(encoded, "other"); err == nil {
+	// The wallet name alone is not the Kalshi execution account.
+	if _, err := selectBinding(encoded, "main"); err == nil {
+		t.Fatal("a wallet name must not select a Kalshi credential")
+	}
+	if _, err := selectBinding(encoded, "kalshi:other"); err == nil {
 		t.Fatal("a missing account binding must fail")
 	}
 }

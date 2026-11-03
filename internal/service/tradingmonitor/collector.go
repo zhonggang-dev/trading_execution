@@ -15,12 +15,16 @@ import (
 	pm "github.com/UniPat-AI/trading_execution/internal/service/pipelinemonitor"
 )
 
+// Binding is one execution account. It trades exactly one venue, its
+// MarketSource (empty means Polymarket).
 type Binding struct {
 	domain.StrategyExecutionBinding
-	SubmissionDisabled bool
-	EntryDisabled      bool
-	StrategyDisabled   bool
-	KalshiEnabled      bool
+	EntryDisabled    bool
+	StrategyDisabled bool
+}
+
+func (b Binding) Venue() domain.MarketSource {
+	return normalizedVenue(b.MarketSource)
 }
 
 func (b Binding) Scope() string {
@@ -73,7 +77,7 @@ func (c *Collector) Collect(ctx context.Context, now time.Time) ([]pm.Check, err
 	checks := c.schedule(now)
 	active := make([]Binding, 0, len(p.Bindings))
 	for _, b := range p.Bindings {
-		if b.SubmissionDisabled || b.StrategyDisabled {
+		if b.StrategyDisabled {
 			checks = append(checks, pm.Check{ID: "binding.processing", Scope: b.Scope(), Status: pm.Suppressed, Summary: "路由按配置停用", Details: "不将主动停用的钱包解释为预测或策略故障"})
 			continue
 		}
@@ -157,7 +161,11 @@ func (c *Collector) accountChecks(ctx context.Context, b Binding) []pm.Check {
 		{"account.heartbeat", "交易所心跳就绪", c.params.HeartbeatCheck},
 	} {
 		check := pm.Check{ID: p.id, Scope: "POLYMARKET/" + b.Scope(), Status: pm.Healthy, Summary: p.summary}
-		if p.check == nil {
+		if b.Venue() == domain.MarketSourceKalshi {
+			check.Scope = "KALSHI/" + b.Scope()
+			check.Status = pm.Suppressed
+			check.Summary = "Kalshi 不适用 Polymarket 对账与心跳门禁"
+		} else if p.check == nil {
 			check.Status = pm.Unknown
 			check.Summary = "账户运行时观测不可读"
 		} else if err := p.check(ctx, b.ExecutionAccountID); err != nil {
@@ -216,7 +224,7 @@ func (c *Collector) predictionChecks(snapshot domain.PredictionSnapshot, binding
 			if source == "" {
 				source = domain.MarketSourcePolymarket
 			}
-			if source == domain.MarketSourceKalshi && !b.KalshiEnabled {
+			if source != b.Venue() {
 				continue
 			}
 			if p.EndAt != nil && !p.EndAt.After(now) {
@@ -276,9 +284,9 @@ func (c *Collector) predictionChecks(snapshot domain.PredictionSnapshot, binding
 			if b.EntryDisabled || !c.params.SubmissionEnabled {
 				status = pm.Suppressed
 				summary = "该路由按配置不要求新开仓输入"
-			} else if venue == domain.MarketSourceKalshi && !b.KalshiEnabled {
+			} else if venue != b.Venue() {
 				status = pm.Suppressed
-				summary = "该路由未启用 Kalshi 输入"
+				summary = "该路由不交易此来源"
 			} else if pending > 0 {
 				budget := min(30*time.Minute, c.params.PredictionLookback/4)
 				status = pm.Suppressed

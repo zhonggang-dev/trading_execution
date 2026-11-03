@@ -176,24 +176,24 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 			if err != nil {
 				return domain.AssetReservation{}, fmt.Errorf("lock sell position: %w", err)
 			}
-			var lotToken, lotMarket, lotModel, lotStrategy, lotStatus string
+			var lotToken, lotMarket, lotStatus string
 			var lotRemaining domain.Decimal
 			err = tx.QueryRowContext(ctx, `
-				SELECT lot.token_id, lot.market_id, lot.model_id,
-				       lot.strategy_id, lot.status, lot.remaining_shares::text
+				SELECT lot.token_id, lot.market_id, lot.status, lot.remaining_shares::text
 				FROM position_lots AS lot
 				WHERE lot.lot_id=$1 AND lot.execution_account_id=$2
 				FOR UPDATE OF lot`, order.Intent.TargetLotID, order.Intent.ExecutionAccountID).Scan(
-				&lotToken, &lotMarket, &lotModel, &lotStrategy, &lotStatus, &lotRemaining)
+				&lotToken, &lotMarket, &lotStatus, &lotRemaining)
 			if errors.Is(err, sql.ErrNoRows) {
 				return domain.AssetReservation{}, reject("TARGET_LOT_NOT_FOUND", "the selected position lot does not exist in this execution account")
 			}
 			if err != nil {
 				return domain.AssetReservation{}, fmt.Errorf("lock target position lot: %w", err)
 			}
-			if lotStatus != string(domain.PositionLotOpen) || lotToken != order.Intent.TokenID || lotMarket != order.Intent.MarketID ||
-				lotModel != order.Intent.ModelID || domain.CanonicalStrategyID(lotStrategy) != domain.CanonicalStrategyID(order.Intent.StrategyID) {
-				return domain.AssetReservation{}, reject("TARGET_LOT_IDENTITY_MISMATCH", "the selected lot does not belong to this model, strategy, market, and token")
+			// A lot belongs to its account. The model and strategy that opened it
+			// are audit history: whatever strategy now runs the account manages it.
+			if lotStatus != string(domain.PositionLotOpen) || lotToken != order.Intent.TokenID || lotMarket != order.Intent.MarketID {
+				return domain.AssetReservation{}, reject("TARGET_LOT_IDENTITY_MISMATCH", "the selected lot does not belong to this market and token")
 			}
 			if comparison, compareErr := lotRemaining.Compare(order.Intent.Size); compareErr != nil || comparison < 0 {
 				return domain.AssetReservation{}, reject("TARGET_LOT_INSUFFICIENT_SHARES", "sell size exceeds the selected lot's remaining shares")

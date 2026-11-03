@@ -77,30 +77,21 @@ type LiveOperations struct {
 type DecisionCycle struct {
 	Enabled                bool
 	OrderSubmissionEnabled bool
-	// SubmissionDisabledAccounts keeps a configured binding in the four-wallet
-	// topology while excluding that account from automatic decision processing,
-	// reconciliation, and durable intent delivery.
-	SubmissionDisabledAccounts []string
-	// EntrySubmissionDisabled is an operator-owned sell-only gate. It blocks
-	// BUY intents without blocking validated exits from managed position lots.
+	// EntrySubmissionDisabled is an operator-owned sell-only gate for every
+	// account. It blocks BUY intents without blocking validated exits from
+	// managed position lots. Per-account sell-only is DecisionAccount.Mode.
 	EntrySubmissionDisabled bool
-	// EntryDisabledAccounts applies the same sell-only rule to an exact account
-	// subset while keeping those accounts active for strategy exits and
-	// reconciliation.
-	EntryDisabledAccounts []string
-	// StrategyDisabledAccounts is the narrow operator switch for "do not send
-	// this wallet to the strategy". The listed accounts stay in the topology and
-	// keep reconciliation, auto redeem, the account entry gate, and durable
-	// intent delivery, but the decision cycle neither loads their position lots
-	// nor calls the strategy API for them. Empty means every binding is sent.
-	StrategyDisabledAccounts []string
-	// KalshiStrategyInputEnabled is the venue-level "send Kalshi to the
-	// strategy" switch. When false, the decision cycle drops every Kalshi
-	// prediction from the PIT snapshot and every Kalshi position lot before it
-	// builds strategy requests, so no Kalshi orderbook is captured and the
-	// strategy never receives Kalshi markets. Polymarket input, reconciliation,
-	// and delivery of already persisted intents are unaffected. Default true.
-	KalshiStrategyInputEnabled   bool
+	// PredictionModelID is the one prediction model every account trades on.
+	// It selects the PIT snapshot rows and is also the model_id sent to the
+	// strategy and written on orders and lots. There is no separate internal
+	// model name: lots belong to their account, so changing the model never
+	// strands an open position.
+	PredictionModelID string
+	// PredictionSourceMode fixes the trusted result channel of that model.
+	PredictionSourceMode domain.PredictionSourceMode
+	// Accounts lists every execution account the decision cycle owns, one row
+	// per account. An account trades exactly one venue.
+	Accounts                     []DecisionAccount
 	RequireCompleteModelCoverage bool
 	PredictionInfraBaseURL       string
 	PredictionInfraToken         string
@@ -111,8 +102,6 @@ type DecisionCycle struct {
 	MaxStartLateness             time.Duration
 	Timeout                      time.Duration
 	PredictionLookback           time.Duration
-	Bindings                     []domain.StrategyExecutionBinding
-	PredictionSourceModes        map[string]domain.PredictionSourceMode
 	// DeliveryConcurrency is how many intents of one wallet's batch are submitted
 	// at once. 1 (the default) is strictly sequential. Asset reservation stays
 	// in strategy order at every value.
@@ -221,7 +210,8 @@ type Kalshi struct {
 	APIKeyID          string
 	PrivateKeyPath    string
 	RequestTimeout    time.Duration
-	LiveBindings      []KalshiLiveBinding
+	// LiveAccounts gives each Kalshi execution account its own credential.
+	LiveAccounts []KalshiLiveAccount
 	// SettlementEnabled applies Kalshi's own settlement records to the ledger
 	// of each tradable Kalshi route.
 	SettlementEnabled  bool
@@ -231,19 +221,118 @@ type Kalshi struct {
 	BalanceDriftThreshold domain.Decimal
 }
 
-// KalshiLiveBinding binds one exact strategy route to one isolated Kalshi
-// credential. PrivateKeyPath points at a root-provisioned 0600 secret file;
-// private key material is never accepted inline.
-type KalshiLiveBinding struct {
-	ModelID            string `json:"model_id"`
-	StrategyID         string `json:"strategy_id"`
+// KalshiLiveAccount gives one Kalshi execution account (a DECISION_CYCLE
+// account row with market_source KALSHI) its isolated credential.
+// PrivateKeyPath points at a root-provisioned 0600 secret file; private key
+// material is never accepted inline.
+type KalshiLiveAccount struct {
 	ExecutionAccountID string `json:"execution_account_id"`
 	APIKeyID           string `json:"api_key_id"`
 	PrivateKeyPath     string `json:"private_key_path"`
 }
 
+// DecisionAccountMode is the operator state of one execution account.
+type DecisionAccountMode string
+
+const (
+	// DecisionAccountActive sends the account to the strategy and lets it buy
+	// and sell.
+	DecisionAccountActive DecisionAccountMode = "ACTIVE"
+	// DecisionAccountSellOnly still sends the account to the strategy, but only
+	// its exits are executed; every BUY is blocked.
+	DecisionAccountSellOnly DecisionAccountMode = "SELL_ONLY"
+	// DecisionAccountPaused stops new strategy requests and every BUY. The
+	// account stays reconciled and its already persisted intents still deliver.
+	DecisionAccountPaused DecisionAccountMode = "PAUSED"
+)
+
+// DecisionAccount is one row of DECISION_CYCLE_ACCOUNTS_JSON: which venue the
+// account trades, which strategy runs it, and its operator mode.
+type DecisionAccount struct {
+	ExecutionAccountID string              `json:"execution_account_id"`
+	MarketSource       domain.MarketSource `json:"market_source"`
+	StrategyID         string              `json:"strategy_id"`
+	Mode               DecisionAccountMode `json:"mode"`
+}
+
+// legacyDecisionVariables were replaced by DECISION_CYCLE_PREDICTION_MODEL_ID,
+// DECISION_CYCLE_ACCOUNTS_JSON and KALSHI_LIVE_ACCOUNTS_JSON. Any of them in
+// the environment, even empty, stops startup so a half-converted environment
+// can never run with a silently different account topology.
+var legacyDecisionVariables = []string{
+	"DECISION_CYCLE_BINDINGS_JSON",
+	"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON",
+	"DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON",
+	"DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON",
+	"DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON",
+	"DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED",
+	"KALSHI_LIVE_BINDINGS_JSON",
+}
+
+// Bindings returns one strategy binding per configured account. Prediction
+// and strategy model are the same configured model.
+func (cycle DecisionCycle) Bindings() []domain.StrategyExecutionBinding {
+	bindings := make([]domain.StrategyExecutionBinding, 0, len(cycle.Accounts))
+	modelID := strings.TrimSpace(cycle.PredictionModelID)
+	for _, account := range cycle.Accounts {
+		bindings = append(bindings, domain.StrategyExecutionBinding{
+			PredictionModelID: modelID, ModelID: modelID,
+			StrategyID: account.StrategyID, ExecutionAccountID: account.ExecutionAccountID,
+			MarketSource: account.MarketSource,
+		}.Normalize())
+	}
+	return bindings
+}
+
+// PredictionSourceModes returns the source-mode map of the configured model.
+func (cycle DecisionCycle) PredictionSourceModes() map[string]domain.PredictionSourceMode {
+	return map[string]domain.PredictionSourceMode{
+		strings.TrimSpace(cycle.PredictionModelID): cycle.PredictionSourceMode,
+	}
+}
+
+// EntryDisabledAccounts returns the accounts that may not buy: SELL_ONLY and
+// PAUSED.
+func (cycle DecisionCycle) EntryDisabledAccounts() []string {
+	return cycle.accountsInModes(DecisionAccountSellOnly, DecisionAccountPaused)
+}
+
+// StrategyDisabledAccounts returns the accounts that are not sent to the
+// strategy: PAUSED.
+func (cycle DecisionCycle) StrategyDisabledAccounts() []string {
+	return cycle.accountsInModes(DecisionAccountPaused)
+}
+
+// AccountsForSource returns the configured accounts of one venue, in
+// configuration order.
+func (cycle DecisionCycle) AccountsForSource(source domain.MarketSource) []DecisionAccount {
+	result := make([]DecisionAccount, 0, len(cycle.Accounts))
+	for _, account := range cycle.Accounts {
+		if account.MarketSource.Normalize() == source.Normalize() {
+			result = append(result, account)
+		}
+	}
+	return result
+}
+
+func (cycle DecisionCycle) accountsInModes(modes ...DecisionAccountMode) []string {
+	result := make([]string, 0)
+	for _, account := range cycle.Accounts {
+		for _, mode := range modes {
+			if account.Mode == mode {
+				result = append(result, account.ExecutionAccountID)
+				break
+			}
+		}
+	}
+	return result
+}
+
 // Load 从环境变量加载并校验服务配置。
 func Load() (Config, error) {
+	if err := rejectLegacyDecisionVariables(); err != nil {
+		return Config{}, err
+	}
 	executionMode := strings.ToLower(env("EXECUTION_MODE", "paper"))
 	logLevel, err := parseLogLevel(env("LOG_LEVEL", "info"))
 	if err != nil {
@@ -342,7 +431,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	kalshiLiveBindings, err := decodeKalshiLiveBindings(os.Getenv("KALSHI_LIVE_BINDINGS_JSON"))
+	kalshiLiveAccounts, err := decodeKalshiLiveAccounts(os.Getenv("KALSHI_LIVE_ACCOUNTS_JSON"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -595,7 +684,7 @@ func Load() (Config, error) {
 			APIKeyID:          strings.TrimSpace(os.Getenv("KALSHI_API_KEY_ID")),
 			PrivateKeyPath:    strings.TrimSpace(os.Getenv("KALSHI_PRIVATE_KEY_PATH")),
 			RequestTimeout:    kalshiRequestTimeout,
-			LiveBindings:      kalshiLiveBindings,
+			LiveAccounts:      kalshiLiveAccounts,
 
 			SettlementEnabled:     kalshiSettlementEnabled,
 			SettlementInterval:    kalshiSettlementInterval,
@@ -799,48 +888,13 @@ func (config Config) Validate() error {
 				config.DecisionCycle.StrategyToken == config.HTTP.JobToken)) {
 			return fmt.Errorf("decision-cycle tokens must be distinct from each other and existing service tokens")
 		}
-		if err := validateDecisionBindings(config.DecisionCycle.Bindings); err != nil {
-			return err
-		}
-		if err := validateFourWalletSubmissionTopology(config.DecisionCycle.Bindings); err != nil {
-			return err
-		}
-		if err := validateDecisionSubmissionDisabledAccounts(
-			config.DecisionCycle.Bindings,
-			config.DecisionCycle.SubmissionDisabledAccounts,
-		); err != nil {
-			return err
-		}
-		if err := validateDecisionSubmissionDisabledAccounts(
-			config.DecisionCycle.Bindings,
-			config.DecisionCycle.EntryDisabledAccounts,
-		); err != nil {
-			return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON: %w", err)
-		}
-		if err := validateDecisionStrategyDisabledAccounts(
-			config.DecisionCycle.Bindings,
-			config.DecisionCycle.StrategyDisabledAccounts,
-		); err != nil {
-			return err
-		}
-		if err := validateDecisionPredictionSourceModes(
-			config.DecisionCycle.Bindings,
-			config.DecisionCycle.PredictionSourceModes,
-		); err != nil {
-			return err
-		}
 	}
-	if config.Execution.Mode == "live" {
-		// These release pins protect the live execution API independently of the
-		// scheduler. Disabling the decision cycle must never remove the
-		// account-scoped BUY gate from direct Submit/Resume paths.
-		if err := validateCurrentWallet67Quarantine(config.DecisionCycle.SubmissionDisabledAccounts); err != nil {
-			return err
-		}
-		if config.DecisionCycle.EntrySubmissionDisabled {
-			return fmt.Errorf("this release requires DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED=false and uses the exact account entry gate")
-		}
-		if err := validateCurrentWallet67EntryDisabledAccounts(config.DecisionCycle.EntryDisabledAccounts); err != nil {
+	// Live startup derives account authorization, the wallet-file account set
+	// and the Kalshi routes from the account rows, so live mode needs them even
+	// while the decision cycle itself is disabled.
+	if config.Execution.Mode == "live" || config.DecisionCycle.Enabled ||
+		len(config.DecisionCycle.Accounts) > 0 || len(config.Kalshi.LiveAccounts) > 0 {
+		if err := validateDecisionAccounts(config.DecisionCycle, config.Kalshi.LiveAccounts); err != nil {
 			return err
 		}
 	}
@@ -864,10 +918,6 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
-	kalshiStrategyInputEnabled, err := boolean("DECISION_CYCLE_KALSHI_STRATEGY_INPUT_ENABLED", true)
-	if err != nil {
-		return DecisionCycle{}, err
-	}
 	interval, err := duration("DECISION_CYCLE_INTERVAL", 10*time.Minute)
 	if err != nil {
 		return DecisionCycle{}, err
@@ -888,40 +938,18 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
-	bindings, err := decodeDecisionBindings(os.Getenv("DECISION_CYCLE_BINDINGS_JSON"))
+	accounts, err := decodeDecisionAccounts(os.Getenv("DECISION_CYCLE_ACCOUNTS_JSON"))
 	if err != nil {
 		return DecisionCycle{}, err
 	}
-	predictionSourceModes, err := decodeDecisionPredictionSourceModes(
-		os.Getenv("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON"),
+	predictionSourceMode := domain.PredictionSourceMode(
+		strings.ToUpper(env("DECISION_CYCLE_PREDICTION_SOURCE_MODE", string(domain.PredictionSourceModeSandbox))),
 	)
-	if err != nil {
-		return DecisionCycle{}, err
-	}
-	submissionDisabledAccounts, err := decodeDecisionSubmissionDisabledAccounts(
-		os.Getenv("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON"),
-	)
-	if err != nil {
-		return DecisionCycle{}, err
-	}
-	entryDisabledAccounts, err := decodeDecisionEntryDisabledAccounts(
-		os.Getenv("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON"),
-	)
-	if err != nil {
-		return DecisionCycle{}, err
-	}
-	strategyDisabledAccounts, err := decodeDecisionAccountList(
-		"DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON",
-		os.Getenv("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON"),
-	)
-	if err != nil {
-		return DecisionCycle{}, err
-	}
 	deliveryConcurrency, err := integer("DECISION_CYCLE_DELIVERY_CONCURRENCY", 1, 1, 8)
 	if err != nil {
 		return DecisionCycle{}, err
 	}
-	orderReportStrategyIDs, err := decodeDecisionAccountList(
+	orderReportStrategyIDs, err := decodeStringList(
 		"DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON",
 		os.Getenv("DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON"),
 	)
@@ -934,11 +962,10 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	}
 	return DecisionCycle{
 		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
-		SubmissionDisabledAccounts:   submissionDisabledAccounts,
 		EntrySubmissionDisabled:      entrySubmissionDisabled,
-		EntryDisabledAccounts:        entryDisabledAccounts,
-		StrategyDisabledAccounts:     strategyDisabledAccounts,
-		KalshiStrategyInputEnabled:   kalshiStrategyInputEnabled,
+		PredictionModelID:            strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_MODEL_ID")),
+		PredictionSourceMode:         predictionSourceMode,
+		Accounts:                     accounts,
 		RequireCompleteModelCoverage: requireCompleteModelCoverage,
 		PredictionInfraBaseURL:       strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_URL")),
 		PredictionInfraToken:         strings.TrimSpace(os.Getenv("DECISION_CYCLE_PREDICTION_INFRA_TOKEN")),
@@ -946,360 +973,185 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		StrategyToken:                strings.TrimSpace(os.Getenv("DECISION_CYCLE_STRATEGY_TOKEN")),
 		Interval:                     interval, StartupDelay: startupDelay,
 		MaxStartLateness: maxStartLateness, Timeout: timeout,
-		PredictionLookback: predictionLookback,
-		Bindings:           bindings, PredictionSourceModes: predictionSourceModes,
+		PredictionLookback:     predictionLookback,
 		DeliveryConcurrency:    deliveryConcurrency,
 		OrderReportStrategyIDs: orderReportStrategyIDs,
 		OrderReportLookback:    orderReportLookback,
 	}, nil
 }
 
-func decodeDecisionEntryDisabledAccounts(value string) ([]string, error) {
-	return decodeDecisionAccountList("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON", value)
+// rejectLegacyDecisionVariables stops startup while any replaced variable is
+// still present in the environment.
+func rejectLegacyDecisionVariables() error {
+	present := make([]string, 0)
+	for _, name := range legacyDecisionVariables {
+		if _, exists := os.LookupEnv(name); exists {
+			present = append(present, name)
+		}
+	}
+	if len(present) > 0 {
+		return fmt.Errorf(
+			"replaced decision-cycle variables are still set: %s; configure DECISION_CYCLE_PREDICTION_MODEL_ID, "+
+				"DECISION_CYCLE_ACCOUNTS_JSON and KALSHI_LIVE_ACCOUNTS_JSON instead and remove these lines",
+			strings.Join(present, ", "),
+		)
+	}
+	return nil
 }
 
-// decodeDecisionAccountList parses one DECISION_CYCLE_*_ACCOUNTS_JSON variable:
-// an empty value means no accounts, otherwise exactly one JSON string array.
-func decodeDecisionAccountList(name, value string) ([]string, error) {
+// decodeStringList parses one JSON string-array variable: an empty value
+// means an empty list, otherwise exactly one JSON array of trimmed strings.
+func decodeStringList(name, value string) ([]string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return nil, nil
 	}
 	decoder := json.NewDecoder(strings.NewReader(value))
 	decoder.DisallowUnknownFields()
-	var accounts []string
-	if err := decoder.Decode(&accounts); err != nil {
+	var items []string
+	if err := decoder.Decode(&items); err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return nil, fmt.Errorf("%s must contain exactly one JSON array", name)
 	}
-	for index := range accounts {
-		accounts[index] = strings.TrimSpace(accounts[index])
+	for index := range items {
+		items[index] = strings.TrimSpace(items[index])
 	}
-	return accounts, nil
+	return items, nil
 }
 
-func decodeKalshiLiveBindings(value string) ([]KalshiLiveBinding, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil, nil
-	}
-	var bindings []KalshiLiveBinding
-	if err := json.Unmarshal([]byte(value), &bindings); err != nil {
-		return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON must be a JSON array: %w", err)
-	}
-	seenRoutes := make(map[string]struct{}, len(bindings))
-	seenKeys := make(map[string]struct{}, len(bindings))
-	for index := range bindings {
-		binding := &bindings[index]
-		binding.ModelID = strings.TrimSpace(binding.ModelID)
-		binding.StrategyID = domain.CanonicalStrategyID(binding.StrategyID)
-		binding.ExecutionAccountID = strings.TrimSpace(binding.ExecutionAccountID)
-		binding.APIKeyID = strings.TrimSpace(binding.APIKeyID)
-		binding.PrivateKeyPath = strings.TrimSpace(binding.PrivateKeyPath)
-		if binding.ModelID == "" || binding.StrategyID == "" || binding.ExecutionAccountID == "" ||
-			binding.APIKeyID == "" || binding.PrivateKeyPath == "" {
-			return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON binding %d is incomplete", index)
-		}
-		if !filepath.IsAbs(binding.PrivateKeyPath) {
-			return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON binding %d private_key_path must be absolute", index)
-		}
-		route := binding.ModelID + "\x00" + binding.StrategyID + "\x00" + binding.ExecutionAccountID
-		if _, duplicate := seenRoutes[route]; duplicate {
-			return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON repeats a strategy route")
-		}
-		seenRoutes[route] = struct{}{}
-		if _, duplicate := seenKeys[binding.APIKeyID]; duplicate {
-			return nil, fmt.Errorf("KALSHI_LIVE_BINDINGS_JSON reuses one API key across bindings")
-		}
-		seenKeys[binding.APIKeyID] = struct{}{}
-	}
-	return bindings, nil
-}
-
-func decodeDecisionPredictionSourceModes(value string) (map[string]domain.PredictionSourceMode, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil, nil
-	}
-	decoder := json.NewDecoder(strings.NewReader(value))
-	opening, err := decoder.Token()
-	if err != nil {
-		return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON: %w", err)
-	}
-	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
-		return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON must be a JSON object")
-	}
-	modes := make(map[string]domain.PredictionSourceMode)
-	for decoder.More() {
-		keyToken, tokenErr := decoder.Token()
-		if tokenErr != nil {
-			return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON: %w", tokenErr)
-		}
-		predictionModelID, ok := keyToken.(string)
-		if !ok {
-			return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON keys must be strings")
-		}
-		if _, duplicate := modes[predictionModelID]; duplicate {
-			return nil, fmt.Errorf(
-				"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON contains duplicate prediction model %q",
-				predictionModelID,
-			)
-		}
-		var mode domain.PredictionSourceMode
-		if decodeErr := decoder.Decode(&mode); decodeErr != nil {
-			return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON: %w", decodeErr)
-		}
-		modes[predictionModelID] = mode
-	}
-	if _, err := decoder.Token(); err != nil {
-		return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return nil, fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON must contain exactly one JSON object")
-	}
-	return modes, nil
-}
-
-func decodeDecisionSubmissionDisabledAccounts(value string) ([]string, error) {
-	return decodeDecisionAccountList("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON", value)
-}
-
-func decodeDecisionBindings(value string) ([]domain.StrategyExecutionBinding, error) {
+// decodeDecisionAccounts parses DECISION_CYCLE_ACCOUNTS_JSON. Empty means no
+// accounts; otherwise it must be exactly one JSON array of account rows.
+func decodeDecisionAccounts(value string) ([]DecisionAccount, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return nil, nil
 	}
 	decoder := json.NewDecoder(strings.NewReader(value))
 	decoder.DisallowUnknownFields()
-	var bindings []domain.StrategyExecutionBinding
-	if err := decoder.Decode(&bindings); err != nil {
-		return nil, fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON: %w", err)
+	var accounts []DecisionAccount
+	if err := decoder.Decode(&accounts); err != nil {
+		return nil, fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON: %w", err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return nil, fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON must contain exactly one JSON array")
+		return nil, fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON must contain exactly one JSON array")
 	}
-	return bindings, nil
+	for index := range accounts {
+		account := &accounts[index]
+		account.ExecutionAccountID = strings.TrimSpace(account.ExecutionAccountID)
+		account.MarketSource = domain.MarketSource(strings.ToUpper(strings.TrimSpace(string(account.MarketSource))))
+		account.StrategyID = domain.CanonicalStrategyID(account.StrategyID)
+		account.Mode = DecisionAccountMode(strings.ToUpper(strings.TrimSpace(string(account.Mode))))
+	}
+	return accounts, nil
 }
 
-func validateDecisionBindings(bindings []domain.StrategyExecutionBinding) error {
-	if len(bindings) == 0 {
-		return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON must contain at least one binding")
+// decodeKalshiLiveAccounts parses KALSHI_LIVE_ACCOUNTS_JSON.
+func decodeKalshiLiveAccounts(value string) ([]KalshiLiveAccount, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
 	}
-	modelStrategies := make(map[string]struct{}, len(bindings))
-	accounts := make(map[string]struct{}, len(bindings))
-	logicalModelSources := make(map[string]string, len(bindings))
-	sourceModelTargets := make(map[string]string, len(bindings))
-	for index, binding := range bindings {
-		binding = binding.Normalize()
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+	var accounts []KalshiLiveAccount
+	if err := decoder.Decode(&accounts); err != nil {
+		return nil, fmt.Errorf("KALSHI_LIVE_ACCOUNTS_JSON must be a JSON array: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("KALSHI_LIVE_ACCOUNTS_JSON must contain exactly one JSON array")
+	}
+	seenAccounts := make(map[string]struct{}, len(accounts))
+	seenKeys := make(map[string]struct{}, len(accounts))
+	for index := range accounts {
+		account := &accounts[index]
+		account.ExecutionAccountID = strings.TrimSpace(account.ExecutionAccountID)
+		account.APIKeyID = strings.TrimSpace(account.APIKeyID)
+		account.PrivateKeyPath = strings.TrimSpace(account.PrivateKeyPath)
+		if account.ExecutionAccountID == "" || account.APIKeyID == "" || account.PrivateKeyPath == "" {
+			return nil, fmt.Errorf("KALSHI_LIVE_ACCOUNTS_JSON account %d is incomplete", index)
+		}
+		if !domain.IsKalshiExecutionAccount(account.ExecutionAccountID) {
+			return nil, fmt.Errorf("KALSHI_LIVE_ACCOUNTS_JSON account %q must start with %q",
+				account.ExecutionAccountID, domain.KalshiExecutionAccountPrefix)
+		}
+		if !filepath.IsAbs(account.PrivateKeyPath) {
+			return nil, fmt.Errorf("KALSHI_LIVE_ACCOUNTS_JSON account %q private_key_path must be absolute", account.ExecutionAccountID)
+		}
+		if _, duplicate := seenAccounts[account.ExecutionAccountID]; duplicate {
+			return nil, fmt.Errorf("KALSHI_LIVE_ACCOUNTS_JSON repeats account %q", account.ExecutionAccountID)
+		}
+		seenAccounts[account.ExecutionAccountID] = struct{}{}
+		if _, duplicate := seenKeys[account.APIKeyID]; duplicate {
+			return nil, fmt.Errorf("KALSHI_LIVE_ACCOUNTS_JSON reuses one API key across accounts")
+		}
+		seenKeys[account.APIKeyID] = struct{}{}
+	}
+	return accounts, nil
+}
+
+// validateDecisionAccounts checks the model and account rows. Every account is
+// independent: there is no fixed account set, model whitelist or per-account
+// strategy pin. A Kalshi account needs exactly one live credential.
+func validateDecisionAccounts(cycle DecisionCycle, kalshiAccounts []KalshiLiveAccount) error {
+	modelID := strings.TrimSpace(cycle.PredictionModelID)
+	if modelID == "" || len(modelID) > 200 {
+		return fmt.Errorf("DECISION_CYCLE_PREDICTION_MODEL_ID must contain 1-200 bytes")
+	}
+	if !cycle.PredictionSourceMode.Valid() {
+		return fmt.Errorf("DECISION_CYCLE_PREDICTION_SOURCE_MODE must be exactly DIRECT or SANDBOX")
+	}
+	if len(cycle.Accounts) == 0 {
+		return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON must contain at least one account")
+	}
+	seen := make(map[string]struct{}, len(cycle.Accounts))
+	kalshi := make(map[string]struct{})
+	notPaused := 0
+	for index, account := range cycle.Accounts {
+		if account.ExecutionAccountID == "" {
+			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON account %d execution_account_id is required", index)
+		}
+		if _, duplicate := seen[account.ExecutionAccountID]; duplicate {
+			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON repeats account %q", account.ExecutionAccountID)
+		}
+		seen[account.ExecutionAccountID] = struct{}{}
+		switch account.MarketSource {
+		case domain.MarketSourcePolymarket, domain.MarketSourceKalshi:
+		default:
+			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON account %q market_source must be POLYMARKET or KALSHI", account.ExecutionAccountID)
+		}
+		if account.MarketSource == domain.MarketSourceKalshi {
+			kalshi[account.ExecutionAccountID] = struct{}{}
+		}
+		switch account.Mode {
+		case DecisionAccountActive, DecisionAccountSellOnly:
+			notPaused++
+		case DecisionAccountPaused:
+		default:
+			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON account %q mode must be ACTIVE, SELL_ONLY or PAUSED", account.ExecutionAccountID)
+		}
+		binding := domain.StrategyExecutionBinding{
+			PredictionModelID: modelID, ModelID: modelID, StrategyID: account.StrategyID,
+			ExecutionAccountID: account.ExecutionAccountID, MarketSource: account.MarketSource,
+		}
 		if err := binding.Validate(); err != nil {
-			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON binding %d: %w", index, err)
-		}
-		pair := binding.ModelID + "\x00" + binding.StrategyID
-		if _, exists := modelStrategies[pair]; exists {
-			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON contains duplicate model/strategy binding")
-		}
-		if _, exists := accounts[binding.ExecutionAccountID]; exists {
-			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON contains duplicate execution account")
-		}
-		if sourceModelID, exists := logicalModelSources[binding.ModelID]; exists && sourceModelID != binding.PredictionModelID {
-			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON maps logical model %q to multiple prediction models", binding.ModelID)
-		}
-		if logicalModelID, exists := sourceModelTargets[binding.PredictionModelID]; exists && logicalModelID != binding.ModelID {
-			return fmt.Errorf("DECISION_CYCLE_BINDINGS_JSON maps prediction model %q to multiple logical models", binding.PredictionModelID)
-		}
-		modelStrategies[pair] = struct{}{}
-		accounts[binding.ExecutionAccountID] = struct{}{}
-		logicalModelSources[binding.ModelID] = binding.PredictionModelID
-		sourceModelTargets[binding.PredictionModelID] = binding.ModelID
-		bindings[index] = binding
-	}
-	return nil
-}
-
-func validateDecisionPredictionSourceModes(
-	bindings []domain.StrategyExecutionBinding,
-	modes map[string]domain.PredictionSourceMode,
-) error {
-	expected := make(map[string]string, len(bindings))
-	for _, rawBinding := range bindings {
-		binding := rawBinding.Normalize()
-		expected[binding.PredictionModelID] = binding.ModelID
-	}
-	for predictionModelID, logicalModelID := range expected {
-		mode, exists := modes[predictionModelID]
-		if !exists {
-			return fmt.Errorf(
-				"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON is missing configured prediction model %q",
-				predictionModelID,
-			)
-		}
-		if !mode.Valid() {
-			return fmt.Errorf(
-				"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON model %q must be exactly DIRECT or SANDBOX",
-				predictionModelID,
-			)
-		}
-		switch logicalModelID {
-		case "gemini_masked", "qwen_masked", "deepseek_masked":
-			if mode != domain.PredictionSourceModeSandbox {
-				return fmt.Errorf("this release requires logical model %s to use SANDBOX prediction source mode", logicalModelID)
-			}
+			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON account %q: %w", account.ExecutionAccountID, err)
 		}
 	}
-	for predictionModelID := range modes {
-		if _, exists := expected[predictionModelID]; !exists {
-			return fmt.Errorf(
-				"DECISION_CYCLE_PREDICTION_SOURCE_MODES_JSON contains unconfigured prediction model %q",
-				predictionModelID,
-			)
+	if notPaused == 0 {
+		return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON cannot pause every account")
+	}
+	credentialed := make(map[string]struct{}, len(kalshiAccounts))
+	for _, account := range kalshiAccounts {
+		if _, exists := kalshi[account.ExecutionAccountID]; !exists {
+			return fmt.Errorf("KALSHI_LIVE_ACCOUNTS_JSON account %q is not a KALSHI account in DECISION_CYCLE_ACCOUNTS_JSON", account.ExecutionAccountID)
 		}
+		credentialed[account.ExecutionAccountID] = struct{}{}
 	}
-	return nil
-}
-
-func validateDecisionSubmissionDisabledAccounts(
-	bindings []domain.StrategyExecutionBinding,
-	accounts []string,
-) error {
-	bound := make(map[string]struct{}, len(bindings))
-	for _, binding := range bindings {
-		bound[binding.Normalize().ExecutionAccountID] = struct{}{}
-	}
-	seen := make(map[string]struct{}, len(accounts))
-	for index, accountID := range accounts {
-		accountID = strings.TrimSpace(accountID)
-		if accountID == "" {
-			return fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON account %d is empty", index)
-		}
-		if _, duplicate := seen[accountID]; duplicate {
-			return fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON contains duplicate account %q", accountID)
-		}
-		if _, exists := bound[accountID]; !exists {
-			return fmt.Errorf("DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON account %q is not a configured binding", accountID)
-		}
-		seen[accountID] = struct{}{}
-	}
-	return nil
-}
-
-// validateDecisionStrategyDisabledAccounts accepts any subset of the bound
-// accounts except the full set: a cycle that sends no binding to the strategy
-// is a misconfiguration, not a switch position.
-func validateDecisionStrategyDisabledAccounts(
-	bindings []domain.StrategyExecutionBinding,
-	accounts []string,
-) error {
-	bound := make(map[string]struct{}, len(bindings))
-	for _, binding := range bindings {
-		bound[binding.Normalize().ExecutionAccountID] = struct{}{}
-	}
-	seen := make(map[string]struct{}, len(accounts))
-	for index, accountID := range accounts {
-		accountID = strings.TrimSpace(accountID)
-		if accountID == "" {
-			return fmt.Errorf("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON account %d is empty", index)
-		}
-		if _, duplicate := seen[accountID]; duplicate {
-			return fmt.Errorf("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON contains duplicate account %q", accountID)
-		}
-		if _, exists := bound[accountID]; !exists {
-			return fmt.Errorf("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON account %q is not a configured binding", accountID)
-		}
-		seen[accountID] = struct{}{}
-	}
-	if len(bound) > 0 && len(seen) >= len(bound) {
-		return fmt.Errorf("DECISION_CYCLE_STRATEGY_DISABLED_ACCOUNTS_JSON cannot disable the strategy for every configured binding")
-	}
-	return nil
-}
-
-// validateCurrentWallet67Quarantine pins this shadow release to all four
-// active accounts. Account-level BUY gating preserves main/wallet-1 exits and
-// reconciliation without using the broader quarantine mechanism.
-func validateCurrentWallet67Quarantine(accounts []string) error {
-	if len(accounts) != 0 {
-		return fmt.Errorf("this release requires DECISION_CYCLE_SUBMISSION_DISABLED_ACCOUNTS_JSON=[]")
-	}
-	return nil
-}
-
-// validateCurrentWallet67EntryDisabledAccounts allows only main/wallet-1 in the
-// account BUY gate (any subset, including empty). wallet-6/wallet-7 can never
-// be gated off by this list. Gated accounts stay active for exits and
-// reconciliation but cannot create a new BUY.
-func validateCurrentWallet67EntryDisabledAccounts(accounts []string) error {
-	seen := make(map[string]struct{}, len(accounts))
-	for _, raw := range accounts {
-		accountID := strings.TrimSpace(raw)
-		if accountID != "main" && accountID != "wallet-1" {
-			return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON may contain only main and wallet-1")
-		}
-		if _, duplicate := seen[accountID]; duplicate {
-			return fmt.Errorf("DECISION_CYCLE_ENTRY_DISABLED_ACCOUNTS_JSON contains duplicate account %q", accountID)
-		}
-		seen[accountID] = struct{}{}
-	}
-	return nil
-}
-
-// validateFourWalletSubmissionTopology prevents a legacy one-binding canary
-// from becoming production merely by enabling the two generic cycle gates.
-// Changing the live topology is a deliberate code/config contract change.
-func validateFourWalletSubmissionTopology(bindings []domain.StrategyExecutionBinding) error {
-	if len(bindings) != 4 {
-		return fmt.Errorf("live decision submission requires exactly 4 bindings: main, wallet-1, wallet-6, wallet-7")
-	}
-	// wallet-6/wallet-7 keep their fixed strategies. main/wallet-1 take the
-	// strategy identifiers from this configuration (any safe, distinct ID);
-	// they may not claim a fixed one.
-	fixedStrategies := map[string]string{
-		"wallet-6": domain.StrategyIDMultfactorV1,
-		"wallet-7": domain.StrategyIDMultfactorV2,
-	}
-	routes := make(map[string]domain.StrategyExecutionBinding, len(bindings))
-	predictionModels := make(map[string]struct{}, 1)
-	maskedModelID := ""
-	for _, rawBinding := range bindings {
-		binding := rawBinding.Normalize()
-		if _, duplicate := routes[binding.ExecutionAccountID]; duplicate {
-			return fmt.Errorf("live decision submission contains duplicate execution account %q", binding.ExecutionAccountID)
-		}
-		routes[binding.ExecutionAccountID] = binding
-		predictionModels[binding.PredictionModelID] = struct{}{}
-		if maskedModelID == "" {
-			maskedModelID = binding.ModelID
-		} else if maskedModelID != binding.ModelID {
-			return fmt.Errorf("live decision submission requires one logical model for all four wallets")
-		}
-	}
-	if maskedModelID != "gemini_masked" && maskedModelID != "qwen_masked" && maskedModelID != "deepseek_masked" {
-		return fmt.Errorf("live decision submission requires a supported masked model route")
-	}
-	if len(predictionModels) != 1 {
-		return fmt.Errorf("live decision submission requires one prediction model for all four wallets")
-	}
-	for _, accountID := range []string{"main", "wallet-1", "wallet-6", "wallet-7"} {
-		if _, exists := routes[accountID]; !exists {
-			return fmt.Errorf("live decision submission requires execution accounts main, wallet-1, wallet-6, and wallet-7")
-		}
-	}
-	for accountID, strategyID := range fixedStrategies {
-		if routes[accountID].StrategyID != strategyID {
-			return fmt.Errorf("live decision submission route for %q must use strategy %q", accountID, strategyID)
-		}
-	}
-	mainStrategy, wallet1Strategy := routes["main"].StrategyID, routes["wallet-1"].StrategyID
-	if mainStrategy == wallet1Strategy {
-		return fmt.Errorf("main and wallet-1 must use distinct strategy IDs")
-	}
-	for accountID, strategyID := range map[string]string{"main": mainStrategy, "wallet-1": wallet1Strategy} {
-		if strategyID == domain.StrategyIDMultfactorV1 || strategyID == domain.StrategyIDMultfactorV2 {
-			return fmt.Errorf("%s cannot reuse the wallet-6/wallet-7 strategy %q", accountID, strategyID)
-		}
-		if err := domain.ValidateStrategyID(strategyID); err != nil {
-			return fmt.Errorf("%s: %w", accountID, err)
+	for accountID := range kalshi {
+		if _, exists := credentialed[accountID]; !exists {
+			return fmt.Errorf("KALSHI account %q has no credential in KALSHI_LIVE_ACCOUNTS_JSON", accountID)
 		}
 	}
 	return nil
