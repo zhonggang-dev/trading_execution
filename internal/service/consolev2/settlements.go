@@ -12,6 +12,10 @@ import (
 type ManagedAccount struct {
 	ExecutionAccountID string `json:"execution_account_id"`
 	MarketSource       string `json:"market_source"`
+	StrategyID         string `json:"strategy_id,omitempty"`
+	Mode               string `json:"mode,omitempty"`
+	PredictionModelID  string `json:"prediction_model_id,omitempty"`
+	SourceMode         string `json:"source_mode,omitempty"`
 }
 
 type AccountDirectory struct {
@@ -48,6 +52,23 @@ func (reader *Reader) Accounts(ctx context.Context) (AccountDirectory, error) {
 			return AccountDirectory{}, dbUnavailable("registered account", err)
 		}
 		if exists {
+			bindingFound := false
+			for _, binding := range reader.config.Bindings {
+				if binding.ExecutionAccountID != account.ExecutionAccountID {
+					continue
+				}
+				if bindingFound || (binding.MarketSource != "" && binding.MarketSource != account.MarketSource) {
+					return AccountDirectory{}, ErrUnavailable
+				}
+				if binding.Mode != "" && binding.Mode != "ACTIVE" && binding.Mode != "SELL_ONLY" && binding.Mode != "PAUSED" {
+					return AccountDirectory{}, ErrUnavailable
+				}
+				if binding.SourceMode != "" && binding.SourceMode != "SANDBOX" && binding.SourceMode != "DIRECT" {
+					return AccountDirectory{}, ErrUnavailable
+				}
+				bindingFound = true
+				account.StrategyID, account.Mode, account.PredictionModelID, account.SourceMode = binding.StrategyID, binding.Mode, binding.PredictionModelID, binding.SourceMode
+			}
 			accounts = append(accounts, account)
 		}
 	}
