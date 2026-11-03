@@ -27,10 +27,10 @@ func TestPortfolioHoldingsHistoryBudgetAndPoolCancellation(t *testing.T) {
 	defer cancel()
 	for _, statement := range []string{
 		`CREATE TEMP TABLE execution_orders(order_id text,execution_account_id text,market_id text,token_id text,intent jsonb,venue text)`,
-		`CREATE TEMP TABLE position_lots(lot_id text,execution_account_id text,market_id text,condition_id text,token_id text,model_id text,strategy_id text,opening_order_id text,opening_fill_key text,outcome_index integer,outcome_name text,status text,remaining_shares numeric,remaining_cost numeric,original_shares numeric,original_cost numeric,average_entry_price numeric,opened_at timestamptz,closed_at timestamptz)`,
+		`CREATE TEMP TABLE position_lots(lot_id text,execution_account_id text,market_id text,condition_id text,token_id text,model_id text,strategy_id text,opening_order_id text,opening_fill_key text,external_adoption_id text,outcome_index integer,outcome_name text,status text,remaining_shares numeric,remaining_cost numeric,original_shares numeric,original_cost numeric,average_entry_price numeric,opened_at timestamptz,closed_at timestamptz)`,
 		`INSERT INTO execution_orders VALUES('budget-order','budget-account','budget-market','budget-token','{"market_source":"POLYMARKET","condition_id":"budget-condition","metadata":{"market_question":"Budget question"}}','polymarket')`,
-		`INSERT INTO position_lots SELECT 'closed-'||n,'budget-account','budget-market','budget-condition','budget-token','old-model','old-strategy','budget-order','closed-fill-'||n,0,'Yes','CLOSED',0,0,1,0.5,0.5,now()-interval '400 days',now() FROM generate_series(1,100000) n`,
-		`INSERT INTO position_lots SELECT 'open-'||n,'budget-account','budget-market','budget-condition','budget-token','model-'||n,'strategy-'||n,'budget-order','open-fill-'||n,0,'Yes','OPEN',1,0.5,1,0.5,0.5,now(),null FROM generate_series(1,2) n`,
+		`INSERT INTO position_lots SELECT 'closed-'||n,'budget-account','budget-market','budget-condition','budget-token','old-model','old-strategy','budget-order','closed-fill-'||n,null,0,'Yes','CLOSED',0,0,1,0.5,0.5,now()-interval '400 days',now() FROM generate_series(1,100000) n`,
+		`INSERT INTO position_lots SELECT 'open-'||n,'budget-account','budget-market','budget-condition','budget-token','model-'||n,'strategy-'||n,'budget-order','open-fill-'||n,null,0,'Yes','OPEN',1,0.5,1,0.5,0.5,now(),null FROM generate_series(1,2) n`,
 	} {
 		if _, err := db.ExecContext(setup, statement); err != nil {
 			t.Fatal(err)

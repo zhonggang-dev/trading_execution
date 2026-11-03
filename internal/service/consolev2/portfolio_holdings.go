@@ -40,14 +40,23 @@ type PortfolioHoldingIdentity struct {
 
 // A frozen opening order is preferred to current routing. Legacy PM orders
 // omit market_source, so their venue is valid evidence. Only when both are
-// absent may the process-validated account directory supply the platform.
-// Contradictory evidence remains NULL and causes a safe unavailable response.
+// absent may a sealed, exact external-adoption baseline or the process-validated
+// account directory supply the platform. Contradictory evidence remains NULL
+// and causes a safe unavailable response.
 const portfolioSourceExpression = `CASE
  WHEN NULLIF(UPPER(open.intent->>'market_source'),'') IS NOT NULL
       AND UPPER(open.intent->>'market_source') NOT IN ('POLYMARKET','KALSHI') THEN NULL
  WHEN UPPER(open.intent->>'market_source') IN ('POLYMARKET','KALSHI')
       AND UPPER(open.venue) IN ('POLYMARKET','KALSHI')
       AND UPPER(open.intent->>'market_source') <> UPPER(open.venue) THEN NULL
+ WHEN l.external_adoption_id IS NOT NULL THEN
+   CASE WHEN l.opening_order_id IS NULL AND l.opening_fill_key IS NULL
+     AND adoption.lot_id IS NOT NULL AND baseline.source='POLYMARKET_DATA_API'
+     AND baseline_item.token_id IS NOT NULL
+     AND (configured.market_source IS NULL OR configured.market_source='POLYMARKET')
+     AND COALESCE(NULLIF(UPPER(open.intent->>'market_source'),''),'POLYMARKET')='POLYMARKET'
+     AND (UPPER(COALESCE(open.venue,'')) NOT IN ('POLYMARKET','KALSHI') OR UPPER(open.venue)='POLYMARKET')
+   THEN 'POLYMARKET' ELSE NULL END
  ELSE COALESCE(NULLIF(UPPER(open.intent->>'market_source'),''),
        CASE WHEN UPPER(open.venue) IN ('POLYMARKET','KALSHI') THEN UPPER(open.venue) END,
        configured.market_source)
@@ -91,6 +100,18 @@ func (reader *Reader) portfolioBase(filter ListFilter) (string, []any, error) {
  AND open.execution_account_id=l.execution_account_id AND open.market_id=l.market_id
  AND open.token_id=l.token_id AND COALESCE(open.intent->>'condition_id','')=l.condition_id
  LEFT JOIN configured ON configured.execution_account_id=l.execution_account_id
+ LEFT JOIN execution_external_position_adoptions adoption
+ ON adoption.external_adoption_id=l.external_adoption_id AND adoption.lot_id=l.lot_id
+ AND adoption.execution_account_id=l.execution_account_id AND adoption.market_id=l.market_id
+ AND adoption.condition_id=l.condition_id AND adoption.token_id=l.token_id
+ AND adoption.outcome_index IS NOT DISTINCT FROM l.outcome_index
+ AND adoption.outcome_name=l.outcome_name
+ LEFT JOIN execution_external_position_baselines baseline
+ ON baseline.baseline_id=adoption.baseline_id AND baseline.execution_account_id=adoption.execution_account_id
+ LEFT JOIN execution_external_position_baseline_items baseline_item
+ ON baseline_item.baseline_id=baseline.baseline_id AND baseline_item.execution_account_id=l.execution_account_id
+ AND baseline_item.condition_id=l.condition_id AND baseline_item.token_id=l.token_id
+ AND baseline_item.outcome_index IS NOT DISTINCT FROM l.outcome_index AND baseline_item.outcome_name=l.outcome_name
  WHERE l.remaining_shares>0 AND l.status IN ('OPEN','SETTLED_PENDING_REDEEM')` + accountWhere + ` )`
 	return base, args, nil
 }
@@ -275,7 +296,7 @@ func (reader *Reader) PortfolioHoldingLots(ctx context.Context, identity Portfol
 	}
 	listArgs := append([]any(nil), args...)
 	limit, offset := pageLimitOffset(filter, &listArgs)
-	rows, err := tx.QueryContext(ctx, base+` SELECT lot_id,execution_account_id,model_id,strategy_id,venue,market_source,market_id,condition_id,token_id,opening_order_id,opening_fill_key,status,original_shares::text,remaining_shares::text,original_cost::text,remaining_cost::text,average_entry_price::text,opened_at,closed_at FROM portfolio_base WHERE `+where+` ORDER BY opened_at DESC,lot_id DESC LIMIT `+limit+` OFFSET `+offset, listArgs...)
+	rows, err := tx.QueryContext(ctx, base+` SELECT lot_id,execution_account_id,model_id,strategy_id,venue,market_source,market_id,condition_id,token_id,COALESCE(opening_order_id,''),COALESCE(opening_fill_key,''),status,original_shares::text,remaining_shares::text,original_cost::text,remaining_cost::text,average_entry_price::text,opened_at,closed_at FROM portfolio_base WHERE `+where+` ORDER BY opened_at DESC,lot_id DESC LIMIT `+limit+` OFFSET `+offset, listArgs...)
 	if err != nil {
 		return Page[PositionLot]{}, dbUnavailable("list portfolio holding lots", err)
 	}
