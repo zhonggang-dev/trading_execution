@@ -1664,6 +1664,8 @@ func TestExternalPositionAdoptionPostgresIntegration(t *testing.T) {
 		t.Fatalf("commit external position adoption: %v", err)
 	}
 
+	assertRetiredAdoptionPortfolio(t, db, accountID, lotID, tokenID, conditionID)
+
 	baselineRepository, err := NewExternalPositionBaselineRepository(db)
 	if err != nil {
 		t.Fatal(err)
