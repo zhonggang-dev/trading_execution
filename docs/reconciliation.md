@@ -236,6 +236,12 @@ impact_scoped_tokens` 给出影响范围；`/health/ready` 只在账户级问题
 容许一个 Data API 显示单位（0.001 份）的差，因为 Data API 把份额四舍五入到 3～4 位（例如链上 5.025174 显示为 5.0251）。
 对账与运维视图（`liveoperations`）使用同一规则（`domain.BaselineSharesTolerance`）。
 
+Data API 不返回的基线零头：未托管基线（含增补）的 token 不在外部快照里，且“基线剩余 + 托管份额”为正且不超过 0.1 份时，
+对账改读该 token 的 ERC-1155 链上余额（`KnownPositionBalances`）。链上与预期精确相等即视为核验通过（`verified_position:<token>`，
+摘要计数 `baseline_dust_verified_onchain`），不再按外部为 0 报漂移；不等则记 `EXTERNAL_POSITION_BASELINE_DRIFT`，外部值为链上值、
+来源 `EVM_ERC1155_ETH_CALL`；读取失败记 token 级 `SOURCE_UNAVAILABLE + RETRY_LATER`。超过 0.1 份的缺失仍按外部为 0 报漂移，
+因为大额缺失更可能是数据源故障。有托管行时身份须与基线一致才走此路径；token 有未决订单时不读链上。基线本身从不修改。
+
 运维命令 `cmd/baselineamend` 只推导、不猜测：从链上读取钱包 ERC-1155 余额（已确认区块），从账本读取托管份额与基线剩余，
 身份取自托管持仓（ADD）或封存基线项（RETIRE），`neg_risk` 未知即拒绝。残余默认不得超过 `--max-add-shares 0.1`。
 
@@ -336,8 +342,8 @@ Data API 找候选交易并用 Polygon 回执验证，有证据就确认、不�
 API/RPC 失败记录为 `SOURCE_UNAVAILABLE + RETRY_LATER`。查询接口可以有界重试，但失败结果绝不
 转换成 `[]` 或余额 `0`。
 
-Data API `/positions` 使用 `sizeThreshold=0&includeArchived=true` 分页读取，避免默认阈值或 archived
-过滤把真实小仓位隐藏。官方上限是 150 次/10 秒；adapter 在所有钱包间共享一个默认 10 QPS 的
+Data API `/v2/positions` 使用 `filter_amount=0&include_archived=true` 按 cursor 分页读取（v1 已于 2026-11-02 下线），
+避免默认 0.1 份阈值或 archived 过滤把真实小仓位隐藏；即便如此 v2 仍会漏掉部分零头，由上面的链上核对兜底。官方上限是 150 次/10 秒；adapter 在所有钱包间共享一个默认 10 QPS 的
 节流器，对账周期不为每个 model/strategy 建立独立 client。
 
 历史 Kalshi `MANUAL_REVIEW + RECONCILIATION_REQUIRED` 只能使用 `cmd/kalshirepair` 做精确订单
