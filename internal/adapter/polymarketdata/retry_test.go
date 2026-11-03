@@ -68,7 +68,7 @@ func retryTestClient(t *testing.T, now time.Time, responses ...scriptedDataAPIRe
 	return client, transport, &waits
 }
 
-const emptyPositionsBody = `[]`
+const emptyPositionsBody = `{"data":[],"pagination":{"has_more":false,"next_cursor":null}}`
 
 func TestPositionClientRetriesRateLimitHonoringRetryAfter(t *testing.T) {
 	now := time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC)
@@ -228,7 +228,7 @@ func TestRedeemActivitiesRetryRateLimit(t *testing.T) {
 	condition := "0x" + fmt.Sprintf("%064x", 2)
 	client, transport, waits := retryTestClient(t, time.Now(),
 		scriptedDataAPIResponse{status: http.StatusTooManyRequests},
-		scriptedDataAPIResponse{status: http.StatusOK, body: `[]`},
+		scriptedDataAPIResponse{status: http.StatusOK, body: emptyPositionsBody},
 	)
 	values, err := client.ListRedeemActivities(context.Background(), wallet, condition, time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC))
 	if err != nil || len(values) != 0 {
@@ -263,7 +263,7 @@ func TestPositionClientRetriesEveryServerError(t *testing.T) {
 	for _, status := range []int{http.StatusInternalServerError, http.StatusNotImplemented, http.StatusBadGateway} {
 		client, transport, _ := retryTestClient(t, time.Now(),
 			scriptedDataAPIResponse{status: status, body: "down"},
-			scriptedDataAPIResponse{status: http.StatusOK, body: "[]"},
+			scriptedDataAPIResponse{status: http.StatusOK, body: emptyPositionsBody},
 		)
 		if _, err := client.ListExternalPositions(context.Background(), "0xabc"); err != nil || transport.calls != 2 {
 			t.Fatalf("status %d: err = %v, calls = %d; want success after one retry", status, err, transport.calls)
