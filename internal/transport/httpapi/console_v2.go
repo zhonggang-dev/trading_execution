@@ -39,6 +39,8 @@ func (server *Server) registerConsoleV2Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/v1/console/v2/decision-cycles/{cycle_id}", readOnly(server.consoleV2DecisionCycle))
 	mux.Handle("GET /api/v1/console/v2/orders", readOnly(server.consoleV2Orders))
 	mux.Handle("GET /api/v1/console/v2/orders/{order_id}/trace", readOnly(server.consoleV2OrderTrace))
+	mux.Handle("GET /api/v1/console/v2/portfolio-holdings", readOnly(server.consoleV2PortfolioHoldings))
+	mux.Handle("GET /api/v1/console/v2/portfolio-holdings/lots", readOnly(server.consoleV2PortfolioHoldingLots))
 	mux.Handle("GET /api/v1/console/v2/holdings", readOnly(server.consoleV2Holdings))
 	mux.Handle("GET /api/v1/console/v2/holdings/lots", readOnly(server.consoleV2HoldingLots))
 	mux.Handle("GET /api/v1/console/v2/position-lots", readOnly(server.consoleV2PositionLots))
@@ -529,4 +531,59 @@ func (server *Server) consoleV2Settlements(writer http.ResponseWriter, request *
 	}
 	value, err := server.consoleV2.Settlements(request.Context(), filter)
 	server.writeConsoleV2Result(writer, value, err)
+}
+
+func (server *Server) consoleV2PortfolioHoldings(writer http.ResponseWriter, request *http.Request) {
+	filter, err := parseConsoleV2Filter(request, consoleV2FilterOptions{
+		Account: true, MarketSource: map[string]struct{}{"POLYMARKET": {}, "KALSHI": {}},
+		Status: map[string]struct{}{"OPEN": {}, "SETTLED_PENDING_REDEEM": {}, "MIXED": {}}, RejectTimeRange: true,
+	})
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_CONSOLE_V2_FILTER", err.Error())
+		return
+	}
+	value, err := server.consoleV2.PortfolioHoldings(request.Context(), filter)
+	server.writeConsoleV2Result(writer, value, err)
+}
+
+func (server *Server) consoleV2PortfolioHoldingLots(writer http.ResponseWriter, request *http.Request) {
+	identity, filter, err := parseConsoleV2PortfolioHoldingLotsQuery(request)
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_CONSOLE_V2_FILTER", err.Error())
+		return
+	}
+	value, err := server.consoleV2.PortfolioHoldingLots(request.Context(), identity, filter)
+	server.writeConsoleV2Result(writer, value, err)
+}
+
+// Reuse the established identity scalar/bounds parser without changing the
+// old nine-field protocol. Only this new route accepts the seven-field key.
+func parseConsoleV2PortfolioHoldingLotsQuery(request *http.Request) (consolev2.PortfolioHoldingIdentity, consolev2.ListFilter, error) {
+	query := request.URL.Query()
+	values := query["holding_identity"]
+	if len(values) != 1 || len(values[0]) > maxHoldingIdentityJSONLength {
+		return consolev2.PortfolioHoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("holding_identity must be provided once within the length limit")
+	}
+	var tuple []json.RawMessage
+	if err := json.Unmarshal([]byte(values[0]), &tuple); err != nil || len(tuple) != 7 {
+		return consolev2.PortfolioHoldingIdentity{}, consolev2.ListFilter{}, fmt.Errorf("holding_identity must be a JSON array of exactly 7 values")
+	}
+	legacyTuple := append([]json.RawMessage{tuple[0], json.RawMessage(`""`), json.RawMessage(`""`)}, tuple[1:]...)
+	encoded, err := json.Marshal(legacyTuple)
+	if err != nil {
+		return consolev2.PortfolioHoldingIdentity{}, consolev2.ListFilter{}, err
+	}
+	query.Set("holding_identity", string(encoded))
+	cloned := request.Clone(request.Context())
+	copiedURL := *request.URL
+	cloned.URL = &copiedURL
+	cloned.URL.RawQuery = query.Encode()
+	legacy, filter, err := parseConsoleV2HoldingLotsQuery(cloned)
+	if err != nil {
+		return consolev2.PortfolioHoldingIdentity{}, filter, err
+	}
+	if legacy.ExecutionAccountID == "" || legacy.MarketID == "" || legacy.TokenID == "" || (legacy.MarketSource != "POLYMARKET" && legacy.MarketSource != "KALSHI") {
+		return consolev2.PortfolioHoldingIdentity{}, filter, fmt.Errorf("portfolio holding identity is incomplete")
+	}
+	return consolev2.PortfolioHoldingIdentity{ExecutionAccountID: legacy.ExecutionAccountID, MarketSource: legacy.MarketSource, MarketID: legacy.MarketID, ConditionID: legacy.ConditionID, TokenID: legacy.TokenID, OutcomeIndex: legacy.OutcomeIndex, OutcomeName: legacy.OutcomeName}, filter, nil
 }

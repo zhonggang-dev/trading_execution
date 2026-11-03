@@ -242,6 +242,7 @@ func TestReaderHoldingsProjection(t *testing.T) {
 	if _, err := reader.HoldingLots(ctx, HoldingIdentity{ExecutionAccountID: accountID}, ListFilter{Query: tokenID}); err == nil {
 		t.Fatal("holding lots accepted unsupported fuzzy filter")
 	}
+	assertAccountPortfolioProjection(t, ctx, db, accountID, marketID, conditionID, tokenID, orderIDs, lotIDs)
 }
 
 // TestReaderHoldingsPaginationStableAcrossMarketSource keeps every identity

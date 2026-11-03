@@ -29,6 +29,8 @@ type API interface {
 	DecisionCycle(context.Context, string) (DecisionCycleDetail, error)
 	Orders(context.Context, ListFilter) (Page[Order], error)
 	OrderTrace(context.Context, string) (OrderTrace, error)
+	PortfolioHoldings(context.Context, ListFilter) (Page[PortfolioHolding], error)
+	PortfolioHoldingLots(context.Context, PortfolioHoldingIdentity, ListFilter) (Page[PositionLot], error)
 	Holdings(context.Context, ListFilter) (Page[Holding], error)
 	HoldingLots(context.Context, HoldingIdentity, ListFilter) (Page[PositionLot], error)
 	PositionLots(context.Context, ListFilter) (Page[PositionLot], error)
