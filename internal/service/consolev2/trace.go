@@ -227,7 +227,7 @@ func (reader *Reader) loadOrderLots(ctx context.Context, orderID string) ([]Posi
 }
 
 func (reader *Reader) loadOrderIssues(ctx context.Context, orderID string) ([]ReconciliationIssue, error) {
-	rows, err := reader.db.QueryContext(ctx, reconciliationIssueProjection+`
+	rows, err := reader.db.QueryContext(ctx, legacyReconciliationIssueProjection+`
 		WHERE issue.order_id=$1 OR issue.venue_order_id=$1
 		ORDER BY issue.observed_at DESC, issue.issue_id DESC
 		LIMIT 100`, orderID)

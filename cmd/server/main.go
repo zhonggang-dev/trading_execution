@@ -297,6 +297,14 @@ func consoleV2RuntimeConfig(cfg config.Config, live *liveRuntime, startedAt time
 		StrategyDisabledAccounts:   cfg.DecisionCycle.StrategyDisabledAccounts,
 		KalshiStrategyInputEnabled: cfg.DecisionCycle.KalshiStrategyInputEnabled,
 	}
+	if live != nil {
+		for _, accountID := range live.polymarketAccounts {
+			config.ManagedAccounts = append(config.ManagedAccounts, consolev2.ManagedAccount{ExecutionAccountID: accountID, MarketSource: "POLYMARKET"})
+		}
+		for _, accountID := range live.kalshiAccounts {
+			config.ManagedAccounts = append(config.ManagedAccounts, consolev2.ManagedAccount{ExecutionAccountID: accountID, MarketSource: "KALSHI"})
+		}
+	}
 	if live != nil && live.decisionRunner != nil {
 		config.RunnerSnapshot = func() consolev2.RunnerSnapshot {
 			status := live.decisionRunner.Snapshot()

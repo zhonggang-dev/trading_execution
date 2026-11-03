@@ -198,13 +198,27 @@ func (reader *Reader) ReconciliationRuns(ctx context.Context, filter ListFilter)
 	return page, nil
 }
 
-const reconciliationIssueProjection = `
+const legacyReconciliationIssueProjection = `
 SELECT issue.issue_id, issue.run_id, issue.execution_account_id, issue.issue_type,
-       NULL::text, issue.resolution, issue.status, issue.order_id,
+       NULL::text AS reason_code, issue.resolution, issue.status, issue.order_id,
        issue.venue_order_id, issue.venue_trade_id, issue.market_id, issue.condition_id,
        issue.token_id, issue.local_value::text, issue.remote_value::text, issue.source,
        issue.observed_at, issue.first_observed_at, issue.impact_scope, issue.resolved_at
 FROM reconciliation_issues issue
+`
+
+const reconciliationIssueProjection = `
+SELECT * FROM (` + legacyReconciliationIssueProjection + `
+UNION ALL
+SELECT 'kalshi-balance-drift:'||execution_account_id,'',execution_account_id,'KALSHI_BALANCE_DRIFT',
+ NULL::text,CASE WHEN status='RESOLVED' THEN 'BALANCE_MATCHED' ELSE 'MANUAL_REVIEW' END,status,
+ '','','','','','',local_balance::text,exchange_balance::text,'KALSHI',last_seen_at,first_seen_at,'ACCOUNT',resolved_at
+FROM kalshi_balance_drift
+UNION ALL
+SELECT 'kalshi-settlement-review:'||execution_account_id||':'||ticker,'',execution_account_id,'KALSHI_SETTLEMENT_REVIEW',
+ NULL::text,'MANUAL_REVIEW','OPEN','','','',ticker,'','',local_cost_basis::text,exchange_revenue::text,'KALSHI',recorded_at,recorded_at,'MARKET',NULL::timestamptz
+FROM kalshi_settlements WHERE status='MANUAL_REVIEW'
+) issue
 `
 
 func (reader *Reader) ReconciliationIssues(ctx context.Context, filter ListFilter) (Page[ReconciliationIssue], error) {

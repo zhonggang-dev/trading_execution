@@ -110,4 +110,5 @@ func TestManagedExternalSellAtomicRepair(t *testing.T) {
 	if err != nil || len(page.Items) != 1 || page.Items[0].OrderID != "" || !sameNumeric(page.Summary.NetCashFlow.String(), "1.79") {
 		t.Fatalf("explicit external history: %#v %v", page, err)
 	}
+	assertConsoleLegacyLedgerParity(t, db, "external-test", domain.LedgerActivityExternalSell)
 }

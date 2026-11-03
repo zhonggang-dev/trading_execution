@@ -258,3 +258,59 @@ func TestConsoleV2ReadPreservesShorterParentDeadline(t *testing.T) {
 		t.Fatalf("derived deadline=%s exceeds parent deadline", deadline)
 	}
 }
+
+func (fake *fakeConsoleV2Service) Accounts(context.Context) (consolev2.AccountDirectory, error) {
+	return consolev2.AccountDirectory{}, fake.readErr
+}
+func (fake *fakeConsoleV2Service) LedgerActivities(context.Context, consolev2.ListFilter) (consolev2.Page[consolev2.LedgerActivity], error) {
+	return consolev2.Page[consolev2.LedgerActivity]{}, fake.readErr
+}
+func (fake *fakeConsoleV2Service) Settlements(context.Context, consolev2.ListFilter) (consolev2.Page[consolev2.Settlement], error) {
+	return consolev2.Page[consolev2.Settlement]{}, fake.readErr
+}
+
+func TestConsoleV2KalshiReadRoutesAndValidation(t *testing.T) {
+	server := testConsoleV2Server(t, &fakeConsoleV2Service{})
+	for _, path := range []string{"accounts", "ledger-activities", "settlements"} {
+		target := "/api/v1/console/v2/" + path
+		for _, token := range []string{"", "execution-secret"} {
+			response := performRequest(t, server, http.MethodGet, target, "", token)
+			if response.Code != http.StatusUnauthorized && response.Code != http.StatusForbidden {
+				t.Fatalf("write token grants read %s: %d", path, response.Code)
+			}
+		}
+		response := performRequest(t, server, http.MethodGet, target, "", "readonly-secret")
+		if response.Code != http.StatusOK {
+			t.Fatalf("route %s: %d %s", path, response.Code, response.Body.String())
+		}
+		if response = performRequest(t, server, http.MethodPost, target, "", "readonly-secret"); response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("writable %s: %d", path, response.Code)
+		}
+	}
+	for _, query := range []string{"?activity_type=KALSHI_NETTING&account=kalshi%3Amain", "?activity_type=KALSHI_SETTLEMENT&offset=9007199254740891", "?activity_type=BUY&q=market"} {
+		response := performRequest(t, server, http.MethodGet, "/api/v1/console/v2/ledger-activities"+query, "", "readonly-secret")
+		if response.Code != http.StatusOK {
+			t.Fatalf("valid ledger query %s: %d %s", query, response.Code, response.Body.String())
+		}
+	}
+	for _, target := range []string{
+		"accounts?q=x", "accounts?bad=%zz", "accounts?x=1;y=2",
+		"ledger-activities?activity_type=NETTING", "ledger-activities?activity_type=BUY&activity_type=SELL",
+		"ledger-activities?model_id=obsolete", "ledger-activities?account=a&execution_account_id=b",
+		"ledger-activities?limit=", "ledger-activities?offset=", "ledger-activities?limit=101", "ledger-activities?offset=9007199254740892",
+		"ledger-activities?activity_type=BUY;ignored=1", "ledger-activities?q=%zz", "ledger-activities?from=invalid",
+		"settlements?market_source=GENERATED", "settlements?status=FILLED", "settlements?side=BUY", "settlements?source=KALSHI&market_source=POLYMARKET",
+	} {
+		response := performRequest(t, server, http.MethodGet, "/api/v1/console/v2/"+target, "", "readonly-secret")
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "INVALID_CONSOLE_V2_FILTER") {
+			t.Fatalf("accepted %s: %d %s", target, response.Code, response.Body.String())
+		}
+	}
+	unavailable := testConsoleV2Server(t, &fakeConsoleV2Service{readErr: consolev2.ErrUnavailable})
+	for _, path := range []string{"accounts", "ledger-activities", "settlements"} {
+		response := performRequest(t, unavailable, http.MethodGet, "/api/v1/console/v2/"+path, "", "readonly-secret")
+		if response.Code != 503 || !strings.Contains(response.Body.String(), "CONSOLE_V2_UNAVAILABLE") {
+			t.Fatalf("failed read disguised: %s %d", path, response.Code)
+		}
+	}
+}

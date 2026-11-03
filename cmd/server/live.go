@@ -54,6 +54,8 @@ type liveRuntime struct {
 	// polymarketAccounts is the already validated Polymarket subset. Keep it
 	// separate from activeAccounts, which also includes Kalshi execution.
 	polymarketAccounts []string
+	// kalshiAccounts contains the actual, successfully composed internal IDs.
+	kalshiAccounts []string
 	// recovery is the order-level lease guard shared with the order coordinator.
 	recovery *orderrecovery.Guard
 }
@@ -603,6 +605,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		kalshiSettlements:  kalshiRuntime.settlements,
 		activeAccounts:     append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
 		polymarketAccounts: append([]string(nil), reconciliationAccountIDs...),
+		kalshiAccounts:     append([]string(nil), kalshiRuntime.activeAccounts...),
 		recovery:           recoveryGuard,
 	}, nil
 }
