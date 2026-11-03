@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
@@ -94,7 +95,7 @@ func (state *runState) reconcilePositions(ctx context.Context, executionAccountI
 		return nil
 	}
 	state.run.VerifyReconciliation("source", "EXTERNAL_POSITIONS")
-	// The Data API can omit sub-centish share dust even with sizeThreshold=0.
+	// The Data API can omit sub-centish share dust even with filter_amount=0.
 	// Verify the actual ERC1155 balance instead of declaring it zero, widening
 	// tolerances, or mutating the managed ledger. No settlement is inferred.
 	if state.service.knownPositionBalances != nil {
@@ -146,8 +147,95 @@ func (state *runState) reconcilePositions(ctx context.Context, executionAccountI
 		}
 		positions = filtered
 	}
+	positions = state.verifyOmittedBaselineDust(ctx, walletAddress, positions, baselines, external)
 	state.comparePositions(ctx, positions, baselines, external)
 	return nil
+}
+
+// maxOmittedBaselineDustShares caps the on-chain fallback for unmanaged
+// baseline tokens the Data API omits. v2 documents a 0.1-share default dust
+// floor and still omits some residuals below it even with filter_amount=0; a
+// larger omission is more likely a source fault and stays a reported drift.
+const maxOmittedBaselineDustShares = domain.Decimal("0.1")
+
+// verifyOmittedBaselineDust checks an unmanaged baseline token that is absent
+// from the external snapshot against its exact ERC1155 balance. An exact match
+// of baseline plus managed shares verifies the token and removes it, and any
+// managed position on it, from the snapshot comparison. A mismatch is a
+// baseline drift carrying the on-chain value; a failed read is a retryable
+// token-scoped source outage. The baseline itself is never changed.
+func (state *runState) verifyOmittedBaselineDust(
+	ctx context.Context,
+	walletAddress string,
+	positions []domain.Position,
+	baselines positionBaselineSnapshot,
+	external positionSnapshot,
+) []domain.Position {
+	if state.service.knownPositionBalances == nil {
+		return positions
+	}
+	localByToken := make(map[string]domain.Position, len(positions))
+	for _, position := range positions {
+		localByToken[position.TokenID] = position
+	}
+	tokenIDs := make([]string, 0, len(baselines.Positions))
+	for tokenID := range baselines.Positions {
+		if _, found := external.Positions[tokenID]; !found && !state.tokenUnresolved(tokenID) {
+			tokenIDs = append(tokenIDs, tokenID)
+		}
+	}
+	sort.Strings(tokenIDs)
+	handled := make(map[string]bool)
+	for _, tokenID := range tokenIDs {
+		baseline := baselines.Positions[tokenID]
+		expected := baseline.Shares
+		if position, hasLocal := localByToken[tokenID]; hasLocal {
+			if !baselineMatchesLocal(baseline, position) {
+				continue
+			}
+			var err error
+			if expected, err = addDecimals(expected, position.TotalShares); err != nil {
+				continue
+			}
+		}
+		positive, signErr := expected.Sign()
+		large, compareErr := expected.Compare(maxOmittedBaselineDustShares)
+		if signErr != nil || compareErr != nil || positive <= 0 || large > 0 {
+			continue
+		}
+		handled[tokenID] = true
+		actual, readErr := state.service.knownPositionBalances.GetKnownPositionBalance(ctx, walletAddress, tokenID)
+		if readErr != nil {
+			state.issue(ctx, domain.ReconciliationIssueParams{Type: domain.ReconciliationIssueSourceUnavailable,
+				Resolution: domain.ReconciliationResolutionRetry, Status: domain.ReconciliationIssueOpen,
+				ConditionID: baseline.ConditionID, TokenID: tokenID, Source: "EVM_ERC1155_ETH_CALL",
+				Details: "verify omitted unmanaged baseline dust: " + readErr.Error()})
+			state.errors = append(state.errors, readErr)
+			continue
+		}
+		if !actual.Equal(expected) {
+			state.recordBaselineDrift(ctx, baselineDriftParams{
+				baseline: baseline, localExpected: expected, remoteValue: actual, source: "EVM_ERC1155_ETH_CALL",
+				details: "omitted unmanaged baseline dust differs from the exact on-chain balance; the baseline is never reduced or imported into the managed ledger",
+			})
+			continue
+		}
+		state.run.Summary["baseline_dust_verified_onchain"]++
+		state.run.VerifyReconciliation("position", tokenID)
+	}
+	if len(handled) == 0 {
+		return positions
+	}
+	for tokenID := range handled {
+		delete(baselines.Positions, tokenID)
+	}
+	filtered := make([]domain.Position, 0, len(positions))
+	for _, position := range positions {
+		if !handled[position.TokenID] {
+			filtered = append(filtered, position)
+		}
+	}
+	return filtered
 }
 
 // reconcileBalance 在成交补录后重新读取并核对本地与链上余额。

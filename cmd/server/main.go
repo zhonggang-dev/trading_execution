@@ -135,6 +135,14 @@ func run() error {
 		ReadOnlyToken:    cfg.HTTP.ReadOnlyToken,
 		WriteTimeout:     cfg.HTTP.WriteTimeout,
 	}
+	pipelineMonitor, err := buildPipelineMonitor(cfg, database, live, startedAt, logger)
+	if err != nil {
+		logger.Warn("pipeline monitor unavailable; execution is unaffected")
+		pipelineMonitor, _ = unavailablePipelineMonitor(logger)
+	}
+	if pipelineMonitor != nil {
+		httpParams.PipelineMonitor = pipelineMonitor
+	}
 	if readiness != nil {
 		httpParams.Readiness = readiness
 	}
@@ -162,6 +170,18 @@ func run() error {
 		if err := live.startBackground(rootContext, logger); err != nil {
 			return err
 		}
+	}
+	if pipelineMonitor != nil {
+		if err := pipelineMonitor.Start(); err != nil {
+			logger.Warn("pipeline monitor did not start; execution is unaffected")
+		}
+		defer func() {
+			stopContext, cancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
+			defer cancel()
+			if err := pipelineMonitor.Stop(stopContext); err != nil {
+				logger.Warn("pipeline monitor shutdown failed", "error", err)
+			}
+		}()
 	}
 
 	if database != nil {
@@ -228,10 +248,10 @@ func run() error {
 }
 
 // buildWalletPnLService wires the public Data API to the authoritative
-// execution_accounts identity for the four live wallets. It is read-only and
+// execution_accounts identity for the managed Polymarket wallets. It is read-only and
 // deliberately absent from paper-mode servers.
 func buildWalletPnLService(database *sql.DB, cfg config.Config, live *liveRuntime) (*walletpnl.Service, error) {
-	if database == nil || live == nil || len(live.activeAccounts) == 0 {
+	if database == nil || live == nil || len(live.polymarketAccounts) == 0 {
 		return nil, nil
 	}
 	addresses, err := postgresadapter.NewWalletAddressRepository(database)
@@ -245,7 +265,7 @@ func buildWalletPnLService(database *sql.DB, cfg config.Config, live *liveRuntim
 	if err != nil {
 		return nil, err
 	}
-	return walletpnl.New(walletpnl.Params{Addresses: addresses, Source: source, Accounts: live.activeAccounts, TTL: 5 * time.Minute})
+	return walletpnl.New(walletpnl.Params{Addresses: addresses, Source: source, Accounts: live.polymarketAccounts, TTL: 5 * time.Minute})
 }
 
 // consoleV2RuntimeConfig builds the browser-safe runtime projection. It keeps
@@ -278,6 +298,14 @@ func consoleV2RuntimeConfig(cfg config.Config, live *liveRuntime, startedAt time
 		EntryDisabledAccounts:      cfg.DecisionCycle.EntryDisabledAccounts(),
 		StrategyDisabledAccounts:   cfg.DecisionCycle.StrategyDisabledAccounts(),
 		KalshiStrategyInputEnabled: true,
+	}
+	if live != nil {
+		for _, accountID := range live.polymarketAccounts {
+			config.ManagedAccounts = append(config.ManagedAccounts, consolev2.ManagedAccount{ExecutionAccountID: accountID, MarketSource: "POLYMARKET"})
+		}
+		for _, accountID := range live.kalshiAccounts {
+			config.ManagedAccounts = append(config.ManagedAccounts, consolev2.ManagedAccount{ExecutionAccountID: accountID, MarketSource: "KALSHI"})
+		}
 	}
 	if live != nil && live.decisionRunner != nil {
 		config.RunnerSnapshot = func() consolev2.RunnerSnapshot {

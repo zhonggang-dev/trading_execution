@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ type consoleV2FilterOptions struct {
 	Account         bool
 	MarketSource    map[string]struct{}
 	Status          map[string]struct{}
+	ActivityType    bool
 	Side            bool
 	RejectTimeRange bool
 }
@@ -29,6 +31,9 @@ func (server *Server) registerConsoleV2Routes(mux *http.ServeMux) {
 	readOnly := func(handler http.HandlerFunc) http.Handler {
 		return server.authenticateReadOnly(server.withConsoleV2ReadDeadline(handler))
 	}
+	mux.Handle("GET /api/v1/console/v2/accounts", readOnly(server.consoleV2Accounts))
+	mux.Handle("GET /api/v1/console/v2/ledger-activities", readOnly(server.consoleV2LedgerActivities))
+	mux.Handle("GET /api/v1/console/v2/settlements", readOnly(server.consoleV2Settlements))
 	mux.Handle("GET /api/v1/console/v2/runtime", readOnly(server.consoleV2Runtime))
 	mux.Handle("GET /api/v1/console/v2/decision-cycles", readOnly(server.consoleV2DecisionCycles))
 	mux.Handle("GET /api/v1/console/v2/decision-cycles/{cycle_id}", readOnly(server.consoleV2DecisionCycle))
@@ -226,16 +231,26 @@ func (server *Server) writeConsoleV2Result(writer http.ResponseWriter, value any
 }
 
 func rejectConsoleV2Query(request *http.Request) error {
-	if len(request.URL.Query()) != 0 {
+	query, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil {
+		return fmt.Errorf("invalid query encoding")
+	}
+	if len(query) != 0 {
 		return fmt.Errorf("query parameters are not supported for this resource")
 	}
 	return nil
 }
 
 func parseConsoleV2Filter(request *http.Request, options consoleV2FilterOptions) (consolev2.ListFilter, error) {
-	query := request.URL.Query()
+	query, parseErr := url.ParseQuery(request.URL.RawQuery)
+	if parseErr != nil {
+		return consolev2.ListFilter{}, fmt.Errorf("invalid query encoding")
+	}
 	allowed := map[string]bool{
 		"limit": true, "offset": true, "q": true, "from": true, "to": true,
+	}
+	if options.ActivityType {
+		allowed["activity_type"] = true
 	}
 	if options.Model {
 		allowed["model_id"] = true
@@ -286,10 +301,16 @@ func parseConsoleV2Filter(request *http.Request, options consoleV2FilterOptions)
 	if err != nil {
 		return consolev2.ListFilter{}, err
 	}
-	filter := consolev2.ListFilter{Limit: 20, Query: strings.TrimSpace(query.Get("q")),
+	filter := consolev2.ListFilter{ActivityType: query.Get("activity_type"), Limit: 20, Query: strings.TrimSpace(query.Get("q")),
 		ModelID: strings.TrimSpace(modelID), StrategyID: strings.TrimSpace(strategyID),
 		ExecutionAccountID: strings.TrimSpace(accountID), MarketSource: strings.TrimSpace(marketSource),
 		Status: strings.TrimSpace(query.Get("status")), Side: strings.TrimSpace(query.Get("side"))}
+	if query.Has("limit") && query.Get("limit") == "" {
+		return consolev2.ListFilter{}, fmt.Errorf("limit must be an integer")
+	}
+	if query.Has("offset") && query.Get("offset") == "" {
+		return consolev2.ListFilter{}, fmt.Errorf("offset must be an integer")
+	}
 	if raw := query.Get("limit"); raw != "" {
 		filter.Limit, err = strconv.Atoi(raw)
 		if err != nil {
@@ -330,6 +351,13 @@ func parseConsoleV2Filter(request *http.Request, options consoleV2FilterOptions)
 	if options.MarketSource != nil && filter.MarketSource != "" {
 		if _, ok := options.MarketSource[filter.MarketSource]; !ok {
 			return consolev2.ListFilter{}, fmt.Errorf("market_source %q is not supported", filter.MarketSource)
+		}
+	}
+	if options.ActivityType && filter.ActivityType != "" {
+		switch filter.ActivityType {
+		case "BUY", "SELL", "EXTERNAL_SELL", "REDEEM", "KALSHI_NETTING", "KALSHI_SETTLEMENT":
+		default:
+			return consolev2.ListFilter{}, fmt.Errorf("unsupported activity_type")
 		}
 	}
 	if options.Side && filter.Side != "" && filter.Side != "BUY" && filter.Side != "SELL" {
@@ -474,4 +502,31 @@ func consoleV2FilterAlias(query map[string][]string, longName, shortName string)
 		return longValues[0], nil
 	}
 	return "", nil
+}
+
+func (server *Server) consoleV2Accounts(writer http.ResponseWriter, request *http.Request) {
+	if err := rejectConsoleV2Query(request); err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_CONSOLE_V2_FILTER", err.Error())
+		return
+	}
+	value, err := server.consoleV2.Accounts(request.Context())
+	server.writeConsoleV2Result(writer, value, err)
+}
+func (server *Server) consoleV2LedgerActivities(writer http.ResponseWriter, request *http.Request) {
+	filter, err := parseConsoleV2Filter(request, consoleV2FilterOptions{Account: true, ActivityType: true})
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_CONSOLE_V2_FILTER", err.Error())
+		return
+	}
+	value, err := server.consoleV2.LedgerActivities(request.Context(), filter)
+	server.writeConsoleV2Result(writer, value, err)
+}
+func (server *Server) consoleV2Settlements(writer http.ResponseWriter, request *http.Request) {
+	filter, err := parseConsoleV2Filter(request, consoleV2FilterOptions{Account: true, MarketSource: map[string]struct{}{"POLYMARKET": {}, "KALSHI": {}}, Status: map[string]struct{}{"READY": {}, "APPROVAL_SUBMITTING": {}, "APPROVAL_SUBMITTED": {}, "REDEEM_SUBMITTING": {}, "REDEEM_SUBMITTED": {}, "CONFIRMED": {}, "APPLIED": {}, "MANUAL_REVIEW": {}}})
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_CONSOLE_V2_FILTER", err.Error())
+		return
+	}
+	value, err := server.consoleV2.Settlements(request.Context(), filter)
+	server.writeConsoleV2Result(writer, value, err)
 }

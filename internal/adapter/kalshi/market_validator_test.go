@@ -426,7 +426,7 @@ func configureKalshiSellIntent(intent *domain.OrderIntent) {
 
 func newKalshiValidatorForTest(t *testing.T, now time.Time, book domain.OrderBookSnapshot) *MarketValidator {
 	t.Helper()
-	validator, err := NewMarketValidator(staticKalshiBookSource{books: []domain.OrderBookSnapshot{book}})
+	validator, err := NewMarketValidator(staticKalshiBookSource{books: []domain.OrderBookSnapshot{book}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

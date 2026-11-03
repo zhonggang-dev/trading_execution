@@ -21,6 +21,9 @@ var (
 // interface here lets transport tests use safe fake projections without a
 // database or a live execution runtime.
 type API interface {
+	Accounts(context.Context) (AccountDirectory, error)
+	LedgerActivities(context.Context, ListFilter) (Page[LedgerActivity], error)
+	Settlements(context.Context, ListFilter) (Page[Settlement], error)
 	Runtime(context.Context) (Runtime, error)
 	DecisionCycles(context.Context, ListFilter) (Page[DecisionCycle], error)
 	DecisionCycle(context.Context, string) (DecisionCycleDetail, error)
@@ -48,6 +51,7 @@ type ListFilter struct {
 	MarketSource       string
 	Status             string
 	Side               string
+	ActivityType       string
 	From               *time.Time
 	To                 *time.Time
 }
@@ -71,6 +75,7 @@ type RuntimeConfig struct {
 	StartedAt                  time.Time
 	RunnerEnabled              bool
 	RunnerInterval             time.Duration
+	ManagedAccounts            []ManagedAccount
 	Bindings                   []Binding
 	OrderSubmissionEnabled     bool
 	EntrySubmissionDisabled    bool

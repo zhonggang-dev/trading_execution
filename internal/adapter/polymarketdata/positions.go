@@ -1,7 +1,6 @@
 package polymarketdata
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -65,20 +64,29 @@ func NewPositionClient(params PositionClientParams) (*PositionClient, error) {
 	}, nil
 }
 
-// wirePosition 表示后端使用的 wirePosition 类型。
+// unlabeledOutcomeIndex is the Data API v2 sentinel for an outcome it could
+// not label; it is not a real index.
+const unlabeledOutcomeIndex = 999
+
+// wirePosition is one Data API v2 /v2/positions row.
 type wirePosition struct {
-	ConditionID  string      `json:"conditionId"`
-	TokenID      string      `json:"asset"`
+	ConditionID  string      `json:"condition_id"`
+	TokenID      string      `json:"token_id"`
 	Outcome      string      `json:"outcome"`
-	OutcomeIndex *int        `json:"outcomeIndex"`
-	Size         wireDecimal `json:"size"`
-	Average      wireDecimal `json:"avgPrice"`
-	Current      wireDecimal `json:"curPrice"`
-	NegRisk      bool        `json:"negativeRisk"`
+	OutcomeIndex *int        `json:"outcome_index"`
+	Size         wireDecimal `json:"current_size"`
+	Average      wireDecimal `json:"avg_price"`
+	Current      wireDecimal `json:"current_price"`
+	NegRisk      bool        `json:"negative_risk"`
 	Redeemable   bool        `json:"redeemable"`
 }
 
 // ListExternalPositions 分页查询指定钱包的外部 Polymarket 仓位。
+//
+// Data API v1 was retired on 2026-11-02. The v2 default status OPEN is the
+// superset that still includes settled-but-unredeemed rows (winning and
+// losing), matching the v1 view; filter_amount=0 lifts the v2 0.1-share
+// default dust floor that v1 did not have.
 func (client *PositionClient) ListExternalPositions(ctx context.Context, walletAddress string) ([]domain.ExternalPosition, error) {
 	walletAddress = strings.ToLower(strings.TrimSpace(walletAddress))
 	if walletAddress == "" {
@@ -87,14 +95,19 @@ func (client *PositionClient) ListExternalPositions(ctx context.Context, walletA
 	const pageSize = 500
 	positions := make([]domain.ExternalPosition, 0)
 	seen := make(map[string]struct{})
-	for page := 0; page < 20; page++ {
-		endpoint := client.baseURL.ResolveReference(&url.URL{Path: "/positions"})
+	cursor := ""
+	for page := 0; page < maxDataAPIPages; page++ {
+		endpoint := client.baseURL.ResolveReference(&url.URL{Path: "/v2/positions"})
 		query := endpoint.Query()
+		// v2 cursors do not carry these filters, so every page restates them.
 		query.Set("user", walletAddress)
-		query.Set("sizeThreshold", "0")
-		query.Set("includeArchived", "true")
+		query.Set("filter_type", "TOKENS")
+		query.Set("filter_amount", "0")
+		query.Set("include_archived", "true")
 		query.Set("limit", strconv.Itoa(pageSize))
-		query.Set("offset", strconv.Itoa(page*pageSize))
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
 		endpoint.RawQuery = query.Encode()
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 		if err != nil {
@@ -104,15 +117,9 @@ func (client *PositionClient) ListExternalPositions(ctx context.Context, walletA
 		if err != nil {
 			return nil, err
 		}
-		var values []wirePosition
-		decoder := json.NewDecoder(bytes.NewReader(body))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&values); err != nil {
-			// The Data API adds fields over time. Decode the same known fields
-			// permissively, while still validating every accounting field below.
-			if err := json.Unmarshal(body, &values); err != nil {
-				return nil, fmt.Errorf("decode Data API positions: %w", err)
-			}
+		values, next, err := decodeDataAPIPage[wirePosition](body, "positions")
+		if err != nil {
+			return nil, err
 		}
 		observedAt := client.now().UTC()
 		for index, value := range values {
@@ -123,7 +130,11 @@ func (client *PositionClient) ListExternalPositions(ctx context.Context, walletA
 			if tokenID == "" || conditionID == "" || outcome == "" {
 				return nil, fmt.Errorf("Data API position %d has incomplete identity", index+page*pageSize)
 			}
-			if value.OutcomeIndex != nil && *value.OutcomeIndex < 0 {
+			outcomeIndex := value.OutcomeIndex
+			if outcomeIndex != nil && *outcomeIndex == unlabeledOutcomeIndex {
+				outcomeIndex = nil
+			}
+			if outcomeIndex != nil && *outcomeIndex < 0 {
 				return nil, fmt.Errorf("Data API position %s has invalid outcome index", tokenID)
 			}
 			if sign, err := shares.Sign(); err != nil || sign < 0 {
@@ -136,17 +147,18 @@ func (client *PositionClient) ListExternalPositions(ctx context.Context, walletA
 			}
 			seen[tokenID] = struct{}{}
 			positions = append(positions, domain.ExternalPosition{
-				ConditionID: conditionID, TokenID: tokenID, OutcomeIndex: cloneInt(value.OutcomeIndex), OutcomeName: outcome,
+				ConditionID: conditionID, TokenID: tokenID, OutcomeIndex: cloneInt(outcomeIndex), OutcomeName: outcome,
 				Shares: shares, AveragePrice: domain.Decimal(value.Average), CurrentPrice: domain.Decimal(value.Current),
 				NegRisk: value.NegRisk, Redeemable: value.Redeemable,
 				Source: "POLYMARKET_DATA_API", ObservedAt: observedAt,
 			})
 		}
-		if len(values) < pageSize {
+		if next == "" {
 			return positions, nil
 		}
+		cursor = next
 	}
-	return nil, fmt.Errorf("Data API positions pagination exceeded 20 pages")
+	return nil, fmt.Errorf("Data API positions pagination exceeded %d pages", maxDataAPIPages)
 }
 
 // cloneInt 复制 Int。

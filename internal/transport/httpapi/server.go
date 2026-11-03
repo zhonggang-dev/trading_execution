@@ -22,6 +22,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/edgedistribution"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
+	"github.com/UniPat-AI/trading_execution/internal/service/pipelinemonitor"
 	"github.com/UniPat-AI/trading_execution/internal/service/positionexit"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 	"github.com/UniPat-AI/trading_execution/internal/service/walletpnl"
@@ -86,11 +87,14 @@ type Params struct {
 	// WriteTimeout is the http.Server write deadline. The reconciliation job
 	// finishes its work before it so the response always reaches the caller.
 	// Zero leaves the request context unchanged.
-	WriteTimeout  time.Duration
-	Logger        *slog.Logger
-	APIToken      string
-	JobToken      string
-	ReadOnlyToken string
+	WriteTimeout    time.Duration
+	Logger          *slog.Logger
+	APIToken        string
+	JobToken        string
+	ReadOnlyToken   string
+	PipelineMonitor interface {
+		Snapshot(context.Context) (pipelinemonitor.Snapshot, error)
+	}
 }
 
 // Server 表示后端使用的 Server 类型。
@@ -110,7 +114,10 @@ type Server struct {
 	apiToken         string
 	jobToken         string
 	readOnlyToken    string
-	handler          http.Handler
+	pipelineMonitor  interface {
+		Snapshot(context.Context) (pipelinemonitor.Snapshot, error)
+	}
+	handler http.Handler
 }
 
 // New 校验依赖和配置后创建当前服务实例。
@@ -154,10 +161,12 @@ func New(params Params) (*Server, error) {
 		apiToken:         apiToken,
 		jobToken:         jobToken,
 		readOnlyToken:    readOnlyToken,
+		pipelineMonitor:  params.PipelineMonitor,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", server.liveness)
 	mux.HandleFunc("GET /health/ready", server.readiness)
+	mux.Handle("GET /api/v1/pipeline-monitor", server.authenticateReadOnly(http.HandlerFunc(server.getPipelineMonitor)))
 	mux.Handle("POST /api/v1/orders", server.authenticate(http.HandlerFunc(server.submit)))
 	mux.Handle("GET /api/v1/orders/{order_id}", server.authenticate(http.HandlerFunc(server.get)))
 	mux.Handle("POST /api/v1/orders/{order_id}/refresh", server.authenticate(http.HandlerFunc(server.refresh)))
@@ -173,6 +182,7 @@ func New(params Params) (*Server, error) {
 	// returns a truthful 503 instead of making the BFF infer availability from
 	// a 404 or risking a nil service call.
 	mux.Handle("GET /api/v1/wallet-pnl", server.authenticateReadOnly(http.HandlerFunc(server.walletPnLHandler)))
+	mux.Handle("GET /api/v1/wallet-pnl/accounts", server.authenticateReadOnly(http.HandlerFunc(server.walletPnLAccountsHandler)))
 	if server.liveOperations != nil {
 		mux.Handle("GET /api/v1/live-operations", server.authenticateReadOnly(http.HandlerFunc(server.getLiveOperations)))
 	}

@@ -21,7 +21,11 @@ func mapHTTPError(method string, status int, headers http.Header, body []byte) e
 	message := responseMessage(body)
 	kind := port.VenueErrorRejected
 	code := classifyCLOBError(status, message)
-	if status >= 500 && (method == http.MethodPost || method == http.MethodDelete) {
+	if method == http.MethodPost && exchangeModeRejectsNewOrders(status, message) {
+		// 官方错误码文档：交易所暂停 / cancel-only / post-only 时下单返回 503，
+		// 订单未被受理，属于确定拒绝，不能按结果不明冻结预占。
+		code = "CLOB_TRADING_PAUSED"
+	} else if status >= 500 && (method == http.MethodPost || method == http.MethodDelete) {
 		kind = port.VenueErrorAmbiguous
 	} else if status >= 500 {
 		kind = port.VenueErrorUnavailable
@@ -33,6 +37,19 @@ func mapHTTPError(method string, status int, headers http.Header, body []byte) e
 		HTTPStatus: status,
 		RetryAfter: parseRetryAfter(headers.Get("Retry-After")),
 	}
+}
+
+// exchangeModeRejectsNewOrders 判断 503 是否为文档列明的交易所模式拒单
+// （Trading is currently disabled / cancel-only / post-only mode）。
+func exchangeModeRejectsNewOrders(status int, message string) bool {
+	if status != http.StatusServiceUnavailable {
+		return false
+	}
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "trading is disabled") ||
+		strings.Contains(lower, "trading is currently disabled") ||
+		strings.Contains(lower, "trading is currently cancel-only") ||
+		strings.Contains(lower, "post-only mode")
 }
 
 // responseMessage 解析并规范化 Message。

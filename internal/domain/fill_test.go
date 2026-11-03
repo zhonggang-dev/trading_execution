@@ -67,3 +67,14 @@ func TestFillStatusDoesNotLeaveTerminalState(t *testing.T) {
 		t.Fatal("retrying fill cannot become confirmed")
 	}
 }
+
+// TestNormalizeFillStatusMapsNotBroadcastedToMatched 验证 MATCHED_NOT_BROADCASTED 被规范化为非终局的 MATCHED，并能继续迁移到 CONFIRMED。
+func TestNormalizeFillStatusMapsNotBroadcastedToMatched(t *testing.T) {
+	status := NormalizeFillStatus("matched_not_broadcasted")
+	if status != FillStatusMatched || !status.Valid() || status.Terminal() {
+		t.Fatalf("normalized status = %q", status)
+	}
+	if !FillStatus("MATCHED_NOT_BROADCASTED").CanTransitionTo(FillStatusConfirmed) {
+		t.Fatal("not-broadcasted fill cannot become confirmed")
+	}
+}

@@ -215,3 +215,61 @@ No migration was added for this API. It reads the existing schema through
 `strategy_decision_runs`, `strategy_order_intent_deliveries`, execution order
 and fill tables, position lots, reconciliation tables, and
 `polymarket_redemptions`.
+
+## Managed accounts, six-type ledger, and settlement progress
+
+- `GET /api/v1/console/v2/accounts` accepts no query and returns
+  `data.accounts[{execution_account_id,market_source}]` plus `observed_at`.
+  Venue membership comes from the validated live composition, intersected with
+  registered accounts. No wallet address or Kalshi API key identity is selected.
+- `GET /api/v1/console/v2/ledger-activities` accepts `execution_account_id`
+  (`account` alias), `activity_type`, `q`, `from`, `to`, `limit`, `offset`.
+  Its standard Page envelope has the legacy ledger row field names, plus
+  `market_source` and `quantity_unit` (`shares` or `pairs`). All amounts remain
+  decimal strings. Both time boundaries are inclusive; without `from`/`to`, the
+  ledger reads all history, matching the legacy ledger's All time control.
+  Explicit `from` retains the common one-year bound. The five-second query
+  budget still applies to all-history counts and summaries. `confirmed_at` and `applied_at` are
+  nullable evidence fields.
+
+  The six activity types are `BUY`, `SELL`, `EXTERNAL_SELL`, `REDEEM`,
+  `KALSHI_NETTING`, `KALSHI_SETTLEMENT`. Netting has one row per durable
+  `KALSHI_NETTED` account event, with an exact prefixed fill/order/account join.
+  Quantity and payout are the account event's cash delta, one dollar per pair;
+  both closure legs are checked against that payout and twice that quantity.
+  An inconsistent event makes the bounded read unavailable rather than silently
+  omitting cash. BUY retains its own debit and fee with zero realized PnL;
+  netting alone carries the two-leg allocated cost and realized PnL. Its
+  confirmation time and execution price are unavailable. Application time is
+  the committed accounting event time.
+
+  Applied Kalshi settlements have one row per stored lot allocation. Payout,
+  cost and PnL come directly from that allocation, including zero payouts;
+  cumulative exchange settlement fees are never charged again. Manual-review
+  rows do not enter this cash ledger. The summary retains the original eleven
+  fields and adds `netting_count`, `settlement_count`, `netting_payout`,
+  `settlement_payout`, `netting_realized_pnl`, `settlement_realized_pnl`.
+  Counts are numbers; amount summaries are decimal strings. The full filtered
+  summary, exact total and page share one read-only repeatable-read snapshot.
+- `GET /api/v1/console/v2/settlements` accepts `execution_account_id`,
+  `market_source`, `status`, `q`, `from`, `to`, `limit`, `offset` (usual aliases).
+  It returns a standard Page of `settlement_id`, `market_source`, account,
+  `market_id`, `condition_id`, `status`, optional `transaction_hash`, nullable
+  decimal-string `payout`, `created_at`, `updated_at`, nullable `settled_at`,
+  `confirmed_at`, `applied_at`. PM retains its eight real redemption states and
+  chain evidence, with payout converted from base units to dollars. Kalshi
+  retains only `APPLIED` or `MANUAL_REVIEW`, uses its ticker as market identity,
+  and has no chain confirmation timestamp or hash. A recorded exchange payout
+  in review is evidence, not a credited payout. The default includes all
+  unfinished rows plus recently created applied rows.
+- `reconciliation-issues` also includes `KALSHI_BALANCE_DRIFT` and
+  `KALSHI_SETTLEMENT_REVIEW`, with source-qualified stable IDs and `source` set
+  to `KALSHI`. Their `run_id` is empty because no sweep audit exists. Balance
+  differences retain durable first/last observations and resolution state;
+  settlement review exposes the recorded local cost and exchange payout, not
+  an invented balance difference. Raw review reasons and exchange JSON remain
+  private. Existing run audits and order trace contracts remain unchanged.
+
+The new resources use the same read-only permission, five-second deadline,
+query validation and safe 400/503 error codes. Legacy `/api/v1/ledger-activities`
+and `/api/v1/daily-pnl` retain their existing four-type protocols and metrics.

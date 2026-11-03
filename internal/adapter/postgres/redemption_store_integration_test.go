@@ -235,6 +235,7 @@ func TestRedemptionStoreAppliesConfirmedBinaryPayoutAtomicallyPostgresIntegratio
 		t.Fatalf("zero-settlement position/lot = %s/%s/%s/%s/%s/%s",
 			losingRealized, losingShares, losingCost, losingMark, losingLifecycle, losingLotStatus)
 	}
+	assertConsoleLegacyLedgerParity(t, database, accountID, domain.LedgerActivityRedeem)
 }
 
 func requireTestRedemption(

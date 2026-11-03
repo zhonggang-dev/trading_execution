@@ -51,6 +51,11 @@ type liveRuntime struct {
 	autoRedeem        *autoredeem.Service
 	kalshiSettlements []*kalshisettlement.Service
 	activeAccounts    []string
+	// polymarketAccounts is the already validated Polymarket subset. Keep it
+	// separate from activeAccounts, which also includes Kalshi execution.
+	polymarketAccounts []string
+	// kalshiAccounts contains the actual, successfully composed internal IDs.
+	kalshiAccounts []string
 	// recovery is the order-level lease guard shared with the order coordinator.
 	recovery *orderrecovery.Guard
 }
@@ -602,10 +607,12 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		repository: repository, execution: kalshiRuntime.execution,
 		readiness: combinedReadiness,
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
-		autoRedeem:        autoRedeemService,
-		kalshiSettlements: kalshiRuntime.settlements,
-		activeAccounts:    append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
-		recovery:          recoveryGuard,
+		autoRedeem:         autoRedeemService,
+		kalshiSettlements:  kalshiRuntime.settlements,
+		activeAccounts:     append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
+		polymarketAccounts: append([]string(nil), reconciliationAccountIDs...),
+		kalshiAccounts:     append([]string(nil), kalshiRuntime.activeAccounts...),
+		recovery:           recoveryGuard,
 	}, nil
 }
 

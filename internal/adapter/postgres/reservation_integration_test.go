@@ -1191,6 +1191,7 @@ func TestFillAndPositionLedgerPostgresIntegration(t *testing.T) {
 		!events[4].SharesAfter.Equal("6.001") {
 		t.Fatalf("settlement events = %#v err=%v", events, err)
 	}
+	assertConsoleLegacyLedgerParity(t, db, "account-fill-ledger", domain.LedgerActivityBuy, domain.LedgerActivitySell)
 }
 
 func TestPolymarketBuyPriceImprovementCanSettleMoreSharesThanRequested(t *testing.T) {

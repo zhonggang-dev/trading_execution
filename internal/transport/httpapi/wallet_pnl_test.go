@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -14,9 +15,15 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/walletpnl"
 )
 
-type walletPnLTestAddresses struct{ values map[string]string }
+type walletPnLTestAddresses struct {
+	values map[string]string
+	err    error
+}
 
 func (reader walletPnLTestAddresses) WalletAddress(_ context.Context, accountID string) (string, error) {
+	if reader.err != nil {
+		return "", reader.err
+	}
 	address, ok := reader.values[accountID]
 	if !ok {
 		return "", errors.New("unknown account")
@@ -110,5 +117,81 @@ func TestWalletPnLEndpointMapsTimeout(t *testing.T) {
 	response := performRequest(t, server, http.MethodGet, "/api/v1/wallet-pnl?execution_account_id=main&interval=1w&fidelity=3h", "", "readonly-secret")
 	if response.Code != http.StatusGatewayTimeout || !strings.Contains(response.Body.String(), "WALLET_PNL_TIMEOUT") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestWalletPnLAccountsEndpointIsReadOnlyAndDoesNotExposeAddresses(t *testing.T) {
+	server := newWalletPnLHTTPTestServer(t, walletPnLTestSource{err: errors.New("must not read external PnL")})
+	path := "/api/v1/wallet-pnl/accounts"
+	for _, test := range []struct {
+		method string
+		token  string
+		want   int
+	}{
+		{http.MethodGet, "", http.StatusUnauthorized},
+		{http.MethodGet, "execution-secret", http.StatusForbidden},
+		{http.MethodPost, "readonly-secret", http.StatusMethodNotAllowed},
+		{http.MethodDelete, "readonly-secret", http.StatusMethodNotAllowed},
+	} {
+		response := performRequest(t, server, test.method, path, "", test.token)
+		if response.Code != test.want {
+			t.Fatalf("%s token=%q status=%d want=%d", test.method, test.token, response.Code, test.want)
+		}
+	}
+	response := performRequest(t, server, http.MethodGet, path, "", "readonly-secret")
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	var envelope struct {
+		Data walletpnl.AccountList `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope.Data.Accounts) != 4 || envelope.Data.ObservedAt.IsZero() {
+		t.Fatalf("response = %#v", envelope)
+	}
+	for _, account := range envelope.Data.Accounts {
+		if account.MarketSource != "POLYMARKET" || account.ExecutionAccountID == "" {
+			t.Fatalf("account = %#v", account)
+		}
+	}
+	if strings.Contains(response.Body.String(), "wallet_address") || strings.Contains(response.Body.String(), "0x") {
+		t.Fatalf("discovery response contains a wallet identity: %s", response.Body.String())
+	}
+	for _, suffix := range []string{"?execution_account_id=main", "?user=0x1111", "?x=1&x=2", "?%zz=invalid"} {
+		if result := performRequest(t, server, http.MethodGet, path+suffix, "", "readonly-secret"); result.Code != http.StatusBadRequest {
+			t.Fatalf("path %s status=%d", path+suffix, result.Code)
+		}
+	}
+}
+
+func TestWalletPnLAccountsEndpointFailureIsNotEmptySuccess(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"registration", errors.New("private database detail"), http.StatusServiceUnavailable},
+		{"timeout", context.DeadlineExceeded, http.StatusGatewayTimeout},
+		{"canceled", context.Canceled, http.StatusServiceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := newWalletPnLHTTPTestServer(t, walletPnLTestSource{})
+			service, err := walletpnl.New(walletpnl.Params{Addresses: walletPnLTestAddresses{err: test.err}, Source: walletPnLTestSource{}, Accounts: []string{"main"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server.walletPnL = service
+			response := performRequest(t, server, http.MethodGet, "/api/v1/wallet-pnl/accounts", "", "readonly-secret")
+			if response.Code != test.want || strings.Contains(response.Body.String(), "private database detail") || strings.Contains(response.Body.String(), `"accounts":[]`) {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+	server := newWalletPnLHTTPTestServer(t, walletPnLTestSource{})
+	server.walletPnL = nil
+	if response := performRequest(t, server, http.MethodGet, "/api/v1/wallet-pnl/accounts", "", "readonly-secret"); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured status=%d body=%s", response.Code, response.Body.String())
 	}
 }

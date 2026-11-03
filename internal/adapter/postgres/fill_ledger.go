@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"strings"
 	"time"
@@ -263,6 +264,22 @@ func (ledger *FillLedger) recordOnce(ctx context.Context, expected domain.Order,
 	if err := insertAccountEvent(ctx, tx, order, fill, accountBefore, accountAfter); err != nil {
 		return domain.FillApplication{}, err
 	}
+	// Runs after the fill's account event so that event's balance delta stays the
+	// fill's own cash and the netting payout gets an event of its own.
+	netting, err := applyKalshiNetting(ctx, tx, kalshiNettingParams{
+		Order: order, Fill: fill, At: fill.ObservedAt,
+		DustShares: ledger.dustSharesThreshold, DustNotional: ledger.dustNotionalThreshold,
+	})
+	if err != nil {
+		return domain.FillApplication{}, err
+	}
+	if len(netting.Events) > 0 {
+		position, err = selectPosition(ctx, tx, fill.ExecutionAccountID, fill.TokenID, true)
+		if err != nil {
+			return domain.FillApplication{}, err
+		}
+		positionEvents = append(positionEvents, netting.Events...)
+	}
 	amounts := fillOrderTransitionParams{
 		Fill: fill, FilledSize: cumulativeShares, FilledNotional: cumulativeNotional,
 		TotalFees: cumulativeFees, AverageFillPrice: averagePrice, IncludeAmounts: true,
@@ -301,10 +318,15 @@ func (ledger *FillLedger) recordOnce(ctx context.Context, expected domain.Order,
 	if err != nil {
 		return domain.FillApplication{}, err
 	}
-	return commitApplication(tx, domain.FillApplication{
+	application, err := commitApplication(tx, domain.FillApplication{
 		Fill: fill, Order: order, Position: &position, PositionEvents: positionEvents,
 		Applied: true, OutboxEventID: outboxID,
 	})
+	if err == nil && netting.Deferred {
+		slog.Warn("Kalshi netting deferred: the opposite side is reserved by an open order",
+			"execution_account_id", fill.ExecutionAccountID, "market_id", fill.MarketID, "fill_key", fill.Key)
+	}
+	return application, err
 }
 
 // verifyFillOrder 验证 Fill Order 的身份和一致性。

@@ -11,16 +11,26 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
+// MarketFeeScheduleReader resolves the official taker fee curve of one Kalshi
+// market. An error means the fee cannot be confirmed.
+type MarketFeeScheduleReader interface {
+	MarketFeeSchedule(ctx context.Context, marketTicker string) (domain.MarketFeeSchedule, error)
+}
+
 type MarketValidator struct {
 	books port.OrderBookSource
+	fees  MarketFeeScheduleReader
 	now   func() time.Time
 }
 
-func NewMarketValidator(books port.OrderBookSource) (*MarketValidator, error) {
+// NewMarketValidator builds the Kalshi market validator. fees sizes the BUY
+// fee reservation from the official fee structure; without it every BUY
+// reserves the configured fee cap.
+func NewMarketValidator(books port.OrderBookSource, fees MarketFeeScheduleReader) (*MarketValidator, error) {
 	if books == nil {
 		return nil, fmt.Errorf("Kalshi orderbook source is required")
 	}
-	return &MarketValidator{books: books, now: time.Now}, nil
+	return &MarketValidator{books: books, fees: fees, now: time.Now}, nil
 }
 
 func (validator *MarketValidator) Validate(ctx context.Context, intent domain.OrderIntent) (domain.MarketValidation, error) {
@@ -33,6 +43,13 @@ func (validator *MarketValidator) Validate(ctx context.Context, intent domain.Or
 		ConditionID: intent.ConditionID, OutcomeIndex: *intent.OutcomeIndex, OutcomeID: intent.OutcomeID, TokenID: intent.TokenID}).Build()
 	if err != nil {
 		return domain.MarketValidation{}, err
+	}
+	// The fee lookup runs before the book capture so its latency never ages the
+	// book that gates the submission.
+	var buyFeeReserve *domain.BuyFeeReserve
+	if intent.Side == domain.SideBuy && validator.fees != nil {
+		schedule, err := validator.fees.MarketFeeSchedule(ctx, intent.MarketID)
+		buyFeeReserve = domain.ResolveBuyFeeReserve(intent.WorstPrice, schedule, err)
 	}
 	books, err := validator.books.Capture(ctx, validator.now().UTC(), []domain.BookTarget{target})
 	if err != nil || len(books) != 1 {
@@ -74,12 +91,14 @@ func (validator *MarketValidator) Validate(ctx context.Context, intent domain.Or
 	if len(book.Asks) > 0 {
 		bestAsk = book.Asks[0].Price
 	}
-	return (domain.MarketValidationParams{Mode: "KALSHI_LIVE_CHECK", ValidatedAt: now,
+	params := domain.MarketValidationParams{Mode: "KALSHI_LIVE_CHECK", ValidatedAt: now,
 		MarketObservedAt: book.SourceAt, StrategySnapshotAt: intent.MarketSnapshotAt.UTC(), LatestBookSourceAt: book.SourceAt,
 		LatestBookObservedAt: book.ObservedAt, OutcomeIndex: *intent.OutcomeIndex, OutcomeName: strings.TrimSpace(intent.OutcomeName),
 		TokenID: intent.TokenID, NegRisk: *intent.ExpectedNegRisk, TickSize: book.TickSize, MinOrderSize: book.MinOrderSize,
 		BestBid: bestBid, BestAsk: bestAsk, WorstPrice: intent.WorstPrice, BookStatus: book.Status,
-		ExecutableSize: executableSize}).Build()
+		ExecutableSize: executableSize}
+	params.BuyFeeReserve = buyFeeReserve
+	return params.Build()
 }
 
 // validateKalshiDepthAwareLimit keeps the strategy's immutable protection
