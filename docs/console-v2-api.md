@@ -337,3 +337,68 @@ available. Zero assets legitimately produce zero value and unrealized PnL,
 with total equal to realized. Return is total divided by peak holding cost
 and stays null whenever that denominator is zero. A missing quote is never
 reported as a zero-valued asset.
+
+## Account core metrics and independent valuation
+
+`GET /api/v1/console/v2/account-core-metrics` accepts only an optional single
+`execution_account_id`. It uses the registered managed-account set, the existing
+read-only credential, a five-second request budget, and the existing safe V2
+400/503 errors. The older `account-performance` snapshot endpoint is unchanged.
+
+The envelope is `data.observed_at/items`. Each item keeps `asset_count`,
+`priced_asset_count`, `current_cost`, `peak_holding_cost`,
+`cumulative_invested_cost`, `realized_pnl`, nullable `market_value`,
+`unrealized_pnl`, `total_pnl`, `return_rate`, `realized_drawdown_14d`,
+`drawdown_from/to`, and `valuation_state`. It adds `ledger_observed_at`, nullable
+`quote_observed_from/to`, `has_reference_prices`, and the complete
+`valuation_assets` list. Money and rates are decimal strings; `return_rate` is a
+ratio, not a percentage. The local ledger is frozen in one read-only RR
+transaction, then the connection is released before fetching market data.
+Quotes have separate observation times, not a fictitious common atomic time.
+
+Each valuation asset has the portfolio identity (`execution_account_id`,
+`market_source`, `market_id`, `condition_id`, `token_id`, nullable `outcome_index`
+and `outcome_name`), nullable `market_question`, exact `remaining_shares` and
+`remaining_cost`, nullable `price/market_value`, `state=priced|unpriced`, nullable
+`price_source/source_at/observed_at/reason`. Reasons are stable enums:
+`missing_price`, `one_sided`, `invalid_price`, `identity_mismatch`, `stale`,
+`timeout`, `source_unavailable`, `unconfirmed_settlement`.
+
+Confirmed official settlement prices take precedence, including valid zero.
+Otherwise Polymarket uses official `current_price` first, then a valid two-sided
+CLOB midpoint. External quantities and average costs never replace local lots;
+the price-specific Data API reader retains zero external quantities. Kalshi
+uses the matching YES/NO midpoint with positive two-sided liquidity. NO bid/ask
+liquidity derives from YES ask/bid liquidity. This is a reference valuation,
+not a promise to match the website. Only `finalized`, a consistent binary result
+and settlement value, and a valid settlement time establish Kalshi finality;
+closed/determined/disputed/amended are not final settlement. PM redeemable 0/1
+prices carry official-settlement provenance; a missing source timestamp remains
+null rather than being fabricated.
+
+Any unpriced asset makes all four account valuation-dependent fields null.
+Local costs, realized income, and the UTC daily 14-day realized drawdown remain
+available. Zero assets have zero market/unrealized value, total equal to
+realized income, and a null rate when the peak-cost denominator is zero. The
+asset limit is 2,000 and the response limit 8 MiB; exceeding a limit fails rather
+than returning a truncated successful total.
+
+Dedicated read clients globally limit active HTTP requests to two and individual
+calls to two seconds. Prices use a 30-second success / three-second failure
+cache, never cached quantities or account values. Identical requests coalesce;
+cancelling one waiter does not cancel another. Completed prices are published
+incrementally, so another platform or fallback timing out does not erase them.
+There is no new background collection, order, balance synchronization, strategy
+call, or database write. Secrets and funding addresses are never in this DTO.
+
+## Official wallet PnL precision metadata
+
+The existing `/api/v1/wallet-pnl` result adds nullable `source_fidelity` and each
+point adds nullable `source_block` as an exact decimal integer string. The
+upstream wallet/interval/fidelity identity is checked. A one-hour output grid
+can still report daily original fidelity; neither that flag nor repeated source
+blocks prohibit using the official returned hourly values, and neither proves
+an independent valuation every hour. No values are interpolated by the backend.
+The 10,000-point / 8-MiB source bounds remain. Shared fetches have independent
+bounded lifetimes, so a cancelled leader does not poison another live waiter.
+Older consumers can ignore the additive metadata.

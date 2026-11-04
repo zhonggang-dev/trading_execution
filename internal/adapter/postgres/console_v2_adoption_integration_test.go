@@ -63,6 +63,12 @@ func assertRetiredAdoptionPortfolio(t *testing.T, db *sql.DB, account, lotID, to
 		t.Fatalf("adoption cost was used as a current price: %#v", performance.Items[0])
 	}
 
+	facts, factsErr := performanceReader.CoreMetricFacts(ctx, account)
+	if factsErr != nil || len(facts.Accounts) != 1 || len(facts.Accounts[0].Assets) != 1 {
+		t.Fatalf("retired core facts %#v %v", facts, factsErr)
+	}
+	assertConsoleAmount(t, facts.Accounts[0].Assets[0].RemainingCost, "0.615")
+	assertConsoleAmount(t, facts.Accounts[0].Metrics.PeakHoldingCost, "0.615")
 	// Corrupt only connection-local shadow copies, never the sealed fixture.
 	// Each broken relation must fail closed instead of borrowing another lot's
 	// valid baseline merely because the account, token or adoption ID exists.

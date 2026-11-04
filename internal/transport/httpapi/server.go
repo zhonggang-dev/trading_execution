@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/buildinfo"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountcoremetrics"
 	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 	"github.com/UniPat-AI/trading_execution/internal/service/edgedistribution"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
@@ -74,14 +75,17 @@ type readinessChecker interface {
 
 // Params 表示后端使用的 Params 类型。
 type Params struct {
-	Service          executionService
-	PositionExitJob  positionExitJob
-	Reconciliation   reconciliationJob
-	TradeHistory     tradeHistoryService
-	WalletPnL        *walletpnl.Service
-	LiveOperations   liveOperationsService
-	EdgeDistribution edgeDistributionService
-	ConsoleV2        consolev2.API
+	Service            executionService
+	PositionExitJob    positionExitJob
+	Reconciliation     reconciliationJob
+	TradeHistory       tradeHistoryService
+	WalletPnL          *walletpnl.Service
+	LiveOperations     liveOperationsService
+	EdgeDistribution   edgeDistributionService
+	ConsoleV2          consolev2.API
+	AccountCoreMetrics interface {
+		Query(context.Context, string) (accountcoremetrics.Response, error)
+	}
 	Readiness        readinessChecker
 	ReadinessTimeout time.Duration
 	// WriteTimeout is the http.Server write deadline. The reconciliation job
@@ -99,14 +103,17 @@ type Params struct {
 
 // Server 表示后端使用的 Server 类型。
 type Server struct {
-	service          executionService
-	positionExitJob  positionExitJob
-	reconciliation   reconciliationJob
-	tradeHistory     tradeHistoryService
-	walletPnL        *walletpnl.Service
-	liveOperations   liveOperationsService
-	edgeDistribution edgeDistributionService
-	consoleV2        consolev2.API
+	service            executionService
+	positionExitJob    positionExitJob
+	reconciliation     reconciliationJob
+	tradeHistory       tradeHistoryService
+	walletPnL          *walletpnl.Service
+	liveOperations     liveOperationsService
+	edgeDistribution   edgeDistributionService
+	consoleV2          consolev2.API
+	accountCoreMetrics interface {
+		Query(context.Context, string) (accountcoremetrics.Response, error)
+	}
 	readinessChecker readinessChecker
 	readinessTimeout time.Duration
 	jobBudget        time.Duration
@@ -146,22 +153,23 @@ func New(params Params) (*Server, error) {
 		}
 	}
 	server := &Server{
-		service:          params.Service,
-		positionExitJob:  params.PositionExitJob,
-		reconciliation:   params.Reconciliation,
-		tradeHistory:     params.TradeHistory,
-		walletPnL:        params.WalletPnL,
-		liveOperations:   params.LiveOperations,
-		edgeDistribution: params.EdgeDistribution,
-		consoleV2:        params.ConsoleV2,
-		readinessChecker: params.Readiness,
-		readinessTimeout: params.ReadinessTimeout,
-		jobBudget:        reconciliationJobBudget(params.WriteTimeout),
-		logger:           params.Logger,
-		apiToken:         apiToken,
-		jobToken:         jobToken,
-		readOnlyToken:    readOnlyToken,
-		pipelineMonitor:  params.PipelineMonitor,
+		service:            params.Service,
+		positionExitJob:    params.PositionExitJob,
+		reconciliation:     params.Reconciliation,
+		tradeHistory:       params.TradeHistory,
+		walletPnL:          params.WalletPnL,
+		liveOperations:     params.LiveOperations,
+		edgeDistribution:   params.EdgeDistribution,
+		consoleV2:          params.ConsoleV2,
+		accountCoreMetrics: params.AccountCoreMetrics,
+		readinessChecker:   params.Readiness,
+		readinessTimeout:   params.ReadinessTimeout,
+		jobBudget:          reconciliationJobBudget(params.WriteTimeout),
+		logger:             params.Logger,
+		apiToken:           apiToken,
+		jobToken:           jobToken,
+		readOnlyToken:      readOnlyToken,
+		pipelineMonitor:    params.PipelineMonitor,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", server.liveness)

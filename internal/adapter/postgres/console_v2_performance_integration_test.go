@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	core "github.com/UniPat-AI/trading_execution/internal/service/accountcoremetrics"
 	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 )
 
@@ -28,6 +29,33 @@ func TestPostgresIntegrationConsoleV2AccountPerformanceKalshi(t *testing.T) {
 		result, err := r.AccountPerformance(ctx, f.account)
 		if err != nil || len(result.Items) != 1 {
 			t.Fatalf("performance=%#v err=%v", result, err)
+		}
+		f.database.SetMaxOpenConns(1)
+		live := core.New(r, coreFixtureQuotes(func(priceCtx context.Context, ts []core.Target) map[string]core.Quote {
+			var one int
+			if e := f.database.QueryRowContext(priceCtx, `SELECT 1`).Scan(&one); e != nil {
+				t.Errorf("DB transaction held across price read: %v", e)
+				return nil
+			}
+			q := map[string]core.Quote{}
+			for _, target := range ts {
+				q[core.Key(target)] = core.Priced("0.5", "KALSHI_BOOK_MID", time.Now().UTC(), nil)
+			}
+			return q
+		}))
+		current, e := live.Query(ctx, f.account)
+		if e != nil || len(current.Items) != 1 {
+			t.Fatalf("core metrics %#v %v", current, e)
+		}
+		m := current.Items[0]
+		old := result.Items[0]
+		assertConsoleAmount(t, m.RealizedPnL, old.RealizedPnL)
+		assertConsoleAmount(t, m.CurrentCost, old.CurrentCost)
+		assertConsoleAmount(t, m.PeakHoldingCost, old.PeakHoldingCost)
+		assertConsoleAmount(t, m.CumulativeInvestedCost, old.CumulativeInvestedCost)
+		assertConsoleAmount(t, m.RealizedDrawdown14D, old.RealizedDrawdown14D)
+		if m.AssetCount != old.AssetCount || m.PricedAssetCount != m.AssetCount {
+			t.Fatalf("core complete local assets %#v", m)
 		}
 		return result.Items[0]
 	}
@@ -117,4 +145,10 @@ func TestPostgresIntegrationConsoleV2AccountPerformanceKalshi(t *testing.T) {
 	assertConsoleAmount(t, *flat.Items[0].MarketValue, "0")
 	assertConsoleAmount(t, *flat.Items[0].UnrealizedPnL, "0")
 	assertConsoleAmount(t, *flat.Items[0].TotalPnL, "1")
+}
+
+type coreFixtureQuotes func(context.Context, []core.Target) map[string]core.Quote
+
+func (f coreFixtureQuotes) Quotes(ctx context.Context, ts []core.Target) map[string]core.Quote {
+	return f(ctx, ts)
 }

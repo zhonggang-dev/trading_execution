@@ -32,6 +32,7 @@ func (server *Server) registerConsoleV2Routes(mux *http.ServeMux) {
 		return server.authenticateReadOnly(server.withConsoleV2ReadDeadline(handler))
 	}
 	mux.Handle("GET /api/v1/console/v2/accounts", readOnly(server.consoleV2Accounts))
+	mux.Handle("GET /api/v1/console/v2/account-core-metrics", readOnly(server.consoleV2AccountCoreMetrics))
 	mux.Handle("GET /api/v1/console/v2/account-performance", readOnly(server.consoleV2AccountPerformance))
 	mux.Handle("GET /api/v1/console/v2/ledger-activities", readOnly(server.consoleV2LedgerActivities))
 	mux.Handle("GET /api/v1/console/v2/settlements", readOnly(server.consoleV2Settlements))
