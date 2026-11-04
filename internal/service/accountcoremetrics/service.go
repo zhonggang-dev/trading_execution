@@ -250,7 +250,7 @@ func validateQuote(q Quote, now time.Time) Quote {
 		return Unknown("invalid_price")
 	}
 	switch *q.Source {
-	case "PM_CURRENT_PRICE", "PM_CLOB_MID", "KALSHI_BOOK_MID":
+	case "PM_CURRENT_PRICE", "PM_CLOB_MID", "KALSHI_BOOK_MID", "KALSHI_LAST_TRADE":
 		if now.Sub(*q.ObservedAt) > 30*time.Second {
 			return Unknown("stale")
 		}

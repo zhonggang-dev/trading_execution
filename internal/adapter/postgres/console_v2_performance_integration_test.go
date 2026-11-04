@@ -39,7 +39,7 @@ func TestPostgresIntegrationConsoleV2AccountPerformanceKalshi(t *testing.T) {
 			}
 			q := map[string]core.Quote{}
 			for _, target := range ts {
-				q[core.Key(target)] = core.Priced("0.5", "KALSHI_BOOK_MID", time.Now().UTC(), nil)
+				q[core.Key(target)] = core.Priced("0.5", "KALSHI_LAST_TRADE", time.Now().UTC(), nil)
 			}
 			return q
 		}))

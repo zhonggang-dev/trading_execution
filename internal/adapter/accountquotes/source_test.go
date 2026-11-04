@@ -122,12 +122,59 @@ func TestKalshiYesNoUsesActualYesLiquidityAndReferenceSource(t *testing.T) {
 		t.Fatal("zero-side book produced price")
 	}
 }
+func TestKalshiOfficialLastTradeFirstAndExactNoComplement(t *testing.T) {
+	for _, last := range []string{"0.01", "0.123456", "0", "1"} {
+		t.Run(last, func(t *testing.T) {
+			m := market()
+			m.LastPrice, m.Volume = ptr(last), ptr("10.00")
+			// An absent sell side must not erase a real last-traded price.
+			m.YesBidSize = ptr("0")
+			s := Source{Kalshi: marketsFunc(func(context.Context, []string) ([]KalshiMarket, error) { return []KalshiMarket{m}, nil })}
+			yes, no := kalshiTarget(0), kalshiTarget(1)
+			q := s.Quotes(context.Background(), []core.Target{yes, no})
+			y, n := q[core.Key(yes)], q[core.Key(no)]
+			expected := map[string]string{"0.01": "0.99", "0.123456": "0.876544", "0": "1", "1": "0"}
+			if y.Price == nil || n.Price == nil || *y.Price != last || *n.Price != expected[last] || *y.Source != "KALSHI_LAST_TRADE" || *n.Source != "KALSHI_LAST_TRADE" || y.SourceAt != nil || n.SourceAt != nil {
+				t.Fatalf("last trade YES=%+v NO=%+v", y, n)
+			}
+		})
+	}
+}
+func TestKalshiMissingInvalidOrUntradedLastFallsBackToValidMid(t *testing.T) {
+	cases := []struct {
+		name         string
+		last, volume *string
+	}{
+		{"missing", nil, ptr("1")}, {"empty", ptr(""), ptr("1")}, {"invalid", ptr("NaN"), ptr("1")},
+		{"negative", ptr("-0.01"), ptr("1")}, {"above-one", ptr("1.01"), ptr("1")},
+		{"never-traded-default-zero", ptr("0"), ptr("0")}, {"missing-volume", ptr("0.2"), nil},
+		{"bad-volume", ptr("0.2"), ptr("bad")}, {"negative-volume", ptr("0.2"), ptr("-1")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := market()
+			m.LastPrice, m.Volume = tc.last, tc.volume
+			s := Source{Kalshi: marketsFunc(func(context.Context, []string) ([]KalshiMarket, error) { return []KalshiMarket{m}, nil })}
+			target := kalshiTarget(1)
+			q := s.Quotes(context.Background(), []core.Target{target})[core.Key(target)]
+			if q.Price == nil || *q.Price != "0.5" || *q.Source != "KALSHI_BOOK_MID" {
+				t.Fatalf("mid fallback: %+v", q)
+			}
+			m.YesBidSize = ptr("0")
+			q = s.Quotes(context.Background(), []core.Target{target})[core.Key(target)]
+			if q.Price != nil || q.Reason == nil || *q.Reason != "one_sided" {
+				t.Fatalf("invalid last plus missing side invented price: %+v", q)
+			}
+		})
+	}
+}
 func TestKalshiOnlyFinalizedIsOfficialSettlement(t *testing.T) {
 	now := time.Now().UTC()
 	for _, status := range []string{"closed", "determined", "disputed", "amended", "finalized"} {
 		t.Run(status, func(t *testing.T) {
 			m := market()
 			m.Status = status
+			m.LastPrice, m.Volume = ptr("0.2"), ptr("100")
 			m.Result = "yes"
 			m.SettlementAt = &now
 			m.SettlementValue = ptr("1")
@@ -150,6 +197,7 @@ func TestKalshiRejectsSettlementConflictAndBadIdentity(t *testing.T) {
 		t.Run(variant, func(t *testing.T) {
 			m := market()
 			m.Status = "finalized"
+			m.LastPrice, m.Volume = ptr("0.2"), ptr("100")
 			m.Result = "yes"
 			m.SettlementAt = &now
 			m.SettlementValue = ptr("1")
