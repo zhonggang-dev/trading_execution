@@ -16,7 +16,7 @@ import (
 // synchronizes funds, starts a background loop, or builds an execution route.
 func buildAccountCoreMetrics(reader *consolev2.Reader, cfg config.Config) *accountcoremetrics.Service {
 	client := &http.Client{Timeout: 2 * time.Second, Transport: accountquotes.NewLimitTransport(nil), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	source := &accountquotes.Source{CLOBURL: cfg.Polymarket.CLOBURL, HTTPClient: client}
+	source := &accountquotes.Source{CLOBURL: cfg.Polymarket.CLOBURL, GammaURL: cfg.Polymarket.GammaURL, HTTPClient: client}
 	positions, err := polymarketdata.NewPositionClient(polymarketdata.PositionClientParams{BaseURL: cfg.Polymarket.DataAPIURL, HTTPClient: client})
 	if err == nil {
 		source.Positions = positions

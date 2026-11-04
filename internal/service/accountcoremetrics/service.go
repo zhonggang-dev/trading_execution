@@ -359,6 +359,9 @@ func (s *Service) readQuotes(ctx context.Context, targets []Target) map[string]Q
 							continue
 						}
 						q = validateQuote(q, now)
+						if prior, ok := f.quotes[k]; ok && prior.Source != nil && *prior.Source == "OFFICIAL_SETTLEMENT" && (q.Source == nil || *q.Source != "OFFICIAL_SETTLEMENT") {
+							continue
+						}
 						if q.Price != nil {
 							q = cloneQuote(q)
 							f.quotes[k] = q

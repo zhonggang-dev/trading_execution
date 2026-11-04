@@ -402,3 +402,15 @@ an independent valuation every hour. No values are interpolated by the backend.
 The 10,000-point / 8-MiB source bounds remain. Shared fetches have independent
 bounded lifetimes, so a cancelled leader does not poison another live waiter.
 Older consumers can ignore the additive metadata.
+
+Polymarket terminal prices also use public Gamma batched identifier lookups
+(`condition_ids` repeated, at most 100, `closed=any`). A result is a final price
+only when `closed=true`, `umaResolutionStatus=resolved`, market/condition IDs
+match, two unique token/outcome mappings match the local outcome index, and the
+two outcome prices are exactly one zero and one one. These final prices override
+both `current_price` and CLOB midpoints, including assets no longer returned by
+account positions. A closed/proposed/disputed market alone is insufficient.
+Gamma does not provide an unambiguous resolution timestamp here, so `source_at`
+remains null; observation time is the actual read time. The lookup runs in the
+same bounded read-only price layer and failures do not erase successful current
+prices from other reads. No ledger settlement or redemption is performed.

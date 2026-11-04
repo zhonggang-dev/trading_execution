@@ -47,6 +47,7 @@ type Source struct {
 	Positions  AddressPositions
 	Kalshi     KalshiMarketReader
 	CLOBURL    string
+	GammaURL   string
 	HTTPClient *http.Client
 	Now        func() time.Time
 }
@@ -105,6 +106,9 @@ func (s *Source) QuotesWithUpdates(ctx context.Context, targets []core.Target, e
 			result[core.Key(t)] = core.Unknown("identity_mismatch")
 		}
 	}
+	settlementsDone := make(chan struct{})
+	var settlements map[string]core.Quote
+	go func() { settlements = s.pmSettlements(ctx, targets, emit); close(settlementsDone) }()
 	var pmWait, all sync.WaitGroup
 	for address, group := range groups {
 		address, group := address, group
@@ -112,6 +116,15 @@ func (s *Source) QuotesWithUpdates(ctx context.Context, targets []core.Target, e
 		go func() {
 			defer pmWait.Done()
 			q := s.pm(ctx, address, group)
+			if emit != nil {
+				emit(q)
+			}
+			<-settlementsDone
+			for _, target := range group {
+				if quote, ok := settlements[core.Key(target)]; ok {
+					q[core.Key(target)] = quote
+				}
+			}
 			mu.Lock()
 			for k, v := range q {
 				result[k] = v
