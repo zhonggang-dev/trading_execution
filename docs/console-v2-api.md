@@ -273,3 +273,67 @@ and fill tables, position lots, reconciliation tables, and
 The new resources use the same read-only permission, five-second deadline,
 query validation and safe 400/503 error codes. Legacy `/api/v1/ledger-activities`
 and `/api/v1/daily-pnl` retain their existing four-type protocols and metrics.
+
+## Account performance
+
+`GET /api/v1/console/v2/account-performance` accepts only an optional single,
+non-empty `execution_account_id`. There are no aliases, dates, pagination or
+model/strategy filters. Unknown, unregistered or unmanaged accounts return
+400 `INVALID_CONSOLE_V2_FILTER`. Without the parameter, `items` contains the
+same registered managed account set as `accounts`, sorted by account ID; no
+cross-account return is calculated. Authentication, five-second budget and
+safe 503 errors are unchanged.
+
+The response is `{ "data": { "observed_at": "...", "items": [...] } }`.
+Each item contains:
+
+- `execution_account_id`, explicit `market_source` (`POLYMARKET` or `KALSHI`),
+  `asset_count`, `priced_asset_count`;
+- decimal strings `current_cost`, `peak_holding_cost`,
+  `cumulative_invested_cost`, `realized_pnl`, `realized_drawdown_14d`;
+- nullable decimal strings `market_value`, `unrealized_pnl`, `total_pnl`,
+  `return_rate` (a ratio, not a percentage);
+- `drawdown_from`, `drawdown_to` (UTC, today included, 14 calendar dates);
+- `valuation_state` (`complete` or `incomplete`), `valuation_reasons`;
+- nullable `snapshot_decision_at` and `snapshot_observed_at` (the earliest
+  strictly matched quote observation for that account).
+
+Registration, event accounting, all current portfolio assets and quotes are
+read in one READ ONLY REPEATABLE READ transaction. Current assets reuse the
+portfolio-holdings identity and provenance, including old strategies, real
+adoptions and positive `SETTLED_PENDING_REDEEM` lots. Counts are asset groups,
+not lots or shares. Current model/strategy bindings do not filter economics.
+
+`peak_holding_cost` replays all historical `cost_basis_delta` values in
+`occurred_at, position_event_id` order and takes the maximum running cost,
+with a zero floor. `cumulative_invested_cost` adds positive BOUGHT, ADOPTED and
+EXTERNAL_BUY_IMPORTED cost deltas. `realized_pnl` sums all
+`realized_pnl_delta` values, including both Kalshi netting legs and the single
+non-zero REDEEMED event from expiration settlement. Account cash payouts and
+fees are not added/deducted again. This is system-managed ledger performance,
+not venue-wide address PnL, net-deposit ROI or an annualized return.
+
+The positive `realized_drawdown_14d` is the maximum high-to-low drop of the
+cumulative daily realized events, starting at zero, grouped by
+`occurred_at AT TIME ZONE 'UTC'`. It includes today's partial day through
+`observed_at`, does not capture intraday peaks, and is independent of the
+official chart's date range. Empty days do not change the cumulative curve.
+
+Valuation uses only one latest sealed decision batch whose decision and
+creation time do not exceed `observed_at`. Members must match source, market,
+condition, token and outcome index. Only status OK with finite uncrossed
+two-sided prices in [0,1] and `observed_at` between 15 minutes ago and the
+response observation time supplies a midpoint; venue `source_at` alone is
+not a freshness test. There are no venue requests, default-zero position
+marks, cost-as-price fallbacks, older-batch fallbacks, new background jobs,
+write paths or migrations.
+
+Any missing/invalid/stale/future member makes the entire account's
+`market_value`, `unrealized_pnl`, `total_pnl`, and `return_rate` null;
+`priced_asset_count` counts only fully valid fresh members. Reason enums are
+`missing_batch`, `missing_quote`, `invalid_quote`, `stale_quote`, and
+`future_quote`. Costs, realized amounts and asset count remain independently
+available. Zero assets legitimately produce zero value and unrealized PnL,
+with total equal to realized. Return is total divided by peak holding cost
+and stays null whenever that denominator is zero. A missing quote is never
+reported as a zero-valued asset.

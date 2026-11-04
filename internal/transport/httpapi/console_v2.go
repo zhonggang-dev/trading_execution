@@ -32,6 +32,7 @@ func (server *Server) registerConsoleV2Routes(mux *http.ServeMux) {
 		return server.authenticateReadOnly(server.withConsoleV2ReadDeadline(handler))
 	}
 	mux.Handle("GET /api/v1/console/v2/accounts", readOnly(server.consoleV2Accounts))
+	mux.Handle("GET /api/v1/console/v2/account-performance", readOnly(server.consoleV2AccountPerformance))
 	mux.Handle("GET /api/v1/console/v2/ledger-activities", readOnly(server.consoleV2LedgerActivities))
 	mux.Handle("GET /api/v1/console/v2/settlements", readOnly(server.consoleV2Settlements))
 	mux.Handle("GET /api/v1/console/v2/runtime", readOnly(server.consoleV2Runtime))
@@ -586,4 +587,34 @@ func parseConsoleV2PortfolioHoldingLotsQuery(request *http.Request) (consolev2.P
 		return consolev2.PortfolioHoldingIdentity{}, filter, fmt.Errorf("portfolio holding identity is incomplete")
 	}
 	return consolev2.PortfolioHoldingIdentity{ExecutionAccountID: legacy.ExecutionAccountID, MarketSource: legacy.MarketSource, MarketID: legacy.MarketID, ConditionID: legacy.ConditionID, TokenID: legacy.TokenID, OutcomeIndex: legacy.OutcomeIndex, OutcomeName: legacy.OutcomeName}, filter, nil
+}
+
+// The performance resource intentionally has no aliases, pagination, dates or
+// other list filters. Unknown and registered-but-unmanaged IDs are rejected by
+// the reader inside its consistent read transaction.
+func (server *Server) consoleV2AccountPerformance(writer http.ResponseWriter, request *http.Request) {
+	query, err := url.ParseQuery(request.URL.RawQuery)
+	account := ""
+	if err == nil {
+		for key, values := range query {
+			if key != "execution_account_id" || len(values) != 1 || values[0] == "" {
+				err = fmt.Errorf("only a single non-empty execution_account_id is supported")
+				break
+			}
+			account = values[0]
+		}
+	}
+	if err == nil {
+		err = consolev2.ValidatePerformanceAccountID(account)
+	}
+	if err != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_CONSOLE_V2_FILTER", "account performance filter is invalid")
+		return
+	}
+	value, err := server.consoleV2.AccountPerformance(request.Context(), account)
+	if errors.Is(err, consolev2.ErrInvalidPerformanceAccount) {
+		writeError(writer, http.StatusBadRequest, "INVALID_CONSOLE_V2_FILTER", consolev2.ErrInvalidPerformanceAccount.Error())
+		return
+	}
+	server.writeConsoleV2Result(writer, value, err)
 }

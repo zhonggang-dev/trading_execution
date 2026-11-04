@@ -321,3 +321,7 @@ func (fake *fakeConsoleV2Service) PortfolioHoldings(context.Context, consolev2.L
 func (fake *fakeConsoleV2Service) PortfolioHoldingLots(context.Context, consolev2.PortfolioHoldingIdentity, consolev2.ListFilter) (consolev2.Page[consolev2.PositionLot], error) {
 	return consolev2.Page[consolev2.PositionLot]{}, fake.readErr
 }
+
+func (fake *fakeConsoleV2Service) AccountPerformance(context.Context, string) (consolev2.AccountPerformanceResponse, error) {
+	return consolev2.AccountPerformanceResponse{}, fake.readErr
+}
