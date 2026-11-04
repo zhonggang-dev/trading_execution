@@ -152,7 +152,9 @@ func run() error {
 	if live != nil {
 		httpParams.LiveOperations = live.operations
 	}
-	httpParams.ConsoleV2 = consolev2.New(database, consoleV2RuntimeConfig(cfg, live, startedAt))
+	consoleReader := consolev2.New(database, consoleV2RuntimeConfig(cfg, live, startedAt))
+	httpParams.ConsoleV2 = consoleReader
+	httpParams.AccountCoreMetrics = buildAccountCoreMetrics(consoleReader, cfg)
 	httpAPI, err := httpapi.New(httpParams)
 	if err != nil {
 		return err

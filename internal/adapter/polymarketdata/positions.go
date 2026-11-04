@@ -88,6 +88,16 @@ type wirePosition struct {
 // losing), matching the v1 view; filter_amount=0 lifts the v2 0.1-share
 // default dust floor that v1 did not have.
 func (client *PositionClient) ListExternalPositions(ctx context.Context, walletAddress string) ([]domain.ExternalPosition, error) {
+	return client.listPositions(ctx, walletAddress, false)
+}
+
+// ListValuationPrices retains zero external quantities: the caller values its
+// local managed shares and must not let external size filter a price source.
+// Reconciliation's ListExternalPositions keeps its existing quantity semantics.
+func (client *PositionClient) ListValuationPrices(ctx context.Context, walletAddress string) ([]domain.ExternalPosition, error) {
+	return client.listPositions(ctx, walletAddress, true)
+}
+func (client *PositionClient) listPositions(ctx context.Context, walletAddress string, includeZero bool) ([]domain.ExternalPosition, error) {
 	walletAddress = strings.ToLower(strings.TrimSpace(walletAddress))
 	if walletAddress == "" {
 		return nil, fmt.Errorf("wallet address is required")
@@ -139,7 +149,7 @@ func (client *PositionClient) ListExternalPositions(ctx context.Context, walletA
 			}
 			if sign, err := shares.Sign(); err != nil || sign < 0 {
 				return nil, fmt.Errorf("Data API position %s has invalid shares", tokenID)
-			} else if sign == 0 {
+			} else if sign == 0 && !includeZero {
 				continue
 			}
 			if _, duplicate := seen[tokenID]; duplicate {

@@ -35,8 +35,9 @@ type Query struct {
 }
 
 type Point struct {
-	Timestamp int64          `json:"timestamp"`
-	TradePnL  domain.Decimal `json:"trade_pnl"`
+	Timestamp   int64          `json:"timestamp"`
+	TradePnL    domain.Decimal `json:"trade_pnl"`
+	SourceBlock *string        `json:"source_block"`
 }
 
 type Result struct {
@@ -46,6 +47,7 @@ type Result struct {
 	Interval           string    `json:"interval"`
 	Fidelity           string    `json:"fidelity"`
 	FetchedAt          time.Time `json:"fetched_at"`
+	SourceFidelity     *string   `json:"source_fidelity"`
 	Points             []Point   `json:"points"`
 }
 
@@ -84,9 +86,11 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 type pending struct {
-	done   chan struct{}
-	result Result
-	err    error
+	done    chan struct{}
+	result  Result
+	err     error
+	cancel  context.CancelFunc
+	waiters int
 }
 
 func New(params Params) (*Service, error) {
@@ -144,6 +148,9 @@ func (service *Service) ListAccounts(ctx context.Context) (AccountList, error) {
 }
 
 func (service *Service) Query(ctx context.Context, query Query) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	if _, ok := service.allowed[strings.TrimSpace(query.ExecutionAccountID)]; !ok {
 		return Result{}, ErrUnknownAccount
 	}
@@ -167,36 +174,57 @@ func (service *Service) Query(ctx context.Context, query Query) (Result, error) 
 		service.mu.Unlock()
 		return cloneResultFor(entry.result, query.ExecutionAccountID), nil
 	}
-	if call, ok := service.inflight[key]; ok {
+	call := service.inflight[key]
+	if call == nil {
+		shared, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		call = &pending{done: make(chan struct{}), cancel: cancel}
+		service.inflight[key] = call
+		go func() {
+			defer cancel()
+			series, fetchErr := service.source.Series(shared, address, query.Interval, query.Fidelity)
+			result := Result{ExecutionAccountID: query.ExecutionAccountID, WalletAddress: address, Metric: "trade_pnl", Interval: query.Interval, Fidelity: query.Fidelity, FetchedAt: service.now().UTC(), SourceFidelity: series.SourceFidelity, Points: make([]Point, 0, len(series.Points))}
+			for _, point := range series.Points {
+				result.Points = append(result.Points, Point{Timestamp: point.Timestamp, TradePnL: point.TradePnL, SourceBlock: point.SourceBlock})
+			}
+			if fetchErr != nil && !errors.Is(fetchErr, context.Canceled) && !errors.Is(fetchErr, context.DeadlineExceeded) {
+				fetchErr = fmt.Errorf("%w: query Data API", ErrUnavailable)
+			}
+			service.mu.Lock()
+			if service.inflight[key] == call {
+				delete(service.inflight, key)
+			}
+			call.result, call.err = result, fetchErr
+			if fetchErr == nil && !errors.Is(shared.Err(), context.Canceled) {
+				service.cache[key] = cacheEntry{result: cloneResult(result), expiresAt: service.now().UTC().Add(service.ttl)}
+				service.trimCacheLocked()
+			}
+			close(call.done)
+			service.mu.Unlock()
+		}()
+	}
+	call.waiters++
+	service.mu.Unlock()
+	select {
+	case <-call.done:
+		service.mu.Lock()
+		call.waiters--
 		service.mu.Unlock()
-		select {
-		case <-call.done:
-			return cloneResultFor(call.result, query.ExecutionAccountID), call.err
-		case <-ctx.Done():
-			return Result{}, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
 		}
+		return cloneResultFor(call.result, query.ExecutionAccountID), call.err
+	case <-ctx.Done():
+		service.mu.Lock()
+		call.waiters--
+		if call.waiters == 0 {
+			call.cancel()
+			if service.inflight[key] == call {
+				delete(service.inflight, key)
+			}
+		}
+		service.mu.Unlock()
+		return Result{}, ctx.Err()
 	}
-	call := &pending{done: make(chan struct{})}
-	service.inflight[key] = call
-	service.mu.Unlock()
-	series, fetchErr := service.source.Series(ctx, address, query.Interval, query.Fidelity)
-	result := Result{ExecutionAccountID: query.ExecutionAccountID, WalletAddress: address, Metric: "trade_pnl", Interval: query.Interval, Fidelity: query.Fidelity, FetchedAt: service.now().UTC(), Points: make([]Point, 0, len(series.Points))}
-	for _, point := range series.Points {
-		result.Points = append(result.Points, Point{Timestamp: point.Timestamp, TradePnL: point.TradePnL})
-	}
-	if fetchErr != nil && !errors.Is(fetchErr, context.Canceled) && !errors.Is(fetchErr, context.DeadlineExceeded) {
-		fetchErr = fmt.Errorf("%w: query Data API", ErrUnavailable)
-	}
-	service.mu.Lock()
-	delete(service.inflight, key)
-	call.result, call.err = result, fetchErr
-	if fetchErr == nil {
-		service.cache[key] = cacheEntry{result: cloneResult(result), expiresAt: service.now().UTC().Add(service.ttl)}
-		service.trimCacheLocked()
-	}
-	close(call.done)
-	service.mu.Unlock()
-	return cloneResultFor(result, query.ExecutionAccountID), fetchErr
 }
 
 func (service *Service) trimCacheLocked() {
@@ -218,6 +246,16 @@ func (service *Service) trimCacheLocked() {
 func cloneResult(result Result) Result {
 	points := make([]Point, len(result.Points))
 	copy(points, result.Points)
+	for i := range points {
+		if points[i].SourceBlock != nil {
+			v := *points[i].SourceBlock
+			points[i].SourceBlock = &v
+		}
+	}
+	if result.SourceFidelity != nil {
+		v := *result.SourceFidelity
+		result.SourceFidelity = &v
+	}
 	result.Points = points
 	return result
 }

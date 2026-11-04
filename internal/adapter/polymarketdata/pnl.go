@@ -22,12 +22,14 @@ const maxPnLNormalizedChars = 256
 
 // PnLSeries 是 Polymarket Data API 的累计 trade_pnl 序列。
 type PnLSeries struct {
-	Points []PnLPoint
+	SourceFidelity *string
+	Points         []PnLPoint
 }
 
 type PnLPoint struct {
-	Timestamp int64
-	TradePnL  domain.Decimal
+	Timestamp   int64
+	SourceBlock *string
+	TradePnL    domain.Decimal
 }
 
 // PnLClient 只读访问公开的 /v2/user-pnl 接口。
@@ -81,9 +83,14 @@ func (client *PnLClient) Series(ctx context.Context, walletAddress, interval, fi
 	}
 	var envelope struct {
 		Data *struct {
-			Points *[]struct {
-				Timestamp int64           `json:"timestamp"`
-				TradePnL  json.RawMessage `json:"trade_pnl"`
+			ProxyWallet    string  `json:"proxy_wallet"`
+			Interval       string  `json:"interval"`
+			Fidelity       string  `json:"fidelity"`
+			SourceFidelity *string `json:"source_fidelity"`
+			Points         *[]struct {
+				Timestamp   int64           `json:"timestamp"`
+				SourceBlock json.RawMessage `json:"source_block"`
+				TradePnL    json.RawMessage `json:"trade_pnl"`
 			} `json:"points"`
 		} `json:"data"`
 	}
@@ -104,8 +111,26 @@ func (client *PnLClient) Series(ctx context.Context, walletAddress, interval, fi
 	if len(*envelope.Data.Points) > maxPnLPoints {
 		return PnLSeries{}, fmt.Errorf("Data API PnL contains too many points")
 	}
+	if !strings.EqualFold(envelope.Data.ProxyWallet, strings.TrimSpace(walletAddress)) {
+		return PnLSeries{}, fmt.Errorf("Data API PnL wallet mismatch")
+	}
+	if envelope.Data.Interval != interval && !(interval == "all" && envelope.Data.Interval == "max") {
+		return PnLSeries{}, fmt.Errorf("Data API PnL interval mismatch")
+	}
+	if envelope.Data.Fidelity != fidelity {
+		return PnLSeries{}, fmt.Errorf("Data API PnL fidelity mismatch")
+	}
+	var sourceFidelity *string
+	if envelope.Data.SourceFidelity != nil {
+		v := strings.TrimSpace(*envelope.Data.SourceFidelity)
+		switch v {
+		case "1h", "3h", "12h", "18h", "1d":
+			sourceFidelity = &v
+		}
+	}
 	points := make([]PnLPoint, 0, len(*envelope.Data.Points))
 	seen := make(map[int64]domain.Decimal, len(*envelope.Data.Points))
+	seenBlocks := make(map[int64]*string, len(*envelope.Data.Points))
 	for _, point := range *envelope.Data.Points {
 		if point.Timestamp <= 0 {
 			return PnLSeries{}, fmt.Errorf("invalid Data API PnL timestamp")
@@ -128,17 +153,31 @@ func (client *PnLClient) Series(ctx context.Context, walletAddress, interval, fi
 		if err != nil {
 			return PnLSeries{}, fmt.Errorf("invalid Data API trade_pnl")
 		}
+		var sourceBlock *string
+		if len(point.SourceBlock) > 0 && string(point.SourceBlock) != "null" {
+			raw := strings.TrimSpace(string(point.SourceBlock))
+			if strings.HasPrefix(raw, "\"") {
+				if json.Unmarshal(point.SourceBlock, &raw) != nil {
+					return PnLSeries{}, fmt.Errorf("invalid PnL source block")
+				}
+			}
+			if raw == "" || len(raw) > 30 || strings.Trim(raw, "0123456789") != "" {
+				return PnLSeries{}, fmt.Errorf("invalid PnL source block")
+			}
+			sourceBlock = &raw
+		}
 		if previous, exists := seen[point.Timestamp]; exists {
-			if comparison, compareErr := pnl.Compare(previous); compareErr != nil || comparison != 0 {
+			if comparison, compareErr := pnl.Compare(previous); compareErr != nil || comparison != 0 || !samePnLSourceBlock(seenBlocks[point.Timestamp], sourceBlock) {
 				return PnLSeries{}, fmt.Errorf("conflicting Data API PnL points")
 			}
 			continue
 		}
 		seen[point.Timestamp] = pnl
-		points = append(points, PnLPoint{Timestamp: point.Timestamp, TradePnL: pnl})
+		seenBlocks[point.Timestamp] = sourceBlock
+		points = append(points, PnLPoint{Timestamp: point.Timestamp, TradePnL: pnl, SourceBlock: sourceBlock})
 	}
 	sort.Slice(points, func(left, right int) bool { return points[left].Timestamp < points[right].Timestamp })
-	return PnLSeries{Points: points}, nil
+	return PnLSeries{Points: points, SourceFidelity: sourceFidelity}, nil
 }
 
 // normalizePnLDecimal accepts only bounded base-10 decimal syntax and expands
@@ -255,4 +294,8 @@ func parseBoundedExponent(raw string) (int, error) {
 		return -value, nil
 	}
 	return value, nil
+}
+
+func samePnLSourceBlock(a, b *string) bool {
+	return (a == nil && b == nil) || (a != nil && b != nil && *a == *b)
 }

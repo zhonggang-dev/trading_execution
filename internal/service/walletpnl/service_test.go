@@ -182,3 +182,82 @@ func TestListAccountsHonorsAlreadyCanceledContext(t *testing.T) {
 		t.Fatalf("error=%v reads=%v", err, addresses.reads)
 	}
 }
+
+type sourceFunction func(context.Context, string, string, string) (polymarketdata.PnLSeries, error)
+
+func (f sourceFunction) Series(ctx context.Context, a, i, g string) (polymarketdata.PnLSeries, error) {
+	return f(ctx, a, i, g)
+}
+func TestServiceMetadataCacheCloneAndLeaderCancellation(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	grid, block := "1d", "9007199254740999"
+	source := sourceFunction(func(ctx context.Context, a, i, g string) (polymarketdata.PnLSeries, error) {
+		mu.Lock()
+		calls++
+		if calls == 1 {
+			close(entered)
+		}
+		mu.Unlock()
+		select {
+		case <-release:
+			return polymarketdata.PnLSeries{SourceFidelity: &grid, Points: []polymarketdata.PnLPoint{{Timestamp: 1, TradePnL: "1", SourceBlock: &block}}}, nil
+		case <-ctx.Done():
+			return polymarketdata.PnLSeries{}, ctx.Err()
+		}
+	})
+	s, e := New(Params{Addresses: fakeAddresses{address: "0x1111111111111111111111111111111111111111"}, Source: source, Accounts: []string{"main"}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	query := Query{ExecutionAccountID: "main", Interval: "1d", Fidelity: "1h"}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, e := s.Query(ctx, query); done <- e }()
+	<-entered
+	other := make(chan Result, 1)
+	go func() {
+		r, e := s.Query(context.Background(), query)
+		if e != nil {
+			t.Errorf("other waiter: %v", e)
+		}
+		other <- r
+	}()
+	until := time.Now().Add(time.Second)
+	for {
+		s.mu.Lock()
+		n := 0
+		for _, pending := range s.inflight {
+			n = pending.waiters
+		}
+		s.mu.Unlock()
+		if n == 2 {
+			break
+		}
+		if time.Now().After(until) {
+			t.Fatal("waiter not joined")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if !errors.Is(<-done, context.Canceled) {
+		t.Fatal("leader cancellation")
+	}
+	close(release)
+	result := <-other
+	if result.SourceFidelity == nil || *result.SourceFidelity != "1d" || result.Points[0].SourceBlock == nil || *result.Points[0].SourceBlock != block {
+		t.Fatal("metadata lost")
+	}
+	*result.SourceFidelity = "1h"
+	*result.Points[0].SourceBlock = "0"
+	cached, e := s.Query(context.Background(), query)
+	if e != nil || *cached.SourceFidelity != "1d" || *cached.Points[0].SourceBlock != block {
+		t.Fatal("cached metadata aliased")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatal("shared fetch repeated", calls)
+	}
+}

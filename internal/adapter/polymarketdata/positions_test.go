@@ -127,3 +127,17 @@ func TestPositionClientFailsClosedOnMalformedV2Envelope(t *testing.T) {
 		})
 	}
 }
+
+func TestValuationPricesPreserveZeroExternalQuantityWithoutChangingReconciliation(t *testing.T) {
+	client, _ := NewPositionClient(PositionClientParams{BaseURL: "https://data-api.example", HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"data":[{"condition_id":"c","token_id":"t","outcome":"No","outcome_index":1,"current_size":0,"avg_price":null,"current_price":0,"redeemable":true}],"pagination":{"has_more":false,"next_cursor":null}}`)), Request: r}, nil
+	})}})
+	old, e := client.ListExternalPositions(context.Background(), "0xabc")
+	if e != nil || len(old) != 0 {
+		t.Fatal("old reconciliation quantity semantics changed")
+	}
+	prices, e := client.ListValuationPrices(context.Background(), "0xabc")
+	if e != nil || len(prices) != 1 || prices[0].CurrentPrice != "0" || prices[0].Shares != "0" {
+		t.Fatal("zero quantity filtered official price", prices, e)
+	}
+}
