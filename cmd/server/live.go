@@ -156,6 +156,9 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err := postgresadapter.CheckBindingAuthorizationMigration(ctx, database); err != nil {
 		return nil, err
 	}
+	if err := postgresadapter.CheckKalshiOperatorControlsMigration(ctx, database); err != nil {
+		return nil, err
+	}
 	if err := postgresadapter.CheckLiveActiveAccountAuthorization(
 		ctx, database, activeAuthorizations,
 	); err != nil {
