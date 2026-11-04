@@ -35,6 +35,8 @@ type KalshiMarket struct {
 	Result          string     `json:"result"`
 	SettlementValue *string    `json:"settlement_value_dollars"`
 	SettlementAt    *time.Time `json:"settlement_ts"`
+	LastPrice       *string    `json:"last_price_dollars"`
+	Volume          *string    `json:"volume_fp"`
 	YesBid          *string    `json:"yes_bid_dollars"`
 	YesAsk          *string    `json:"yes_ask_dollars"`
 	NoBid           *string    `json:"no_bid_dollars"`
@@ -540,6 +542,23 @@ func (s *Source) kalshi(ctx context.Context, targets []core.Target, emit func(ma
 					}
 					result[k] = core.Priced(p, "OFFICIAL_SETTLEMENT", observed, m.SettlementAt)
 					continue
+				}
+				// last_price_dollars is a YES price, including for NO holdings.
+				// Positive traded volume distinguishes a real zero price from the
+				// default value of a market that has never traded. Market updated_time
+				// is metadata time, not trade time, so SourceAt stays unknown.
+				if m.LastPrice != nil && m.Volume != nil && len(*m.Volume) <= 256 {
+					volume, err := domain.ParseDecimal(*m.Volume)
+					if sign, signErr := volume.Sign(); err == nil && signErr == nil && sign > 0 {
+						if p, priceErr := price(*m.LastPrice); priceErr == nil {
+							if !yes {
+								value, _ := new(big.Rat).SetString(p)
+								p = ratText(new(big.Rat).Sub(big.NewRat(1, 1), value))
+							}
+							result[k] = core.Priced(p, "KALSHI_LAST_TRADE", observed, nil)
+							continue
+						}
+					}
 				}
 				bid, ask, bidSize, askSize := m.YesBid, m.YesAsk, m.YesBidSize, m.YesAskSize
 				if !yes {
