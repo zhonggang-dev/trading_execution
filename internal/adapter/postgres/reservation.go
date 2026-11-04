@@ -98,6 +98,10 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 					!existing.DailyRiskNotional.Equal(authorization.dailyRiskNotional) {
 					return domain.AssetReservation{}, reject("RISK_AUTHORIZATION_CHANGED", "the existing live reservation was authorized by different risk state")
 				}
+			} else if requiresKalshiOperatorControls(order) {
+				if err := authorizeKalshiOperatorControls(ctx, tx, order.Intent); err != nil {
+					return domain.AssetReservation{}, err
+				}
 			}
 			return existing.AssetReservation, nil
 		}
@@ -140,6 +144,10 @@ func (manager *ReservationManager) Reserve(ctx context.Context, order domain.Ord
 		if requiresAtomicLiveRisk(order) {
 			authorization, err = manager.authorizeLiveRisk(ctx, tx, order, now, reserveUnitPrice, "")
 			if err != nil {
+				return domain.AssetReservation{}, err
+			}
+		} else if requiresKalshiOperatorControls(order) {
+			if err := authorizeKalshiOperatorControls(ctx, tx, order.Intent); err != nil {
 				return domain.AssetReservation{}, err
 			}
 		}

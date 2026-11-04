@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	liveMarketValidationMode = "LIVE_CHECK"
-	maxRiskFreshnessWindow   = 365 * 24 * time.Hour
-	maxRiskFutureSkew        = 2 * time.Second
+	liveMarketValidationMode   = "LIVE_CHECK"
+	kalshiMarketValidationMode = "KALSHI_LIVE_CHECK"
+	maxRiskFreshnessWindow     = 365 * 24 * time.Hour
+	maxRiskFutureSkew          = 2 * time.Second
 )
 
 type liveRiskPolicy struct {
@@ -41,6 +42,25 @@ type liveRiskAuthorization struct {
 func requiresAtomicLiveRisk(order domain.Order) bool {
 	return order.MarketValidation != nil &&
 		strings.EqualFold(strings.TrimSpace(order.MarketValidation.Mode), liveMarketValidationMode)
+}
+
+// requiresKalshiOperatorControls reports a live Kalshi order, identified by
+// the evidence of the server-side Kalshi market validator.
+func requiresKalshiOperatorControls(order domain.Order) bool {
+	return order.MarketValidation != nil &&
+		strings.EqualFold(strings.TrimSpace(order.MarketValidation.Mode), kalshiMarketValidationMode)
+}
+
+// authorizeKalshiOperatorControls applies the operator stop controls to a
+// Kalshi order: the global kill switch and the account, strategy and market
+// pauses. Kalshi has no risk policy, strategy binding or reconciliation run,
+// so those Polymarket gates do not apply, and an account without an ACCOUNT
+// row has simply never been paused. Mirrors migration 0042.
+func authorizeKalshiOperatorControls(ctx context.Context, tx *sql.Tx, intent domain.OrderIntent) error {
+	if err := checkGlobalRiskControl(ctx, tx); err != nil {
+		return err
+	}
+	return checkLiveRiskControls(ctx, tx, intent, false)
 }
 
 // authorizeLiveRisk runs after execution_accounts has been locked. Every
@@ -221,7 +241,14 @@ func checkLiveRiskBindingAndControls(ctx context.Context, tx *sql.Tx, intent dom
 	if err != nil {
 		return fmt.Errorf("load strategy execution binding: %w", err)
 	}
+	return checkLiveRiskControls(ctx, tx, intent, true)
+}
 
+// checkLiveRiskControls rejects an intent whose account, strategy or market is
+// paused. requireAccountControl makes a missing ACCOUNT row a rejection, as it
+// is for Polymarket accounts that must be explicitly armed.
+func checkLiveRiskControls(ctx context.Context, tx *sql.Tx, intent domain.OrderIntent, requireAccountControl bool) error {
+	canonicalStrategy := domain.CanonicalStrategyID(intent.StrategyID)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT control_scope, control_key, paused, reason
 		FROM execution_risk_controls
@@ -271,7 +298,7 @@ func checkLiveRiskBindingAndControls(ctx context.Context, tx *sql.Tx, intent dom
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate scoped live risk controls: %w", err)
 	}
-	if !accountSeen {
+	if requireAccountControl && !accountSeen {
 		return reject("EXECUTION_ACCOUNT_PAUSED", "the mandatory execution account control is missing")
 	}
 	return nil

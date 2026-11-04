@@ -30,9 +30,28 @@ type ExpectedActiveExecutionAccount struct {
 // configured prediction model.
 const bindingAuthorizationMarker = "binding-authorization: strategy+account (migration 0041)"
 
+// kalshiOperatorControlsMarker is written into enforce_live_order_submit_risk
+// by migration 0042. Its absence means a Kalshi order recovered after a crash
+// could reach the exchange past the kill switch and the pauses.
+const kalshiOperatorControlsMarker = "kalshi-operator-controls: kill switch and pauses (migration 0042)"
+
 // CheckBindingAuthorizationMigration fails closed unless the submit trigger
 // authorizes (strategy, account) as this release does.
 func CheckBindingAuthorizationMigration(ctx context.Context, db *sql.DB) error {
+	return checkSubmitRiskTriggerMarker(ctx, db, bindingAuthorizationMarker,
+		"migration 0041_binding_authorization_without_model.sql is not applied; "+
+			"the submit trigger would reject orders whose model_id differs from the binding row")
+}
+
+// CheckKalshiOperatorControlsMigration fails closed unless the submit trigger
+// also holds Kalshi orders to the kill switch and the pauses.
+func CheckKalshiOperatorControlsMigration(ctx context.Context, db *sql.DB) error {
+	return checkSubmitRiskTriggerMarker(ctx, db, kalshiOperatorControlsMarker,
+		"migration 0042_kalshi_operator_controls.sql is not applied; "+
+			"the submit trigger would let Kalshi orders past the kill switch and the pauses")
+}
+
+func checkSubmitRiskTriggerMarker(ctx context.Context, db *sql.DB, marker, missing string) error {
 	if db == nil {
 		return fmt.Errorf("postgres is required")
 	}
@@ -47,15 +66,14 @@ func CheckBindingAuthorizationMigration(ctx context.Context, db *sql.DB) error {
 		JOIN pg_proc function ON function.oid=trigger_row.tgfoid
 		WHERE trigger_row.tgrelid=to_regclass('execution_orders')
 		  AND NOT trigger_row.tgisinternal
-		  AND function.proname='enforce_live_order_submit_risk'`, bindingAuthorizationMarker).Scan(&triggers, &applied); err != nil {
+		  AND function.proname='enforce_live_order_submit_risk'`, marker).Scan(&triggers, &applied); err != nil {
 		return fmt.Errorf("inspect live submit trigger: %w", err)
 	}
 	if triggers == 0 {
 		return fmt.Errorf("execution_orders has no enforce_live_order_submit_risk trigger")
 	}
 	if !applied {
-		return fmt.Errorf("migration 0041_binding_authorization_without_model.sql is not applied; " +
-			"the submit trigger would reject orders whose model_id differs from the binding row")
+		return fmt.Errorf("%s", missing)
 	}
 	return nil
 }

@@ -88,3 +88,26 @@ reconciliation freshness 放进 ReservationManager 的同一个账户行锁事�
 避免“先查再扣”的 TOCTOU；数据库 trigger 还会在进入 SUBMITTING 前
 二次阻断 crash-resume 绕过。全局 Kill Switch 在 migration 中默认开启，必须完成账户、policy、
 binding 和新鲜对账审计后才能显式解除。
+
+## Kalshi 的运营开关
+
+Kalshi 账户没有风险策略、策略绑定和对账轮次，上面的数据库原子风控只有运营开关这一部分对它生效。市场校验结果为 `KALSHI_LIVE_CHECK` 的订单，在预占时和进入 SUBMITTING 时（migration `0042`）都要检查：
+
+| code | 条件 |
+| --- | --- |
+| `GLOBAL_KILL_SWITCH` | 全局停止交易；开关行缺失同样拒绝 |
+| `EXECUTION_ACCOUNT_PAUSED` | Kalshi 账户的 ACCOUNT 行 `paused=TRUE` |
+| `STRATEGY_PAUSED` / `MARKET_RISK_PAUSED` | 该账户的 STRATEGY / MARKET 行 `paused=TRUE`（提交触发器统一报 `STRATEGY_OR_MARKET_PAUSED`） |
+
+和 Polymarket 的差别只有一点：Kalshi 账户没有 ACCOUNT 行视为未暂停，不需要预先开通。开关只拦新下单，买卖都拦；已提交订单的恢复、撤单和结算扫描照常进行。已预占但尚未提交的订单被拦时走拒单流程，释放预占。
+
+只暂停 Kalshi：
+
+```sql
+INSERT INTO execution_risk_controls (execution_account_id, control_scope, control_key, paused, reason)
+VALUES ('kalshi:main', 'ACCOUNT', '', TRUE, '<原因>')
+ON CONFLICT (execution_account_id, control_scope, control_key)
+DO UPDATE SET paused = TRUE, reason = EXCLUDED.reason, version = execution_risk_controls.version + 1;
+```
+
+恢复时把 `paused` 改回 `FALSE` 并同样 `version + 1`，不需要重启。新版本启动时会检查 `0042` 已执行，未执行则拒绝启动，因此要先跑迁移再切 release；旧版本可以在已迁移的库上继续运行。
