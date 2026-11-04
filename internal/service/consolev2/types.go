@@ -22,6 +22,7 @@ var (
 // database or a live execution runtime.
 type API interface {
 	Accounts(context.Context) (AccountDirectory, error)
+	AccountPerformance(context.Context, string) (AccountPerformanceResponse, error)
 	LedgerActivities(context.Context, ListFilter) (Page[LedgerActivity], error)
 	Settlements(context.Context, ListFilter) (Page[Settlement], error)
 	Runtime(context.Context) (Runtime, error)

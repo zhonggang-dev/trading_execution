@@ -49,6 +49,20 @@ func assertRetiredAdoptionPortfolio(t *testing.T, db *sql.DB, account, lotID, to
 		t.Fatalf("adoption/config platform conflict accepted: %v", err)
 	}
 
+	// A retired, explicitly managed account needs no current binding to keep
+	// its real adopted asset and historical invested cost in performance.
+	performanceReader := consolev2.New(db, consolev2.RuntimeConfig{ManagedAccounts: []consolev2.ManagedAccount{{ExecutionAccountID: account, MarketSource: "POLYMARKET"}}})
+	performance, err := performanceReader.AccountPerformance(ctx, account)
+	if err != nil || len(performance.Items) != 1 || performance.Items[0].AssetCount != 1 {
+		t.Fatalf("retired adopted performance: %#v %v", performance, err)
+	}
+	assertConsoleAmount(t, performance.Items[0].CurrentCost, "0.615")
+	assertConsoleAmount(t, performance.Items[0].CumulativeInvestedCost, "0.615")
+	assertConsoleAmount(t, performance.Items[0].PeakHoldingCost, "0.615")
+	if performance.Items[0].MarketValue != nil || performance.Items[0].TotalPnL != nil {
+		t.Fatalf("adoption cost was used as a current price: %#v", performance.Items[0])
+	}
+
 	// Corrupt only connection-local shadow copies, never the sealed fixture.
 	// Each broken relation must fail closed instead of borrowing another lot's
 	// valid baseline merely because the account, token or adoption ID exists.

@@ -2,6 +2,7 @@ package consolev2
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -34,44 +35,11 @@ func (reader *Reader) Accounts(ctx context.Context) (AccountDirectory, error) {
 		return AccountDirectory{}, err
 	}
 	defer tx.Rollback()
-	accounts := make([]ManagedAccount, 0, len(reader.config.ManagedAccounts))
-	seen := map[string]string{}
-	for _, account := range reader.config.ManagedAccounts {
-		if account.ExecutionAccountID == "" || (account.MarketSource != "POLYMARKET" && account.MarketSource != "KALSHI") {
-			return AccountDirectory{}, ErrUnavailable
-		}
-		if previous, ok := seen[account.ExecutionAccountID]; ok {
-			if previous != account.MarketSource {
-				return AccountDirectory{}, ErrUnavailable
-			}
-			continue
-		}
-		seen[account.ExecutionAccountID] = account.MarketSource
-		var exists bool
-		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM execution_accounts WHERE execution_account_id=$1)`, account.ExecutionAccountID).Scan(&exists); err != nil {
-			return AccountDirectory{}, dbUnavailable("registered account", err)
-		}
-		if exists {
-			bindingFound := false
-			for _, binding := range reader.config.Bindings {
-				if binding.ExecutionAccountID != account.ExecutionAccountID {
-					continue
-				}
-				if bindingFound || (binding.MarketSource != "" && binding.MarketSource != account.MarketSource) {
-					return AccountDirectory{}, ErrUnavailable
-				}
-				if binding.Mode != "" && binding.Mode != "ACTIVE" && binding.Mode != "SELL_ONLY" && binding.Mode != "PAUSED" {
-					return AccountDirectory{}, ErrUnavailable
-				}
-				if binding.SourceMode != "" && binding.SourceMode != "SANDBOX" && binding.SourceMode != "DIRECT" {
-					return AccountDirectory{}, ErrUnavailable
-				}
-				bindingFound = true
-				account.StrategyID, account.Mode, account.PredictionModelID, account.SourceMode = binding.StrategyID, binding.Mode, binding.PredictionModelID, binding.SourceMode
-			}
-			accounts = append(accounts, account)
-		}
+	accounts, err := reader.managedAccountsInTx(ctx, tx)
+	if err != nil {
+		return AccountDirectory{}, err
 	}
+
 	if err = tx.Commit(); err != nil {
 		return AccountDirectory{}, dbUnavailable("commit account directory", err)
 	}
@@ -82,6 +50,50 @@ func (reader *Reader) Accounts(ctx context.Context) (AccountDirectory, error) {
 		return accounts[i].ExecutionAccountID < accounts[j].ExecutionAccountID
 	})
 	return AccountDirectory{Accounts: accounts, ObservedAt: reader.now().UTC()}, nil
+}
+
+// managedAccountsInTx is shared with account performance so registration,
+// membership, and all financial facts are read in the same database snapshot.
+func (reader *Reader) managedAccountsInTx(ctx context.Context, tx *sql.Tx) ([]ManagedAccount, error) {
+	accounts := make([]ManagedAccount, 0, len(reader.config.ManagedAccounts))
+	seen := map[string]string{}
+	for _, account := range reader.config.ManagedAccounts {
+		if account.ExecutionAccountID == "" || (account.MarketSource != "POLYMARKET" && account.MarketSource != "KALSHI") {
+			return nil, ErrUnavailable
+		}
+		if previous, ok := seen[account.ExecutionAccountID]; ok {
+			if previous != account.MarketSource {
+				return nil, ErrUnavailable
+			}
+			continue
+		}
+		seen[account.ExecutionAccountID] = account.MarketSource
+		var exists bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM execution_accounts WHERE execution_account_id=$1)`, account.ExecutionAccountID).Scan(&exists); err != nil {
+			return nil, dbUnavailable("registered account", err)
+		}
+		if exists {
+			bindingFound := false
+			for _, binding := range reader.config.Bindings {
+				if binding.ExecutionAccountID != account.ExecutionAccountID {
+					continue
+				}
+				if bindingFound || (binding.MarketSource != "" && binding.MarketSource != account.MarketSource) {
+					return nil, ErrUnavailable
+				}
+				if binding.Mode != "" && binding.Mode != "ACTIVE" && binding.Mode != "SELL_ONLY" && binding.Mode != "PAUSED" {
+					return nil, ErrUnavailable
+				}
+				if binding.SourceMode != "" && binding.SourceMode != "SANDBOX" && binding.SourceMode != "DIRECT" {
+					return nil, ErrUnavailable
+				}
+				bindingFound = true
+				account.StrategyID, account.Mode, account.PredictionModelID, account.SourceMode = binding.StrategyID, binding.Mode, binding.PredictionModelID, binding.SourceMode
+			}
+			accounts = append(accounts, account)
+		}
+	}
+	return accounts, nil
 }
 
 type Settlement struct {
