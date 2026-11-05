@@ -30,6 +30,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/kalshisettlement"
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/marketvalidation"
+	"github.com/UniPat-AI/trading_execution/internal/service/nofillrelease"
 	"github.com/UniPat-AI/trading_execution/internal/service/orderrecovery"
 	"github.com/UniPat-AI/trading_execution/internal/service/readiness"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
@@ -189,6 +190,16 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	noFillSchema, err := postgresadapter.NoFillReleaseTablesPresent(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+	if !noFillSchema {
+		logger.Error("migration 0046 (order venue expiry and no-fill release audit) is missing; venue expiry recording and automatic no-fill release are off, trading continues")
+	}
+	if cfg.Polymarket.IOCOrderType == "GTD" && !noFillSchema {
+		logger.Warn("emulated IOC uses GTD but its venue expiry cannot be recorded without migration 0046")
+	}
 	tradingClient, err := polymarket.NewTradingClient(polymarket.TradingClientParams{
 		BaseURL:        cfg.Polymarket.CLOBURL,
 		HTTPClient:     clobHTTP,
@@ -199,6 +210,8 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		// Zero keeps the adapter defaults (8/s, burst 4).
 		RequestsPerSecond: float64(cfg.Polymarket.RequestsPerSecond),
 		Burst:             cfg.Polymarket.Burst,
+		IOCOrderType:      cfg.Polymarket.IOCOrderType,
+		IOCOrderLifetime:  cfg.Polymarket.IOCOrderLifetime,
 	})
 	if err != nil {
 		return nil, err
@@ -257,7 +270,13 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		)
 	}
 
-	repository, err := postgresadapter.NewOrderRepository(database)
+	repositoryOptions := []postgresadapter.OrderRepositoryOption{
+		postgresadapter.WithSubmitInFlightGrace(cfg.Execution.SubmitInFlightGrace),
+	}
+	if noFillSchema {
+		repositoryOptions = append(repositoryOptions, postgresadapter.WithOrderAttemptVenueExpiry())
+	}
+	repository, err := postgresadapter.NewOrderRepository(database, repositoryOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -337,9 +356,16 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, err
 	}
 
+	unacceptedResolver, err := composeNoFillResolver(cfg, database, tradingClient, noFillSchema, logger)
+	if err != nil {
+		return nil, err
+	}
 	executionService, err := execution.New(execution.Params{
 		Repository:               repository,
 		Venue:                    reconciliationVenue,
+		SubmitAttemptTimeout:     cfg.Execution.SubmitAttemptTimeout,
+		SubmitInFlightGrace:      cfg.Execution.SubmitInFlightGrace,
+		UnacceptedResolver:       unacceptedResolver,
 		Guard:                    guard,
 		MarketValidator:          marketValidator,
 		Reservations:             reservations,
@@ -633,6 +659,52 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		maintenance:        maintenance,
 		maintenanceProbe:   maintenanceProbe,
 	}, nil
+}
+
+// composeNoFillResolver builds the automatic no-fill release of unaccepted
+// Polymarket orders. It returns nil (orders stay frozen as before) when the
+// mode is off or migration 0046 is missing.
+func composeNoFillResolver(
+	cfg config.Config,
+	database *sql.DB,
+	clob polymarket.NoFillCLOBReader,
+	schemaPresent bool,
+	logger *slog.Logger,
+) (port.UnacceptedOrderResolver, error) {
+	mode, err := nofillrelease.ParseMode(cfg.Polymarket.UnacceptedAutoResolve)
+	if err != nil {
+		return nil, err
+	}
+	if mode == nofillrelease.ModeOff || !schemaPresent {
+		logger.Info("automatic no-fill release disabled", "mode", string(mode), "schema_present", schemaPresent)
+		return nil, nil
+	}
+	store, err := postgresadapter.NewNoFillReleaseStore(database, nil)
+	if err != nil {
+		return nil, err
+	}
+	venue, err := polymarket.NewNoFillEvidenceReader(clob, nil)
+	if err != nil {
+		return nil, err
+	}
+	scanner, err := evmrpc.NewOrderFilledScanner(evmrpc.OrderFilledScanParams{
+		RPCURL:                cfg.Polymarket.PolygonRPCURL,
+		RequiredConfirmations: uint64(cfg.Polymarket.OrderFilledConfirmations),
+		HTTPClient:            noRedirectHTTPClient(cfg.Polymarket.RequestTimeout),
+		RequestTimeout:        cfg.Polymarket.RequestTimeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure no-fill OrderFilled scanner: %w", err)
+	}
+	resolver, err := nofillrelease.New(nofillrelease.Params{
+		Store: store, Venue: venue, Chain: scanner, Mode: mode, Logger: logger,
+		Policy: nofillrelease.Policy{Grace: cfg.Polymarket.UnacceptedResolveGrace},
+	})
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("automatic no-fill release enabled", "mode", string(mode), "grace", cfg.Polymarket.UnacceptedResolveGrace.String())
+	return resolver, nil
 }
 
 // optionalQuarantineReadiness prevents a nil concrete pointer from becoming a

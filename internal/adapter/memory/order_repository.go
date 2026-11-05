@@ -19,6 +19,17 @@ type OrderRepository struct {
 	byClientOrderID map[string]string
 	events          map[string][]domain.OrderEvent
 	attempts        map[string][]domain.OrderAttempt
+	// submitInFlightGrace mirrors the PostgreSQL coordinator filter for
+	// SUBMITTING orders whose placement may still be running.
+	submitInFlightGrace time.Duration
+}
+
+// SetSubmitInFlightGrace keeps SUBMITTING orders younger than grace (relative
+// to the selection bound) out of coordinator selection, like PostgreSQL.
+func (repository *OrderRepository) SetSubmitInFlightGrace(grace time.Duration) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	repository.submitInFlightGrace = grace
 }
 
 // NewOrderRepository 创建并初始化 Order Repository。
@@ -221,6 +232,10 @@ func (repository *OrderRepository) listPending(
 			if _, active := accounts[order.Intent.ExecutionAccountID]; !active {
 				continue
 			}
+		}
+		if order.Status == domain.OrderStatusSubmitting && repository.submitInFlightGrace > 0 &&
+			order.UpdatedAt.After(before.Add(-repository.submitInFlightGrace)) {
+			continue
 		}
 		if coordinatorEligible(order) && !order.UpdatedAt.After(before) {
 			orders = append(orders, domain.CloneOrder(order))

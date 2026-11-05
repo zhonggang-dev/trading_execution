@@ -342,11 +342,14 @@ type readinessChecker interface {
 
 // buildPaperRuntime 装配确定性的模拟交易链路；配置数据库时仍持久化订单和预占。
 func buildPaperRuntime(cfg config.Config, database *sql.DB, guard port.Guard) (port.OrderRepository, *execution.Service, error) {
-	var repository port.OrderRepository = memory.NewOrderRepository()
+	memoryRepository := memory.NewOrderRepository()
+	memoryRepository.SetSubmitInFlightGrace(cfg.Execution.SubmitInFlightGrace)
+	var repository port.OrderRepository = memoryRepository
 	var reservations port.AssetReservationManager = paper.NewReservationManager()
 	if database != nil {
 		var err error
-		repository, err = postgresadapter.NewOrderRepository(database)
+		repository, err = postgresadapter.NewOrderRepository(database,
+			postgresadapter.WithSubmitInFlightGrace(cfg.Execution.SubmitInFlightGrace))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -370,6 +373,8 @@ func buildPaperRuntime(cfg config.Config, database *sql.DB, guard port.Guard) (p
 		EntryDisabledAccounts:   cfg.DecisionCycle.EntryDisabledAccounts(),
 		// 模拟交易所同步返回结果，不会产生延迟出现的外部成交。
 		ImmediateCancelFinality: true,
+		SubmitAttemptTimeout:    cfg.Execution.SubmitAttemptTimeout,
+		SubmitInFlightGrace:     cfg.Execution.SubmitInFlightGrace,
 	})
 	if err != nil {
 		return nil, nil, err

@@ -302,6 +302,14 @@ func (prepared heartbeatPrepared) ExpectedVenueOrderID() string {
 	return prepared.inner.ExpectedVenueOrderID()
 }
 
+// VenueExpiresAt forwards the venue expiry of the wrapped placement.
+func (prepared heartbeatPrepared) VenueExpiresAt() (time.Time, bool) {
+	if prepared.inner == nil {
+		return time.Time{}, false
+	}
+	return port.PreparedVenueExpiry(prepared.inner)
+}
+
 func (venue *Venue) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {
 	if err := venue.checkPlace(ctx, order); err != nil {
 		return nil, err

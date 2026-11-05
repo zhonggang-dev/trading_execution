@@ -38,6 +38,10 @@ var (
 	// or 5xx). A decision cycle degrades to exit-only on it; authentication
 	// failures and invalid data never carry it.
 	ErrPredictionSourceUnavailable = errors.New("prediction source unavailable")
+	// ErrSubmitInFlight: the order is SUBMITTING and its placement attempt is
+	// still owned by a live submission in this process. Recovery must wait
+	// instead of forcing the order to UNKNOWN; it is not a failure.
+	ErrSubmitInFlight = errors.New("order submit attempt is still in flight")
 )
 
 // ExecutionAccountScope is the process-owned account boundary for live
@@ -126,6 +130,36 @@ type TimeInForceSupport interface {
 // bytes and credentials must never be persisted in the order ledger.
 type PreparedPlacement interface {
 	ExpectedVenueOrderID() string
+}
+
+// ExpiringPreparedPlacement is an optional PreparedPlacement capability: the
+// venue-enforced expiry of the signed order (Polymarket GTD). Absent, or
+// ok=false, means the order has no venue expiry. Every wrapper around a
+// prepared placement must forward it; a missing forward only loses the expiry
+// (the order then never qualifies for automatic no-fill release).
+type ExpiringPreparedPlacement interface {
+	VenueExpiresAt() (time.Time, bool)
+}
+
+// PreparedVenueExpiry returns the venue expiry carried by a prepared placement.
+func PreparedVenueExpiry(placement PreparedPlacement) (time.Time, bool) {
+	expiring, ok := placement.(ExpiringPreparedPlacement)
+	if !ok || expiring == nil {
+		return time.Time{}, false
+	}
+	expiresAt, ok := expiring.VenueExpiresAt()
+	if !ok || expiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	return expiresAt.UTC(), true
+}
+
+// UnacceptedOrderResolver evaluates an UNKNOWN order whose venue read returned
+// no order. released is true only when the order was cancelled and its
+// reservation released in one transaction; every other result, including an
+// error, leaves the order UNKNOWN and its reservation frozen.
+type UnacceptedOrderResolver interface {
+	ResolveUnaccepted(ctx context.Context, order domain.Order) (current domain.Order, released bool, err error)
 }
 
 // PreparedVenue separates signing from the state-changing POST. Live venues

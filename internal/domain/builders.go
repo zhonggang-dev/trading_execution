@@ -62,6 +62,7 @@ type OrderAttemptParams struct {
 	RequestFingerprint string
 	VenueOrderID       string
 	StartedAt          time.Time
+	VenueExpiresAt     *time.Time
 }
 
 // Build 校验尝试序号和类型后构建处于 STARTED 状态的订单尝试。
@@ -78,6 +79,14 @@ func (params OrderAttemptParams) Build() (OrderAttempt, error) {
 	default:
 		return OrderAttempt{}, fmt.Errorf("unsupported order attempt kind %q", params.Kind)
 	}
+	var venueExpiresAt *time.Time
+	if params.VenueExpiresAt != nil {
+		if params.Kind != OrderAttemptSubmit || params.VenueExpiresAt.IsZero() {
+			return OrderAttempt{}, fmt.Errorf("only a SUBMIT attempt may carry a non-zero venue expiry")
+		}
+		value := params.VenueExpiresAt.UTC()
+		venueExpiresAt = &value
+	}
 	return OrderAttempt{
 		ID:                 params.ID,
 		OrderID:            params.OrderID,
@@ -87,6 +96,7 @@ func (params OrderAttemptParams) Build() (OrderAttempt, error) {
 		RequestFingerprint: params.RequestFingerprint,
 		VenueOrderID:       params.VenueOrderID,
 		StartedAt:          params.StartedAt.UTC(),
+		VenueExpiresAt:     venueExpiresAt,
 	}, nil
 }
 

@@ -578,9 +578,10 @@ func TestCrashAfterPreparedPostReconcilesByPersistedExpectedHash(t *testing.T) {
 			FilledSize: "0", ObservedAt: time.Date(2026, 8, 18, 8, 0, 1, 0, time.UTC),
 		},
 	}
+	reservations := paper.NewReservationManager()
 	service, err := execution.New(execution.Params{
 		Repository: repository, Venue: venue, Guard: allowGuard{},
-		MarketValidator: allowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
 		RequirePreparedPlacement: true,
 		AccountScope:             allowAllAccountScope{},
 		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 1, 0, time.UTC) },
@@ -597,7 +598,23 @@ func TestCrashAfterPreparedPostReconcilesByPersistedExpectedHash(t *testing.T) {
 	if err != nil || stored.Status != domain.OrderStatusSubmitting || stored.VenueOrderID != expectedHash {
 		t.Fatalf("crash state = %#v, %v", stored, err)
 	}
-	refreshed, err := service.Refresh(context.Background(), stored.ID)
+	// The same process still owns the STARTED attempt: recovery must wait.
+	if _, err := service.Refresh(context.Background(), stored.ID); !errors.Is(err, execution.ErrSubmitInFlight) || venue.getCalls.Load() != 0 {
+		t.Fatalf("same-process Refresh() error = %v, get calls=%d; want in-flight wait", err, venue.getCalls.Load())
+	}
+	// A restarted process takes the attempt over at once.
+	venue.getOrder.ObservedAt = time.Date(2026, 8, 18, 8, 0, 2, 0, time.UTC)
+	restarted, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue, Guard: allowGuard{},
+		MarketValidator: allowMarketValidator{}, Reservations: reservations,
+		RequirePreparedPlacement: true,
+		AccountScope:             allowAllAccountScope{},
+		Now:                      func() time.Time { return time.Date(2026, 8, 18, 8, 0, 2, 0, time.UTC) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := restarted.Refresh(context.Background(), stored.ID)
 	if err != nil || refreshed.Status != domain.OrderStatusLive || refreshed.VenueOrderID != expectedHash || venue.getCalls.Load() != 1 {
 		t.Fatalf("Refresh() = %#v, %v, get calls=%d", refreshed, err, venue.getCalls.Load())
 	}

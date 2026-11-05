@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
@@ -96,6 +97,14 @@ func (prepared conditionalFundingPrepared) ExpectedVenueOrderID() string {
 		return ""
 	}
 	return prepared.inner.ExpectedVenueOrderID()
+}
+
+// VenueExpiresAt forwards the venue expiry of the wrapped placement.
+func (prepared conditionalFundingPrepared) VenueExpiresAt() (time.Time, bool) {
+	if prepared.inner == nil {
+		return time.Time{}, false
+	}
+	return port.PreparedVenueExpiry(prepared.inner)
 }
 
 func (venue *ConditionalFundingVenue) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {

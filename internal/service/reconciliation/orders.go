@@ -285,6 +285,13 @@ func (state *runState) refreshOrder(ctx context.Context, order domain.Order, fil
 	}
 	refreshed, err := state.service.orderRefresher.Refresh(ctx, order.ID)
 	if err != nil {
+		if errors.Is(err, port.ErrSubmitInFlight) {
+			// The placement is still running in this process. The order stays
+			// in recovery (its token is excluded from asset comparison) without
+			// a source issue; the next run sees its recorded outcome.
+			state.run.Summary["orders_submit_in_flight"]++
+			return order, nil
+		}
 		if errors.Is(err, port.ErrOrderRevisionConflict) {
 			// Another worker progressed the order first; the next read sees it.
 			state.run.Summary["orders_refresh_conflicts"]++
@@ -296,6 +303,12 @@ func (state *runState) refreshOrder(ctx context.Context, order domain.Order, fil
 	state.run.Summary["orders_refreshed"]++
 	if order.Status == domain.OrderStatusCancelled || refreshed.Status != domain.OrderStatusCancelled {
 		return refreshed, nil
+	}
+	if refreshed.FailureCode == domain.NoFillReleaseAutoReasonCode {
+		// The venue never had the order; the release transaction already
+		// recorded its own evidence and resolved the order's issues.
+		state.run.Summary["orders_no_fill_released"]++
+		return refreshed, state.finalizeCancellationWhenSafe(ctx, refreshed, fillEvidenceComplete)
 	}
 	state.recordConfirmedCancellation(ctx, order, refreshed)
 	return refreshed, state.finalizeCancellationWhenSafe(ctx, refreshed, fillEvidenceComplete)
