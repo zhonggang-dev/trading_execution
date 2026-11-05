@@ -229,6 +229,9 @@ type KalshiLiveAccount struct {
 	ExecutionAccountID string `json:"execution_account_id"`
 	APIKeyID           string `json:"api_key_id"`
 	PrivateKeyPath     string `json:"private_key_path"`
+	// OfficialUserID enables the optional official account PnL read path.
+	// It is not an API key id and never changes the execution identity.
+	OfficialUserID string `json:"official_user_id,omitempty"`
 }
 
 // DecisionAccountMode is the operator state of one execution account.
@@ -1069,6 +1072,7 @@ func decodeKalshiLiveAccounts(value string) ([]KalshiLiveAccount, error) {
 		account.ExecutionAccountID = strings.TrimSpace(account.ExecutionAccountID)
 		account.APIKeyID = strings.TrimSpace(account.APIKeyID)
 		account.PrivateKeyPath = strings.TrimSpace(account.PrivateKeyPath)
+		account.OfficialUserID = strings.TrimSpace(account.OfficialUserID)
 		if account.ExecutionAccountID == "" || account.APIKeyID == "" || account.PrivateKeyPath == "" {
 			return nil, fmt.Errorf("KALSHI_LIVE_ACCOUNTS_JSON account %d is incomplete", index)
 		}

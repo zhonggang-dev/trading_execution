@@ -120,6 +120,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	kalshiPnLService, err := buildKalshiPnLService(cfg, live)
+	if err != nil {
+		return err
+	}
 	edgeDistributionService, err := buildEdgeDistributionService(database)
 	if err != nil {
 		return err
@@ -128,6 +132,7 @@ func run() error {
 		Service:          executionService,
 		TradeHistory:     tradeHistoryService,
 		WalletPnL:        walletPnLService,
+		KalshiPnL:        kalshiPnLService,
 		EdgeDistribution: edgeDistributionService,
 		Logger:           logger,
 		APIToken:         cfg.HTTP.APIToken,

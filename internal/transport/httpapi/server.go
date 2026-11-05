@@ -22,6 +22,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 	"github.com/UniPat-AI/trading_execution/internal/service/edgedistribution"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
+	"github.com/UniPat-AI/trading_execution/internal/service/kalshipnl"
 	"github.com/UniPat-AI/trading_execution/internal/service/liveoperations"
 	"github.com/UniPat-AI/trading_execution/internal/service/pipelinemonitor"
 	"github.com/UniPat-AI/trading_execution/internal/service/positionexit"
@@ -80,6 +81,7 @@ type Params struct {
 	Reconciliation     reconciliationJob
 	TradeHistory       tradeHistoryService
 	WalletPnL          *walletpnl.Service
+	KalshiPnL          *kalshipnl.Service
 	LiveOperations     liveOperationsService
 	EdgeDistribution   edgeDistributionService
 	ConsoleV2          consolev2.API
@@ -108,6 +110,7 @@ type Server struct {
 	reconciliation     reconciliationJob
 	tradeHistory       tradeHistoryService
 	walletPnL          *walletpnl.Service
+	kalshiPnL          *kalshipnl.Service
 	liveOperations     liveOperationsService
 	edgeDistribution   edgeDistributionService
 	consoleV2          consolev2.API
@@ -158,6 +161,7 @@ func New(params Params) (*Server, error) {
 		reconciliation:     params.Reconciliation,
 		tradeHistory:       params.TradeHistory,
 		walletPnL:          params.WalletPnL,
+		kalshiPnL:          params.KalshiPnL,
 		liveOperations:     params.LiveOperations,
 		edgeDistribution:   params.EdgeDistribution,
 		consoleV2:          params.ConsoleV2,
@@ -191,6 +195,8 @@ func New(params Params) (*Server, error) {
 	// a 404 or risking a nil service call.
 	mux.Handle("GET /api/v1/wallet-pnl", server.authenticateReadOnly(http.HandlerFunc(server.walletPnLHandler)))
 	mux.Handle("GET /api/v1/wallet-pnl/accounts", server.authenticateReadOnly(http.HandlerFunc(server.walletPnLAccountsHandler)))
+	mux.Handle("GET /api/v1/kalshi-pnl", server.authenticateReadOnly(http.HandlerFunc(server.kalshiPnLHandler)))
+	mux.Handle("GET /api/v1/kalshi-pnl/accounts", server.authenticateReadOnly(http.HandlerFunc(server.kalshiPnLAccountsHandler)))
 	if server.liveOperations != nil {
 		mux.Handle("GET /api/v1/live-operations", server.authenticateReadOnly(http.HandlerFunc(server.getLiveOperations)))
 	}
