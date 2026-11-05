@@ -356,3 +356,82 @@ func TestPMClampedSettlementTerminalIsNotHistoricalPrice(t *testing.T) {
 		}
 	}
 }
+
+func TestPMKnownLocalSettlementsPreserveRealPreSettlementPrices(t *testing.T) {
+	parse := func(v string) time.Time {
+		at, e := time.Parse(time.RFC3339Nano, v)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return at
+	}
+	cases := []struct{ name, from, confirmed, to, price string }{
+		{"G2 Esports", "2026-09-29T11:50:26Z", "2026-09-29T12:23:35.362096Z", "2026-09-29T13:23:01.311128Z", "0"},
+		{"Paper Rex", "2026-09-29T09:20:27Z", "2026-09-29T12:23:35.362096Z", "2026-09-29T13:23:01.311128Z", "1"},
+		{"Navalnaya No", "2026-10-09T06:50:33Z", "2026-10-09T12:13:31.735869Z", "2026-10-19T04:29:24.160397Z", "1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			from, confirmed, to := parse(tc.from), parse(tc.confirmed), parse(tc.to)
+			var hits atomic.Int32
+			s, close := fixtureSource(t, func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				if r.URL.Path != "/v2/prices-history" || r.URL.Query().Get("as_of") != "" {
+					t.Error("known finalization must avoid demanding missing network tx evidence", r.URL.Path)
+					http.Error(w, "unexpected endpoint", 400)
+					return
+				}
+				data := []map[string]any{}
+				for at := from.Truncate(time.Hour); at.Before(confirmed); at = at.Add(time.Hour) {
+					data = append(data, map[string]any{"timestamp": at.Unix(), "price": 0.4, "resolution_seconds": 3600})
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "pagination": map[string]any{"has_more": false}})
+			})
+			defer close()
+			known := h.Settlement{EffectiveAt: confirmed, Price: tc.price, Source: "OFFICIAL_SETTLEMENT", SourceReference: "LOCAL_POSITION:exact-account:exact-token:POLYMARKET_DATA_API:condition", FetchedAt: confirmed}
+			result, e := s.FetchWithSettlements(context.Background(), h.Window{Asset: pmAsset(), From: from, To: to}, []h.Settlement{known})
+			if e != nil {
+				t.Fatal(e)
+			}
+			if hits.Load() != 1 || result.Series.Coverage[0].State != "complete" {
+				t.Fatal(result, hits.Load())
+			}
+			if p, ok := h.PriceAt(result.Series, confirmed.Add(-time.Nanosecond)); !ok || p.Price != "0.4" {
+				t.Fatal("local payout traveled backwards", p, ok)
+			}
+			if p, ok := h.PriceAt(result.Series, to); !ok || p.Price != tc.price {
+				t.Fatal("known local tail missing", p, ok)
+			}
+			if len(result.Series.Settlements) != 1 || result.Series.Settlements[0].SourceReference != known.SourceReference || !result.Series.Settlements[0].FetchedAt.Equal(confirmed) {
+				t.Fatal("original local evidence changed", result.Series.Settlements)
+			}
+		})
+	}
+}
+func TestPMKnownSettlementCannotInventMissingPrehistory(t *testing.T) {
+	from := time.Unix(1793206800, 0).UTC()
+	known := h.Settlement{EffectiveAt: from.Add(4 * time.Hour), Price: "1", Source: "OFFICIAL_SETTLEMENT", SourceReference: "LOCAL_POSITION:known", FetchedAt: from}
+	s, close := fixtureSource(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/resolutions" {
+			fmt.Fprint(w, `{"data":[]}`)
+		} else {
+			fmt.Fprint(w, `{"data":[],"pagination":{"has_more":false}}`)
+		}
+	})
+	defer close()
+	result, e := s.FetchWithSettlements(context.Background(), h.Window{Asset: pmAsset(), From: from, To: from.Add(5 * time.Hour)}, []h.Settlement{known})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if result.Series.Coverage[0].State != "missing" {
+		t.Fatal("known tail falsely replaced missing pre-settlement prices", result)
+	}
+	if _, ok := h.PriceAt(result.Series, from); ok {
+		t.Fatal("invented prehistory")
+	}
+	for _, bad := range []h.Settlement{{EffectiveAt: from, Price: "0.5", Source: "OFFICIAL_SETTLEMENT", SourceReference: "LOCAL_POSITION:bad"}, {EffectiveAt: from, Price: "1", Source: "UNTRUSTED", SourceReference: "bad"}, {EffectiveAt: time.Unix(2100000000, 0), Price: "1", Source: "OFFICIAL_SETTLEMENT", SourceReference: "future"}} {
+		if _, e = s.FetchWithSettlements(context.Background(), h.Window{Asset: pmAsset(), From: from, To: from.Add(time.Hour)}, []h.Settlement{bad}); e == nil {
+			t.Fatal("invalid known settlement accepted", bad)
+		}
+	}
+}

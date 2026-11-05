@@ -161,16 +161,17 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 		return out, fmt.Errorf("history window budget exceeded")
 	}
 	type request struct {
-		Key  string    `json:"key"`
-		From time.Time `json:"from"`
-		To   time.Time `json:"to"`
+		Key   string        `json:"key"`
+		Asset history.Asset `json:"asset"`
+		From  time.Time     `json:"from"`
+		To    time.Time     `json:"to"`
 	}
 	rs := make([]request, 0, len(windows))
 	for _, w := range windows {
 		if e := w.Asset.Validate(); e != nil {
 			return out, e
 		}
-		rs = append(rs, request{w.Asset.Key(), w.From.Add(-time.Hour), w.To})
+		rs = append(rs, request{Key: w.Asset.Key(), Asset: w.Asset, From: w.From.Add(-time.Hour), To: w.To})
 	}
 	raw, _ := json.Marshal(rs)
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
@@ -238,7 +239,32 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 	if err = rows.Close(); err != nil {
 		return out, err
 	}
+	local, err := localHistorySettlements(ctx, tx, string(raw), out.ObservedAt)
+	if err != nil {
+		return out, err
+	}
+	for key, values := range local {
+		series := out.Series[key]
+		merged, e := history.MergeSettlements(series.Settlements, values, out.ObservedAt)
+		if e != nil {
+			return out, e
+		}
+		series.Settlements = merged
+		out.Series[key] = series
+		encoded, _ := json.Marshal(merged)
+		payloadBytes += len(encoded)
+		other += len(values)
+		if payloadBytes > 64<<20 || other > 20000 {
+			return out, fmt.Errorf("history settlement input budget exceeded")
+		}
+		digests = append(digests, sha256.Sum256([]byte(key+"\x00local_settlement\x00"+string(encoded))))
+	}
 	for key, series := range out.Series {
+		var e error
+		series.Settlements, e = history.MergeSettlements(series.Settlements, nil, out.ObservedAt)
+		if e != nil {
+			return out, e
+		}
 		history.SortSeries(&series)
 		out.Series[key] = series
 	}

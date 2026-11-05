@@ -86,6 +86,12 @@ type Result struct {
 type Source interface {
 	Fetch(context.Context, Window) (Result, error)
 }
+
+// SettlementAwareSource optionally accepts already verified local/history facts.
+// Implementations must still acquire genuine pre-settlement observations.
+type SettlementAwareSource interface {
+	FetchWithSettlements(context.Context, Window, []Settlement) (Result, error)
+}
 type Store interface {
 	Reader
 	Targets(context.Context, time.Time) ([]Window, error)
@@ -142,4 +148,43 @@ func SortSeries(s *Series) {
 		return s.Points[i].At.Before(s.Points[j].At)
 	})
 	sort.Slice(s.Settlements, func(i, j int) bool { return s.Settlements[i].EffectiveAt.Before(s.Settlements[j].EffectiveAt) })
+}
+
+// MergeSettlements keeps one deterministic reference per effective time and
+// rejects contradictory final payouts. Only already verified official binary
+// facts belong here; their original observation timestamps remain unchanged.
+func MergeSettlements(existing, additional []Settlement, asOf time.Time) ([]Settlement, error) {
+	byTime := map[int64]Settlement{}
+	payout := ""
+	for _, batch := range [][]Settlement{existing, additional} {
+		for _, v := range batch {
+			if v.Source != "OFFICIAL_SETTLEMENT" || v.SourceReference == "" || v.EffectiveAt.IsZero() || !v.EffectiveAt.After(time.Unix(0, 0)) || v.EffectiveAt.After(asOf) || !ValidPrice(v.Price) {
+				return nil, fmt.Errorf("invalid trusted historical settlement")
+			}
+			n, _ := new(big.Rat).SetString(v.Price)
+			canonical := "0"
+			if n.Cmp(big.NewRat(1, 1)) == 0 {
+				canonical = "1"
+			} else if n.Sign() != 0 {
+				return nil, fmt.Errorf("non-binary trusted historical settlement")
+			}
+			if payout != "" && payout != canonical {
+				return nil, fmt.Errorf("conflicting historical settlement evidence")
+			}
+			payout = canonical
+			v.Price = canonical
+			v.EffectiveAt = v.EffectiveAt.UTC()
+			key := v.EffectiveAt.UnixNano()
+			old, ok := byTime[key]
+			if !ok || v.SourceReference < old.SourceReference || (v.SourceReference == old.SourceReference && v.FetchedAt.Before(old.FetchedAt)) {
+				byTime[key] = v
+			}
+		}
+	}
+	result := make([]Settlement, 0, len(byTime))
+	for _, v := range byTime {
+		result = append(result, v)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].EffectiveAt.Before(result[j].EffectiveAt) })
+	return result, nil
 }

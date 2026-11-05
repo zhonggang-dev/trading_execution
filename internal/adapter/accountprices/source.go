@@ -150,19 +150,30 @@ func (s *Source) get(ctx context.Context, base, path string, q url.Values, out a
 var errNotFound = fmt.Errorf("history market not found")
 
 func (s *Source) Fetch(ctx context.Context, w h.Window) (h.Result, error) {
+	return s.FetchWithSettlements(ctx, w, nil)
+}
+
+func (s *Source) FetchWithSettlements(ctx context.Context, w h.Window, known []h.Settlement) (h.Result, error) {
 	if e := w.Asset.Validate(); e != nil {
 		return h.Result{}, e
 	}
 	if w.To.Before(w.From) || w.To.Sub(w.From) > 14*24*time.Hour {
 		return h.Result{}, fmt.Errorf("history window exceeds 14 days")
 	}
-	result := h.Result{Window: w, Series: h.Series{Points: []h.Point{}, Settlements: []h.Settlement{}, Coverage: []h.Coverage{}}}
-	var err error
+	verified, err := h.MergeSettlements(nil, known, s.p.Now().UTC())
+	if err != nil {
+		return h.Result{}, err
+	}
+	result := h.Result{Window: w, Series: h.Series{Points: []h.Point{}, Settlements: verified, Coverage: []h.Coverage{}}}
 	if w.Asset.MarketSource == "POLYMARKET" {
 		err = s.polymarket(ctx, w, &result.Series)
 	} else {
 		err = s.kalshi(ctx, w, &result.Series)
 	}
+	if err != nil {
+		return h.Result{}, err
+	}
+	result.Series.Settlements, err = h.MergeSettlements(result.Series.Settlements, nil, s.p.Now().UTC())
 	if err != nil {
 		return h.Result{}, err
 	}
