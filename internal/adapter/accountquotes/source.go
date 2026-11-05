@@ -37,6 +37,7 @@ type KalshiMarket struct {
 	SettlementAt    *time.Time `json:"settlement_ts"`
 	LastPrice       *string    `json:"last_price_dollars"`
 	Volume          *string    `json:"volume_fp"`
+	Volume24h       *string    `json:"volume_24h_fp"`
 	YesBid          *string    `json:"yes_bid_dollars"`
 	YesAsk          *string    `json:"yes_ask_dollars"`
 	NoBid           *string    `json:"no_bid_dollars"`
@@ -543,55 +544,25 @@ func (s *Source) kalshi(ctx context.Context, targets []core.Target, emit func(ma
 					result[k] = core.Priced(p, "OFFICIAL_SETTLEMENT", observed, m.SettlementAt)
 					continue
 				}
-				// last_price_dollars is a YES price, including for NO holdings.
-				// Positive traded volume distinguishes a real zero price from the
-				// default value of a market that has never traded. Market updated_time
-				// is metadata time, not trade time, so SourceAt stays unknown.
-				if m.LastPrice != nil && m.Volume != nil && len(*m.Volume) <= 256 {
-					volume, err := domain.ParseDecimal(*m.Volume)
-					if sign, signErr := volume.Sign(); err == nil && signErr == nil && sign > 0 {
-						if p, priceErr := price(*m.LastPrice); priceErr == nil {
-							if !yes {
-								value, _ := new(big.Rat).SetString(p)
-								p = ratText(new(big.Rat).Sub(big.NewRat(1, 1), value))
-							}
-							result[k] = core.Priced(p, "KALSHI_LAST_TRADE", observed, nil)
-							continue
-						}
-					}
-				}
-				bid, ask, bidSize, askSize := m.YesBid, m.YesAsk, m.YesBidSize, m.YesAskSize
-				if !yes {
-					bid, ask, bidSize, askSize = m.NoBid, m.NoAsk, m.YesAskSize, m.YesBidSize
-				}
-				if m.YesBid != nil && m.YesAsk != nil && m.NoBid != nil && m.NoAsk != nil {
-					yb, e1 := price(*m.YesBid)
-					ya, e2 := price(*m.YesAsk)
-					nb, e3 := price(*m.NoBid)
-					na, e4 := price(*m.NoAsk)
-					if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-						result[k] = core.Unknown("invalid_price")
-						continue
-					}
-					ybr, _ := new(big.Rat).SetString(yb)
-					yar, _ := new(big.Rat).SetString(ya)
-					nbr, _ := new(big.Rat).SetString(nb)
-					nar, _ := new(big.Rat).SetString(na)
-					if new(big.Rat).Add(yar, nbr).Cmp(big.NewRat(1, 1)) != 0 || new(big.Rat).Add(ybr, nar).Cmp(big.NewRat(1, 1)) != 0 {
-						result[k] = core.Unknown("invalid_price")
-						continue
-					}
-				}
-				if bid == nil || ask == nil || bidSize == nil || askSize == nil {
-					result[k] = core.Unknown("one_sided")
+				// Kalshi markets expose no last-trade time (updated_time is non-trading
+				// metadata time), so SourceAt stays unknown for both live sources.
+				// Order: last trade when volume_24h_fp > 0 shows a trade in the last
+				// 24 hours; otherwise a valid book midpoint; otherwise the older last
+				// trade (closed or very thin markets), and only then the mid reason.
+				last, hasLast := kalshiLastTrade(m, yes)
+				if hasLast && positiveDecimal(m.Volume24h) {
+					result[k] = core.Priced(last, "KALSHI_LAST_TRADE", observed, nil)
 					continue
 				}
-				mid, reason := midpoint([]level{{Price: *bid, Size: *bidSize}}, []level{{Price: *ask, Size: *askSize}})
-				if reason != "" {
+				mid, reason := kalshiMid(m, yes)
+				switch {
+				case reason == "":
+					result[k] = core.Priced(mid, "KALSHI_BOOK_MID", observed, nil)
+				case hasLast:
+					result[k] = core.Priced(last, "KALSHI_LAST_TRADE", observed, nil)
+				default:
 					result[k] = core.Unknown(reason)
-					continue
 				}
-				result[k] = core.Priced(mid, "KALSHI_BOOK_MID", observed, nil)
 			}
 		}
 		if emit != nil {
@@ -599,6 +570,64 @@ func (s *Source) kalshi(ctx context.Context, targets []core.Target, emit func(ma
 		}
 	}
 	return result
+}
+
+// kalshiLastTrade returns the holding-side last traded price. last_price_dollars
+// is a YES price, including for NO holdings. Positive cumulative volume
+// distinguishes a real zero price from the default of a never-traded market.
+func kalshiLastTrade(m KalshiMarket, yes bool) (string, bool) {
+	if m.LastPrice == nil || !positiveDecimal(m.Volume) {
+		return "", false
+	}
+	p, err := price(*m.LastPrice)
+	if err != nil {
+		return "", false
+	}
+	if !yes {
+		value, _ := new(big.Rat).SetString(p)
+		p = ratText(new(big.Rat).Sub(big.NewRat(1, 1), value))
+	}
+	return p, true
+}
+
+func positiveDecimal(text *string) bool {
+	if text == nil || len(*text) > 256 {
+		return false
+	}
+	value, err := domain.ParseDecimal(*text)
+	if err != nil {
+		return false
+	}
+	sign, err := value.Sign()
+	return err == nil && sign > 0
+}
+
+// kalshiMid returns the holding-side book midpoint, or the reason it is unusable.
+func kalshiMid(m KalshiMarket, yes bool) (string, string) {
+	bid, ask, bidSize, askSize := m.YesBid, m.YesAsk, m.YesBidSize, m.YesAskSize
+	if !yes {
+		bid, ask, bidSize, askSize = m.NoBid, m.NoAsk, m.YesAskSize, m.YesBidSize
+	}
+	if m.YesBid != nil && m.YesAsk != nil && m.NoBid != nil && m.NoAsk != nil {
+		yb, e1 := price(*m.YesBid)
+		ya, e2 := price(*m.YesAsk)
+		nb, e3 := price(*m.NoBid)
+		na, e4 := price(*m.NoAsk)
+		if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
+			return "", "invalid_price"
+		}
+		ybr, _ := new(big.Rat).SetString(yb)
+		yar, _ := new(big.Rat).SetString(ya)
+		nbr, _ := new(big.Rat).SetString(nb)
+		nar, _ := new(big.Rat).SetString(na)
+		if new(big.Rat).Add(yar, nbr).Cmp(big.NewRat(1, 1)) != 0 || new(big.Rat).Add(ybr, nar).Cmp(big.NewRat(1, 1)) != 0 {
+			return "", "invalid_price"
+		}
+	}
+	if bid == nil || ask == nil || bidSize == nil || askSize == nil {
+		return "", "one_sided"
+	}
+	return midpoint([]level{{Price: *bid, Size: *bidSize}}, []level{{Price: *ask, Size: *askSize}})
 }
 
 type limitedBody struct {
