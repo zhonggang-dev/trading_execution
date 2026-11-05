@@ -25,10 +25,11 @@ type CohortMetrics struct {
 }
 
 type CohortResponse struct {
-	ObservedAt  time.Time       `json:"observed_at"`
-	OpeningFrom *time.Time      `json:"opening_from"`
-	OpeningTo   *time.Time      `json:"opening_to"`
-	Items       []CohortMetrics `json:"items"`
+	ObservedAt          time.Time                            `json:"observed_at"`
+	OpeningFrom         *time.Time                           `json:"opening_from"`
+	OpeningTo           *time.Time                           `json:"opening_to"`
+	Items               []CohortMetrics                      `json:"items"`
+	UnavailableAccounts []consolev2.CohortUnavailableAccount `json:"unavailable_accounts"`
 }
 
 func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter) (CohortResponse, error) {
@@ -52,8 +53,19 @@ func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter
 	if err != nil {
 		return CohortResponse{}, err
 	}
-	result := CohortResponse{ObservedAt: priced.ObservedAt, OpeningFrom: facts.OpeningFrom, OpeningTo: facts.OpeningTo, Items: make([]CohortMetrics, 0, len(priced.Items))}
+	result := CohortResponse{ObservedAt: priced.ObservedAt, OpeningFrom: facts.OpeningFrom, OpeningTo: facts.OpeningTo, Items: make([]CohortMetrics, 0, len(priced.Items)), UnavailableAccounts: append([]consolev2.CohortUnavailableAccount{}, facts.UnavailableAccounts...)}
+	seen := map[string]bool{}
+	for _, a := range facts.UnavailableAccounts {
+		if a.Reason != "missing_disposition_evidence" || (a.MarketSource != "POLYMARKET" && a.MarketSource != "KALSHI") || a.ExecutionAccountID == "" || seen[a.ExecutionAccountID] || consolev2.ValidatePerformanceAccountID(a.ExecutionAccountID) != nil || (filter.ExecutionAccountID != "" && a.ExecutionAccountID != filter.ExecutionAccountID) {
+			return CohortResponse{}, consolev2.ErrUnavailable
+		}
+		seen[a.ExecutionAccountID] = true
+	}
 	for _, m := range priced.Items {
+		if seen[m.ExecutionAccountID] {
+			return CohortResponse{}, consolev2.ErrUnavailable
+		}
+		seen[m.ExecutionAccountID] = true
 		c, ok := facts.Cohorts[m.ExecutionAccountID]
 		if !ok || c.HoldingAssetCount != m.AssetCount || c.OpenedAssetCount != c.HoldingAssetCount+c.ClosedAssetCount {
 			return CohortResponse{}, consolev2.ErrUnavailable

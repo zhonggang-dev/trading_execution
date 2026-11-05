@@ -89,8 +89,44 @@ func TestCohortMetricFactsAllClosedZeroPayoutAndExternalSell(t *testing.T) {
 	}
 	// Missing a zero-value settlement is still incomplete accounting.
 	f.exec(t, `DELETE FROM position_lot_redemptions`)
-	if _, err = f.reader.CohortMetricFacts(context.Background(), CohortFilter{ExecutionAccountID: "pm"}); !errors.Is(err, ErrUnavailable) {
-		t.Fatal("missing zero flow accepted", err)
+	missing, err := f.reader.CohortMetricFacts(context.Background(), CohortFilter{ExecutionAccountID: "pm"})
+	if err != nil || len(missing.Accounts) != 0 || len(missing.Cohorts) != 0 || len(missing.UnavailableAccounts) != 1 || missing.UnavailableAccounts[0].Reason != "missing_disposition_evidence" {
+		t.Fatal("missing zero flow was presented as complete accounting", missing, err)
+	}
+}
+
+func TestCohortMetricFactsMissingHistoryIsolatedByAccountAndOpeningRange(t *testing.T) {
+	f := cohortFixture(t)
+	f.cohortLot(t, "old-operator-closed", "1", "0", "0.5", "0.01", f.now.Add(-30*24*time.Hour))
+	f.cohortLot(t, "healthy", "4", "4", "2", "0.04", f.now.Add(-30*time.Minute))
+	for _, table := range []struct{ name, id string }{{"execution_orders", "order_id"}, {"execution_fills", "fill_key"}, {"position_lots", "lot_id"}} {
+		f.exec(t, `UPDATE `+table.name+` SET execution_account_id='flat' WHERE `+table.id+`='healthy'`)
+	}
+	got, err := f.reader.CohortMetricFacts(context.Background(), CohortFilter{})
+	if err != nil || len(got.Accounts) != 2 || len(got.UnavailableAccounts) != 1 || got.UnavailableAccounts[0].ExecutionAccountID != "pm" || got.UnavailableAccounts[0].MarketSource != "POLYMARKET" || got.UnavailableAccounts[0].Reason != "missing_disposition_evidence" {
+		t.Fatal("missing old history erased valid accounts", got, err)
+	}
+	for _, a := range got.Accounts {
+		if a.Metrics.ExecutionAccountID == "flat" {
+			performanceAmount(t, a.Metrics.CumulativeInvestedCost, "2")
+			if len(a.Assets) != 1 || got.Cohorts["flat"].OpenedAssetCount != 1 {
+				t.Fatal("healthy cohort changed", a)
+			}
+		}
+		if a.Metrics.ExecutionAccountID == "pm" {
+			t.Fatal("part of an incomplete account returned as complete")
+		}
+	}
+	from, to := f.now.Add(-time.Hour), f.now
+	recent, err := f.reader.CohortMetricFacts(context.Background(), CohortFilter{ExecutionAccountID: "pm", OpeningFrom: &from, OpeningTo: &to})
+	if err != nil || len(recent.Accounts) != 1 || len(recent.UnavailableAccounts) != 0 || recent.Cohorts["pm"].OpenedAssetCount != 0 {
+		t.Fatal("excluding old missing evidence did not restore an exact account", recent, err)
+	}
+	// More closed allocations than original shares remain corruption, not a
+	// historical-evidence warning.
+	f.cohortSell(t, "old-operator-closed", "over", "2", "1", "0", f.now.Add(-time.Hour))
+	if _, err = f.reader.CohortMetricFacts(context.Background(), CohortFilter{}); !errors.Is(err, ErrUnavailable) {
+		t.Fatal("over-allocation was hidden by the historical warning", err)
 	}
 }
 func TestCohortMetricFactsEmptyScopeCancellationAndLargeHistory(t *testing.T) {
