@@ -8,6 +8,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountmaintenance"
 	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisioncycle"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
@@ -72,5 +73,26 @@ func TestConsoleV2AccountsUseValidatedVenueMembership(t *testing.T) {
 	}
 	if empty := consoleV2RuntimeConfig(cfg, nil, time.Now()); len(empty.ManagedAccounts) != 0 {
 		t.Fatal("unvalidated config exposed as account directory")
+	}
+}
+
+func TestConsoleV2RuntimeReportsMaintenanceAccountsAsSubmissionDisabled(t *testing.T) {
+	registry := accountmaintenance.New()
+	live := &liveRuntime{maintenance: registry, polymarketAccounts: []string{"main", "wallet-7"}}
+	reader := consolev2.New(nil, consoleV2RuntimeConfig(config.Config{}, live, time.Now()))
+	value, err := reader.Runtime(context.Background())
+	if err != nil || len(value.Submission.SubmissionDisabledAccounts) != 0 {
+		t.Fatalf("runtime without maintenance = %#v, %v", value.Submission, err)
+	}
+	registry.Enter("wallet-7", accountmaintenance.ReasonPreflightCLOBAuth, "401")
+	registry.Enter("kalshi:main", accountmaintenance.ReasonKalshiRouteUnavailable, "bad key")
+	value, err = reader.Runtime(context.Background())
+	if err != nil || strings.Join(value.Submission.SubmissionDisabledAccounts, ",") != "kalshi:main,wallet-7" {
+		t.Fatalf("runtime with maintenance = %#v, %v", value.Submission, err)
+	}
+	registry.Exit("wallet-7", accountmaintenance.ReasonPreflightCLOBAuth)
+	value, _ = reader.Runtime(context.Background())
+	if strings.Join(value.Submission.SubmissionDisabledAccounts, ",") != "kalshi:main" {
+		t.Fatalf("runtime after leaving maintenance = %#v", value.Submission)
 	}
 }

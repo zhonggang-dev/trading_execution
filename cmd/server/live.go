@@ -18,6 +18,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountmaintenance"
 	"github.com/UniPat-AI/trading_execution/internal/service/accountscope"
 	"github.com/UniPat-AI/trading_execution/internal/service/autoredeem"
 	"github.com/UniPat-AI/trading_execution/internal/service/chaincash"
@@ -58,6 +59,10 @@ type liveRuntime struct {
 	kalshiAccounts []string
 	// recovery is the order-level lease guard shared with the order coordinator.
 	recovery *orderrecovery.Guard
+	// maintenance lists accounts that take no new orders after an
+	// account-local startup failure; maintenanceProbe clears recovered ones.
+	maintenance      *accountmaintenance.Registry
+	maintenanceProbe *accountMaintenanceProbe
 }
 
 // buildLiveRuntimeParams 收拢实盘依赖装配参数，避免长参数列表破坏函数声明可读性。
@@ -82,6 +87,8 @@ type liveAccountPreflightResult struct {
 }
 
 // buildLiveRuntime 装配 Polymarket V2 实盘链路，并在开放 HTTP 前完成启动对账和首次只读快照。
+// 全局依赖（数据库、迁移、配置、CLOB 协议）失败仍然拒绝启动；单个账户的预检或
+// 启动对账失败只让该账户进入维护态，首次只读快照或心跳失败只记录日志并由后台重试。
 func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	ctx, cfg := params.ctx, params.cfg
 	database, databaseReadiness := params.database, params.databaseReadiness
@@ -196,14 +203,9 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
-	protocol, err := tradingClient.ProbeProtocol(ctx, cfg.Polymarket.MaxClockSkew)
-	if err != nil {
-		return nil, fmt.Errorf("Polymarket CLOB V2 protocol preflight: %w", err)
+	if err := preflightLiveProtocol(ctx, tradingClient, cfg.Polymarket.MaxClockSkew, logger); err != nil {
+		return nil, err
 	}
-	logger.Info("Polymarket CLOB V2 protocol preflight passed",
-		"version", protocol.Version,
-		"clock_skew_ms", protocol.ClockSkew.Milliseconds(),
-	)
 
 	geoblock, err := polymarket.NewGeoblockClient(polymarket.GeoblockClientParams{
 		URL:        cfg.Polymarket.GeoblockURL,
@@ -223,38 +225,14 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	}
 
 	entryDisabledAccounts := cfg.DecisionCycle.EntryDisabledAccounts()
-	entryDisabledSet := make(map[string]struct{}, len(entryDisabledAccounts))
-	for _, accountID := range entryDisabledAccounts {
-		entryDisabledSet[accountID] = struct{}{}
-	}
-	expectedBindings := make([]postgresadapter.ExpectedExecutionAccount, 0, len(accounts))
-	for _, account := range accounts {
-		_, quarantined := quarantinedAccountSet[account.ExecutionAccountID]
-		_, buyDisabled := entryDisabledSet[account.ExecutionAccountID]
-		preflight, preflightErr := preflightLiveAccount(
-			ctx, account.ExecutionAccountID, quarantined, buyDisabled, tradingClient, eligibility,
-		)
-		if preflightErr != nil {
-			return nil, preflightErr
-		}
-		expectedBindings = append(expectedBindings, postgresadapter.ExpectedExecutionAccount{
-			ExecutionAccountID: account.ExecutionAccountID,
-			WalletAddress:      preflight.account.FunderAddress,
-		})
-		if quarantined {
-			logger.Warn("Polymarket quarantined account identity preflight passed",
-				"execution_account_id", account.ExecutionAccountID,
-				"open_orders", preflight.account.OpenOrderCount,
-				"funding_and_placement_preflight_skipped", true,
-			)
-			continue
-		}
-		logger.Info("Polymarket live account preflight passed",
-			"execution_account_id", account.ExecutionAccountID,
-			"open_orders", preflight.account.OpenOrderCount,
-			"required_v2_allowances_positive", preflight.funding.RequiredAllowancesPositive,
-			"eligibility_reason", preflight.eligibility.Reason,
-		)
+	maintenance := accountmaintenance.New()
+	expectedBindings, err := preflightLiveAccounts(liveAccountPreflightParams{
+		ctx: ctx, accounts: accounts, quarantined: quarantinedAccountSet,
+		entryDisabled: entryDisabledAccounts, client: tradingClient, eligibility: eligibility,
+		maintenance: maintenance, logger: logger,
+	})
+	if err != nil {
+		return nil, err
 	}
 	if err := postgresadapter.CheckLiveAccountBindings(
 		ctx, database, expectedBindings, polymarketCollateralAsset,
@@ -380,7 +358,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, err
 	}
 	kalshiRuntime, err := composeKalshiExecution(ctx, cfg, database, repository, guard, fillLedger,
-		executionService, logger)
+		executionService, maintenance, logger)
 	if err != nil {
 		return nil, fmt.Errorf("compose Kalshi live execution: %w", err)
 	}
@@ -479,7 +457,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		return nil, err
 	}
 	placementReconciliationReadiness, err := newPlacementAccountReadiness(
-		runner, optionalQuarantineReadiness(quarantineChecker),
+		runner, optionalQuarantineReadiness(quarantineChecker), maintenance,
 	)
 	if err != nil {
 		return nil, err
@@ -492,8 +470,19 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	}
 
 	startupSweep := runner.Sweep(ctx, domain.ReconciliationTriggerStartup)
-	if err := validateStartupReconciliation(startupSweep, len(reconciliationAccountIDs)); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("live startup reconciliation: %w", err)
+	}
+	reconciliationFailures, err := validateStartupReconciliation(startupSweep, reconciliationAccountIDs)
+	if err != nil {
 		return nil, err
+	}
+	for _, failure := range reconciliationFailures {
+		// A RUNNING row left by a killed process, or a failed scan, blocks only
+		// this account. The scheduled loop keeps reconciling it; once the
+		// existing 30-minute lease expires the recorder closes the stale row.
+		enterAccountMaintenance(logger, maintenance, failure.accountID,
+			accountmaintenance.ReasonStartupReconciliationFailed, failure.detail)
 	}
 	if triggerBridge.Dropped() != 0 {
 		return nil, fmt.Errorf("live startup dropped %d reconciliation trigger(s)", triggerBridge.Dropped())
@@ -552,8 +541,13 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The read-only snapshot only feeds GET /api/v1/live-operations, which
+	// answers 503 until a refresh succeeds; operations.Run keeps retrying.
 	if err := operations.Refresh(ctx); err != nil {
-		return nil, fmt.Errorf("build initial live operations snapshot: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("build initial live operations snapshot: %w", ctxErr)
+		}
+		logger.Warn("initial live operations snapshot failed; the background loop will retry", "error", err)
 	}
 	// Every configured Kalshi account gets a delivery slot, including one whose
 	// preflight failed: its persisted intents are then claimed and held back by
@@ -568,6 +562,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		cfg: cfg, database: database, positionSource: fillLedger, orderBooks: orderBooks,
 		executor: kalshiRuntime.execution, accountIDs: accountIDs, logger: logger,
 		submissionPolicy: kalshiRuntime.execution, routeInputPolicy: kalshiRuntime.execution, accountGate: decisionAccountGate,
+		maintenance: maintenance,
 	})
 	if err != nil {
 		return nil, err
@@ -593,18 +588,37 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	maintenanceProbe, err := newAccountMaintenanceProbe(accountMaintenanceProbeParams{
+		registry: maintenance,
+		preflight: func(probeCtx context.Context, accountID string) (liveAccountPreflightResult, error) {
+			_, quarantined := quarantinedAccountSet[accountID]
+			return preflightLiveAccount(probeCtx, accountID, quarantined, tradingClient, eligibility)
+		},
+		reconciliation: runner,
+		logger:         logger,
+	})
+	if err != nil {
+		return nil, err
+	}
 	// Activating the dead-man switch can cancel pre-existing orders, so it is
-	// intentionally the final fallible startup action after reconciliation,
-	// the initial operations snapshot, and decision-cycle composition.
+	// intentionally the final startup action after reconciliation, the initial
+	// operations snapshot, and decision-cycle composition. A failed account
+	// heartbeat closes only that account's placement gate (clobheartbeat.Venue)
+	// and heartbeat.Run retries every account every interval.
 	if err := heartbeat.Start(ctx); err != nil {
-		return nil, fmt.Errorf("start Polymarket CLOB heartbeat: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("start Polymarket CLOB heartbeat: %w", ctxErr)
+		}
+		logger.Warn("initial Polymarket CLOB heartbeat failed for some accounts; the heartbeat loop will retry",
+			"error", err)
+	} else if err := heartbeat.Check(ctx); err != nil {
+		logger.Warn("initial Polymarket CLOB heartbeat is not fresh; the heartbeat loop will retry", "error", err)
 	}
-	if err := heartbeat.Check(ctx); err != nil {
-		return nil, fmt.Errorf("verify initial Polymarket CLOB heartbeat freshness: %w", err)
-	}
+	// The message is kept verbatim: deployment verification waits for it.
 	logger.Info("Polymarket live startup reconciliation passed",
 		"accounts", len(reconciliationAccountIDs),
 		"quarantined_accounts", len(quarantinedAccountIDs),
+		"maintenance_accounts", maintenance.AccountIDs(),
 	)
 	return &liveRuntime{
 		repository: repository, execution: kalshiRuntime.execution,
@@ -616,6 +630,8 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		polymarketAccounts: append([]string(nil), reconciliationAccountIDs...),
 		kalshiAccounts:     append([]string(nil), kalshiRuntime.activeAccounts...),
 		recovery:           recoveryGuard,
+		maintenance:        maintenance,
+		maintenanceProbe:   maintenanceProbe,
 	}, nil
 }
 
@@ -696,19 +712,56 @@ func requireExactLiveAccountSet(label string, actual, expected []string) error {
 	return nil
 }
 
+type liveProtocolProbeClient interface {
+	ProbeProtocol(context.Context, time.Duration) (polymarket.ProtocolProbe, error)
+}
+
+// preflightLiveProtocol stays fatal (design D4): the CLOB V2 protocol and the
+// signing clock offset it synchronizes are shared by every Polymarket account,
+// so a failure is global and systemd restarts the whole process.
+func preflightLiveProtocol(ctx context.Context, client liveProtocolProbeClient, maxClockSkew time.Duration,
+	logger *slog.Logger) error {
+	protocol, err := client.ProbeProtocol(ctx, maxClockSkew)
+	if err != nil {
+		return fmt.Errorf("Polymarket CLOB V2 protocol preflight: %w", err)
+	}
+	logger.Info("Polymarket CLOB V2 protocol preflight passed",
+		"version", protocol.Version,
+		"clock_skew_ms", protocol.ClockSkew.Milliseconds(),
+	)
+	return nil
+}
+
+// liveAccountPreflightError is an account-local preflight failure: the account
+// enters maintenance with the reason instead of stopping the process.
+type liveAccountPreflightError struct {
+	reason string
+	err    error
+}
+
+func (failure *liveAccountPreflightError) Error() string { return failure.err.Error() }
+func (failure *liveAccountPreflightError) Unwrap() error { return failure.err }
+
+func accountPreflightFailure(reason string, format string, args ...any) error {
+	return &liveAccountPreflightError{reason: reason, err: fmt.Errorf(format, args...)}
+}
+
+// preflightLiveAccount runs only read-only venue requests: the authenticated
+// open-order list, the balance-allowance read, and placement eligibility.
+// A zero pUSD cash balance is not a failure: an account fully invested in
+// positions must still be able to sell, and every BUY is limited by the local
+// ledger reservation and a deterministic venue insufficient-balance rejection.
 func preflightLiveAccount(
 	ctx context.Context,
 	executionAccountID string,
 	quarantined bool,
-	buyDisabled bool,
 	client liveAccountProbeClient,
 	eligibility polymarket.GeographicEligibilityChecker,
 ) (liveAccountPreflightResult, error) {
 	probe, err := client.ProbeAccount(ctx, executionAccountID)
 	if err != nil {
-		return liveAccountPreflightResult{}, fmt.Errorf(
-			"execution account %q authenticated CLOB preflight: %w", executionAccountID, err,
-		)
+		return liveAccountPreflightResult{}, accountPreflightFailure(accountmaintenance.ReasonPreflightCLOBAuth,
+			"execution account %q authenticated CLOB preflight: %w", executionAccountID, err)
 	}
 	result := liveAccountPreflightResult{account: probe}
 	if quarantined {
@@ -723,37 +776,93 @@ func preflightLiveAccount(
 
 	funding, err := client.ProbeFunding(ctx, executionAccountID)
 	if err != nil {
-		return liveAccountPreflightResult{}, fmt.Errorf(
-			"execution account %q CLOB funding preflight: %w", executionAccountID, err,
-		)
+		return liveAccountPreflightResult{}, accountPreflightFailure(accountmaintenance.ReasonPreflightFundingUnavailable,
+			"execution account %q CLOB funding preflight: %w", executionAccountID, err)
 	}
 	result.funding = &funding
-	// An account behind the BUY gate can never spend collateral, so an empty
-	// balance (funds moved out on purpose) must not stop the whole service.
-	// Allowances and placement eligibility are still required.
-	if !funding.CollateralBalancePositive && !buyDisabled {
-		return liveAccountPreflightResult{}, fmt.Errorf(
-			"execution account %q has no positive CLOB pUSD collateral balance", executionAccountID,
-		)
-	}
 	if !funding.RequiredAllowancesPositive {
-		return liveAccountPreflightResult{}, fmt.Errorf(
-			"execution account %q is missing a positive pUSD allowance for a required CLOB V2 exchange", executionAccountID,
-		)
+		return liveAccountPreflightResult{}, accountPreflightFailure(accountmaintenance.ReasonPreflightAllowanceMissing,
+			"execution account %q is missing a positive pUSD allowance for a required CLOB V2 exchange", executionAccountID)
 	}
 	placement, err := eligibility.Check(ctx, executionAccountID)
 	if err != nil {
-		return liveAccountPreflightResult{}, fmt.Errorf(
-			"execution account %q placement eligibility preflight: %w", executionAccountID, err,
-		)
+		return liveAccountPreflightResult{}, accountPreflightFailure(accountmaintenance.ReasonPreflightEligibilityUnavailable,
+			"execution account %q placement eligibility preflight: %w", executionAccountID, err)
 	}
 	result.eligibility = &placement
 	if placement.Blocked {
-		return liveAccountPreflightResult{}, fmt.Errorf(
-			"execution account %q is not eligible to place CLOB orders (%s)", executionAccountID, placement.Reason,
-		)
+		return liveAccountPreflightResult{}, accountPreflightFailure(accountmaintenance.ReasonPreflightNotEligible,
+			"execution account %q is not eligible to place CLOB orders (%s)", executionAccountID, placement.Reason)
 	}
 	return result, nil
+}
+
+type liveAccountPreflightParams struct {
+	ctx           context.Context
+	accounts      []polymarket.TradingAccount
+	quarantined   map[string]struct{}
+	entryDisabled []string
+	client        liveAccountProbeClient
+	eligibility   polymarket.GeographicEligibilityChecker
+	maintenance   *accountmaintenance.Registry
+	logger        *slog.Logger
+}
+
+// preflightLiveAccounts runs every Polymarket account preflight. An
+// account-local failure puts only that account in maintenance; the startup
+// deadline and untyped failures still stop the process. Every account,
+// including one in maintenance, is returned for the global wallet-binding and
+// ledger checks, using the funder address from the wallet file (the same value
+// the authenticated probe reports).
+func preflightLiveAccounts(params liveAccountPreflightParams) ([]postgresadapter.ExpectedExecutionAccount, error) {
+	logger := params.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	entryDisabled := make(map[string]struct{}, len(params.entryDisabled))
+	for _, accountID := range params.entryDisabled {
+		entryDisabled[strings.TrimSpace(accountID)] = struct{}{}
+	}
+	expected := make([]postgresadapter.ExpectedExecutionAccount, 0, len(params.accounts))
+	for _, account := range params.accounts {
+		accountID := account.ExecutionAccountID
+		expected = append(expected, postgresadapter.ExpectedExecutionAccount{
+			ExecutionAccountID: accountID,
+			WalletAddress:      strings.ToLower(strings.TrimSpace(account.FunderAddress)),
+		})
+		_, quarantined := params.quarantined[accountID]
+		preflight, err := preflightLiveAccount(params.ctx, accountID, quarantined, params.client, params.eligibility)
+		if err != nil {
+			if ctxErr := params.ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("execution account %q preflight: %w", accountID, ctxErr)
+			}
+			var accountErr *liveAccountPreflightError
+			if !errors.As(err, &accountErr) {
+				return nil, err
+			}
+			enterAccountMaintenance(logger, params.maintenance, accountID, accountErr.reason, err.Error())
+			continue
+		}
+		if quarantined {
+			logger.Warn("Polymarket quarantined account identity preflight passed",
+				"execution_account_id", accountID,
+				"open_orders", preflight.account.OpenOrderCount,
+				"funding_and_placement_preflight_skipped", true,
+			)
+			continue
+		}
+		if _, buyDisabled := entryDisabled[accountID]; !buyDisabled && !preflight.funding.CollateralBalancePositive {
+			logger.Warn("active account has no positive pUSD collateral; BUY will be limited by reservations",
+				"execution_account_id", accountID)
+		}
+		logger.Info("Polymarket live account preflight passed",
+			"execution_account_id", accountID,
+			"open_orders", preflight.account.OpenOrderCount,
+			"required_v2_allowances_positive", preflight.funding.RequiredAllowancesPositive,
+			"eligibility_reason", preflight.eligibility.Reason,
+		)
+	}
+	return expected, nil
 }
 
 func partitionReconciliationAccounts(configured, quarantined []string) ([]string, []string, error) {
@@ -847,49 +956,105 @@ func composeChainCashLedger(cfg config.Config, database *sql.DB, accountIDs []st
 	})
 }
 
+// startupReconciliationFailure is one account whose startup reconciliation did
+// not finish (FAILED, or still RUNNING because another row holds the lease).
+type startupReconciliationFailure struct {
+	accountID string
+	detail    string
+}
+
 // validateStartupReconciliation confirms that every configured account was
 // observed during startup. ATTENTION_REQUIRED is a durable, account-local
 // state: global readiness remains degraded and CheckAccount blocks placement
 // for that wallet, while unrelated reconciled wallets may continue trading.
-func validateStartupReconciliation(result reconciliation.SweepResult, expectedAccounts int) error {
-	if len(result.Runs) != expectedAccounts {
-		return fmt.Errorf("live startup reconciliation returned %d account run(s), want %d", len(result.Runs), expectedAccounts)
+// An account whose run failed, or whose error is not durably recorded, is
+// returned for maintenance. Only a wrong run count or an error that cannot be
+// attributed to one account fails startup.
+func validateStartupReconciliation(
+	result reconciliation.SweepResult,
+	accounts []string,
+) ([]startupReconciliationFailure, error) {
+	if len(result.Runs) != len(accounts) {
+		return nil, fmt.Errorf("live startup reconciliation returned %d account run(s), want %d", len(result.Runs), len(accounts))
 	}
 	attentionErrors := make(map[string]string, len(result.Runs))
-	for _, run := range result.Runs {
+	failedDetails := make(map[string][]string, len(result.Runs))
+	var order []string
+	markFailed := func(accountID, detail string) {
+		if _, exists := failedDetails[accountID]; !exists {
+			order = append(order, accountID)
+		}
+		failedDetails[accountID] = append(failedDetails[accountID], detail)
+	}
+	known := make(map[string]struct{}, len(accounts))
+	for index, run := range result.Runs {
+		accountID := strings.TrimSpace(run.Run.ExecutionAccountID)
+		if accountID == "" {
+			// A run that never started (for example, the account lock was not
+			// acquired) carries no identity; Sweep keeps the configured order.
+			accountID = strings.TrimSpace(accounts[index])
+		}
+		known[accountID] = struct{}{}
 		switch run.Run.Status {
 		case domain.ReconciliationRunCompleted:
 		case domain.ReconciliationRunAttentionRequired:
 			if run.Run.Error != "" {
-				attentionErrors[run.Run.ExecutionAccountID] = run.Run.Error
+				attentionErrors[accountID] = run.Run.Error
 			}
 		default:
-			return fmt.Errorf(
-				"execution account %q startup reconciliation failed closed (status %s, issues %d)",
-				run.Run.ExecutionAccountID, run.Run.Status, len(run.Issues),
-			)
+			status := run.Run.Status
+			if status == "" {
+				status = "NOT_RUN"
+			}
+			markFailed(accountID, fmt.Sprintf("startup reconciliation failed closed (status %s, issues %d)",
+				status, len(run.Issues)))
 		}
 	}
-	var unpersisted []error
+	var unattributed []error
 	for _, sweepErr := range result.Errors {
 		if sweepErr == nil {
 			continue
 		}
-		persisted := false
-		for accountID, runError := range attentionErrors {
-			if sweepErr.Error() == "reconcile "+accountID+": "+runError {
-				persisted = true
-				break
-			}
+		accountID, attributed := reconciliationErrorAccount(sweepErr, known)
+		if !attributed {
+			unattributed = append(unattributed, sweepErr)
+			continue
 		}
-		if !persisted {
-			unpersisted = append(unpersisted, sweepErr)
+		if runError, exists := attentionErrors[accountID]; exists &&
+			sweepErr.Error() == "reconcile "+accountID+": "+runError {
+			continue
 		}
+		markFailed(accountID, sweepErr.Error())
 	}
-	if err := errors.Join(unpersisted...); err != nil {
-		return fmt.Errorf("live startup reconciliation failed: %w", err)
+	if err := errors.Join(unattributed...); err != nil {
+		return nil, fmt.Errorf("live startup reconciliation failed: %w", err)
 	}
-	return nil
+	failures := make([]startupReconciliationFailure, 0, len(order))
+	for _, accountID := range order {
+		failures = append(failures, startupReconciliationFailure{
+			accountID: accountID, detail: strings.Join(failedDetails[accountID], "; "),
+		})
+	}
+	return failures, nil
+}
+
+// reconciliationErrorAccount attributes a runner error ("reconcile <id>: ...")
+// to a configured account.
+func reconciliationErrorAccount(err error, known map[string]struct{}) (string, bool) {
+	message := err.Error()
+	if !strings.HasPrefix(message, "reconcile ") {
+		return "", false
+	}
+	rest := strings.TrimPrefix(message, "reconcile ")
+	separator := strings.Index(rest, ": ")
+	if separator <= 0 {
+		return "", false
+	}
+	accountID := rest[:separator]
+	if _, exists := known[accountID]; !exists {
+		return "", false
+	}
+	return accountID, true
 }
 
 // startBackground 启动 heartbeat、对账、只读快照和可选决策周期后台循环。
@@ -940,6 +1105,9 @@ func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Lo
 			logger.Error("live operations snapshot loop stopped", "error", err)
 		}
 	}()
+	if runtime.maintenanceProbe != nil {
+		go runtime.maintenanceProbe.Run(ctx)
+	}
 	if runtime.autoRedeem != nil {
 		go func() {
 			if err := runtime.autoRedeem.Run(ctx); err != nil && ctx.Err() == nil {

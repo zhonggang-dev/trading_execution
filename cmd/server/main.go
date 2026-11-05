@@ -301,10 +301,16 @@ func consoleV2RuntimeConfig(cfg config.Config, live *liveRuntime, startedAt time
 		EntrySubmissionDisabled: cfg.DecisionCycle.EntrySubmissionDisabled,
 		// Account quarantine and the global Kalshi input switch no longer exist;
 		// the fields stay in the console contract with their neutral values.
+		// Maintenance accounts are merged in at read time (MaintenanceAccounts).
 		SubmissionDisabledAccounts: nil,
 		EntryDisabledAccounts:      cfg.DecisionCycle.EntryDisabledAccounts(),
 		StrategyDisabledAccounts:   cfg.DecisionCycle.StrategyDisabledAccounts(),
 		KalshiStrategyInputEnabled: true,
+	}
+	if live != nil && live.maintenance != nil {
+		// Accounts held in maintenance after an account-local startup failure
+		// are reported through the existing submission-disabled fields.
+		config.MaintenanceAccounts = live.maintenance.AccountIDs
 	}
 	if live != nil {
 		for _, accountID := range live.polymarketAccounts {

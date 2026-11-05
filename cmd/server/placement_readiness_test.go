@@ -8,6 +8,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountmaintenance"
 )
 
 type placementCheckerFunc func(context.Context, string) error
@@ -106,5 +107,38 @@ func assertReconciliationGate(t *testing.T, _ port.VenueOrder, err error) {
 	var venueErr *port.VenueError
 	if !errors.As(err, &venueErr) || venueErr.Code != "RECONCILIATION_NOT_READY" {
 		t.Fatalf("Place() error = %v, want RECONCILIATION_NOT_READY", err)
+	}
+}
+
+func TestPlacementAccountReadinessRefusesMaintenanceAccount(t *testing.T) {
+	registry := accountmaintenance.New()
+	registry.Enter("wallet-7", accountmaintenance.ReasonPreflightAllowanceMissing, "allowance 0")
+	checks := 0
+	readiness, err := newPlacementAccountReadiness(placementCheckerFunc(func(context.Context, string) error {
+		checks++
+		return nil
+	}), nil, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	underlying := &placementTestVenue{}
+	venue, err := newPlacementReadinessVenue(underlying)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := venue.Bind(readiness); err != nil {
+		t.Fatal(err)
+	}
+	placed, placeErr := venue.Place(context.Background(), placementTestOrder("wallet-7"))
+	assertReconciliationGate(t, placed, placeErr)
+	if !strings.Contains(placeErr.Error(), "maintenance") || underlying.places != 0 {
+		t.Fatalf("maintenance place = %v, places %d", placeErr, underlying.places)
+	}
+	if _, err := venue.Place(context.Background(), placementTestOrder("main")); err != nil || underlying.places != 1 || checks != 1 {
+		t.Fatalf("healthy place = %v, places %d, checks %d", err, underlying.places, checks)
+	}
+	registry.Exit("wallet-7", accountmaintenance.ReasonPreflightAllowanceMissing)
+	if _, err := venue.Place(context.Background(), placementTestOrder("wallet-7")); err != nil {
+		t.Fatalf("place after maintenance = %v", err)
 	}
 }
