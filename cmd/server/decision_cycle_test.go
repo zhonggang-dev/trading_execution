@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountmaintenance"
 )
 
 type decisionRunnerTestPositionSource struct{}
@@ -164,5 +167,52 @@ func TestVenueAccountGateRoutesKalshiAccountsToTheirOwnSlot(t *testing.T) {
 	}
 	if _, err := newVenueAccountGate(nil, nil); err == nil {
 		t.Fatal("newVenueAccountGate accepted a nil Polymarket gate")
+	}
+}
+
+// TestBuildDecisionRunnerHoldsKalshiAccountsWhenMarketDataKeyFails covers the
+// decision-cycle half of acceptance 4: a broken Kalshi market-data key no
+// longer stops the runner from being built; Kalshi accounts are held in
+// maintenance and Polymarket accounts are untouched.
+func TestBuildDecisionRunnerHoldsKalshiAccountsWhenMarketDataKeyFails(t *testing.T) {
+	database, err := sql.Open("pgx", "postgres://unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	registry := accountmaintenance.New()
+	params := buildDecisionRunnerParams{
+		cfg: config.Config{
+			Execution: config.Execution{Venue: "polymarket"},
+			Kalshi: config.Kalshi{MarketDataEnabled: true, APIURL: "https://kalshi.example",
+				APIKeyID: "key", PrivateKeyPath: "/tmp/does-not-exist/kalshi.pem"},
+			DecisionCycle: config.DecisionCycle{
+				Enabled: true, PredictionInfraBaseURL: "https://prediction.example",
+				PredictionInfraToken: "prediction-token", StrategyBaseURL: "https://strategy.example",
+				StrategyToken: "strategy-token", Interval: 10 * time.Minute, Timeout: time.Minute,
+				OrderSubmissionEnabled: true, RequireCompleteModelCoverage: true, PredictionLookback: 3 * time.Hour,
+				PredictionModelID: "producer", PredictionSourceMode: domain.PredictionSourceModeDirect,
+				Accounts: []config.DecisionAccount{
+					{ExecutionAccountID: "account", MarketSource: domain.MarketSourcePolymarket,
+						StrategyID: domain.StrategyIDMultfactorV1, Mode: config.DecisionAccountActive},
+					{ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi,
+						StrategyID: domain.StrategyIDMultfactorV1, Mode: config.DecisionAccountActive},
+				},
+			},
+		},
+		database: database, positionSource: decisionRunnerTestPositionSource{},
+		orderBooks: decisionRunnerTestOrderBookSource{}, executor: decisionRunnerTestExecutor{},
+		accountGate: decisionRunnerTestAccountGate{}, accountIDs: []string{"account"},
+		maintenance: registry, logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	runner, err := buildDecisionRunner(params)
+	if err != nil || runner == nil {
+		t.Fatalf("buildDecisionRunner() = %#v, %v, want a runner without Kalshi books", runner, err)
+	}
+	if reason, ok := registry.MaintenanceReason("kalshi:main"); !ok || reason != accountmaintenance.ReasonKalshiMarketDataUnavailable {
+		t.Fatalf("Kalshi maintenance = %q, %v", reason, ok)
+	}
+	if _, ok := registry.MaintenanceReason("account"); ok {
+		t.Fatal("Polymarket account entered maintenance because of Kalshi market data")
 	}
 }

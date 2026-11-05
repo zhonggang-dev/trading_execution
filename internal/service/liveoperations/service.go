@@ -139,14 +139,13 @@ func (service *Service) Refresh(ctx context.Context) error {
 }
 
 // Run 按固定周期更新快照，单次失败保留上一份成功结果并记录降级原因。
+// 首次刷新失败（包括启动时）也不会停止循环：在第一份成功快照之前 Snapshot
+// 返回 ErrSnapshotUnavailable，后续周期继续重试。
 func (service *Service) Run(ctx context.Context) error {
 	if service.cache.Load() == nil {
 		refreshContext, cancel := context.WithTimeout(ctx, service.refreshTimeout)
-		err := service.Refresh(refreshContext)
+		_ = service.Refresh(refreshContext)
 		cancel()
-		if err != nil {
-			return err
-		}
 	}
 	ticker := time.NewTicker(service.interval)
 	defer ticker.Stop()
