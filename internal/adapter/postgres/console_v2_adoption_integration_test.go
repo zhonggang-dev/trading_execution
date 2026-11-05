@@ -69,6 +69,17 @@ func assertRetiredAdoptionPortfolio(t *testing.T, db *sql.DB, account, lotID, to
 	}
 	assertConsoleAmount(t, facts.Accounts[0].Assets[0].RemainingCost, "0.615")
 	assertConsoleAmount(t, facts.Accounts[0].Metrics.PeakHoldingCost, "0.615")
+	cohort, cohortErr := performanceReader.CohortMetricFacts(ctx, consolev2.CohortFilter{ExecutionAccountID: account})
+	if cohortErr != nil || len(cohort.Accounts) != 1 || len(cohort.Accounts[0].Assets) != 1 {
+		t.Fatalf("retired adopted cohort %#v %v", cohort, cohortErr)
+	}
+	c := cohort.Cohorts[account]
+	if c.OpenedAssetCount != 1 || c.HoldingAssetCount != 1 || c.ClosedAssetCount != 0 {
+		t.Fatalf("adopted cohort counts %#v", c)
+	}
+	assertConsoleAmount(t, cohort.Accounts[0].Metrics.CumulativeInvestedCost, "0.615")
+	assertConsoleAmount(t, cohort.Accounts[0].Assets[0].RemainingCost, "0.615")
+	assertConsoleAmount(t, c.BuyFees, "0") // No historical fee is fabricated for adoption.
 	// Corrupt only connection-local shadow copies, never the sealed fixture.
 	// Each broken relation must fail closed instead of borrowing another lot's
 	// valid baseline merely because the account, token or adoption ID exists.

@@ -438,3 +438,9 @@ prices from other reads. No ledger settlement or redemption is performed.
 支持账户筛选的列表资源新增可选 `account_scope=active|all`，与 `execution_account_id`（含别名 `account`）互斥。省略保留旧全部账户行为；新工作区默认显式发送 `active`。仅配置模式 `ACTIVE`、`SELL_ONLY` 属于活跃；`PAUSED` 和未知模式不纳入。具体暂停账户仍可单独查询。
 
 范围在订单、持仓、成交与结算、对账等资源的 SQL 谓词中应用，精确 total、summary 和当前页共用筛选，不能在浏览器按页隐藏暂停账户。账户目录继续列出所有受管账户，以支持选择暂停账户。详情及精确 lot 展开沿用自身身份，不新增聚合范围参数。
+
+### 旧历史关闭缺少分配证据
+
+部分历史人工清理把 lot 置为 CLOSED，但未保留对应卖出、赎回或结算分配。新读投影不能将缺失回款视为零，或把同一账户可算的部分伪称为账户总计。所选 lot 存在 `remaining_shares + 已记录关闭份额 < original_shares` 时，响应新增 `unavailable_accounts:[{execution_account_id,market_source,reason:"missing_disposition_evidence"}]`，整账户不进入 `items`，且不返回猜测金额。`items` 与 `unavailable_accounts` 的账户并集仍完整等于请求范围内已注册账户；其他完整账户继续正常计算。单账户同样返回明确警示；选择不包含缺证据 lot 的较近开仓区间可恢复计算。无缺口时此字段为空数组。
+
+这仅隔离明确缺失的历史关闭证据，不吞掉数据库错误、身份冲突、份额超分配、损坏净对冲或金额不合法：这些情况仍返回安全 503。不会修改生产历史账本。

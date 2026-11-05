@@ -34,9 +34,18 @@ type CohortAccountFact struct {
 }
 type CohortMetricFacts struct {
 	CoreMetricFacts
-	OpeningFrom *time.Time
-	OpeningTo   *time.Time
-	Cohorts     map[string]CohortAccountFact
+	OpeningFrom         *time.Time
+	OpeningTo           *time.Time
+	Cohorts             map[string]CohortAccountFact
+	UnavailableAccounts []CohortUnavailableAccount
+}
+
+// Missing historical disposition records cannot be reconstructed as a zero
+// payout. This stable warning carries no guessed financial values.
+type CohortUnavailableAccount struct {
+	ExecutionAccountID string `json:"execution_account_id"`
+	MarketSource       string `json:"market_source"`
+	Reason             string `json:"reason"`
 }
 
 func ValidateCohortFilter(f CohortFilter) error {
@@ -109,7 +118,7 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 	if err != nil {
 		return CohortMetricFacts{}, err
 	}
-	result := CohortMetricFacts{CoreMetricFacts: CoreMetricFacts{ObservedAt: now, Accounts: make([]CoreAccountFact, 0, len(accounts))}, OpeningFrom: filter.OpeningFrom, OpeningTo: filter.OpeningTo, Cohorts: map[string]CohortAccountFact{}}
+	result := CohortMetricFacts{CoreMetricFacts: CoreMetricFacts{ObservedAt: now, Accounts: make([]CoreAccountFact, 0, len(accounts))}, OpeningFrom: filter.OpeningFrom, OpeningTo: filter.OpeningTo, Cohorts: map[string]CohortAccountFact{}, UnavailableAccounts: []CohortUnavailableAccount{}}
 	accountIndices := map[string]int{}
 	for _, a := range accounts {
 		f := CoreAccountFact{Metrics: AccountPerformance{ExecutionAccountID: a.ExecutionAccountID, MarketSource: a.MarketSource, CurrentCost: "0", PeakHoldingCost: "0", CumulativeInvestedCost: "0", RealizedPnL: "0", RealizedDrawdown14D: "0", DrawdownFrom: now, DrawdownTo: now}, Assets: []CoreAssetFact{}}
@@ -290,7 +299,44 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 	if err = queryRowsError(rows, "cohort disposition rows"); err != nil {
 		return CohortMetricFacts{}, err
 	}
-	// Aggregate after validating full lot conservation, never by token alone.
+	// Older operator cleanups closed some lots without a disposition allocation.
+	// Isolate only this explicit evidence gap by account. Over-allocation and
+	// malformed source/netting evidence remain hard failures; no lost proceeds
+	// or fees are guessed, and no otherwise valid subset is called an account.
+	missingDisposition := map[string]bool{}
+	for _, l := range lots {
+		switch new(big.Rat).Add(l.remainingShares, l.closedShares).Cmp(l.originalShares) {
+		case 1:
+			return CohortMetricFacts{}, ErrUnavailable
+		case -1:
+			missingDisposition[l.asset.ExecutionAccountID] = true
+		}
+	}
+	availableAccounts := make([]CoreAccountFact, 0, len(result.Accounts))
+	for _, a := range result.Accounts {
+		id := a.Metrics.ExecutionAccountID
+		if missingDisposition[id] {
+			result.UnavailableAccounts = append(result.UnavailableAccounts, CohortUnavailableAccount{ExecutionAccountID: id, MarketSource: a.Metrics.MarketSource, Reason: "missing_disposition_evidence"})
+			delete(accountIndices, id)
+			continue
+		}
+		accountIndices[id] = len(availableAccounts)
+		availableAccounts = append(availableAccounts, a)
+	}
+	result.Accounts = availableAccounts
+	for id, l := range lots {
+		if missingDisposition[l.asset.ExecutionAccountID] {
+			delete(lots, id)
+		}
+	}
+	availableEvents := events[:0]
+	for _, e := range events {
+		if !missingDisposition[e.account] {
+			availableEvents = append(availableEvents, e)
+		}
+	}
+	events = availableEvents
+	// Aggregate only fully attributable accounts, never by token alone.
 	assets := map[string]*CoreAssetFact{}
 	assetHoldings := map[string]bool{}
 	invested := map[string]*big.Rat{}
@@ -303,9 +349,6 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 		}
 	}
 	for _, l := range lots {
-		if new(big.Rat).Add(l.remainingShares, l.closedShares).Cmp(l.originalShares) != 0 {
-			return CohortMetricFacts{}, ErrUnavailable
-		}
 		id := l.asset.ExecutionAccountID
 		invested[id].Add(invested[id], l.principal)
 		realized[id].Add(realized[id], l.realized)
