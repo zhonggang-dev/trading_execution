@@ -251,6 +251,13 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
  SELECT r.lot_id,'kalshi:'||r.lot_id,r.settled_shares,r.allocated_payout,0,r.settled_at,
  (l.market_source='KALSHI' AND r.execution_account_id=l.execution_account_id AND r.ticker=l.market_id AND r.token_id=l.token_id AND p.status='APPLIED' AND p.applied_at<=$2)
  FROM selected_lots l JOIN kalshi_settlement_lots r ON r.lot_id=l.lot_id LEFT JOIN kalshi_settlements p ON p.execution_account_id=r.execution_account_id AND p.ticker=r.ticker WHERE r.settled_at<=$2
+ UNION ALL
+ SELECT h.lot_id,'historical-rebased:'||h.sale_id,h.allocated_shares,h.allocated_gross_proceeds-h.allocated_fee,h.allocated_fee,h.sold_at,
+ (l.market_source='POLYMARKET' AND h.execution_account_id=l.execution_account_id AND h.market_id=l.market_id AND h.condition_id=l.condition_id AND h.token_id=l.token_id
+  AND h.cash_effect=0 AND h.allocated_principal=l.original_cost AND h.allocated_shares=l.original_shares
+  AND e.execution_account_id=l.execution_account_id AND e.event_type='MANUAL_REBASE' AND e.occurred_at=l.closed_at AND e.occurred_at>=h.sold_at)
+ FROM selected_lots l JOIN historical_rebased_lot_sales h ON h.lot_id=l.lot_id
+ LEFT JOIN execution_account_events e ON e.account_event_id=h.rebase_account_event_id WHERE h.sold_at<=$2
  ) SELECT lot_id,flow_id,shares::text,net::text,sell_fee::text,at,COALESCE(valid,FALSE) FROM flows ORDER BY at,flow_id,lot_id LIMIT ` + fmt.Sprint(MaxCohortClosures+1)
 	rows, err = tx.QueryContext(ctx, q, args...)
 	if err != nil {

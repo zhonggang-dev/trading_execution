@@ -39,6 +39,7 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_fill_events'),
 			('position_lots'),
 			('position_lot_closures'),
+			('historical_rebased_lot_sales'),
 			('position_events'),
 			('execution_account_events'),
 			('execution_outbox'),
