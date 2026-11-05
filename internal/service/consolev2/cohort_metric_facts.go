@@ -37,6 +37,7 @@ type CohortMetricFacts struct {
 	OpeningFrom         *time.Time
 	OpeningTo           *time.Time
 	Cohorts             map[string]CohortAccountFact
+	Replay              map[string]CohortReplayFact
 	UnavailableAccounts []CohortUnavailableAccount
 }
 
@@ -70,6 +71,8 @@ type cohortLot struct {
 	originalShares, remainingShares, principal, buyFee *big.Rat
 	opened                                             time.Time
 	closedShares, realized, sellFees                   *big.Rat
+	dispositions                                       []CohortReplayDisposition
+	originalText, remainingText, principalText         string
 }
 type cohortCashEvent struct {
 	at          time.Time
@@ -118,7 +121,7 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 	if err != nil {
 		return CohortMetricFacts{}, err
 	}
-	result := CohortMetricFacts{CoreMetricFacts: CoreMetricFacts{ObservedAt: now, Accounts: make([]CoreAccountFact, 0, len(accounts))}, OpeningFrom: filter.OpeningFrom, OpeningTo: filter.OpeningTo, Cohorts: map[string]CohortAccountFact{}, UnavailableAccounts: []CohortUnavailableAccount{}}
+	result := CohortMetricFacts{CoreMetricFacts: CoreMetricFacts{ObservedAt: now, Accounts: make([]CoreAccountFact, 0, len(accounts))}, OpeningFrom: filter.OpeningFrom, OpeningTo: filter.OpeningTo, Cohorts: map[string]CohortAccountFact{}, Replay: map[string]CohortReplayFact{}, UnavailableAccounts: []CohortUnavailableAccount{}}
 	accountIndices := map[string]int{}
 	for _, a := range accounts {
 		f := CoreAccountFact{Metrics: AccountPerformance{ExecutionAccountID: a.ExecutionAccountID, MarketSource: a.MarketSource, CurrentCost: "0", PeakHoldingCost: "0", CumulativeInvestedCost: "0", RealizedPnL: "0", RealizedDrawdown14D: "0", DrawdownFrom: now, DrawdownTo: now}, Assets: []CoreAssetFact{}}
@@ -198,6 +201,7 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 			return CohortMetricFacts{}, ErrUnavailable
 		}
 		l.originalShares, l.remainingShares, l.principal, l.buyFee = ns[0], ns[1], ns[2], ns[3]
+		l.originalText, l.remainingText, l.principalText = original.String, remaining.String, principal.String
 		l.closedShares, l.realized, l.sellFees = new(big.Rat), new(big.Rat), new(big.Rat)
 		l.asset.RemainingShares = remaining.String
 		l.asset.RemainingCost = cohortText(new(big.Rat).Quo(new(big.Rat).Mul(l.principal, l.remainingShares), l.originalShares))
@@ -301,6 +305,15 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 		cost := new(big.Rat).Quo(new(big.Rat).Mul(l.principal, qty), l.originalShares)
 		l.realized.Add(l.realized, new(big.Rat).Sub(new(big.Rat).Add(cash, sellFee), cost))
 		l.sellFees.Add(l.sellFees, sellFee)
+		// Preserve finite SQL NUMERIC allocation precision before replay sums.
+		scale := 0
+		for _, raw := range []string{net, fee} {
+			if dot := strings.IndexByte(raw, '.'); dot >= 0 && len(raw)-dot-1 > scale {
+				scale = len(raw) - dot - 1
+			}
+		}
+		gross := new(big.Rat).Add(cash, sellFee).FloatString(scale)
+		l.dispositions = append(l.dispositions, CohortReplayDisposition{ID: flow, At: at.UTC(), Shares: shares, GrossProceeds: gross})
 		events = append(events, cohortCashEvent{at: at, phase: 1, id: flow + ":" + id, account: l.asset.ExecutionAccountID, delta: new(big.Rat).Neg(cost)})
 	}
 	if err = queryRowsError(rows, "cohort disposition rows"); err != nil {
@@ -357,6 +370,9 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 	}
 	for _, l := range lots {
 		id := l.asset.ExecutionAccountID
+		replay := result.Replay[id]
+		replay.Lots = append(replay.Lots, CohortReplayLot{LotID: l.id, Asset: l.asset, OriginalShares: l.originalText, RemainingShares: l.remainingText, OriginalPrincipal: l.principalText, OpenedAt: l.opened.UTC(), Dispositions: l.dispositions})
+		result.Replay[id] = replay
 		invested[id].Add(invested[id], l.principal)
 		realized[id].Add(realized[id], l.realized)
 		buyFees[id].Add(buyFees[id], l.buyFee)
@@ -487,6 +503,9 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 	}
 	for i := range result.Accounts {
 		a := &result.Accounts[i]
+		replay := result.Replay[a.Metrics.ExecutionAccountID]
+		sort.Slice(replay.Lots, func(i, j int) bool { return replay.Lots[i].LotID < replay.Lots[j].LotID })
+		result.Replay[a.Metrics.ExecutionAccountID] = replay
 		sort.Slice(a.Assets, func(i, j int) bool { return cohortIdentity(a.Assets[i]) < cohortIdentity(a.Assets[j]) })
 		c := result.Cohorts[a.Metrics.ExecutionAccountID]
 		if c.OpenedAssetCount == 0 {

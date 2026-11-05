@@ -10,6 +10,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	core "github.com/UniPat-AI/trading_execution/internal/service/accountcoremetrics"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountpricehistory"
 	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 )
 
@@ -94,6 +95,29 @@ func TestPostgresIntegrationCohortRealFillNettingSellAndSettlement(t *testing.T)
 	assertConsoleAmount(t, *item.UnrealizedPnL, "2.2")
 	assertConsoleAmount(t, *item.TotalPnL, "4.1")
 	assertConsoleAmount(t, *item.ROI, "0.5")
+	// The same real FillLedger/netting/settlement allocations drive history.
+	// SAME marked at .9 reaches gross +5.8 together with NET/other legs;
+	// the current endpoint is +4.1, hence the largest drop is 1.7. Fees never
+	// enter this curve, and immediately netted legs expose no interim peak.
+	history := cohortHistoricalQuotes(func(_ context.Context, windows []accountpricehistory.Window) (accountpricehistory.Dataset, error) {
+		data := accountpricehistory.Dataset{Series: map[string]accountpricehistory.Series{}, Version: "real-ledger-history"}
+		for _, w := range windows {
+			price := "0.5"
+			if w.Asset.MarketID == "SAME" {
+				price = "0.9"
+			}
+			data.Series[w.Asset.Key()] = accountpricehistory.Series{Points: []accountpricehistory.Point{{At: from.Add(-time.Minute), Price: price, ResolutionSeconds: 3600}}, Coverage: []accountpricehistory.Coverage{{From: from, To: f.clock, State: "complete"}}}
+		}
+		return data, nil
+	})
+	withHistory, err := core.New(reader, quotes, history).QueryCohort(context.Background(), filter)
+	if err != nil || len(withHistory.Items) != 1 || withHistory.Items[0].DrawdownState != "available" || withHistory.Items[0].MaxDrawdown == nil {
+		t.Fatal("real cohort drawdown unavailable", withHistory, err)
+	}
+	assertConsoleAmount(t, *withHistory.Items[0].TotalPnL, "4.1")
+	assertConsoleAmount(t, *withHistory.Items[0].MaxDrawdown, "1.7")
+	assertConsoleAmount(t, withHistory.Items[0].BuyFees, "0.35")
+	assertConsoleAmount(t, withHistory.Items[0].SellFees, "0.08")
 	raw, _ := json.Marshal(got)
 	if strings.Contains(string(raw), "key-kalshi") || strings.Contains(string(raw), "FundingAddress") {
 		t.Fatal("private identity leaked")
@@ -112,6 +136,12 @@ type cohortQuotes func(context.Context, []core.Target) map[string]core.Quote
 
 func (f cohortQuotes) Quotes(ctx context.Context, t []core.Target) map[string]core.Quote {
 	return f(ctx, t)
+}
+
+type cohortHistoricalQuotes func(context.Context, []accountpricehistory.Window) (accountpricehistory.Dataset, error)
+
+func (f cohortHistoricalQuotes) Load(ctx context.Context, windows []accountpricehistory.Window) (accountpricehistory.Dataset, error) {
+	return f(ctx, windows)
 }
 
 func TestPostgresIntegrationCohortSeparatesOppositeOutsideLots(t *testing.T) {

@@ -9,12 +9,13 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarketdata"
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/service/accountcoremetrics"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountpricehistory"
 	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 )
 
 // This constructor creates only read dependencies: it never probes capabilities,
 // synchronizes funds, starts a background loop, or builds an execution route.
-func buildAccountCoreMetrics(reader *consolev2.Reader, cfg config.Config) *accountcoremetrics.Service {
+func buildAccountCoreMetrics(reader *consolev2.Reader, cfg config.Config, history ...accountpricehistory.Reader) *accountcoremetrics.Service {
 	client := &http.Client{Timeout: 2 * time.Second, Transport: accountquotes.NewLimitTransport(nil), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	source := &accountquotes.Source{CLOBURL: cfg.Polymarket.CLOBURL, GammaURL: cfg.Polymarket.GammaURL, HTTPClient: client}
 	positions, err := polymarketdata.NewPositionClient(polymarketdata.PositionClientParams{BaseURL: cfg.Polymarket.DataAPIURL, HTTPClient: client})
@@ -31,5 +32,5 @@ func buildAccountCoreMetrics(reader *consolev2.Reader, cfg config.Config) *accou
 			source.Kalshi = k
 		}
 	}
-	return accountcoremetrics.New(reader, source)
+	return accountcoremetrics.New(reader, source, history...)
 }

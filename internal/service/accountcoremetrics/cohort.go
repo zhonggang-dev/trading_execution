@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/UniPat-AI/trading_execution/internal/service/accountpricehistory"
 	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 )
 
@@ -14,14 +15,15 @@ type CohortFactsReader interface {
 
 type CohortMetrics struct {
 	Metrics
-	OpenedAssetCount  int     `json:"opened_asset_count"`
-	HoldingAssetCount int     `json:"holding_asset_count"`
-	ClosedAssetCount  int     `json:"closed_asset_count"`
-	ROI               *string `json:"roi"`
-	BuyFees           string  `json:"buy_fees"`
-	SellFees          string  `json:"sell_fees"`
-	MaxDrawdown       *string `json:"max_drawdown"`
-	DrawdownState     string  `json:"drawdown_state"`
+	OpenedAssetCount  int               `json:"opened_asset_count"`
+	HoldingAssetCount int               `json:"holding_asset_count"`
+	ClosedAssetCount  int               `json:"closed_asset_count"`
+	ROI               *string           `json:"roi"`
+	BuyFees           string            `json:"buy_fees"`
+	SellFees          string            `json:"sell_fees"`
+	MaxDrawdown       *string           `json:"max_drawdown"`
+	DrawdownState     string            `json:"drawdown_state"`
+	DrawdownCoverage  *DrawdownCoverage `json:"drawdown_coverage,omitempty"`
 }
 
 type CohortResponse struct {
@@ -49,9 +51,44 @@ func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter
 	if err != nil {
 		return CohortResponse{}, err
 	}
+	replays := map[string]drawdownReplay{}
+	if s.history != nil {
+		for account, replay := range facts.Replay {
+			r, e := prepareDrawdown(ctx, replay.Lots, account, facts.ObservedAt)
+			if e != nil {
+				return CohortResponse{}, e
+			}
+			replays[account] = r
+		}
+	}
+	type historyResult struct {
+		data accountpricehistory.Dataset
+		err  error
+	}
+	history := make(chan historyResult, 1)
+	historyCtx, historyCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer historyCancel()
+	windows := mergeDrawdownWindows(replays)
+	if s.history != nil && len(windows) > 0 {
+		go func() {
+			data, err := s.history.Load(historyCtx, windows)
+			history <- historyResult{data: data, err: err}
+		}()
+	} else {
+		history <- historyResult{}
+	}
 	priced, err := s.queryFacts(ctx, facts.CoreMetricFacts)
 	if err != nil {
 		return CohortResponse{}, err
+	}
+	var loaded historyResult
+	select {
+	case loaded = <-history:
+	case <-historyCtx.Done():
+		loaded.err = historyCtx.Err()
+	}
+	if ctx.Err() != nil {
+		return CohortResponse{}, ctx.Err()
 	}
 	result := CohortResponse{ObservedAt: priced.ObservedAt, OpeningFrom: facts.OpeningFrom, OpeningTo: facts.OpeningTo, Items: make([]CohortMetrics, 0, len(priced.Items)), UnavailableAccounts: append([]consolev2.CohortUnavailableAccount{}, facts.UnavailableAccounts...)}
 	seen := map[string]bool{}
@@ -77,6 +114,7 @@ func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter
 			}
 		}
 		item := CohortMetrics{Metrics: m, OpenedAssetCount: c.OpenedAssetCount, HoldingAssetCount: c.HoldingAssetCount, ClosedAssetCount: c.ClosedAssetCount, BuyFees: c.BuyFees, SellFees: c.SellFees, MaxDrawdown: c.MaxDrawdown, DrawdownState: c.DrawdownState}
+		s.finishDrawdown(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, facts.ObservedAt)
 		if m.TotalPnL != nil {
 			invested, e := number(m.CumulativeInvestedCost)
 			if e != nil || invested.Sign() < 0 {
@@ -92,6 +130,9 @@ func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter
 			}
 		}
 		result.Items = append(result.Items, item)
+	}
+	if ctx.Err() != nil {
+		return CohortResponse{}, ctx.Err()
 	}
 	raw, e := json.Marshal(result)
 	if e != nil || len(raw) > 8*1024*1024 {
