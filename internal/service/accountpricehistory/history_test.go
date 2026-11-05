@@ -174,3 +174,39 @@ func TestSyncStorageFailureReportsOnlyValidatedSQLState(t *testing.T) {
 		})
 	}
 }
+
+type awareTestSource struct {
+	legacyCalls int
+	known       []Settlement
+}
+
+func (s *awareTestSource) Fetch(context.Context, Window) (Result, error) {
+	s.legacyCalls++
+	return Result{}, fmt.Errorf("legacy Fetch must not be used when settlements are supported")
+}
+func (s *awareTestSource) FetchWithSettlements(_ context.Context, w Window, known []Settlement) (Result, error) {
+	s.known = append([]Settlement(nil), known...)
+	return Result{Window: w, Series: Series{Points: []Point{{At: w.From, Price: "0.4", ResolutionSeconds: 3600}}, Settlements: known, Coverage: []Coverage{{From: w.From, To: w.To, State: "complete"}}}}, nil
+}
+func TestSyncPassesVerifiedKnownSettlementsWithoutChangingAssetIdentity(t *testing.T) {
+	now := time.Date(2026, 11, 5, 8, 0, 0, 0, time.UTC)
+	a := testAsset()
+	from := now.Add(-48 * time.Hour)
+	known := Settlement{EffectiveAt: from.Add(time.Hour), Price: "0", Source: "OFFICIAL_SETTLEMENT", SourceReference: "LOCAL_POSITION:original", FetchedAt: from.Add(time.Hour)}
+	store := &memoryStore{targets: []Window{{Asset: a, From: from, To: now.Add(-24 * time.Hour)}}, data: Dataset{Series: map[string]Series{a.Key(): {Settlements: []Settlement{known}}}}}
+	source := &awareTestSource{}
+	report, e := Run(context.Background(), store, source, SyncOptions{Now: now, Workers: 1})
+	if e != nil || report.Saved != 1 || source.legacyCalls != 0 || len(source.known) != 1 || source.known[0].SourceReference != known.SourceReference {
+		t.Fatal(report, e, source)
+	}
+	if len(store.saves) != 1 || store.saves[0].Window.Asset.Key() != a.Key() || !store.saves[0].Series.Settlements[0].EffectiveAt.Equal(known.EffectiveAt) {
+		t.Fatal("known evidence changed identity or original time", store.saves)
+	}
+	// A later run sees the persisted terminal and committed prefix. It must
+	// not fetch an already complete closed lifecycle again.
+	store.data.Series[a.Key()] = store.saves[0].Series
+	second, err := Run(context.Background(), store, source, SyncOptions{Now: now, Workers: 1})
+	if err != nil || second.Planned != 0 || second.Saved != 0 || len(store.saves) != 1 {
+		t.Fatal("repeated run did not reuse committed terminal", second, err)
+	}
+}

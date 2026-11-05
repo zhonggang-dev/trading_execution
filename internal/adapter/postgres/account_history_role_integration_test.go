@@ -53,7 +53,13 @@ func TestPostgresIntegrationHistoryNonSuperOwnerFKPermission(t *testing.T) {
 			t.Errorf("clean isolated role: %v", e)
 		}
 	})
-	if _, err = admin.Exec(`CREATE SCHEMA ` + schema + ` AUTHORIZATION ` + role); err != nil {
+	// The runtime role owns the new history relations, while real old
+	// business tables are created by the fixture owner and granted SELECT.
+	business := newIntegrationDatabase(t, dsn)
+	if err = business.QueryRow(`SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = admin.Exec(`ALTER SCHEMA ` + schema + ` OWNER TO ` + role); err != nil {
 		t.Fatal(err)
 	}
 	runtimeCfg := cfg.Copy()
@@ -135,6 +141,11 @@ func TestPostgresIntegrationHistoryNonSuperOwnerFKPermission(t *testing.T) {
 	}
 	if n := scalar(t, runtimeDB, `SELECT COUNT(*)::text FROM account_price_history_windows`); n != "1" {
 		t.Fatal("idempotent Save duplicated raw evidence", n)
+	}
+	_, err = store.Load(context.Background(), []h.Window{window})
+	expectState(err, "42501")
+	if _, err = admin.Exec(`GRANT SELECT ON ` + schema + `.execution_positions TO ` + role); err != nil {
+		t.Fatal(err)
 	}
 	data, err := store.Load(context.Background(), []h.Window{window})
 	if err != nil {

@@ -188,7 +188,13 @@ func Run(ctx context.Context, store Store, source Source, options SyncOptions) (
 		go func() {
 			defer workers.Done()
 			for job := range queue {
-				result, e := source.Fetch(ctx, job)
+				var result Result
+				var e error
+				if aware, ok := source.(SettlementAwareSource); ok {
+					result, e = aware.FetchWithSettlements(ctx, job, data.Series[job.Asset.Key()].Settlements)
+				} else {
+					result, e = source.Fetch(ctx, job)
+				}
 				if e != nil {
 					_ = store.Save(ctx, Result{Window: job, Series: Series{Coverage: []Coverage{{From: job.From, To: job.To, State: "error", Reason: "source_unavailable", FetchedAt: time.Now().UTC()}}}})
 					mu.Lock()
