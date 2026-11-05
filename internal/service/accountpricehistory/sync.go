@@ -15,6 +15,10 @@ type SyncOptions struct {
 	Workers    int
 	DryRun     bool
 }
+
+// Match the source's per-window sample budget as well as its 14-day span.
+const maxSourceSamplesPerWindow = 10000
+
 type Failure struct {
 	AssetKey string    `json:"asset_key"`
 	From     time.Time `json:"from"`
@@ -36,9 +40,89 @@ type SyncReport struct {
 	Busy       bool      `json:"busy"`
 }
 
-// Plan subtracts successfully committed coverage and rechecks the last two
-// hours for late source revisions. Missing windows are never checkpoints.
+// Plan verifies the actual computation samples even inside complete coverage.
+// Historical requirements need no request when a valid point already exists.
+// The newest completed hour has its own bounded official refresh checkpoint;
+// an admissible older point alone must not stand in for hourly collection.
 func Plan(targets []Window, data Dataset, now time.Time) []Window {
+	legacy := []Window{}
+	result := []Window{}
+	refreshes := map[string]bool{}
+	for _, target := range targets {
+		if target.RequiredAt == nil {
+			legacy = append(legacy, target)
+			continue
+		}
+		missing := []time.Time{}
+		series := data.Series[target.Asset.Key()]
+		if !refreshes[target.Asset.Key()] {
+			if refresh, ok := hourlyRefresh(target, series, now); ok {
+				result = append(result, refresh)
+				refreshes[target.Asset.Key()] = true
+			}
+		}
+		for _, at := range RequiredTimes(target) {
+			if !at.Before(now) {
+				continue
+			}
+			if _, ok := PriceAt(series, at); !ok {
+				missing = append(missing, at)
+			}
+		}
+		for len(missing) > 0 {
+			stop := missing[0].Add(14 * 24 * time.Hour)
+			n := sort.Search(len(missing), func(i int) bool { return missing[i].After(stop) })
+			n = min(n, maxSourceSamplesPerWindow)
+			result = append(result, Window{Asset: target.Asset, From: missing[0], To: missing[n-1], RequiredAt: append([]time.Time{}, missing[:n]...)})
+			missing = missing[n:]
+		}
+	}
+	result = append(result, planLegacy(legacy, data, now)...)
+	lastAttempt := func(w Window) time.Time {
+		var latest time.Time
+		for _, c := range data.Series[w.Asset.Key()].Coverage {
+			if !c.To.Before(w.From) && !c.From.After(w.To) && c.FetchedAt.After(latest) {
+				latest = c.FetchedAt
+			}
+		}
+		return latest
+	}
+	sort.SliceStable(result, func(i, j int) bool { return lastAttempt(result[i]).Before(lastAttempt(result[j])) })
+	return result
+}
+
+// Only a real successful refresh of this exact hour is an hourly checkpoint.
+// Broad historical coverage may have reused a <=1h point without reading the
+// latest official value for the new hour, so it is insufficient here.
+func hourlyRefresh(target Window, series Series, now time.Time) (Window, bool) {
+	hour := now.UTC().Truncate(time.Hour)
+	needed := false
+	for _, at := range RequiredTimes(target) {
+		if at.Equal(hour) {
+			needed = true
+			break
+		}
+	}
+	if !needed {
+		return Window{}, false
+	}
+	for _, terminal := range series.Settlements {
+		if terminal.Source == "OFFICIAL_SETTLEMENT" && terminal.SourceReference != "" && !terminal.EffectiveAt.After(hour) && ValidPrice(terminal.Price) {
+			return Window{}, false
+		}
+	}
+	if _, priced := PriceAt(series, hour); priced {
+		for _, coverage := range series.Coverage {
+			if coverage.State == "complete" && coverage.Reason == "hourly_refresh" && coverage.From.Equal(hour) && coverage.To.Equal(hour) && !coverage.FetchedAt.Before(hour) {
+				return Window{}, false
+			}
+		}
+	}
+	return Window{Asset: target.Asset, From: hour, To: hour, RequiredAt: []time.Time{hour}, RefreshAt: &hour}, true
+}
+
+// planLegacy subtracts committed range coverage and revisits two recent hours.
+func planLegacy(targets []Window, data Dataset, now time.Time) []Window {
 	result := []Window{}
 	for _, target := range targets {
 		end := target.To
@@ -72,7 +156,7 @@ func Plan(targets []Window, data Dataset, now time.Time) []Window {
 			if c.From.After(cursor) {
 				stop := minTime(c.From, end)
 				if stop.After(cursor) {
-					gaps = append(gaps, Window{target.Asset, cursor, stop})
+					gaps = append(gaps, Window{Asset: target.Asset, From: cursor, To: stop})
 				}
 			}
 			if c.To.After(cursor) {
@@ -83,7 +167,7 @@ func Plan(targets []Window, data Dataset, now time.Time) []Window {
 			}
 		}
 		if cursor.Before(end) {
-			gaps = append(gaps, Window{target.Asset, cursor, end})
+			gaps = append(gaps, Window{Asset: target.Asset, From: cursor, To: end})
 		}
 		if target.To.After(now.Add(-2*time.Hour)) && end.After(now.Add(-2*time.Hour)) {
 			start := now.Truncate(time.Hour).Add(-2 * time.Hour)
@@ -91,7 +175,7 @@ func Plan(targets []Window, data Dataset, now time.Time) []Window {
 				start = target.From
 			}
 			if start.Before(end) {
-				gaps = append(gaps, Window{target.Asset, start, end})
+				gaps = append(gaps, Window{Asset: target.Asset, From: start, To: end})
 			}
 		}
 		sort.Slice(gaps, func(i, j int) bool { return gaps[i].From.Before(gaps[j].From) })
@@ -108,7 +192,7 @@ func Plan(targets []Window, data Dataset, now time.Time) []Window {
 		for _, g := range merged {
 			for g.From.Before(g.To) {
 				stop := minTime(g.To, g.From.Add(14*24*time.Hour))
-				result = append(result, Window{g.Asset, g.From, stop})
+				result = append(result, Window{Asset: g.Asset, From: g.From, To: stop})
 				g.From = stop
 			}
 		}
@@ -167,6 +251,14 @@ func Run(ctx context.Context, store Store, source Source, options SyncOptions) (
 	if err != nil {
 		return report, err
 	}
+	if data.ObservedAt.IsZero() {
+		data.ObservedAt = options.Now
+	}
+	if !options.DryRun && source != nil {
+		if err = PersistKnownSettlements(ctx, store, targets, data); err != nil {
+			return report, err
+		}
+	}
 	jobs := Plan(targets, data, options.Now)
 	report.Planned = len(jobs)
 	if len(jobs) > options.MaxWindows {
@@ -174,6 +266,10 @@ func Run(ctx context.Context, store Store, source Source, options SyncOptions) (
 		jobs = jobs[:options.MaxWindows]
 	}
 	if options.DryRun {
+		report.FinishedAt = time.Now().UTC()
+		return report, nil
+	}
+	if len(jobs) == 0 {
 		report.FinishedAt = time.Now().UTC()
 		return report, nil
 	}
@@ -190,7 +286,9 @@ func Run(ctx context.Context, store Store, source Source, options SyncOptions) (
 			for job := range queue {
 				var result Result
 				var e error
-				if aware, ok := source.(SettlementAwareSource); ok {
+				if aware, ok := source.(SeriesAwareSource); ok {
+					result, e = aware.FetchWithSeries(ctx, job, data.Series[job.Asset.Key()])
+				} else if aware, ok := source.(SettlementAwareSource); ok {
 					result, e = aware.FetchWithSettlements(ctx, job, data.Series[job.Asset.Key()].Settlements)
 				} else {
 					result, e = source.Fetch(ctx, job)

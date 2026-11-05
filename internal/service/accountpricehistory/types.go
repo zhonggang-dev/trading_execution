@@ -38,9 +38,11 @@ func (a Asset) Validate() error {
 }
 
 type Window struct {
-	Asset Asset     `json:"asset"`
-	From  time.Time `json:"from"`
-	To    time.Time `json:"to"`
+	Asset      Asset       `json:"asset"`
+	From       time.Time   `json:"from"`
+	To         time.Time   `json:"to"`
+	RequiredAt []time.Time `json:"required_at,omitempty"`
+	RefreshAt  *time.Time  `json:"refresh_at,omitempty"`
 }
 type Point struct {
 	At                time.Time  `json:"at"`
@@ -91,6 +93,11 @@ type Source interface {
 // Implementations must still acquire genuine pre-settlement observations.
 type SettlementAwareSource interface {
 	FetchWithSettlements(context.Context, Window, []Settlement) (Result, error)
+}
+
+// SeriesAwareSource repairs only missing required samples using existing facts.
+type SeriesAwareSource interface {
+	FetchWithSeries(context.Context, Window, Series) (Result, error)
 }
 type Store interface {
 	Reader

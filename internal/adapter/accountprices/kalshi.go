@@ -214,6 +214,9 @@ func (s *Source) kalshi(ctx context.Context, w h.Window, series *h.Series) error
 		}
 		series.Points = append(series.Points, h.Point{At: at, Price: price, FetchedAt: s.p.Now().UTC(), ResolutionSeconds: 3600, Source: source})
 	}
+	return s.fillKalshiGaps(ctx, w, series, no)
+}
+func (s *Source) fillKalshiGaps(ctx context.Context, w h.Window, series *h.Series, no bool) error {
 	h.SortSeries(series)
 	// Merge missing marks into windows anchored at their last known price. An
 	// empty complete trade response is positive no-trade evidence, not a timeout.
@@ -245,11 +248,16 @@ func (s *Source) kalshi(ctx context.Context, w h.Window, series *h.Series) error
 		tradePoints := []h.Point{}
 		for _, trade := range trades {
 			at, ok := timestamp(trade["created_time"])
-			if !ok || at.Before(g.from) || at.After(g.to) {
+			if !ok || at.Before(g.from.Truncate(time.Second)) || at.After(ceilHistorySecond(g.to)) {
 				return fmt.Errorf("Kalshi trade time outside requested range")
 			}
 			if text(trade["ticker"]) != w.Asset.MarketID {
 				return fmt.Errorf("Kalshi trade identity mismatch")
+			}
+			// The API accepts whole-second bounds. Query a superset, then
+			// exclude later fractions rather than using future transactions.
+			if at.Before(g.from) || at.After(g.to) {
+				continue
 			}
 			price := text(trade["yes_price_dollars"])
 			if !h.ValidPrice(price) {
@@ -269,7 +277,11 @@ func (s *Source) kalshi(ctx context.Context, w h.Window, series *h.Series) error
 		for i := range series.Points {
 			if series.Points[i].At.Equal(g.from) && series.Points[i].Source != "KALSHI_BOOK_MID" {
 				until := firstUntil
+				if len(tradePoints) == 0 && series.Points[i].ValidUntil != nil && series.Points[i].ValidUntil.After(until) {
+					until = *series.Points[i].ValidUntil
+				}
 				series.Points[i].ValidUntil = &until
+				series.Points[i].FetchedAt = s.p.Now().UTC()
 			}
 		}
 		for i := range tradePoints {
@@ -349,7 +361,7 @@ func (s *Source) kalshiTradesAtCutoff(ctx context.Context, ticker string, from, 
 	return unique, nil
 }
 func (s *Source) kalshiTradesPart(ctx context.Context, path, ticker string, from, to time.Time) ([]map[string]json.RawMessage, error) {
-	q := url.Values{"ticker": {ticker}, "min_ts": {strconv.FormatInt(from.Unix(), 10)}, "max_ts": {strconv.FormatInt(to.Unix(), 10)}, "limit": {"1000"}}
+	q := url.Values{"ticker": {ticker}, "min_ts": {strconv.FormatInt(from.Unix(), 10)}, "max_ts": {strconv.FormatInt(ceilHistorySecond(to).Unix(), 10)}, "limit": {"1000"}}
 	seen := map[string]bool{}
 	result := []map[string]json.RawMessage{}
 	for page := 0; page < 100; page++ {
@@ -377,4 +389,12 @@ func (s *Source) kalshiTradesPart(ctx context.Context, path, ticker string, from
 		q.Set("cursor", e.Cursor)
 	}
 	return nil, fmt.Errorf("Kalshi trade pagination incomplete")
+}
+
+func ceilHistorySecond(at time.Time) time.Time {
+	base := at.Truncate(time.Second)
+	if base.Before(at) {
+		return base.Add(time.Second)
+	}
+	return base
 }
