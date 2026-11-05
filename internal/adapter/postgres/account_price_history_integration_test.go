@@ -29,12 +29,14 @@ func applyHistoryMigration(t *testing.T, db *sql.DB) {
 	if e := db.QueryRow(`SELECT current_schema()`).Scan(&schema); e != nil {
 		t.Fatal(e)
 	}
-	raw, e := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "0044_account_price_history.sql"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	if _, e = db.Exec(strings.ReplaceAll(string(raw), "search_path=public,pg_temp", "search_path="+schema+",pg_temp")); e != nil {
-		t.Fatal(e)
+	for _, name := range []string{"0044_account_price_history.sql", "0047_account_history_fk_lock_permission.sql"} {
+		raw, e := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
+		if e != nil {
+			t.Fatal(e)
+		}
+		if _, e = db.Exec(strings.ReplaceAll(string(raw), "search_path=public,pg_temp", "search_path="+schema+",pg_temp")); e != nil {
+			t.Fatal(e)
+		}
 	}
 }
 func historyTestAsset() h.Asset {
