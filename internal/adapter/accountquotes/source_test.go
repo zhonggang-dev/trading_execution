@@ -126,9 +126,7 @@ func TestKalshiOfficialLastTradeFirstAndExactNoComplement(t *testing.T) {
 	for _, last := range []string{"0.01", "0.123456", "0", "1"} {
 		t.Run(last, func(t *testing.T) {
 			m := market()
-			m.LastPrice, m.Volume = ptr(last), ptr("10.00")
-			// An absent sell side must not erase a real last-traded price.
-			m.YesBidSize = ptr("0")
+			m.LastPrice, m.Volume, m.Volume24h = ptr(last), ptr("10.00"), ptr("5")
 			s := Source{Kalshi: marketsFunc(func(context.Context, []string) ([]KalshiMarket, error) { return []KalshiMarket{m}, nil })}
 			yes, no := kalshiTarget(0), kalshiTarget(1)
 			q := s.Quotes(context.Background(), []core.Target{yes, no})
@@ -136,6 +134,86 @@ func TestKalshiOfficialLastTradeFirstAndExactNoComplement(t *testing.T) {
 			expected := map[string]string{"0.01": "0.99", "0.123456": "0.876544", "0": "1", "1": "0"}
 			if y.Price == nil || n.Price == nil || *y.Price != last || *n.Price != expected[last] || *y.Source != "KALSHI_LAST_TRADE" || *n.Source != "KALSHI_LAST_TRADE" || y.SourceAt != nil || n.SourceAt != nil {
 				t.Fatalf("last trade YES=%+v NO=%+v", y, n)
+			}
+		})
+	}
+}
+func TestKalshiLastTradeWithoutRecentVolumeUsesValidMid(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		volume24h *string
+	}{
+		{"zero", ptr("0")}, {"zero-decimal", ptr("0.00")}, {"missing", nil}, {"empty", ptr("")},
+		{"invalid", ptr("bad")}, {"negative", ptr("-1")}, {"too-long", ptr(strings.Repeat("1", 257))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := market()
+			m.LastPrice, m.Volume, m.Volume24h = ptr("0.9"), ptr("10"), tc.volume24h
+			s := Source{Kalshi: marketsFunc(func(context.Context, []string) ([]KalshiMarket, error) { return []KalshiMarket{m}, nil })}
+			yes, no := kalshiTarget(0), kalshiTarget(1)
+			q := s.Quotes(context.Background(), []core.Target{yes, no})
+			y, n := q[core.Key(yes)], q[core.Key(no)]
+			if y.Price == nil || *y.Price != "0.5" || *y.Source != "KALSHI_BOOK_MID" || y.SourceAt != nil ||
+				n.Price == nil || *n.Price != "0.5" || *n.Source != "KALSHI_BOOK_MID" || n.SourceAt != nil {
+				t.Fatalf("stale last trade must yield to mid: YES=%+v NO=%+v", y, n)
+			}
+		})
+	}
+}
+func TestKalshiStaleLastTradeKeptWhenBookUnusable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*KalshiMarket)
+	}{
+		{"one-sided", func(m *KalshiMarket) { m.YesBidSize = ptr("0") }},
+		{"missing-prices", func(m *KalshiMarket) { m.YesAsk, m.NoBid = nil, nil }},
+		{"invalid-book", func(m *KalshiMarket) { m.NoBid = ptr("0.3") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := market()
+			m.LastPrice, m.Volume, m.Volume24h = ptr("0.2"), ptr("10"), ptr("0")
+			tc.edit(&m)
+			s := Source{Kalshi: marketsFunc(func(context.Context, []string) ([]KalshiMarket, error) { return []KalshiMarket{m}, nil })}
+			yes, no := kalshiTarget(0), kalshiTarget(1)
+			q := s.Quotes(context.Background(), []core.Target{yes, no})
+			y, n := q[core.Key(yes)], q[core.Key(no)]
+			if y.Price == nil || *y.Price != "0.2" || *y.Source != "KALSHI_LAST_TRADE" || y.SourceAt != nil ||
+				n.Price == nil || *n.Price != "0.8" || *n.Source != "KALSHI_LAST_TRADE" || n.SourceAt != nil {
+				t.Fatalf("unusable book must keep last trade: YES=%+v NO=%+v", y, n)
+			}
+		})
+	}
+}
+func TestKalshiRecentLastTradePreferredOverValidMid(t *testing.T) {
+	m := market()
+	m.LastPrice, m.Volume, m.Volume24h = ptr("0.9"), ptr("10"), ptr("0.01")
+	s := Source{Kalshi: marketsFunc(func(context.Context, []string) ([]KalshiMarket, error) { return []KalshiMarket{m}, nil })}
+	target := kalshiTarget(0)
+	q := s.Quotes(context.Background(), []core.Target{target})[core.Key(target)]
+	if q.Price == nil || *q.Price != "0.9" || *q.Source != "KALSHI_LAST_TRADE" || q.SourceAt != nil {
+		t.Fatalf("recent last trade: %+v", q)
+	}
+}
+func TestKalshiStaleLastTradeYieldsAsymmetricNoMidAndKeepsMidReasons(t *testing.T) {
+	m := market()
+	m.YesBid, m.YesAsk, m.NoBid, m.NoAsk = ptr("0.3"), ptr("0.5"), ptr("0.5"), ptr("0.7")
+	m.LastPrice, m.Volume, m.Volume24h = ptr("0.9"), ptr("10"), ptr("0")
+	s := Source{Kalshi: marketsFunc(func(context.Context, []string) ([]KalshiMarket, error) { return []KalshiMarket{m}, nil })}
+	no := kalshiTarget(1)
+	if q := s.Quotes(context.Background(), []core.Target{no})[core.Key(no)]; q.Price == nil || *q.Price != "0.6" || *q.Source != "KALSHI_BOOK_MID" {
+		t.Fatalf("NO mid fallback: %+v", q)
+	}
+	for name, edit := range map[string]func(*KalshiMarket){
+		"non-complementary": func(m *KalshiMarket) { m.NoBid = ptr("0.3") },
+		"unparseable":       func(m *KalshiMarket) { m.YesAsk = ptr("bad") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := market()
+			edit(&m)
+			s := Source{Kalshi: marketsFunc(func(context.Context, []string) ([]KalshiMarket, error) { return []KalshiMarket{m}, nil })}
+			q := s.Quotes(context.Background(), []core.Target{no})[core.Key(no)]
+			if q.Price != nil || q.Reason == nil || *q.Reason != "invalid_price" {
+				t.Fatalf("no last trade with invalid book: %+v", q)
 			}
 		})
 	}
@@ -153,7 +231,7 @@ func TestKalshiMissingInvalidOrUntradedLastFallsBackToValidMid(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := market()
-			m.LastPrice, m.Volume = tc.last, tc.volume
+			m.LastPrice, m.Volume, m.Volume24h = tc.last, tc.volume, ptr("1")
 			s := Source{Kalshi: marketsFunc(func(context.Context, []string) ([]KalshiMarket, error) { return []KalshiMarket{m}, nil })}
 			target := kalshiTarget(1)
 			q := s.Quotes(context.Background(), []core.Target{target})[core.Key(target)]

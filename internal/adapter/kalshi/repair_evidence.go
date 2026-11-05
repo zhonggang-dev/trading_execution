@@ -27,7 +27,9 @@ func (source *RepairEvidenceSource) Inspect(ctx context.Context, order domain.Or
 	if clientOrderID == "" {
 		return kalshirepair.Evidence{}, fmt.Errorf("local client_order_id is required")
 	}
-	listed, err := source.client.FindOrderByClientOrderID(ctx, clientOrderID)
+	listed, err := source.client.FindOrderByClientOrderID(
+		ctx, clientOrderID, order.Intent.MarketID, orderLookupStart(order.CreatedAt),
+	)
 	if err != nil {
 		return kalshirepair.Evidence{}, fmt.Errorf("find Kalshi order by client_order_id: %w", err)
 	}
