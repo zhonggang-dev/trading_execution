@@ -76,10 +76,21 @@ func (recorder *fakeOrderBookSnapshotRecorder) ClaimBatch(
 	return batch, true, nil
 }
 
-// Capture 返回模拟行情快照。
+// Capture 返回模拟行情快照。Like a real source it only returns books of the
+// requested tokens; a token without a configured book is left to alignBooks.
 func (source *fakeOrderBookSource) Capture(_ context.Context, _ time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, error) {
 	source.targets = targets
-	return source.books, nil
+	requested := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		requested[target.TokenID] = struct{}{}
+	}
+	books := make([]domain.OrderBookSnapshot, 0, len(source.books))
+	for _, book := range source.books {
+		if _, wanted := requested[book.TokenID]; wanted {
+			books = append(books, book)
+		}
+	}
+	return books, nil
 }
 
 // fakeStrategy 表示后端使用的 fakeStrategy 类型。
@@ -3268,27 +3279,44 @@ func TestRunCapturesNoKalshiBookWithoutKalshiAccount(t *testing.T) {
 	}
 }
 
+// TestRunRejectsLotOfAnotherVenue keeps lot ownership strict per account: an
+// account whose ledger holds a lot of another venue or account is excluded for
+// the cycle (no strategy call, not treated as flat), while the other account
+// still runs, and the cycle error names the excluded account.
 func TestRunRejectsLotOfAnotherVenue(t *testing.T) {
 	decisionAt := time.Date(2026, 9, 5, 4, 20, 0, 0, time.UTC)
 	polymarket := validPrediction(decisionAt)
-	for name, mutate := range map[string]func(accountPositionSource){
-		"Kalshi lot on a Polymarket account": func(positions accountPositionSource) {
-			lot := positions[testKalshiAccount][0]
-			lot.ExecutionAccountID = testBinding().ExecutionAccountID
-			positions[testBinding().ExecutionAccountID] = append(positions[testBinding().ExecutionAccountID], lot)
+	for name, testCase := range map[string]struct {
+		mutate  func(accountPositionSource)
+		broken  string
+		healthy string
+	}{
+		"Kalshi lot on a Polymarket account": {
+			mutate: func(positions accountPositionSource) {
+				lot := positions[testKalshiAccount][0]
+				lot.ExecutionAccountID = testBinding().ExecutionAccountID
+				positions[testBinding().ExecutionAccountID] = append(positions[testBinding().ExecutionAccountID], lot)
+			},
+			broken: testBinding().ExecutionAccountID, healthy: testKalshiAccount,
 		},
-		"Polymarket lot on a Kalshi account": func(positions accountPositionSource) {
-			lot := positions[testBinding().ExecutionAccountID][0]
-			lot.ExecutionAccountID = testKalshiAccount
-			positions[testKalshiAccount] = append(positions[testKalshiAccount], lot)
+		"Polymarket lot on a Kalshi account": {
+			mutate: func(positions accountPositionSource) {
+				lot := positions[testBinding().ExecutionAccountID][0]
+				lot.ExecutionAccountID = testKalshiAccount
+				positions[testKalshiAccount] = append(positions[testKalshiAccount], lot)
+			},
+			broken: testKalshiAccount, healthy: testBinding().ExecutionAccountID,
 		},
-		"lot of another account": func(positions accountPositionSource) {
-			positions[testBinding().ExecutionAccountID][0].ExecutionAccountID = "someone-else"
+		"lot of another account": {
+			mutate: func(positions accountPositionSource) {
+				positions[testBinding().ExecutionAccountID][0].ExecutionAccountID = "someone-else"
+			},
+			broken: testBinding().ExecutionAccountID, healthy: testKalshiAccount,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			positions := venueAccountPositions(decisionAt, polymarket)
-			mutate(positions)
+			testCase.mutate(positions)
 			strategy := &matrixStrategy{}
 			service, err := newTestService(Params{
 				PredictionSource: fakePredictionSource{snapshot: mixedVenueSnapshot(decisionAt, polymarket)},
@@ -3303,11 +3331,28 @@ func TestRunRejectsLotOfAnotherVenue(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			if _, err := service.Run(context.Background(), decisionAt); err == nil {
-				t.Fatal("Run() accepted a lot that does not belong to the account's venue")
+			result, err := service.Run(context.Background(), decisionAt)
+			if err == nil || !strings.Contains(err.Error(), testCase.broken) {
+				t.Fatalf("Run() error = %v, want an error naming %s", err, testCase.broken)
 			}
-			if len(strategy.requests) != 0 {
-				t.Fatalf("strategy was called with an inconsistent ledger: %#v", strategy.requests)
+			requests := requestsByAccount(strategy)
+			if _, called := requests[testCase.broken]; called {
+				t.Fatalf("strategy was called with an inconsistent ledger for %s", testCase.broken)
+			}
+			if _, called := requests[testCase.healthy]; !called || len(strategy.requests) != 1 {
+				t.Fatalf("strategy requests = %d, want exactly one for healthy account %s", len(strategy.requests), testCase.healthy)
+			}
+			for _, run := range result.Runs {
+				switch run.Context.ExecutionAccountID {
+				case testCase.broken:
+					if !run.InputUnavailable || run.FailureStage != FailureStagePositions || run.Error == nil {
+						t.Fatalf("broken run = %#v, want input unavailable at positions", run)
+					}
+				case testCase.healthy:
+					if run.Error != nil || run.InputUnavailable {
+						t.Fatalf("healthy run = %#v", run)
+					}
+				}
 			}
 		})
 	}

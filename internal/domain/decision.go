@@ -883,6 +883,9 @@ type StrategyExit struct {
 const (
 	StrategyEntryBlockIncompleteModelCoverage = "INCOMPLETE_MODEL_COVERAGE"
 	StrategyEntryBlockSubmissionDisabled      = "ENTRY_SUBMISSION_DISABLED"
+	// StrategyEntryBlockPredictionSourceUnavailable marks an exit-only cycle
+	// whose prediction source was unavailable (timeout, transport, 429, 5xx).
+	StrategyEntryBlockPredictionSourceUnavailable = "PREDICTION_SOURCE_UNAVAILABLE"
 )
 
 // StrategyEntryPolicy is appended by Trading only when entries are blocked so

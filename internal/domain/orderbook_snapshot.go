@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// OrderBookErrorVenueCaptureFailed marks every book of a venue whose whole
+// capture failed (or exceeded its own budget) in one decision cycle. The
+// decision cycle does not call the strategy for that venue's accounts.
+const OrderBookErrorVenueCaptureFailed = "VENUE_ORDERBOOK_CAPTURE_FAILED"
+
 // OrderBookSnapshotBatch is the immutable shared market-data evidence for one
 // global decision boundary. Snapshots are canonicalized and sorted before the
 // content identity is computed.
