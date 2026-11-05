@@ -58,6 +58,14 @@ func TestCohortMetricFactsOpeningBoundsDistinctPartialAndSource(t *testing.T) {
 	performanceAmount(t, m.Metrics.CumulativeInvestedCost, "5")
 	performanceAmount(t, c.BuyFees, "0.15")
 	performanceAmount(t, c.SellFees, "0.15")
+	replay := got.Replay["pm"]
+	if len(replay.Lots) != 2 || replay.Lots[0].LotID != "fully-closed" || replay.Lots[1].LotID != "included" {
+		t.Fatal("replay omitted closed lots or opening bounds", replay)
+	}
+	performanceAmount(t, replay.Lots[0].OriginalPrincipal, "1")
+	performanceAmount(t, replay.Lots[0].Dispositions[0].GrossProceeds, "2")
+	performanceAmount(t, replay.Lots[1].OriginalPrincipal, "4")
+	performanceAmount(t, replay.Lots[1].Dispositions[0].GrossProceeds, "3")
 	f.exec(t, `UPDATE execution_fills SET token_id='other' WHERE fill_key='included'`)
 	if _, err = f.reader.CohortMetricFacts(context.Background(), CohortFilter{ExecutionAccountID: "pm"}); !errors.Is(err, ErrUnavailable) {
 		t.Fatal("identity conflict accepted", err)
@@ -87,12 +95,44 @@ func TestCohortMetricFactsAllClosedZeroPayoutAndExternalSell(t *testing.T) {
 	if len(got.Accounts[0].Assets) != 0 {
 		t.Fatal("closed priced as holding")
 	}
+	if len(got.Replay["pm"].Lots) != 2 {
+		t.Fatal("all closed assets are required for historical drawdown", got.Replay)
+	}
+	for _, lot := range got.Replay["pm"].Lots {
+		if len(lot.Dispositions) != 1 || lot.Dispositions[0].At != f.now {
+			t.Fatal("disposition time not preserved", lot)
+		}
+		if lot.LotID == "redeemed" {
+			performanceAmount(t, lot.Dispositions[0].GrossProceeds, "0")
+		} else {
+			performanceAmount(t, lot.Dispositions[0].GrossProceeds, "3")
+		}
+	}
 	// Missing a zero-value settlement is still incomplete accounting.
 	f.exec(t, `DELETE FROM position_lot_redemptions`)
 	missing, err := f.reader.CohortMetricFacts(context.Background(), CohortFilter{ExecutionAccountID: "pm"})
 	if err != nil || len(missing.Accounts) != 0 || len(missing.Cohorts) != 0 || len(missing.UnavailableAccounts) != 1 || missing.UnavailableAccounts[0].Reason != "missing_disposition_evidence" {
 		t.Fatal("missing zero flow was presented as complete accounting", missing, err)
 	}
+}
+
+func TestCohortReplayPreservesFullAllocationPrecision(t *testing.T) {
+	f := cohortFixture(t)
+	remaining := "0.111111111111111111111111111111"
+	closed := "0.888888888888888888888888888889"
+	principal := "0.333333333333333333333333333333"
+	gross := "0.987654321098765432109876543210"
+	f.cohortLot(t, "precise", "1", remaining, principal, "0.01", f.now.Add(-2*time.Hour))
+	f.cohortSell(t, "precise", "precise-sale", closed, gross, "0.000000000000000000000000000001", f.now.Add(-time.Hour))
+	got, err := f.reader.CohortMetricFacts(context.Background(), CohortFilter{ExecutionAccountID: "pm"})
+	if err != nil || len(got.Replay["pm"].Lots) != 1 {
+		t.Fatal(got, err)
+	}
+	l := got.Replay["pm"].Lots[0]
+	performanceAmount(t, l.OriginalPrincipal, principal)
+	performanceAmount(t, l.RemainingShares, remaining)
+	performanceAmount(t, l.Dispositions[0].Shares, closed)
+	performanceAmount(t, l.Dispositions[0].GrossProceeds, gross)
 }
 
 func TestCohortMetricFactsMissingHistoryIsolatedByAccountAndOpeningRange(t *testing.T) {

@@ -159,7 +159,7 @@ func run() error {
 	}
 	consoleReader := consolev2.New(database, consoleV2RuntimeConfig(cfg, live, startedAt))
 	httpParams.ConsoleV2 = consoleReader
-	httpParams.AccountCoreMetrics = buildAccountCoreMetrics(consoleReader, cfg)
+	httpParams.AccountCoreMetrics = buildAccountCoreMetrics(consoleReader, cfg, postgresadapter.NewAccountPriceHistoryStore(database))
 	httpAPI, err := httpapi.New(httpParams)
 	if err != nil {
 		return err

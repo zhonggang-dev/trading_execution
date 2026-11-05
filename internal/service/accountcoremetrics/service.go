@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountpricehistory"
 	"github.com/UniPat-AI/trading_execution/internal/service/consolev2"
 )
 
@@ -93,12 +94,15 @@ type Asset struct {
 	Reason             *string    `json:"reason"`
 }
 type Service struct {
-	facts   FactsReader
-	quotes  QuoteReader
-	now     func() time.Time
-	mu      sync.Mutex
-	cache   map[string]entry
-	flights map[string]*flight
+	facts         FactsReader
+	quotes        QuoteReader
+	now           func() time.Time
+	mu            sync.Mutex
+	cache         map[string]entry
+	flights       map[string]*flight
+	history       accountpricehistory.Reader
+	drawdownMu    sync.Mutex
+	drawdownCache map[string]drawdownCacheEntry
 }
 type entry struct {
 	quote   Quote
@@ -111,8 +115,12 @@ type flight struct {
 	quotes  map[string]Quote
 }
 
-func New(facts FactsReader, quotes QuoteReader) *Service {
-	return &Service{facts: facts, quotes: quotes, now: time.Now, cache: map[string]entry{}, flights: map[string]*flight{}}
+func New(facts FactsReader, quotes QuoteReader, histories ...accountpricehistory.Reader) *Service {
+	s := &Service{facts: facts, quotes: quotes, now: time.Now, cache: map[string]entry{}, flights: map[string]*flight{}}
+	if len(histories) > 0 {
+		s.history = histories[0]
+	}
+	return s
 }
 func (s *Service) Query(ctx context.Context, account string) (Response, error) {
 	if s == nil || s.facts == nil {

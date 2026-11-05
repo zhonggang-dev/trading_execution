@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly account historical price sync
+
+[Timer]
+OnCalendar=*-*-* *:17:00 UTC
+Persistent=true
+RandomizedDelaySec=30
+Unit=account-price-history.service
+
+[Install]
+WantedBy=timers.target
