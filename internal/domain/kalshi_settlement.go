@@ -62,3 +62,88 @@ type KalshiBalanceCheck struct {
 	Difference      Decimal
 	Drifted         bool
 }
+
+// KalshiMarketPosition is one row of the exchange's account positions: the
+// signed net contracts of one market, YES positive and NO negative.
+type KalshiMarketPosition struct {
+	Ticker     string
+	PositionFP Decimal
+	// Raw is the exact response row, kept for audit.
+	Raw []byte
+}
+
+// KalshiLedgerSnapshot is the unlocked local state read before the exchange
+// is asked, so the locked check can prove nothing moved in between.
+type KalshiLedgerSnapshot struct {
+	AccountVersion int64
+	// Quiet is true when the account has no active reservation, no reserved
+	// cash, and no non-terminal order.
+	Quiet bool
+}
+
+// KalshiLedgerObservation is what one sweep read from the exchange, handed to
+// the locked running sync.
+type KalshiLedgerObservation struct {
+	// AccountVersionBefore is execution_accounts.version read before the
+	// exchange balance.
+	AccountVersionBefore int64
+	ExchangeBalance      Decimal
+	// PositionCheckEnabled requires a matching position check before cash is
+	// synced. Positions is nil when they were not read this sweep.
+	PositionCheckEnabled bool
+	Positions            []KalshiMarketPosition
+	PositionsError       string
+	// SettlementActivity is set when the sweep saw any exchange settlement
+	// record of a held market; SettlementReadFailed when a read failed.
+	SettlementActivity   bool
+	SettlementReadFailed bool
+	Threshold            Decimal
+	ObservedAt           time.Time
+}
+
+// Kalshi running-sync outcomes, stored in kalshi_ledger_checks.
+const (
+	KalshiBalanceInSync              = "IN_SYNC"
+	KalshiBalancePendingConfirmation = "PENDING_CONFIRMATION"
+	KalshiBalanceSynced              = "SYNCED"
+	KalshiBalanceSkipped             = "SKIPPED"
+
+	KalshiPositionsMatched = "MATCHED"
+	KalshiPositionsDrifted = "DRIFTED"
+	KalshiPositionsSkipped = "SKIPPED"
+	KalshiPositionsError   = "ERROR"
+)
+
+// Reasons a running cash sync was skipped, in the order they are checked.
+const (
+	KalshiSyncSkipReservationActive   = "RESERVATION_ACTIVE"
+	KalshiSyncSkipOrderInFlight       = "ORDER_IN_FLIGHT"
+	KalshiSyncSkipLedgerChanged       = "LEDGER_CHANGED"
+	KalshiSyncSkipSettlementPending   = "SETTLEMENT_PENDING"
+	KalshiSyncSkipNettingPending      = "NETTING_PENDING"
+	KalshiSyncSkipPositionsUnverified = "POSITIONS_UNVERIFIED"
+	KalshiSyncSkipPositionMismatch    = "POSITION_MISMATCH"
+)
+
+// KalshiLedgerSyncResult reports one running sync.
+type KalshiLedgerSyncResult struct {
+	BalanceOutcome     string
+	SkipReason         string
+	PreviousSkipReason string
+	ConsecutiveSkips   int64
+	TotalSkips         int64
+	LocalBalance       Decimal
+	ExchangeBalance    Decimal
+	Difference         Decimal
+	// Drifted is set when the difference exceeded the threshold and was
+	// recorded in kalshi_balance_drift.
+	Drifted bool
+	// SyncEventID is the KALSHI_BALANCE_SYNC event of a SYNCED outcome.
+	SyncEventID     string
+	FirstObservedAt time.Time
+	// PositionsOutcome is empty when the position check is disabled.
+	PositionsOutcome           string
+	PositionsSkipReason        string
+	OpenPositionDrifts         int
+	PreviousOpenPositionDrifts int
+}
