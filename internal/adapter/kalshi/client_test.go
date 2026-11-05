@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -456,6 +457,7 @@ func TestKalshiUnknownSubmissionRecoversByClientOrderIDAndReleasesReservation(t 
 			writer.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = writer.Write([]byte(`{"error":{"code":"service_unavailable","message":"matching engine unavailable"}}`))
 		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/orders":
+			assertOrderLookupQuery(t, request, "TEST-MARKET", strconv.FormatInt(now.Add(-15*time.Minute).Unix(), 10), "")
 			_, _ = fmt.Fprintf(writer, `{"orders":[{"order_id":%q,"client_order_id":"strategy-order-recovery","ticker":"TEST-MARKET","status":"canceled","fill_count_fp":"0","remaining_count_fp":"0","initial_count_fp":"2","last_update_time":"2026-08-31T00:00:01Z"}],"cursor":""}`, authoritativeID)
 		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/orders/"+authoritativeID:
 			_, _ = fmt.Fprintf(writer, `{"order":{"order_id":%q,"client_order_id":"strategy-order-recovery","ticker":"TEST-MARKET","outcome_side":"yes","book_side":"bid","type":"limit","time_in_force":"fill_or_kill","yes_price_dollars":"0.6000","status":"canceled","fill_count_fp":"0","remaining_count_fp":"0","initial_count_fp":"2","cancel_order_on_pause":true,"subaccount_number":0,"last_update_time":"2026-08-31T00:00:01Z"}}`, authoritativeID)
@@ -516,6 +518,158 @@ func TestKalshiUnknownSubmissionRecoversByClientOrderIDAndReleasesReservation(t 
 	reservation, found = reservations.Get(result.Order.ID)
 	if !found || reservation.Status != domain.ReservationStatusReleased {
 		t.Fatalf("final reservation = %#v, found=%v; want RELEASED", reservation, found)
+	}
+}
+
+func assertOrderLookupQuery(t *testing.T, request *http.Request, ticker, minTS, cursor string) {
+	t.Helper()
+	query := request.URL.Query()
+	want := map[string]string{"limit": "1000", "ticker": ticker, "min_ts": minTS, "cursor": cursor}
+	for key, value := range want {
+		if value == "" {
+			if _, present := query[key]; present {
+				t.Errorf("order lookup %s present = %q, want omitted", key, query.Get(key))
+			}
+		} else if len(query[key]) != 1 || query.Get(key) != value {
+			t.Errorf("order lookup %s = %q, want %q", key, query[key], value)
+		}
+	}
+	for key := range query {
+		if _, known := want[key]; !known {
+			t.Errorf("order lookup sent unexpected filter %s=%q", key, query.Get(key))
+		}
+	}
+}
+
+func TestKalshiUnknownSubmissionMissingFromFilteredLookupStaysUnknownWithoutBudget(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	now := time.Date(2026, 8, 31, 0, 10, 0, 0, time.UTC)
+	var lookups int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		verifySignature(t, request, "key", &privateKey.PublicKey)
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/trade-api/v2/portfolio/events/orders":
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = writer.Write([]byte(`{"error":{"code":"service_unavailable","message":"matching engine unavailable"}}`))
+		case request.Method == http.MethodGet && request.URL.Path == "/trade-api/v2/portfolio/orders":
+			lookups++
+			assertOrderLookupQuery(t, request, "TEST-MARKET", strconv.FormatInt(now.Add(-15*time.Minute).Unix(), 10), "")
+			_, _ = writer.Write([]byte(`{"orders":[{"order_id":"other","client_order_id":"someone-else","ticker":"TEST-MARKET","status":"canceled"}],"cursor":""}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewClient(ClientParams{
+		BaseURL: server.URL, APIKeyID: "key", PrivateKey: privateKey,
+		HTTPClient: &http.Client{Timeout: time.Second}, Now: func() time.Time { return now }, LiveTradingEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	venue, err := NewVenue(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := memory.NewOrderRepository()
+	service, err := execution.New(execution.Params{
+		Repository: repository, Venue: venue,
+		Guard: kalshiAllowGuard{}, MarketValidator: kalshiAllowMarketValidator{}, Reservations: paper.NewReservationManager(),
+		RequirePreparedPlacement: true, AccountScope: kalshiAllowAccountScope{},
+		MaxReconcileAttempts: 1,
+		Now:                  func() time.Time { return now },
+		NewID:                func() string { return "kalshi-missing-order" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := validKalshiIntent(domain.SideBuy, "YES")
+	intent.ClientOrderID = "strategy-order-missing"
+	result, submitErr := service.Submit(context.Background(), intent)
+	if submitErr == nil || result.Order.Status != domain.OrderStatusUnknown {
+		t.Fatalf("ambiguous Submit() = %#v, %v", result, submitErr)
+	}
+	for round := 0; round < 3; round++ {
+		refreshed, err := service.Refresh(context.Background(), result.Order.ID)
+		var venueError *port.VenueError
+		if !errors.As(err, &venueError) || venueError.Code != "KALSHI_ORDER_VISIBILITY_PENDING" {
+			t.Fatalf("Refresh(%d) error = %v, want KALSHI_ORDER_VISIBILITY_PENDING", round, err)
+		}
+		if refreshed.Status != domain.OrderStatusUnknown || refreshed.VenueOrderID != intent.ClientOrderID {
+			t.Fatalf("Refresh(%d) order = %#v, want UNKNOWN without budget", round, refreshed)
+		}
+	}
+	if lookups != 3 {
+		t.Fatalf("filtered lookups = %d, want 3", lookups)
+	}
+}
+
+func TestKalshiFindOrderByClientOrderIDCarriesFiltersOnEveryPage(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	createdAfter := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
+	minTS := strconv.FormatInt(createdAfter.Unix(), 10)
+	var pages int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		verifySignature(t, request, "key", &privateKey.PublicKey)
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path != "/trade-api/v2/portfolio/orders" {
+			http.NotFound(writer, request)
+			return
+		}
+		pages++
+		switch pages {
+		case 1:
+			assertOrderLookupQuery(t, request, "TEST-MARKET", minTS, "")
+			_, _ = writer.Write([]byte(`{"orders":[{"order_id":"other","client_order_id":"someone-else","ticker":"TEST-MARKET"}],"cursor":"page-2"}`))
+		default:
+			assertOrderLookupQuery(t, request, "TEST-MARKET", minTS, "page-2")
+			_, _ = writer.Write([]byte(`{"orders":[{"order_id":"wanted-id","client_order_id":"wanted","ticker":"TEST-MARKET"}],"cursor":""}`))
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, false)
+	order, err := client.FindOrderByClientOrderID(context.Background(), " wanted ", " TEST-MARKET ", createdAfter)
+	if err != nil || order.OrderID != "wanted-id" || pages != 2 {
+		t.Fatalf("FindOrderByClientOrderID() = %#v, %v after %d pages", order, err, pages)
+	}
+	if len(minTS) != 10 {
+		t.Fatalf("min_ts %q must be Unix seconds", minTS)
+	}
+}
+
+func TestKalshiFindOrderByClientOrderIDOmitsUnknownFiltersAndRejectsStuckCursor(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	var pages int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		pages++
+		cursor := ""
+		if pages > 1 {
+			cursor = "same"
+		}
+		assertOrderLookupQuery(t, request, "", "", cursor)
+		_, _ = writer.Write([]byte(`{"orders":[],"cursor":"same"}`))
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, false)
+	_, err := client.FindOrderByClientOrderID(context.Background(), "wanted", " ", time.Time{})
+	if err == nil || !strings.Contains(err.Error(), "cursor did not advance") || pages != 2 {
+		t.Fatalf("stuck cursor error = %v after %d pages", err, pages)
+	}
+	var venueError *port.VenueError
+	if errors.As(err, &venueError) {
+		t.Fatalf("stuck cursor must stay a budgeted error, got %#v", venueError)
+	}
+}
+
+func TestKalshiOrderLookupStart(t *testing.T) {
+	if !orderLookupStart(time.Time{}).IsZero() {
+		t.Fatal("zero CreatedAt must omit min_ts")
+	}
+	created := time.Date(2026, 8, 31, 0, 10, 0, 0, time.UTC)
+	if got := orderLookupStart(created); !got.Equal(created.Add(-15 * time.Minute)) {
+		t.Fatalf("orderLookupStart() = %s", got)
 	}
 }
 

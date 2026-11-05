@@ -235,3 +235,22 @@ func TestCoreMetricsCacheExpiresFromActualObservationNotInsertion(t *testing.T) 
 		t.Fatal("expired observation reused instead of refreshed", e, calls.Load())
 	}
 }
+func TestCoreMetricsKalshiMidFallbackIsReferenceAndLastTradeIsNot(t *testing.T) {
+	for source, reference := range map[string]bool{"KALSHI_BOOK_MID": true, "KALSHI_LAST_TRADE": false} {
+		t.Run(source, func(t *testing.T) {
+			now := time.Now().UTC()
+			s := New(factsFunc(func(context.Context, string) (consolev2.CoreMetricFacts, error) { return fixture(now), nil }), quotesFunc(func(_ context.Context, ts []Target) map[string]Quote {
+				return map[string]Quote{Key(ts[0]): Priced("0.5", source, now, nil)}
+			}))
+			s.now = func() time.Time { return now }
+			got, e := s.Query(context.Background(), "")
+			if e != nil {
+				t.Fatal(e)
+			}
+			asset := got.Items[0].ValuationAssets[0]
+			if got.Items[0].HasReferencePrices != reference || asset.PriceSource == nil || *asset.PriceSource != source || asset.SourceAt != nil {
+				t.Fatalf("source %s reference=%v asset=%+v", source, got.Items[0].HasReferencePrices, asset)
+			}
+		})
+	}
+}

@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -219,14 +220,40 @@ func (client *Client) GetOrder(ctx context.Context, orderID string) (Order, erro
 	return order, nil
 }
 
-func (client *Client) FindOrderByClientOrderID(ctx context.Context, clientOrderID string) (Order, error) {
+// kalshiOrderLookupLookback only absorbs clock skew: the local CreatedAt is
+// stamped before the POST, so the remote created/updated times are later.
+const kalshiOrderLookupLookback = 15 * time.Minute
+
+// orderLookupStart returns the min_ts lower bound for a client_order_id lookup,
+// or the zero time (no min_ts filter) when the local creation time is unknown.
+func orderLookupStart(createdAt time.Time) time.Time {
+	if createdAt.IsZero() {
+		return time.Time{}
+	}
+	return createdAt.Add(-kalshiOrderLookupLookback)
+}
+
+// FindOrderByClientOrderID scans GET /portfolio/orders, which has no
+// client_order_id filter, narrowed by ticker and min_ts (Unix seconds) when
+// provided; an empty ticker or zero createdAfter omits that filter. Canceled or
+// executed orders older than Kalshi's orders_updated_ts cutoff are only served
+// by /historical/orders, which is not queried here; a miss stays
+// KALSHI_ORDER_VISIBILITY_PENDING.
+func (client *Client) FindOrderByClientOrderID(ctx context.Context, clientOrderID, ticker string, createdAfter time.Time) (Order, error) {
 	wanted, cursor := strings.TrimSpace(clientOrderID), ""
+	ticker = strings.TrimSpace(ticker)
 	for page := 0; page < 100; page++ {
 		var envelope struct {
 			Orders []Order `json:"orders"`
 			Cursor string  `json:"cursor"`
 		}
 		query := url.Values{"limit": []string{"1000"}}
+		if ticker != "" {
+			query.Set("ticker", ticker)
+		}
+		if !createdAfter.IsZero() {
+			query.Set("min_ts", strconv.FormatInt(createdAfter.Unix(), 10))
+		}
 		if cursor != "" {
 			query.Set("cursor", cursor)
 		}

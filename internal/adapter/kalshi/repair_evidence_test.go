@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,8 @@ func TestRepairEvidenceUsesClientLookupThenAuthoritativeFillScope(t *testing.T) 
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/trade-api/v2/portfolio/orders":
+			// A legacy order without local ticker/creation time keeps the unfiltered scan.
+			assertOrderLookupQuery(t, request, "", "", "")
 			_, _ = fmt.Fprint(writer, `{"orders":[{"order_id":"venue-authoritative","client_order_id":"client-legacy","ticker":"KXTEST-YES","status":"canceled"}],"cursor":""}`)
 		case "/trade-api/v2/portfolio/orders/venue-authoritative":
 			_, _ = fmt.Fprint(writer, `{"order":{"order_id":"venue-authoritative","client_order_id":"client-legacy","ticker":"KXTEST-YES","outcome_side":"yes","side":"yes","action":"buy","book_side":"bid","type":"limit","yes_price_dollars":"0.5000","no_price_dollars":"0.5000","self_trade_prevention_type":"taker_at_cross","cancel_order_on_pause":true,"subaccount_number":0,"status":"canceled","fill_count_fp":"0","remaining_count_fp":"0","initial_count_fp":"20","last_update_time":"2026-09-01T07:00:00Z"}}`)
@@ -56,6 +59,36 @@ func TestRepairEvidenceUsesClientLookupThenAuthoritativeFillScope(t *testing.T) 
 		len(evidence.FillIDs) != 0 || !evidence.ObservedAt.Equal(now) ||
 		evidence.OrderQuerySource != "KALSHI_ORDER_BY_CLIENT_THEN_ORDER_ID" || evidence.FillQuerySource != "KALSHI_FILLS_BY_ORDER_ID" {
 		t.Fatalf("evidence=%#v", evidence)
+	}
+}
+
+func TestRepairEvidenceFiltersLookupByLocalTickerAndCreationTime(t *testing.T) {
+	privateKey := testPrivateKey(t)
+	createdAt := time.Date(2026, 9, 1, 7, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/trade-api/v2/portfolio/orders":
+			assertOrderLookupQuery(t, request, "KXTEST-YES", strconv.FormatInt(createdAt.Add(-15*time.Minute).Unix(), 10), "")
+			_, _ = fmt.Fprint(writer, `{"orders":[{"order_id":"venue-authoritative","client_order_id":"client-legacy","ticker":"KXTEST-YES"}],"cursor":""}`)
+		case "/trade-api/v2/portfolio/orders/venue-authoritative":
+			_, _ = fmt.Fprint(writer, `{"order":{"order_id":"venue-authoritative","client_order_id":"client-legacy","ticker":"KXTEST-YES","status":"canceled","fill_count_fp":"0","remaining_count_fp":"0","initial_count_fp":"20","last_update_time":"2026-09-01T07:00:00Z"}}`)
+		case "/trade-api/v2/portfolio/fills":
+			_, _ = fmt.Fprint(writer, `{"fills":[],"cursor":""}`)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := testClient(t, server.URL, "key", privateKey, false)
+	source, err := NewRepairEvidenceSource(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := domain.Order{CreatedAt: createdAt, Intent: domain.OrderIntent{ClientOrderID: "client-legacy", MarketID: "KXTEST-YES"}}
+	evidence, err := source.Inspect(context.Background(), order)
+	if err != nil || evidence.OrderID != "venue-authoritative" {
+		t.Fatalf("filtered repair evidence = %#v, %v", evidence, err)
 	}
 }
 

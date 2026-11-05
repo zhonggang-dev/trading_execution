@@ -142,7 +142,9 @@ func (venue *Venue) remoteOrder(ctx context.Context, order domain.Order) (Order,
 	)
 	if storedID != "" && storedID == clientOrderID {
 		var listed Order
-		listed, err = venue.client.FindOrderByClientOrderID(ctx, clientOrderID)
+		listed, err = venue.client.FindOrderByClientOrderID(
+			ctx, clientOrderID, order.Intent.MarketID, orderLookupStart(order.CreatedAt),
+		)
 		if err == nil {
 			if strings.TrimSpace(listed.OrderID) == "" || strings.TrimSpace(listed.ClientOrderID) != clientOrderID ||
 				strings.TrimSpace(listed.Ticker) != strings.TrimSpace(order.Intent.MarketID) {
