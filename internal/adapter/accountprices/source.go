@@ -10,7 +10,6 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -154,6 +153,9 @@ func (s *Source) Fetch(ctx context.Context, w h.Window) (h.Result, error) {
 }
 
 func (s *Source) FetchWithSettlements(ctx context.Context, w h.Window, known []h.Settlement) (h.Result, error) {
+	if w.RequiredAt != nil || w.RefreshAt != nil {
+		return s.FetchWithSeries(ctx, w, h.Series{Settlements: known})
+	}
 	if e := w.Asset.Validate(); e != nil {
 		return h.Result{}, e
 	}
@@ -192,14 +194,7 @@ func (s *Source) FetchWithSettlements(ctx context.Context, w h.Window, known []h
 	result.Series.Coverage = append(result.Series.Coverage, h.Coverage{From: w.From, To: w.To, State: state, Reason: reason, FetchedAt: s.p.Now().UTC()})
 	return result, nil
 }
-func marks(w h.Window) []time.Time {
-	r := []time.Time{w.From, w.To}
-	for t := w.From.Truncate(time.Hour).Add(time.Hour); t.Before(w.To); t = t.Add(time.Hour) {
-		r = append(r, t)
-	}
-	sort.Slice(r, func(i, j int) bool { return r[i].Before(r[j]) })
-	return r
-}
+func marks(w h.Window) []time.Time { return h.RequiredTimes(w) }
 func text(raw json.RawMessage) string {
 	var v string
 	if json.Unmarshal(raw, &v) == nil {
@@ -225,102 +220,22 @@ func subtractOne(v string) (string, bool) {
 	return new(big.Rat).Sub(big.NewRat(1, 1), n).FloatString(12), true
 }
 func (s *Source) polymarket(ctx context.Context, w h.Window, series *h.Series) error {
-	type point struct {
-		Timestamp  int64       `json:"timestamp"`
-		Price      json.Number `json:"price"`
-		Resolution int         `json:"resolution_seconds"`
-	}
-	type envelope struct {
-		Data       []point `json:"data"`
-		Pagination struct {
-			HasMore bool    `json:"has_more"`
-			Next    *string `json:"next_cursor"`
-		} `json:"pagination"`
-	}
-	query := url.Values{"token_id": {w.Asset.TokenID}, "start": {strconv.FormatInt(w.From.Truncate(time.Hour).Add(-time.Hour).Unix(), 10)}, "end": {strconv.FormatInt(w.To.Unix()+1, 10)}, "bucket_seconds": {"3600"}, "limit": {"10000"}}
-	cursors := map[string]bool{}
-	count := 0
-	appendPoints := func(ps []point, boundary *time.Time) error {
-		for _, p := range ps {
-			if boundary != nil && time.Unix(p.Timestamp, 0).After(*boundary) {
-				return fmt.Errorf("PM as_of returned future price")
-			}
-		}
-		for _, p := range ps {
-			if boundary == nil && p.Resolution == 0 {
-				continue
-			} // resolved window terminals may be clamped into the past
-			price, priceErr := canonicalJSONPrice(p.Price)
-			if priceErr != nil || p.Timestamp <= 0 || p.Resolution < 0 {
-				return fmt.Errorf("invalid PM historical price")
-			}
-			at := time.Unix(p.Timestamp, 0).UTC()
-			if at.After(w.To) {
-				continue
-			}
-			source := at
-			series.Points = append(series.Points, h.Point{At: at, Price: price, SourceAt: &source, FetchedAt: s.p.Now().UTC(), ResolutionSeconds: p.Resolution, Source: "PM_HISTORY"})
-			count++
-			if count > 10000 {
-				return fmt.Errorf("PM history point budget exceeded")
-			}
-		}
-		return nil
-	}
-	for page := 0; page < 100; page++ {
-		var e envelope
-		if err := s.get(ctx, s.p.PMBaseURL, "/v2/prices-history", query, &e); err != nil {
-			return err
-		}
-		if e.Data == nil {
-			return fmt.Errorf("PM history omitted data")
-		}
-		if !e.Pagination.HasMore && e.Pagination.Next != nil && *e.Pagination.Next != "" {
-			return fmt.Errorf("PM history pagination inconsistent")
-		}
-		if err := appendPoints(e.Data, nil); err != nil {
-			return err
-		}
-		if !e.Pagination.HasMore {
-			break
-		}
-		if e.Pagination.Next == nil || *e.Pagination.Next == "" || cursors[*e.Pagination.Next] || page == 99 {
-			return fmt.Errorf("PM history pagination incomplete")
-		}
-		cursors[*e.Pagination.Next] = true
-		query.Set("cursor", *e.Pagination.Next)
+	if err := s.pmHistory(ctx, w, series); err != nil {
+		return err
 	}
 	h.SortSeries(series)
 	for _, at := range []time.Time{w.From, w.To} {
 		if _, ok := h.PriceAt(*series, at); ok {
 			continue
 		}
-		var e envelope
-		q := url.Values{"token_id": {w.Asset.TokenID}, "as_of": {strconv.FormatInt(at.Unix(), 10)}}
-		if err := s.get(ctx, s.p.PMBaseURL, "/v2/prices-history", q, &e); err != nil {
-			return err
-		}
-		if e.Data == nil {
-			return fmt.Errorf("PM boundary omitted data")
-		}
-		if e.Pagination.HasMore {
-			return fmt.Errorf("PM boundary response incomplete")
-		}
-		if err := appendPoints(e.Data, &at); err != nil {
+		if err := s.pmAsOf(ctx, w, at, series); err != nil {
 			return err
 		}
 		h.SortSeries(series)
 	}
-	needSettlement := false
 	for _, at := range marks(w) {
 		if _, ok := h.PriceAt(*series, at); !ok {
-			needSettlement = true
-			break
-		}
-	}
-	if needSettlement {
-		if err := s.pmSettlement(ctx, w, series); err != nil {
-			return err
+			return s.pmSettlement(ctx, w, series)
 		}
 	}
 	return nil

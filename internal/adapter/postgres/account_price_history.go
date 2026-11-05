@@ -15,6 +15,14 @@ import (
 	history "github.com/UniPat-AI/trading_execution/internal/service/accountpricehistory"
 )
 
+// Only proofs for the identical price, real source and anchor may be unioned.
+// A price/source/anchor revision uses the ordinary newest-observation rule.
+const sameHistoryAnchor = `(stored.point->>'price')::numeric=(EXCLUDED.point->>'price')::numeric
+ AND stored.point->>'source'=EXCLUDED.point->>'source'
+ AND (stored.point->>'source_at')::timestamptz IS NOT DISTINCT FROM (EXCLUDED.point->>'source_at')::timestamptz
+ AND (stored.point->>'resolution_seconds')::integer=(EXCLUDED.point->>'resolution_seconds')::integer`
+const mergedHistoryValidity = `CASE WHEN ` + sameHistoryAnchor + ` THEN GREATEST(stored.valid_until,EXCLUDED.valid_until) ELSE EXCLUDED.valid_until END`
+
 type AccountPriceHistoryStore struct{ db *sql.DB }
 
 func NewAccountPriceHistoryStore(db *sql.DB) *AccountPriceHistoryStore {
@@ -104,9 +112,12 @@ func (s *AccountPriceHistoryStore) Save(ctx context.Context, r history.Result) e
 	}
 	if len(r.Series.Points) > 0 {
 		raw, _ := json.Marshal(r.Series.Points)
-		_, err = tx.ExecContext(ctx, `INSERT INTO account_price_history_points(asset_key,point_at,valid_until,fetched_at,history_id,point)
+		_, err = tx.ExecContext(ctx, `INSERT INTO account_price_history_points AS stored(asset_key,point_at,valid_until,fetched_at,history_id,point)
  SELECT $1,(p->>'at')::timestamptz,(p->>'valid_until')::timestamptz,(p->>'fetched_at')::timestamptz,$2,p FROM jsonb_array_elements($3::jsonb)p
- ON CONFLICT(asset_key,point_at) DO UPDATE SET valid_until=EXCLUDED.valid_until,fetched_at=EXCLUDED.fetched_at,history_id=EXCLUDED.history_id,point=EXCLUDED.point WHERE EXCLUDED.fetched_at>=account_price_history_points.fetched_at`, r.Window.Asset.Key(), id, string(raw))
+ ON CONFLICT(asset_key,point_at) DO UPDATE SET valid_until=`+mergedHistoryValidity+`,fetched_at=GREATEST(stored.fetched_at,EXCLUDED.fetched_at),
+ history_id=CASE WHEN `+sameHistoryAnchor+` AND stored.valid_until IS NOT NULL AND (EXCLUDED.valid_until IS NULL OR stored.valid_until>EXCLUDED.valid_until) THEN stored.history_id ELSE EXCLUDED.history_id END,
+ point=jsonb_set(CASE WHEN `+sameHistoryAnchor+` AND stored.fetched_at>EXCLUDED.fetched_at THEN stored.point ELSE EXCLUDED.point END,'{valid_until}',COALESCE(to_jsonb(`+mergedHistoryValidity+`),'null'::jsonb))
+ WHERE EXCLUDED.fetched_at>=stored.fetched_at OR `+sameHistoryAnchor, r.Window.Asset.Key(), id, string(raw))
 		if err != nil {
 			return err
 		}
@@ -132,9 +143,14 @@ func saveHistoryCoverage(ctx context.Context, tx *sql.Tx, key string, id int64, 
 		return fmt.Errorf("invalid coverage state")
 	}
 	coverageKey := c.State
-	if c.State == "complete" {
+	if c.State == "complete" && c.Reason == "hourly_refresh" {
+		if !c.From.Equal(c.To) || !c.From.Equal(c.From.UTC().Truncate(time.Hour)) {
+			return fmt.Errorf("invalid hourly refresh marker")
+		}
+		coverageKey = "hourly_refresh"
+	} else if c.State == "complete" {
 		var earliest, latest sql.NullTime
-		if err := tx.QueryRowContext(ctx, `SELECT MIN(window_from),MAX(window_to) FROM account_price_history_coverage WHERE asset_key=$1 AND state='complete' AND window_to>=$2 AND window_from<=$3`, key, c.From, c.To).Scan(&earliest, &latest); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT MIN(window_from),MAX(window_to) FROM account_price_history_coverage WHERE asset_key=$1 AND state='complete' AND reason<>'hourly_refresh' AND window_to>=$2 AND window_from<=$3`, key, c.From, c.To).Scan(&earliest, &latest); err != nil {
 			return err
 		}
 		if earliest.Valid && earliest.Time.Before(c.From) {
@@ -143,13 +159,15 @@ func saveHistoryCoverage(ctx context.Context, tx *sql.Tx, key string, id int64, 
 		if latest.Valid && latest.Time.After(c.To) {
 			c.To = latest.Time
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM account_price_history_coverage WHERE asset_key=$1 AND state='complete' AND window_to>=$2 AND window_from<=$3`, key, c.From, c.To); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM account_price_history_coverage WHERE asset_key=$1 AND state='complete' AND reason<>'hourly_refresh' AND window_to>=$2 AND window_from<=$3`, key, c.From, c.To); err != nil {
 			return err
 		}
 		coverageKey = "complete:" + strconv.FormatInt(c.From.UnixNano(), 10)
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO account_price_history_coverage(asset_key,coverage_key,window_from,window_to,state,reason,fetched_at,history_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
- ON CONFLICT(asset_key,coverage_key) DO UPDATE SET window_from=EXCLUDED.window_from,window_to=EXCLUDED.window_to,state=EXCLUDED.state,reason=EXCLUDED.reason,fetched_at=EXCLUDED.fetched_at,history_id=EXCLUDED.history_id WHERE EXCLUDED.fetched_at>=account_price_history_coverage.fetched_at`, key, coverageKey, c.From, c.To, c.State, c.Reason, c.FetchedAt, id)
+ ON CONFLICT(asset_key,coverage_key) DO UPDATE SET window_from=EXCLUDED.window_from,window_to=EXCLUDED.window_to,state=EXCLUDED.state,reason=EXCLUDED.reason,fetched_at=EXCLUDED.fetched_at,history_id=EXCLUDED.history_id WHERE (EXCLUDED.reason='hourly_refresh' AND (EXCLUDED.window_from>account_price_history_coverage.window_from
+ OR (EXCLUDED.window_from=account_price_history_coverage.window_from AND EXCLUDED.fetched_at>=account_price_history_coverage.fetched_at)))
+ OR (EXCLUDED.reason<>'hourly_refresh' AND EXCLUDED.fetched_at>=account_price_history_coverage.fetched_at)`, key, coverageKey, c.From, c.To, c.State, c.Reason, c.FetchedAt, id)
 	return err
 }
 func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.Window) (history.Dataset, error) {
@@ -181,8 +199,19 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 	defer tx.Rollback()
 	// Read projections, never the growing raw audit window stream. The point
 	// budget applies to unique effective inputs, not number of hourly runs.
+	// Retain the latest eligible predecessor too: an expired newer anchor must
+	// block an older long proof, even when it falls outside this narrow window.
 	query := `WITH requested AS(SELECT * FROM jsonb_to_recordset($1::jsonb)AS r(key text,"from" timestamptz,"to" timestamptz)), input AS(
  SELECT DISTINCT p.asset_key,p.history_id,'point'::text AS kind,p.point::text AS payload FROM requested r JOIN account_price_history_points p ON p.asset_key=r.key AND p.point_at<=r."to" AND (p.point_at>=r."from" OR p.valid_until>=r."from")
+ UNION SELECT DISTINCT p.asset_key,p.history_id,'point',p.point::text FROM requested r JOIN LATERAL (
+  SELECT predecessor.* FROM account_price_history_points predecessor
+  WHERE predecessor.asset_key=r.key AND predecessor.point_at<r."from"
+   AND (predecessor.point->>'resolution_seconds')::integer BETWEEN 0 AND 3600
+   AND predecessor.point->>'price'=btrim(predecessor.point->>'price')
+   AND position('e' in lower(predecessor.point->>'price'))=0 AND position('/' in predecessor.point->>'price')=0
+   AND (predecessor.point->>'price')::numeric BETWEEN 0 AND 1
+  ORDER BY predecessor.point_at DESC LIMIT 1
+ ) p ON true
  UNION ALL SELECT DISTINCT p.asset_key,p.history_id,'settlement',p.settlement::text FROM requested r JOIN account_price_history_settlements p ON p.asset_key=r.key AND p.effective_at<=r."to"
  UNION ALL SELECT DISTINCT c.asset_key,c.history_id,'coverage',jsonb_build_object('from',c.window_from,'to',c.window_to,'state',c.state,'reason',c.reason,'fetched_at',c.fetched_at)::text FROM requested r JOIN account_price_history_coverage c ON c.asset_key=r.key AND c.window_to>=r."from" AND c.window_from<=r."to")
  SELECT asset_key,history_id,kind,payload FROM input LIMIT 2020001`
@@ -297,6 +326,13 @@ func latestHistoryPoints(points []history.Point) []history.Point {
 	return result
 }
 func (s *AccountPriceHistoryStore) Targets(ctx context.Context, now time.Time) ([]history.Window, error) {
+	holding, err := s.holdingTargets(ctx, now)
+	if err != nil {
+		return nil, err
+	}
+	return s.requirementTargets(ctx, now, holding)
+}
+func (s *AccountPriceHistoryStore) holdingTargets(ctx context.Context, now time.Time) ([]history.Window, error) {
 	// This reads authoritative lot identities and their actual final disposition.
 	// Source is explicit order venue/intent or a verified PM adoption baseline.
 	rows, err := s.db.QueryContext(ctx, `SELECT CASE WHEN l.external_adoption_id IS NOT NULL AND b.source='POLYMARKET_DATA_API' THEN 'POLYMARKET' ELSE COALESCE(NULLIF(UPPER(o.intent->>'market_source'),''),NULLIF(UPPER(o.venue),'')) END,l.market_id,l.condition_id,l.token_id,l.outcome_index,NULLIF(l.outcome_name,''),l.opened_at,CASE WHEN l.remaining_shares>0 THEN $1 ELSE COALESCE(h.sold_at,l.closed_at) END

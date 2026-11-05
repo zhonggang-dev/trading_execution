@@ -20,7 +20,11 @@ type assetCoverage struct {
 // could otherwise call a short holding complete despite lacking its entry mark.
 func summarizeCoverage(ctx context.Context, target h.Window, series h.Series, observedAt time.Time) (assetCoverage, error) {
 	end := target.To
-	if completed := observedAt.UTC().Truncate(time.Hour); end.After(completed) {
+	if target.RequiredAt != nil {
+		if end.After(observedAt) {
+			end = observedAt
+		}
+	} else if completed := observedAt.UTC().Truncate(time.Hour); end.After(completed) {
 		end = completed
 	}
 	item := assetCoverage{Asset: target.Asset, From: target.From, To: target.To, SampledThrough: end}
@@ -28,6 +32,22 @@ func summarizeCoverage(ctx context.Context, target h.Window, series h.Series, ob
 		return item, err
 	}
 	if end.Before(target.From) {
+		return item, nil
+	}
+	if target.RequiredAt != nil {
+		for _, at := range h.RequiredTimes(target) {
+			if !at.Before(observedAt) {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return item, err
+			}
+			if _, ok := h.PriceAt(series, at); ok {
+				item.Available++
+			} else {
+				item.Missing++
+			}
+		}
 		return item, nil
 	}
 	check := func(at time.Time) error {

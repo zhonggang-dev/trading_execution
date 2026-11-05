@@ -58,7 +58,7 @@ func TestPlanResumesFailedWindowsWithoutDroppingHistory(t *testing.T) {
 	from := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	asset := testAsset()
 	end := from.Add(40 * 24 * time.Hour)
-	target := Window{asset, from, end}
+	target := Window{Asset: asset, From: from, To: end}
 	data := Dataset{Series: map[string]Series{asset.Key(): {Coverage: []Coverage{{From: from, To: from.Add(14 * 24 * time.Hour), State: "complete"}, {From: from.Add(14 * 24 * time.Hour), To: from.Add(28 * 24 * time.Hour), State: "error"}}}}}
 	plan := Plan([]Window{target}, data, end.Add(time.Hour))
 	if len(plan) != 2 || !plan[0].From.Equal(from.Add(14*24*time.Hour)) || !plan[1].To.Equal(end) {
@@ -74,7 +74,7 @@ func TestPlanRecentOverlapAndLateRevision(t *testing.T) {
 	now := time.Date(2026, 11, 5, 8, 17, 0, 0, time.UTC)
 	from := now.Add(-10 * time.Hour)
 	data := Dataset{Series: map[string]Series{a.Key(): {Coverage: []Coverage{{From: from, To: now.Truncate(time.Hour), State: "complete"}}}}}
-	jobs := Plan([]Window{{a, from, now}}, data, now)
+	jobs := Plan([]Window{{Asset: a, From: from, To: now}}, data, now)
 	if len(jobs) != 1 || jobs[0].From != now.Truncate(time.Hour).Add(-2*time.Hour) || jobs[0].To != now.Truncate(time.Hour) {
 		t.Fatal(jobs)
 	}
@@ -104,7 +104,7 @@ func (f sourceFunc) Fetch(c context.Context, w Window) (Result, error) { return 
 func TestSyncDryRunAndFailedWindowsNeverBecomeComplete(t *testing.T) {
 	now := time.Now().UTC()
 	a := testAsset()
-	store := &memoryStore{targets: []Window{{a, now.Add(-48 * time.Hour), now.Add(-24 * time.Hour)}}, data: Dataset{Series: map[string]Series{}}}
+	store := &memoryStore{targets: []Window{{Asset: a, From: now.Add(-48 * time.Hour), To: now.Add(-24 * time.Hour)}}, data: Dataset{Series: map[string]Series{}}}
 	source := sourceFunc(func(context.Context, Window) (Result, error) { return Result{}, fmt.Errorf("temporary source failure") })
 	r, e := Run(context.Background(), store, source, SyncOptions{Now: now, DryRun: true})
 	if e != nil || r.Planned != 1 || len(store.saves) != 0 {
@@ -199,14 +199,14 @@ func TestSyncPassesVerifiedKnownSettlementsWithoutChangingAssetIdentity(t *testi
 	if e != nil || report.Saved != 1 || source.legacyCalls != 0 || len(source.known) != 1 || source.known[0].SourceReference != known.SourceReference {
 		t.Fatal(report, e, source)
 	}
-	if len(store.saves) != 1 || store.saves[0].Window.Asset.Key() != a.Key() || !store.saves[0].Series.Settlements[0].EffectiveAt.Equal(known.EffectiveAt) {
+	if len(store.saves) != 2 || store.saves[1].Window.Asset.Key() != a.Key() || !store.saves[1].Series.Settlements[0].EffectiveAt.Equal(known.EffectiveAt) {
 		t.Fatal("known evidence changed identity or original time", store.saves)
 	}
 	// A later run sees the persisted terminal and committed prefix. It must
 	// not fetch an already complete closed lifecycle again.
-	store.data.Series[a.Key()] = store.saves[0].Series
+	store.data.Series[a.Key()] = store.saves[1].Series
 	second, err := Run(context.Background(), store, source, SyncOptions{Now: now, Workers: 1})
-	if err != nil || second.Planned != 0 || second.Saved != 0 || len(store.saves) != 1 {
+	if err != nil || second.Planned != 0 || second.Saved != 0 || len(store.saves) != 3 {
 		t.Fatal("repeated run did not reuse committed terminal", second, err)
 	}
 }

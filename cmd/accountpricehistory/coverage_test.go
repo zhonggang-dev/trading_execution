@@ -47,3 +47,14 @@ func TestCoverageCancellationDoesNotReturnSuccessfulCounts(t *testing.T) {
 		t.Fatal("cancelled coverage inspection succeeded", err)
 	}
 }
+
+func TestCoverageInspectsExplicitCurrentHourCashEvents(t *testing.T) {
+	at := time.Date(2026, 11, 5, 13, 0, 0, 0, time.UTC)
+	event := at.Add(5 * time.Minute)
+	w := h.Window{From: at.Add(-time.Hour), To: at.Add(17 * time.Minute), RequiredAt: []time.Time{event}}
+	series := h.Series{Points: []h.Point{{At: at.Add(-time.Hour), Price: "0.5", ResolutionSeconds: 3600}}}
+	got, err := summarizeCoverage(context.Background(), w, series, at.Add(17*time.Minute))
+	if err != nil || got.Missing != 1 || got.Available != 0 || !got.SampledThrough.Equal(w.To) {
+		t.Fatal("current-hour event was silently truncated to full hour", got, err)
+	}
+}
