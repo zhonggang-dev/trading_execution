@@ -23,7 +23,7 @@ Kalshi市场K线按 `market_settled_ts` 路由live/archive；成交流水独立�
 
 ## CLI
 
-先从合并master的精确源码构建两个二进制（主服务及工具），将工具置于同一release目录：
+从PR合并后的master完整SHA源码构建工具，在已验证release中保留二进制及来源记录；通过独立受保护指针 `/opt/trading-execution/account-price-history/current` 引用，不依赖主服务的current切换：
 
 ```sh
 go build -o accountpricehistory ./cmd/accountpricehistory
@@ -41,8 +41,30 @@ accountpricehistory coverage
 
 目标来自完整lot真实持有段，外部接管与historical_rebased_lot_sales正确结束时间保留；按资产跨账户合并重叠时段。暂停账户仍持仓时继续同步。已退出且历史完整，或已有可信终价覆盖之后，不再无限更新。
 
-## 调度
+## 权限迁移
 
-`deploy/account-price-history.service` 使用现有 `/etc/trading-execution/env`，调用 `/opt/trading-execution/current/accountpricehistory`。首次安装保持timer禁用；完成受限回填与五账户覆盖验证后启用 `account-price-history.timer`，每小时UTC :17运行，Persistent=true。独立oneshot失败不影响交易主服务；并发最多2，总速率最多2req/s，单HTTP请求12秒，429尊重Retry-After且有限重试。
+已应用的0044不修改。增量迁移 `0047_account_history_fk_lock_permission.sql` 只向 `trading_execution_app` 授予原始历史表 `UPDATE(history_id)`，供PostgreSQL外键内部 `SELECT FOR KEY SHARE` 的行锁权限检查；不授予整表UPDATE或其他列写权限，不移除外键。原追加式语句触发器仍拒绝任何真实UPDATE/DELETE/TRUNCATE。
 
-部署后必须记录至少两次自然小时调度。异常先停止timer/回退读取开关，保留行情证据；不删除表、重写资金或替换其他会话部署。迁移只涉及新增对象，可由具备public CREATE及新对象权限的受限应用配置执行；生产执行由发布者统一进行。
+部署必须使用真实非超级用户角色验证Save，而非仅用超级用户跑迁移：0044状态下可出现42501且整笔事务回滚；0047后Save/Load及重复执行应成功，孤儿外键仍23503，直接变更原始事实仍被拒绝。同步报告的storage failure只保留经过校验的五位SQLSTATE，不输出原错误文本、DSN或SQL参数。 角色回归只在专用隔离PostgreSQL上运行，测试连接须能创建和清理临时LOGIN角色与schema；生产应用连接不得用作测试连接。
+
+## XXL-JOB调度
+
+统一复用prediction_infra现有XXL-JOB BEAN执行器，handler为 `syncAccountPriceHistoryJob`。它无shell直接调用固定CLI：
+
+```text
+/opt/trading-execution/account-price-history/current/accountpricehistory incremental --max-windows 250 --timeout 45m
+```
+
+Infra配置 `ACCOUNT_PRICE_HISTORY_ENABLED/BINARY/DATABASE_URL/MAX_WINDOWS/TIMEOUT`；默认关闭；小时任务配置与XXL参数硬上限均为250窗口/45m，参数只能进一步收紧配置。BINARY为上述受保护绝对路径，DATABASE_URL来自服务器专用受限环境，子进程仅获得PATH和专用数据库连接配置，不继承整份Infra凭据。XXL参数仅允许 `{"max_windows":250,"timeout":"45m"}`，只能收紧配置预算。
+
+首次回填及五账户覆盖验证完成后，在XXL Admin创建BEAN任务，使用每小时:17调度（例如cron `0 17 * * * ?`），配置失败重试与防重叠策略。CLI自身仍有数据库防重入锁、并发最多2、总速率最多2req/s、单HTTP12秒及有限重试。busy、failed、missing、deferred或无效报告必须失败回调，不能把未执行或未完成当成功；取消先SIGTERM，再有界结束，断点可续。XXL日志只保留job/log ID及结构化计数，不原样透传stderr或失败详情。
+
+仓库不再提供该任务的systemd service/timer模板，避免双调度入口。部署后观察至少两次真实XXL小时触发及回调；不得为验收手动触发交易周期。
+
+## 独立制品与回滚
+
+工具与主服务遵守同一master来源要求：PR合并后按完整SHA导出构建，记录 `source_branch=master`、完整commit、源码归档SHA256、CLI二进制SHA256和release路径。独立指针只能指向含已验真工具的release，不能随主服务更新到缺少工具的旧二进制集合。
+
+发布者持保护锁并核对预期worker指针后原子切换 `/opt/trading-execution/account-price-history/current`；不切主服务current，release清理须同时保护worker当前及回滚引用。
+
+异常时在XXL禁用本任务、等待或有界取消其自身执行，保留历史数据；仅将独立工具指针回滚至已核验release，核对handler配置和工具hash后再恢复调度。不删历史表、不改业务账本、不回退其他会话服务。

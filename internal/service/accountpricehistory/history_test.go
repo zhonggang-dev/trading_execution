@@ -2,7 +2,9 @@ package accountpricehistory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -126,5 +128,49 @@ func TestPriceAtCannotResurrectOlderPriceAfterNewObservationExpires(t *testing.T
 	SortSeries(&series)
 	if _, ok := PriceAt(series, at.Add(4*time.Hour)); ok {
 		t.Fatal("resurrected older price across a newer observation")
+	}
+}
+
+type storageStateError struct{ code string }
+
+func (e storageStateError) Error() string {
+	return "password=must-not-leak SELECT private_connection_data"
+}
+func (e storageStateError) SQLState() string { return e.code }
+
+type failingStorage struct {
+	*memoryStore
+	err error
+}
+
+func (s failingStorage) Save(context.Context, Result) error { return s.err }
+func TestSyncStorageFailureReportsOnlyValidatedSQLState(t *testing.T) {
+	for _, code := range []string{"42501", "invalid state", "abcde"} {
+		t.Run(code, func(t *testing.T) {
+			now := time.Date(2026, 11, 5, 8, 0, 0, 0, time.UTC)
+			a := testAsset()
+			w := Window{Asset: a, From: now.Add(-48 * time.Hour), To: now.Add(-24 * time.Hour)}
+			store := failingStorage{memoryStore: &memoryStore{targets: []Window{w}, data: Dataset{Series: map[string]Series{}}}, err: fmt.Errorf("sensitive wrapper: %w", storageStateError{code})}
+			source := sourceFunc(func(_ context.Context, w Window) (Result, error) {
+				return Result{Window: w, Series: Series{Coverage: []Coverage{{From: w.From, To: w.To, State: "complete"}}}}, nil
+			})
+			report, err := Run(context.Background(), store, source, SyncOptions{Now: now, Workers: 1})
+			if err == nil || report.Failed != 1 || len(report.Failures) != 1 {
+				t.Fatal(report, err)
+			}
+			want := ""
+			if code == "42501" {
+				want = code
+			}
+			if report.Failures[0].Detail != want {
+				t.Fatal("unexpected storage diagnostic", report.Failures[0].Detail)
+			}
+			raw, _ := json.Marshal(report)
+			for _, secret := range []string{"password", "SELECT", "private_connection_data", "sensitive wrapper"} {
+				if strings.Contains(string(raw), secret) {
+					t.Fatal("storage error text leaked", secret)
+				}
+			}
+		})
 	}
 }

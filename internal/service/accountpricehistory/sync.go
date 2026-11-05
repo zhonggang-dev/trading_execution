@@ -2,6 +2,7 @@ package accountpricehistory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -202,7 +203,7 @@ func Run(ctx context.Context, store Store, source Source, options SyncOptions) (
 					mu.Lock()
 					report.Failed++
 					if len(report.Failures) < 20 {
-						report.Failures = append(report.Failures, Failure{job.Asset.Key(), job.From, job.To, "storage_unavailable", ""})
+						report.Failures = append(report.Failures, Failure{job.Asset.Key(), job.From, job.To, "storage_unavailable", storageSQLState(e)})
 					}
 					mu.Unlock()
 					continue
@@ -241,4 +242,23 @@ send:
 		return report, fmt.Errorf("history sync has failed windows")
 	}
 	return report, nil
+}
+
+// Expose only the SQLSTATE interface. Error text may contain SQL, connection
+// information or bind values and must never enter the sync report.
+func storageSQLState(err error) string {
+	var state interface{ SQLState() string }
+	if !errors.As(err, &state) {
+		return ""
+	}
+	code := state.SQLState()
+	if len(code) != 5 {
+		return ""
+	}
+	for _, c := range code {
+		if !(c >= '0' && c <= '9') && !(c >= 'A' && c <= 'Z') {
+			return ""
+		}
+	}
+	return code
 }
