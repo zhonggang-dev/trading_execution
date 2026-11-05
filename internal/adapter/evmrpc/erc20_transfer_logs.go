@@ -215,7 +215,13 @@ func (reader *ERC20TransferLogReader) RequireBlock(ctx context.Context, blockNum
 
 // BlockHeader returns the canonical hash and timestamp of one block.
 func (reader *ERC20TransferLogReader) BlockHeader(ctx context.Context, blockNumber uint64) (string, time.Time, error) {
-	raw, err := reader.rpc.rpcCall(ctx, "eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", blockNumber), false})
+	return rpcBlockHeader(ctx, reader.rpc, blockNumber)
+}
+
+// rpcBlockHeader reads the canonical hash and timestamp of one block and
+// fails when the backend does not serve it yet.
+func rpcBlockHeader(ctx context.Context, rpc *OrderFilledEvidenceReader, blockNumber uint64) (string, time.Time, error) {
+	raw, err := rpc.rpcCall(ctx, "eth_getBlockByNumber", []any{fmt.Sprintf("0x%x", blockNumber), false})
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("read block %d: %w", blockNumber, err)
 	}
@@ -272,10 +278,17 @@ func (reader *ERC20TransferLogReader) BalanceAt(ctx context.Context, walletAddre
 func (reader *ERC20TransferLogReader) getLogs(
 	ctx context.Context, address any, fromBlock, toBlock uint64, topics []any,
 ) ([]rpcLog, error) {
+	return rpcGetLogs(ctx, reader.rpc, address, fromBlock, toBlock, topics)
+}
+
+// rpcGetLogs issues one bounded eth_getLogs call.
+func rpcGetLogs(
+	ctx context.Context, rpc *OrderFilledEvidenceReader, address any, fromBlock, toBlock uint64, topics []any,
+) ([]rpcLog, error) {
 	if toBlock < fromBlock || toBlock-fromBlock+1 > MaxTransferLogChunkBlocks {
 		return nil, fmt.Errorf("log chunk [%d, %d] exceeds %d blocks", fromBlock, toBlock, MaxTransferLogChunkBlocks)
 	}
-	raw, err := reader.rpc.rpcCall(ctx, "eth_getLogs", []any{map[string]any{
+	raw, err := rpc.rpcCall(ctx, "eth_getLogs", []any{map[string]any{
 		"address":   address,
 		"fromBlock": fmt.Sprintf("0x%x", fromBlock),
 		"toBlock":   fmt.Sprintf("0x%x", toBlock),

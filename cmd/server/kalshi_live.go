@@ -224,6 +224,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 	service, err := execution.New(execution.Params{Repository: repository, Venue: venue, Guard: guard, MarketValidator: validator,
 		Reservations: reservations, FillSynchronizer: processor, AuthoritativeFills: true, AccountScope: scope,
 		RequirePreparedPlacement: true, MaxReconcileAttempts: cfg.Polymarket.MaxReconcileAttempts,
+		SubmitAttemptTimeout: cfg.Execution.SubmitAttemptTimeout, SubmitInFlightGrace: cfg.Execution.SubmitInFlightGrace,
 		CancelFillFinalityGrace: cfg.Polymarket.CancelFillFinalityGrace, EntrySubmissionDisabled: cfg.DecisionCycle.EntrySubmissionDisabled,
 		EntryDisabledAccounts: entryDisabledAccounts})
 	if err != nil {

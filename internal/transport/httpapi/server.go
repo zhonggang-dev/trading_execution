@@ -688,6 +688,8 @@ func (server *Server) handleExecutionError(writer http.ResponseWriter, err error
 		writeError(writer, http.StatusConflict, "IDEMPOTENCY_CONFLICT", err.Error())
 	case errors.Is(err, port.ErrOrderNotFound):
 		writeError(writer, http.StatusNotFound, "ORDER_NOT_FOUND", err.Error())
+	case errors.Is(err, port.ErrSubmitInFlight):
+		writeError(writer, http.StatusConflict, "ORDER_SUBMIT_IN_FLIGHT", err.Error())
 	case errors.As(err, &rejection):
 		writeError(writer, http.StatusUnprocessableEntity, rejection.Code, rejection.Reason)
 	default:

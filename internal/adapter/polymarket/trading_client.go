@@ -41,8 +41,15 @@ type TradingClientParams struct {
 	// trusted before it is re-read. Polymarket can enable or change fees on a
 	// market, so a reservation must not rely on a schedule cached forever.
 	FeeScheduleTTL time.Duration
-	Now            func() time.Time
-	Random         io.Reader
+	// IOCOrderType is the CLOB order type that carries an emulated IOC: GTC
+	// (default, no venue expiry) or GTD (expires IOCOrderLifetime after the
+	// exchange clock). IOCOrderLifetime defaults to five minutes and must stay
+	// within [4m, 15m]: the CLOB rejects a GTD expiring less than three minutes
+	// ahead and retires it one minute before the stated expiry.
+	IOCOrderType     string
+	IOCOrderLifetime time.Duration
+	Now              func() time.Time
+	Random           io.Reader
 }
 
 // TradingClient 表示后端使用的 TradingClient 类型。
@@ -71,6 +78,15 @@ type cachedFeeSchedule struct {
 }
 
 const defaultFeeScheduleTTL = 15 * time.Minute
+
+// Emulated IOC GTD lifetime bounds. The CLOB requires a GTD expiration at
+// least three minutes ahead and retires the order one minute before it; the
+// lower bound adds a minute of margin for clock skew and POST latency.
+const (
+	DefaultIOCOrderLifetime = 5 * time.Minute
+	MinIOCOrderLifetime     = 4 * time.Minute
+	MaxIOCOrderLifetime     = 15 * time.Minute
+)
 
 var (
 	_ port.FillSource                = (*TradingClient)(nil)
@@ -358,6 +374,19 @@ func NewTradingClient(params TradingClientParams) (*TradingClient, error) {
 	if params.FeeScheduleTTL < 0 {
 		return nil, fmt.Errorf("Polymarket fee schedule TTL must not be negative")
 	}
+	params.IOCOrderType = strings.ToUpper(strings.TrimSpace(params.IOCOrderType))
+	if params.IOCOrderType == "" {
+		params.IOCOrderType = string(domain.TimeInForceGTC)
+	}
+	if params.IOCOrderType != string(domain.TimeInForceGTC) && params.IOCOrderType != string(domain.TimeInForceGTD) {
+		return nil, fmt.Errorf("Polymarket emulated IOC order type must be GTC or GTD")
+	}
+	if params.IOCOrderLifetime == 0 {
+		params.IOCOrderLifetime = DefaultIOCOrderLifetime
+	}
+	if params.IOCOrderLifetime < MinIOCOrderLifetime || params.IOCOrderLifetime > MaxIOCOrderLifetime {
+		return nil, fmt.Errorf("Polymarket emulated IOC GTD lifetime must be between %s and %s", MinIOCOrderLifetime, MaxIOCOrderLifetime)
+	}
 	client := &TradingClient{
 		baseURL:        baseURL,
 		httpClient:     params.HTTPClient,
@@ -374,6 +403,8 @@ func NewTradingClient(params TradingClientParams) (*TradingClient, error) {
 			metadata:       params.Metadata,
 			minBuyNotional: params.MinBuyNotional,
 			random:         params.Random,
+			iocOrderType:   params.IOCOrderType,
+			iocLifetime:    params.IOCOrderLifetime,
 		},
 	}
 	client.builder.now = client.protocolNow
@@ -405,6 +436,8 @@ type preparedCLOBPlacement struct {
 	executionAccountID string
 	expectedOrderID    string
 	body               []byte
+	// venueExpiresAt is the signed GTD expiry; zero when the order has none.
+	venueExpiresAt time.Time
 }
 
 func (placement *preparedCLOBPlacement) ExpectedVenueOrderID() string {
@@ -412,6 +445,14 @@ func (placement *preparedCLOBPlacement) ExpectedVenueOrderID() string {
 		return ""
 	}
 	return placement.expectedOrderID
+}
+
+// VenueExpiresAt reports the venue-enforced expiry of the signed order.
+func (placement *preparedCLOBPlacement) VenueExpiresAt() (time.Time, bool) {
+	if placement == nil || placement.venueExpiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	return placement.venueExpiresAt, true
 }
 
 // PreparePlace validates and signs an order but cannot send POST /order.
@@ -441,6 +482,10 @@ func (client *TradingClient) PreparePlace(ctx context.Context, order domain.Orde
 	if err != nil {
 		return nil, err
 	}
+	venueExpiresAt, _, err := payloadVenueExpiry(payload)
+	if err != nil {
+		return nil, newInvalidError("INVALID_EXPIRATION", err.Error())
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal signed CLOB order: %w", err)
@@ -449,6 +494,7 @@ func (client *TradingClient) PreparePlace(ctx context.Context, order domain.Orde
 		localOrderID: order.ID, clientOrderID: order.Intent.ClientOrderID,
 		executionAccountID: order.Intent.ExecutionAccountID,
 		expectedOrderID:    expectedOrderID, body: append([]byte(nil), body...),
+		venueExpiresAt: venueExpiresAt,
 	}, nil
 }
 

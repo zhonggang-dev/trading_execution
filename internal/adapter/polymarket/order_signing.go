@@ -67,6 +67,11 @@ type orderBuilder struct {
 	minBuyNotional domain.Decimal
 	now            func() time.Time
 	random         io.Reader
+	// iocOrderType is the CLOB order type that carries an emulated IOC:
+	// "GTC" (no venue expiry, the historical behaviour and the default) or
+	// "GTD" (expires iocLifetime after the exchange clock at signing time).
+	iocOrderType string
+	iocLifetime  time.Duration
 }
 
 // build 校验订单精度并构建签名后的 CLOB 提交载荷。
@@ -87,7 +92,7 @@ func (builder orderBuilder) build(ctx context.Context, order domain.Order, accou
 	if err != nil {
 		return postOrderPayload{}, "", err
 	}
-	orderType, err := clobOrderType(order.Intent.TimeInForce)
+	orderType, err := builder.clobOrderType(order.Intent.TimeInForce)
 	if err != nil {
 		return postOrderPayload{}, "", err
 	}
@@ -102,6 +107,15 @@ func (builder orderBuilder) build(ctx context.Context, order domain.Order, accou
 			return postOrderPayload{}, "", newInvalidError("INVALID_EXPIRATION", "GTD expiration must be in the future")
 		}
 		expiration = fmt.Sprintf("%d", order.Intent.ExpiresAt.UTC().Unix())
+	} else if order.Intent.TimeInForce == domain.TimeInForceIOC && orderType == string(domain.TimeInForceGTD) {
+		// Emulated IOC as a short-lived GTD. The expiry is not part of the V2
+		// EIP-712 order struct, so the order hash is identical to the GTC form;
+		// only the CLOB enforces it. It is taken from the same exchange clock
+		// that stamps the signed order.
+		if builder.iocLifetime <= 0 {
+			return postOrderPayload{}, "", newInvalidError("INVALID_EXPIRATION", "emulated IOC GTD lifetime is not configured")
+		}
+		expiration = fmt.Sprintf("%d", builder.now().UTC().Add(builder.iocLifetime).Unix())
 	}
 	metadata := normalizeBytes32(builder.metadata)
 	builderCode := normalizeBytes32(builder.builderCode)
@@ -418,6 +432,36 @@ func normalizeBytes32(value string) string {
 		return ""
 	}
 	return "0x" + strings.ToLower(value)
+}
+
+// clobOrderType maps the time in force with the builder's emulated-IOC carrier.
+func (builder orderBuilder) clobOrderType(timeInForce domain.TimeInForce) (string, error) {
+	orderType, err := clobOrderType(timeInForce)
+	if err != nil || timeInForce != domain.TimeInForceIOC {
+		return orderType, err
+	}
+	switch builder.iocOrderType {
+	case "", string(domain.TimeInForceGTC):
+		return orderType, nil
+	case string(domain.TimeInForceGTD):
+		return string(domain.TimeInForceGTD), nil
+	default:
+		return "", newInvalidError("ORDER_TYPE_UNSUPPORTED", "unsupported emulated IOC order type")
+	}
+}
+
+// payloadVenueExpiry returns the venue-enforced expiry of a signed payload.
+// "0" means the order never expires at the venue.
+func payloadVenueExpiry(payload postOrderPayload) (time.Time, bool, error) {
+	raw := strings.TrimSpace(payload.Order.Expiration)
+	if raw == "" || raw == "0" {
+		return time.Time{}, false, nil
+	}
+	seconds, ok := new(big.Int).SetString(raw, 10)
+	if !ok || seconds.Sign() <= 0 || !seconds.IsInt64() {
+		return time.Time{}, false, fmt.Errorf("signed order expiration %q is invalid", raw)
+	}
+	return time.Unix(seconds.Int64(), 0).UTC(), true, nil
 }
 
 // clobOrderType 将领域有效期类型映射为 CLOB 订单类型。

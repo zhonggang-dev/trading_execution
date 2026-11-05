@@ -76,4 +76,8 @@ type OrderAttempt struct {
 	ErrorMessage       string              `json:"error_message,omitempty"`
 	StartedAt          time.Time           `json:"started_at"`
 	CompletedAt        *time.Time          `json:"completed_at,omitempty"`
+	// VenueExpiresAt is the venue-enforced expiry carried by a SUBMIT attempt
+	// (Polymarket GTD). Nil means the placement had no venue expiry, which is
+	// also how every attempt written before migration 0046 reads.
+	VenueExpiresAt *time.Time `json:"venue_expires_at,omitempty"`
 }
