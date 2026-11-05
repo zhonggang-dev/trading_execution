@@ -125,7 +125,7 @@ const settlementProjection = `
 `
 
 func (reader *Reader) Settlements(ctx context.Context, filter ListFilter) (Page[Settlement], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[Settlement]{}, err
 	}
@@ -142,6 +142,7 @@ func (reader *Reader) Settlements(ctx context.Context, filter ListFilter) (Page[
 	if filter.ExecutionAccountID != "" {
 		add("execution_account_id=$%d", filter.ExecutionAccountID)
 	}
+	clauses = appendAccountScope(clauses, &args, filter, "execution_account_id")
 	if filter.MarketSource != "" {
 		add("market_source=$%d", filter.MarketSource)
 	}

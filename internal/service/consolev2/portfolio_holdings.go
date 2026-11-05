@@ -63,6 +63,10 @@ const portfolioSourceExpression = `CASE
  END`
 
 func (reader *Reader) portfolioBase(filter ListFilter) (string, []any, error) {
+	filter, scopeErr := reader.normalizeScopedFilter(filter)
+	if scopeErr != nil {
+		return "", nil, scopeErr
+	}
 	sources := make([]ManagedAccount, 0, len(reader.config.ManagedAccounts))
 	seen := map[string]string{}
 	for _, account := range reader.config.ManagedAccounts {
@@ -87,6 +91,10 @@ func (reader *Reader) portfolioBase(filter ListFilter) (string, []any, error) {
 	if filter.ExecutionAccountID != "" {
 		args = append(args, filter.ExecutionAccountID)
 		accountWhere = " AND l.execution_account_id=$2"
+	}
+	scopeClauses := appendAccountScope(nil, &args, filter, "l.execution_account_id")
+	if len(scopeClauses) > 0 {
+		accountWhere += " AND " + scopeClauses[0]
 	}
 	base := `WITH configured AS (
  SELECT execution_account_id, market_source FROM jsonb_to_recordset($1::jsonb)
@@ -257,7 +265,7 @@ func (reader *Reader) PortfolioHoldingLots(ctx context.Context, identity Portfol
 	if err != nil {
 		return Page[PositionLot]{}, err
 	}
-	if filter.Query != "" || filter.ExecutionAccountID != "" || filter.MarketSource != "" || filter.Status != "" {
+	if filter.Query != "" || filter.ExecutionAccountID != "" || filter.AccountScope != "" || filter.MarketSource != "" || filter.Status != "" {
 		return Page[PositionLot]{}, fmt.Errorf("portfolio holding lots only support limit and offset")
 	}
 	identity, err = normalizePortfolioIdentity(identity)

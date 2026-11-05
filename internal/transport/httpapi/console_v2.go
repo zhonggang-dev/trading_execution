@@ -33,6 +33,7 @@ func (server *Server) registerConsoleV2Routes(mux *http.ServeMux) {
 	}
 	mux.Handle("GET /api/v1/console/v2/accounts", readOnly(server.consoleV2Accounts))
 	mux.Handle("GET /api/v1/console/v2/account-core-metrics", readOnly(server.consoleV2AccountCoreMetrics))
+	mux.Handle("GET /api/v1/console/v2/account-cohort-metrics", readOnly(server.consoleV2AccountCohortMetrics))
 	mux.Handle("GET /api/v1/console/v2/account-performance", readOnly(server.consoleV2AccountPerformance))
 	mux.Handle("GET /api/v1/console/v2/ledger-activities", readOnly(server.consoleV2LedgerActivities))
 	mux.Handle("GET /api/v1/console/v2/settlements", readOnly(server.consoleV2Settlements))
@@ -267,6 +268,7 @@ func parseConsoleV2Filter(request *http.Request, options consoleV2FilterOptions)
 	if options.Account {
 		allowed["execution_account_id"] = true
 		allowed["account"] = true
+		allowed["account_scope"] = true
 	}
 	if options.MarketSource != nil {
 		allowed["market_source"] = true
@@ -306,9 +308,13 @@ func parseConsoleV2Filter(request *http.Request, options consoleV2FilterOptions)
 		return consolev2.ListFilter{}, err
 	}
 	filter := consolev2.ListFilter{ActivityType: query.Get("activity_type"), Limit: 20, Query: strings.TrimSpace(query.Get("q")),
-		ModelID: strings.TrimSpace(modelID), StrategyID: strings.TrimSpace(strategyID),
+		AccountScope: query.Get("account_scope"),
+		ModelID:      strings.TrimSpace(modelID), StrategyID: strings.TrimSpace(strategyID),
 		ExecutionAccountID: strings.TrimSpace(accountID), MarketSource: strings.TrimSpace(marketSource),
 		Status: strings.TrimSpace(query.Get("status")), Side: strings.TrimSpace(query.Get("side"))}
+	if (query.Has("account_scope") && filter.AccountScope == "") || consolev2.ValidateAccountScope(filter.ExecutionAccountID, filter.AccountScope) != nil {
+		return consolev2.ListFilter{}, fmt.Errorf("account_scope is invalid or conflicts with execution_account_id")
+	}
 	if query.Has("limit") && query.Get("limit") == "" {
 		return consolev2.ListFilter{}, fmt.Errorf("limit must be an integer")
 	}

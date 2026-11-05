@@ -161,7 +161,7 @@ FROM (
 ) AS activity`
 
 func (reader *Reader) LedgerActivities(ctx context.Context, filter ListFilter) (Page[LedgerActivity], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[LedgerActivity]{}, err
 	}
@@ -177,6 +177,7 @@ func (reader *Reader) LedgerActivities(ctx context.Context, filter ListFilter) (
 	if filter.ExecutionAccountID != "" {
 		add("execution_account_id=$%d", filter.ExecutionAccountID)
 	}
+	clauses = appendAccountScope(clauses, &args, filter, "execution_account_id")
 	if filter.ActivityType != "" {
 		add("activity_type=$%d", filter.ActivityType)
 	}
@@ -209,6 +210,7 @@ func (reader *Reader) LedgerActivities(ctx context.Context, filter ListFilter) (
 		if filter.ExecutionAccountID != "" {
 			checkAdd("e.execution_account_id=$%d", filter.ExecutionAccountID)
 		}
+		checks = appendAccountScope(checks, &checkArgs, filter, "e.execution_account_id")
 		if filter.From != nil {
 			checkAdd("e.occurred_at >= $%d", filter.From.UTC())
 

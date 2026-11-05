@@ -414,3 +414,27 @@ Gamma does not provide an unambiguous resolution timestamp here, so `source_at`
 remains null; observation time is the actual read time. The lookup runs in the
 same bounded read-only price layer and failures do not erase successful current
 prices from other reads. No ledger settlement or redemption is performed.
+
+## 开仓区间账户核心指标
+
+`GET /api/v1/console/v2/account-cohort-metrics` 为新的只读统计，不改变旧 `account-core-metrics` 或资金账本的含费记录。
+
+参数：可选 `execution_account_id`；或 `account_scope=active|all`（不能与具体账户并用）；可选成对 `opening_from` / `opening_to` RFC3339，按 `[from,to)` 筛选开仓批次，省略为全历史开仓。`active` 仅包含配置 `ACTIVE` / `SELL_ONLY`；具体暂停账户仍可单独查询。所有后续平仓、赎回、Kalshi 净对冲及结算追踪至 `observed_at`，估值用最新价格，不按区间终点截断。
+
+响应仍为 `data.observed_at/items[]`，另含 nullable `opening_from/opening_to`。每账户保留当前资产/定价明细、成本及收益字段；新增：
+
+- `opened_asset_count`：所选 lot 按完整结果资产身份去重后的资产数。
+- `holding_asset_count`（等于 `asset_count`）、`closed_asset_count`：所选批次尚有剩余即持仓（含待赎回和部分平仓），全部平掉才已平仓；两者之和等于开仓资产数。
+- `buy_fees` / `sell_fees`：仅归属所选批次且已实际记录的买入/卖出费用。反向 BUY 净对冲费用仍为买入费用；结算不新增卖出费用。接管资产没有记录的历史费用不猜测。
+- `roi`：总盈亏 / 累计投入本金；`return_rate`：总盈亏 / 历史最高同时持仓本金。返回比率字符串；分母为零或缺价时为 null。
+- `max_drawdown` / `drawdown_state`：暂无完整历史逐时持仓报价覆盖时返回 null / `history_unavailable`，不以已实现回撤替代总盈亏回撤；空开仓集合为 `"0"` / `available`。兼容基类中的 `realized_drawdown_14d` 不供此视图使用。
+
+新统计全部本金及收益排除手续费：开仓本金取真实 fill.gross_notional（接管取登记原始成本）；本金按所选 lot 份额分配至剩余/关闭部分，已实现为真实分配回款加回实际卖出费减对应本金。净对冲保留已入账各腿回款归属。浮动为最新估值减剩余本金，总盈亏为已实现加浮动。最高持仓本金按所选批次生命周期重放，同刻开仓先于关闭；没有空闲余额或未成交挂单。
+
+注册、源身份、原始份额与开仓 fill、剩余份额与全部真实 allocation 守恒、全部账本字段在一个 READ ONLY REPEATABLE READ 快照核对；事务释放后复用独立官方取价服务。保留 5 秒请求预算、100000 lot / 200000 disposition / 2000 当前资产 / 8 MiB 响应上限，超限失败不截成员。未知/重复/单侧日期/反向或空区间/账户范围冲突为 400；数据库、身份/守恒失败为安全 503；缺价保留本金与已实现事实，估值/浮动/总盈亏/两个收益率为 null。
+
+### 工作区活跃账户范围
+
+支持账户筛选的列表资源新增可选 `account_scope=active|all`，与 `execution_account_id`（含别名 `account`）互斥。省略保留旧全部账户行为；新工作区默认显式发送 `active`。仅配置模式 `ACTIVE`、`SELL_ONLY` 属于活跃；`PAUSED` 和未知模式不纳入。具体暂停账户仍可单独查询。
+
+范围在订单、持仓、成交与结算、对账等资源的 SQL 谓词中应用，精确 total、summary 和当前页共用筛选，不能在浏览器按页隐藏暂停账户。账户目录继续列出所有受管账户，以支持选择暂停账户。详情及精确 lot 展开沿用自身身份，不新增聚合范围参数。

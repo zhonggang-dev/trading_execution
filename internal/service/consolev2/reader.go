@@ -432,6 +432,9 @@ func countQuery(ctx context.Context, tx *sql.Tx, query string, args []any, opera
 }
 
 func normalizeFilter(filter ListFilter) (ListFilter, error) {
+	if err := ValidateAccountScope(filter.ExecutionAccountID, filter.AccountScope); err != nil {
+		return ListFilter{}, err
+	}
 	if filter.Limit == 0 {
 		filter.Limit = defaultLimit
 	}

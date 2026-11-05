@@ -99,7 +99,7 @@ func normalizeHoldingIdentity(identity HoldingIdentity) (HoldingIdentity, error)
 // window: an old OPEN lot is still a current asset. Historical date filtering
 // belongs to PositionLots, where opened_at is explicit.
 func (reader *Reader) Holdings(ctx context.Context, filter ListFilter) (Page[Holding], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[Holding]{}, err
 	}
@@ -128,6 +128,7 @@ func (reader *Reader) Holdings(ctx context.Context, filter ListFilter) (Page[Hol
 	if filter.ExecutionAccountID != "" {
 		conditions = append(conditions, "l.execution_account_id = "+arg(filter.ExecutionAccountID))
 	}
+	conditions = appendAccountScope(conditions, &args, filter, "l.execution_account_id")
 	if filter.MarketSource != "" {
 		conditions = append(conditions, "COALESCE(NULLIF(open.intent->>'market_source',''), '') = "+arg(filter.MarketSource))
 	}
@@ -242,7 +243,7 @@ ORDER BY paged.last_opened_at DESC, paged.execution_account_id, paged.model_id,
 // the caller already selected a precise group, and history belongs to
 // PositionLots.
 func (reader *Reader) HoldingLots(ctx context.Context, identity HoldingIdentity, filter ListFilter) (Page[PositionLot], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[PositionLot]{}, err
 	}
@@ -250,7 +251,7 @@ func (reader *Reader) HoldingLots(ctx context.Context, identity HoldingIdentity,
 		return Page[PositionLot]{}, fmt.Errorf("holding lots do not support time filters")
 	}
 	if filter.Query != "" || filter.ModelID != "" || filter.StrategyID != "" ||
-		filter.ExecutionAccountID != "" || filter.MarketSource != "" ||
+		filter.ExecutionAccountID != "" || filter.AccountScope != "" || filter.MarketSource != "" ||
 		filter.Status != "" || filter.Side != "" {
 		return Page[PositionLot]{}, fmt.Errorf("holding lots only support limit and offset")
 	}
