@@ -2523,16 +2523,24 @@ func newIntegrationDatabase(t *testing.T, databaseURL string) *sql.DB {
 		if err != nil {
 			t.Fatalf("read migration %s: %v", name, err)
 		}
-		if _, err := db.Exec(string(migration)); err != nil {
+		migrationSQL := string(migration)
+		if name == "0043_rebased_historical_lot_sales.sql" {
+			migrationSQL = strings.ReplaceAll(migrationSQL, "search_path=public,pg_temp", "search_path="+schema+",pg_temp")
+		}
+		if _, err := db.Exec(migrationSQL); err != nil {
 			t.Fatalf("apply migration %s: %v", name, err)
 		}
 	}
-	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql", "0029_position_lot_model_route_successors.sql", "0030_remove_position_lot_model_routes.sql", "0031_reconciliation_balance_snapshot_block.sql", "0032_redeemed_zero_mark_price.sql", "0033_chain_cash_ledger.sql", "0034_polymarket_redemption_submit_failures.sql", "0037_external_position_baseline_amendments.sql", "0038_kalshi_settlements.sql", "0039_order_decision_quotes.sql", "0040_order_decision_meta.sql", "0041_binding_authorization_without_model.sql", "0042_kalshi_operator_controls.sql"} {
+	for _, name := range []string{"0021_polymarket_auto_redeem.sql", "0022_lot_entry_price_from_fill_notional.sql", "0023_internal_rejection_freshness.sql", "0024_managed_external_sells.sql", "0025_sell_exit_freshness_exemption.sql", "0026_strategy_orderbook_snapshots.sql", "0027_order_recovery_isolation.sql", "0028_pending_polygon_settlement_evidence.sql", "0029_position_lot_model_route_successors.sql", "0030_remove_position_lot_model_routes.sql", "0031_reconciliation_balance_snapshot_block.sql", "0032_redeemed_zero_mark_price.sql", "0033_chain_cash_ledger.sql", "0034_polymarket_redemption_submit_failures.sql", "0037_external_position_baseline_amendments.sql", "0038_kalshi_settlements.sql", "0039_order_decision_quotes.sql", "0040_order_decision_meta.sql", "0041_binding_authorization_without_model.sql", "0042_kalshi_operator_controls.sql", "0043_rebased_historical_lot_sales.sql"} {
 		migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", name))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(string(migration)); err != nil {
+		migrationSQL := string(migration)
+		if name == "0043_rebased_historical_lot_sales.sql" {
+			migrationSQL = strings.ReplaceAll(migrationSQL, "search_path=public,pg_temp", "search_path="+schema+",pg_temp")
+		}
+		if _, err := db.Exec(migrationSQL); err != nil {
 			t.Fatalf("apply %s: %v", name, err)
 		}
 	}

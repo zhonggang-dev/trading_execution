@@ -36,6 +36,13 @@ func (reader *OrderFilledEvidenceReader) ReadExternalSell(ctx context.Context, r
 	if !sameEvidence(current, evidence) {
 		return evidence, fmt.Errorf("sell receipt changed")
 	}
+	if err = verifyExternalSellCash(receipt, evidence, collateral); err != nil {
+		return evidence, err
+	}
+	return evidence, nil
+}
+
+func verifyExternalSellCash(receipt rpcReceipt, evidence OrderFilledEvidence, collateral string) error {
 	actual := new(big.Int)
 	walletTopic := "0x" + strings.Repeat("0", 24) + strings.TrimPrefix(evidence.Maker, "0x")
 	for _, log := range receipt.Logs {
@@ -43,11 +50,11 @@ func (reader *OrderFilledEvidenceReader) ReadExternalSell(ctx context.Context, r
 			continue
 		}
 		if log.Removed != nil && *log.Removed {
-			return evidence, fmt.Errorf("removed transfer log")
+			return fmt.Errorf("removed transfer log")
 		}
 		amount, ok := new(big.Int).SetString(strings.TrimPrefix(log.Data, "0x"), 16)
 		if !ok || amount.Sign() < 0 {
-			return evidence, fmt.Errorf("invalid transfer amount")
+			return fmt.Errorf("invalid transfer amount")
 		}
 		if strings.EqualFold(log.Topics[2], walletTopic) {
 			actual.Add(actual, amount)
@@ -59,9 +66,9 @@ func (reader *OrderFilledEvidenceReader) ReadExternalSell(ctx context.Context, r
 	gross, _ := new(big.Int).SetString(evidence.TakerAmountBaseUnits, 10)
 	fee, _ := new(big.Int).SetString(evidence.FeeBaseUnits, 10)
 	if gross == nil || fee == nil || actual.Sign() <= 0 || actual.Cmp(new(big.Int).Sub(gross, fee)) != 0 {
-		return evidence, fmt.Errorf("actual collateral transfers do not equal SELL proceeds minus fee")
+		return fmt.Errorf("actual collateral transfers do not equal SELL proceeds minus fee")
 	}
-	return evidence, nil
+	return nil
 }
 
 // ReadTokenBalance reads one known token at an explicit block. tokenID empty
