@@ -59,3 +59,22 @@ func TestCohortValuationReusesQuotesAndGrossROI(t *testing.T) {
 		t.Fatal("invalid count identity accepted", err)
 	}
 }
+
+func TestCohortUnavailableAccountsHaveNoGuessedFinancialValues(t *testing.T) {
+	now := time.Now().UTC()
+	facts := consolev2.CohortMetricFacts{CoreMetricFacts: consolev2.CoreMetricFacts{ObservedAt: now, Accounts: []consolev2.CoreAccountFact{}}, Cohorts: map[string]consolev2.CohortAccountFact{}, UnavailableAccounts: []consolev2.CohortUnavailableAccount{{ExecutionAccountID: "retired", MarketSource: "POLYMARKET", Reason: "missing_disposition_evidence"}}}
+	s := New(cohortReaderFixture{facts: facts}, nil)
+	got, err := s.QueryCohort(context.Background(), consolev2.CohortFilter{ExecutionAccountID: "retired"})
+	if err != nil || len(got.Items) != 0 || len(got.UnavailableAccounts) != 1 {
+		t.Fatal(got, err)
+	}
+	raw, _ := json.Marshal(got)
+	if strings.Contains(string(raw), "realized_pnl") || strings.Contains(string(raw), "market_value") {
+		t.Fatal("financial amounts fabricated for unavailable account", string(raw))
+	}
+	facts.UnavailableAccounts = append(facts.UnavailableAccounts, facts.UnavailableAccounts[0])
+	s = New(cohortReaderFixture{facts: facts}, nil)
+	if _, err = s.QueryCohort(context.Background(), consolev2.CohortFilter{}); !errors.Is(err, consolev2.ErrUnavailable) {
+		t.Fatal("duplicate warnings accepted", err)
+	}
+}
