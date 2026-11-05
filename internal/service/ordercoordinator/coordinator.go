@@ -274,6 +274,9 @@ func (coordinator *Coordinator) resumeOrder(ctx context.Context, order domain.Or
 func (coordinator *Coordinator) refreshOrder(ctx context.Context, order domain.Order) (sweepAction, error) {
 	if coordinator.recovery == nil {
 		if _, err := coordinator.execution.Refresh(ctx, order.ID); err != nil {
+			if errors.Is(err, port.ErrSubmitInFlight) {
+				return sweepActionDeferred, nil
+			}
 			return sweepActionNone, ignoreRevisionConflict("refresh", order.ID, err)
 		}
 		return sweepActionRefresh, nil
@@ -282,8 +285,9 @@ func (coordinator *Coordinator) refreshOrder(ctx context.Context, order domain.O
 		Order: order, Holder: coordinator.recoveryHolder,
 		Work: func(workCtx context.Context) (domain.OrderRecoveryOutcomeKind, error) {
 			refreshed, err := coordinator.execution.Refresh(workCtx, order.ID)
-			if errors.Is(err, port.ErrOrderRevisionConflict) {
-				// Someone else progressed the order; no venue call was wasted twice.
+			if errors.Is(err, port.ErrOrderRevisionConflict) || errors.Is(err, port.ErrSubmitInFlight) {
+				// Someone else progressed the order, or its own submission is
+				// still running; no venue call was wasted twice.
 				return domain.OrderRecoveryOutcomeWaiting, nil
 			}
 			if err != nil {

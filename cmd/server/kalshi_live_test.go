@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountmaintenance"
 )
 
 type routeTestExecution struct{ submitted []domain.OrderIntent }
@@ -65,8 +69,9 @@ func TestKalshiPreflightFailureLeavesPolymarketRouteOperational(t *testing.T) {
 		}},
 	}
 	primary := &routeTestExecution{}
+	registry := accountmaintenance.New()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	composition, err := composeKalshiExecution(context.Background(), cfg, nil, memory.NewOrderRepository(), nil, nil, primary, logger)
+	composition, err := composeKalshiExecution(context.Background(), cfg, nil, memory.NewOrderRepository(), nil, nil, primary, registry, logger)
 	if err != nil {
 		t.Fatalf("composeKalshiExecution() error = %v", err)
 	}
@@ -75,6 +80,12 @@ func TestKalshiPreflightFailureLeavesPolymarketRouteOperational(t *testing.T) {
 	}
 	if len(composition.settlements) != 0 {
 		t.Fatalf("settlement services = %d, want none for a route that failed preflight", len(composition.settlements))
+	}
+	if reason, ok := registry.MaintenanceReason("kalshi:main"); !ok || reason != accountmaintenance.ReasonKalshiRouteUnavailable {
+		t.Fatalf("failed Kalshi route maintenance = %q, %v", reason, ok)
+	}
+	if _, ok := registry.MaintenanceReason("main"); ok {
+		t.Fatal("Kalshi preflight failure put a Polymarket account in maintenance")
 	}
 	polymarketIntent := domain.OrderIntent{
 		ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main",
@@ -128,7 +139,7 @@ func TestComposeKalshiRejectsCredentialWithoutKalshiAccount(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if _, err := composeKalshiExecution(context.Background(), cfg, nil, memory.NewOrderRepository(), nil, nil,
-		&routeTestExecution{}, logger); err == nil {
+		&routeTestExecution{}, nil, logger); err == nil {
 		t.Fatal("a Kalshi credential without a KALSHI account row must fail startup")
 	}
 }
@@ -188,5 +199,91 @@ func TestRetryKalshiRateLimitStopsWhenContextEnds(t *testing.T) {
 		func(context.Context) (string, error) { calls++; return "", rateLimitedError() })
 	if !kalshiRateLimited(err) || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+// A database without migration 0045 must not stop the process: the running
+// sync and position check are switched off and the drift-only check remains.
+func TestResolveKalshiLedgerSyncFallsBackWithoutTheMigration(t *testing.T) {
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logged, nil))
+	cfg := config.Config{Kalshi: config.Kalshi{SettlementEnabled: true, BalanceSyncEnabled: true, PositionCheckEnabled: true}}
+	if got := resolveKalshiLedgerSync(context.Background(), cfg, nil, logger); got != (kalshiLedgerSync{}) {
+		t.Fatalf("switches without the tables = %#v, want both off", got)
+	}
+	if !strings.Contains(logged.String(), "migration 0045 are missing") || !strings.Contains(logged.String(), "level=ERROR") {
+		t.Fatalf("log = %q, want an error naming the missing migration", logged.String())
+	}
+
+	logged.Reset()
+	cfg.Kalshi.BalanceSyncEnabled = false
+	if got := resolveKalshiLedgerSync(context.Background(), cfg, nil, logger); got != (kalshiLedgerSync{}) || logged.Len() != 0 {
+		t.Fatalf("disabled sync = %#v log %q, want off without a table check", got, logged.String())
+	}
+	cfg.Kalshi.BalanceSyncEnabled, cfg.Kalshi.SettlementEnabled = true, false
+	if got := resolveKalshiLedgerSync(context.Background(), cfg, nil, logger); got != (kalshiLedgerSync{balance: true, positions: true}) || logged.Len() != 0 {
+		t.Fatalf("settlement disabled = %#v log %q, want the configured switches unused and unchecked", got, logged.String())
+	}
+}
+
+// TestKalshiKeyFailureWithProtectedAssetsFreezesOnlyKalshi covers acceptance 4:
+// a bad local Kalshi key on an account with open reservations no longer
+// stops the process. The account is frozen in maintenance (no route, no
+// settlement, nothing released) and Polymarket keeps trading.
+func TestKalshiKeyFailureWithProtectedAssetsFreezesOnlyKalshi(t *testing.T) {
+	original := kalshiProtectedAssets
+	t.Cleanup(func() { kalshiProtectedAssets = original })
+	kalshiProtectedAssets = func(context.Context, *sql.DB, string) (bool, error) { return true, nil }
+
+	cfg := config.Config{
+		Kalshi: config.Kalshi{MarketDataEnabled: true, LiveAccounts: []config.KalshiLiveAccount{{
+			ExecutionAccountID: "kalshi:main", APIKeyID: "key", PrivateKeyPath: "/tmp/does-not-exist/kalshi.pem",
+		}}},
+		DecisionCycle: config.DecisionCycle{PredictionModelID: "echo", Accounts: []config.DecisionAccount{
+			{ExecutionAccountID: "main", MarketSource: domain.MarketSourcePolymarket, StrategyID: domain.StrategyIDMultfactorV2, Mode: config.DecisionAccountActive},
+			{ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi, StrategyID: domain.StrategyIDMultfactorV2, Mode: config.DecisionAccountActive},
+		}},
+	}
+	primary := &routeTestExecution{}
+	registry := accountmaintenance.New()
+	var logs bytes.Buffer
+	composition, err := composeKalshiExecution(context.Background(), cfg, nil, memory.NewOrderRepository(), nil, nil,
+		primary, registry, slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("composeKalshiExecution() = %v, want the frozen account to degrade instead of stopping startup", err)
+	}
+	if len(composition.activeAccounts) != 0 || len(composition.settlements) != 0 {
+		t.Fatalf("frozen account composed: active=%#v settlements=%d", composition.activeAccounts, len(composition.settlements))
+	}
+	entries := registry.Entries("kalshi:main")
+	if len(entries) != 1 || entries[0].Reason != accountmaintenance.ReasonKalshiRouteUnavailable ||
+		!strings.Contains(entries[0].Detail, "protected assets frozen") {
+		t.Fatalf("frozen account maintenance = %#v", entries)
+	}
+	if !strings.Contains(logs.String(), "frozen in maintenance") {
+		t.Fatalf("freeze was not logged at error level:\n%s", logs.String())
+	}
+	pm := domain.OrderIntent{ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main",
+		MarketSource: domain.MarketSourcePolymarket}
+	if !composition.execution.Enabled(pm) {
+		t.Fatal("Polymarket disabled by a Kalshi key failure")
+	}
+	if _, err := composition.execution.Submit(context.Background(), pm); err != nil || len(primary.submitted) != 1 {
+		t.Fatalf("Polymarket submit = %v, submitted %d", err, len(primary.submitted))
+	}
+	kalshiIntent := pm
+	kalshiIntent.MarketSource, kalshiIntent.ExecutionAccountID = domain.MarketSourceKalshi, "kalshi:main"
+	if composition.execution.Enabled(kalshiIntent) {
+		t.Fatal("frozen Kalshi account accepted a delivery")
+	}
+	if _, err := composition.execution.Submit(context.Background(), kalshiIntent); err == nil {
+		t.Fatal("frozen Kalshi account accepted a new order")
+	}
+
+	// A failed protected-asset lookup is a database problem and stays fatal.
+	kalshiProtectedAssets = func(context.Context, *sql.DB, string) (bool, error) { return false, errors.New("db down") }
+	if _, err := composeKalshiExecution(context.Background(), cfg, nil, memory.NewOrderRepository(), nil, nil,
+		primary, accountmaintenance.New(), slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
+		t.Fatal("protected-asset lookup failure must stop startup")
 	}
 }

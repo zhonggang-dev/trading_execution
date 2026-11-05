@@ -16,6 +16,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountmaintenance"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisioncycle"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
 	"github.com/UniPat-AI/trading_execution/internal/service/strategyreport"
@@ -34,6 +35,9 @@ type buildDecisionRunnerParams struct {
 	// routeInputPolicy skips the strategy call for accounts whose venue route
 	// cannot place orders (a Kalshi account in maintenance); nil routes all.
 	routeInputPolicy decisioncycle.RouteInputPolicy
+	// maintenance receives the Kalshi accounts that cannot trade because the
+	// Kalshi market-data client could not be built; optional.
+	maintenance *accountmaintenance.Registry
 }
 
 // buildDecisionRunner composes the pull-based production workflow without
@@ -77,11 +81,25 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 			HTTPClient:     noRedirectHTTPClient(params.cfg.Kalshi.RequestTimeout),
 		})
 		if buildErr != nil {
-			return nil, fmt.Errorf("build Kalshi authenticated client: %w", buildErr)
+			buildErr = fmt.Errorf("build Kalshi authenticated client: %w", buildErr)
+		} else if kalshiOrderBooks, buildErr = kalshi.NewOrderBookSource(kalshi.OrderBookParams{Client: kalshiClient}); buildErr != nil {
+			buildErr = fmt.Errorf("build Kalshi orderbook source: %w", buildErr)
 		}
-		kalshiOrderBooks, buildErr = kalshi.NewOrderBookSource(kalshi.OrderBookParams{Client: kalshiClient})
 		if buildErr != nil {
-			return nil, fmt.Errorf("build Kalshi orderbook source: %w", buildErr)
+			// A local Kalshi key/client problem must not stop Polymarket. Without
+			// Kalshi books every Kalshi account is held in maintenance (no strategy
+			// call, no delivery); marketbooks reports Kalshi targets as not
+			// configured. A restart is needed after the key is repaired.
+			kalshiOrderBooks = nil
+			logger := params.logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Error("Kalshi market data unavailable; Kalshi accounts held in maintenance", "error", buildErr)
+			for _, accountID := range configuredKalshiAccountIDs(cycleConfig) {
+				enterAccountMaintenance(logger, params.maintenance, accountID,
+					accountmaintenance.ReasonKalshiMarketDataUnavailable, buildErr.Error())
+			}
 		}
 	}
 	// Each venue's capture has its own budget (marketbooks.DefaultVenueTimeout);

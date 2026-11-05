@@ -85,6 +85,10 @@ type RuntimeConfig struct {
 	OrderSubmissionEnabled     bool
 	EntrySubmissionDisabled    bool
 	SubmissionDisabledAccounts []string
+	// MaintenanceAccounts returns the accounts currently held in maintenance
+	// (no strategy input, no new orders). They are reported as submission
+	// disabled; nil means none.
+	MaintenanceAccounts        func() []string
 	EntryDisabledAccounts      []string
 	StrategyDisabledAccounts   []string
 	KalshiStrategyInputEnabled bool

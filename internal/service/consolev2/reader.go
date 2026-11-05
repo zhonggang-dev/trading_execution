@@ -115,7 +115,7 @@ func (reader *Reader) Runtime(ctx context.Context) (Runtime, error) {
 		Submission: RuntimeSubmission{
 			OrderSubmissionEnabled:     reader.config.OrderSubmissionEnabled,
 			EntrySubmissionDisabled:    reader.config.EntrySubmissionDisabled,
-			SubmissionDisabledAccounts: append([]string(nil), reader.config.SubmissionDisabledAccounts...),
+			SubmissionDisabledAccounts: reader.submissionDisabledAccounts(),
 			EntryDisabledAccounts:      append([]string(nil), reader.config.EntryDisabledAccounts...),
 			StrategyDisabledAccounts:   append([]string(nil), reader.config.StrategyDisabledAccounts...),
 			KalshiStrategyInputEnabled: reader.config.KalshiStrategyInputEnabled,
@@ -142,6 +142,7 @@ func (reader *Reader) runtimeAccounts(ctx context.Context) ([]RuntimeAccount, st
 	}
 	defer tx.Rollback()
 
+	submissionDisabled := reader.submissionDisabledAccounts()
 	values := make([]string, 0, len(reader.config.Bindings))
 	args := make([]any, 0, len(reader.config.Bindings)*3)
 	for index, binding := range reader.config.Bindings {
@@ -243,13 +244,13 @@ ORDER BY configured.execution_account_id, configured.model_id, configured.strate
 			return nil, "unavailable", dbUnavailable("scan runtime accounts", fmt.Errorf("count outside supported range"))
 		}
 		account.OpenIssueCount, account.OpenOrderCount = int(openIssues), int(openOrders)
-		account.StrategyInputState = runtimeAccountState(account.ExecutionAccountID, reader.config.SubmissionDisabledAccounts, reader.config.StrategyDisabledAccounts, false)
+		account.StrategyInputState = runtimeAccountState(account.ExecutionAccountID, submissionDisabled, reader.config.StrategyDisabledAccounts, false)
 		account.EntryGateState = runtimeEntryGateState(
 			cycleAt,
 			cycleEntryEnabled,
 			entryBlockReason,
 		)
-		account.OrderSubmissionState = runtimeAccountState(account.ExecutionAccountID, reader.config.SubmissionDisabledAccounts, nil, !reader.config.OrderSubmissionEnabled)
+		account.OrderSubmissionState = runtimeAccountState(account.ExecutionAccountID, submissionDisabled, nil, !reader.config.OrderSubmissionEnabled)
 		if mode := runtimeBindingMode(reader.config.Bindings, account.ModelID, account.StrategyID, account.ExecutionAccountID); mode != "" {
 			account.SourceMode = mode
 		}
@@ -262,6 +263,21 @@ ORDER BY configured.execution_account_id, configured.model_id, configured.strate
 		return nil, "unavailable", dbUnavailable("commit runtime accounts", err)
 	}
 	return accounts, "available", nil
+}
+
+// submissionDisabledAccounts merges the static disabled accounts with the
+// accounts currently in maintenance, without duplicates and in a stable order.
+func (reader *Reader) submissionDisabledAccounts() []string {
+	result := append([]string(nil), reader.config.SubmissionDisabledAccounts...)
+	if reader.config.MaintenanceAccounts == nil {
+		return result
+	}
+	for _, accountID := range reader.config.MaintenanceAccounts() {
+		if !containsString(result, accountID) {
+			result = append(result, accountID)
+		}
+	}
+	return result
 }
 
 func runtimeBindingMode(bindings []Binding, modelID, strategyID, accountID string) string {

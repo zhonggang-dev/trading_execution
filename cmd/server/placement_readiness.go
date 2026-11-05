@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/executionrouter"
 )
 
 // placementReadinessVenue closes the construction cycle between execution and
@@ -30,19 +32,29 @@ type placementAccountReadinessChecker interface {
 type placementAccountReadiness struct {
 	reconciliation placementAccountReadinessChecker
 	global         readinessChecker
+	// maintenance is defense in depth behind the execution router: a path that
+	// reaches the Polymarket execution directly is still refused locally.
+	maintenance executionrouter.Maintenance
 }
 
 func newPlacementAccountReadiness(
 	reconciliation placementAccountReadinessChecker,
 	global readinessChecker,
+	maintenance executionrouter.Maintenance,
 ) (*placementAccountReadiness, error) {
 	if reconciliation == nil {
 		return nil, fmt.Errorf("account reconciliation readiness is required")
 	}
-	return &placementAccountReadiness{reconciliation: reconciliation, global: global}, nil
+	return &placementAccountReadiness{reconciliation: reconciliation, global: global, maintenance: maintenance}, nil
 }
 
 func (checker *placementAccountReadiness) CheckPlacement(ctx context.Context, order domain.Order) error {
+	if checker.maintenance != nil {
+		accountID := strings.TrimSpace(order.Intent.ExecutionAccountID)
+		if reason, maintenance := checker.maintenance.MaintenanceReason(accountID); maintenance {
+			return fmt.Errorf("execution account %q is in maintenance (%s)", accountID, reason)
+		}
+	}
 	if err := checker.reconciliation.CheckPlacement(ctx, order); err != nil {
 		return fmt.Errorf("reconciliation: %w", err)
 	}
@@ -104,6 +116,14 @@ func (prepared placementReadinessPrepared) ExpectedVenueOrderID() string {
 		return ""
 	}
 	return prepared.inner.ExpectedVenueOrderID()
+}
+
+// VenueExpiresAt forwards the venue expiry of the wrapped placement.
+func (prepared placementReadinessPrepared) VenueExpiresAt() (time.Time, bool) {
+	if prepared.inner == nil {
+		return time.Time{}, false
+	}
+	return port.PreparedVenueExpiry(prepared.inner)
 }
 
 func (venue *placementReadinessVenue) PreparePlace(ctx context.Context, order domain.Order) (port.PreparedPlacement, error) {

@@ -416,6 +416,58 @@ func (client *Client) ListFills(ctx context.Context, orderID string) ([]Fill, er
 	return nil, fmt.Errorf("Kalshi fill lookup exceeded pagination limit")
 }
 
+// ListMarketFills returns every account fill of one market ticker. It is
+// read-only evidence for the settlement review tool; each row must name the
+// requested market and carry a fill id and a count.
+func (client *Client) ListMarketFills(ctx context.Context, ticker string) ([]Fill, error) {
+	ticker, cursor := strings.TrimSpace(ticker), ""
+	if ticker == "" || strings.Contains(ticker, ":") {
+		return nil, fmt.Errorf("Kalshi fill ticker is required")
+	}
+	result := make([]Fill, 0)
+	for page := 0; page < 100; page++ {
+		var envelope struct {
+			Fills  *[]Fill `json:"fills"`
+			Cursor *string `json:"cursor"`
+		}
+		query := url.Values{"ticker": []string{ticker}, "limit": []string{"1000"}}
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
+		if err := client.doAuthenticated(ctx, http.MethodGet, "/trade-api/v2/portfolio/fills?"+query.Encode(), nil, &envelope); err != nil {
+			return nil, err
+		}
+		if envelope.Fills == nil {
+			return nil, fmt.Errorf("Kalshi fills response omitted the fills collection")
+		}
+		if envelope.Cursor == nil {
+			return nil, fmt.Errorf("Kalshi fills response omitted the pagination cursor")
+		}
+		for _, fill := range *envelope.Fills {
+			remoteTicker := strings.TrimSpace(fill.Ticker)
+			if remoteTicker == "" {
+				remoteTicker = strings.TrimSpace(fill.MarketTicker)
+			}
+			if remoteTicker != ticker {
+				return nil, fmt.Errorf("Kalshi fills response returned market %q for %q", remoteTicker, ticker)
+			}
+			if strings.TrimSpace(fill.FillID) == "" || fill.Count.IsEmpty() {
+				return nil, fmt.Errorf("Kalshi fill of %s omitted fill_id or count_fp", ticker)
+			}
+			result = append(result, fill)
+		}
+		next := strings.TrimSpace(*envelope.Cursor)
+		if next == "" {
+			return result, nil
+		}
+		if next == cursor {
+			return nil, fmt.Errorf("Kalshi fills cursor did not advance")
+		}
+		cursor = next
+	}
+	return nil, fmt.Errorf("Kalshi fill lookup exceeded pagination limit")
+}
+
 // ListOrderFills returns Kalshi's authoritative account fills for the exact
 // venue order. The API reports final fee_cost per fill, so no fee is inferred.
 func (client *Client) ListOrderFills(ctx context.Context, order domain.Order) ([]domain.Fill, error) {

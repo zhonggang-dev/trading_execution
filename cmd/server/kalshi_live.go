@@ -14,6 +14,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/port"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountmaintenance"
 	"github.com/UniPat-AI/trading_execution/internal/service/accountscope"
 	"github.com/UniPat-AI/trading_execution/internal/service/execution"
 	"github.com/UniPat-AI/trading_execution/internal/service/executionrouter"
@@ -33,14 +34,15 @@ type kalshiComposition struct {
 
 func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sql.DB, repository port.OrderRepository,
 	guard port.Guard, ledger *postgresadapter.FillLedger, primary executionrouter.Execution,
-	logger *slog.Logger) (kalshiComposition, error) {
+	maintenance *accountmaintenance.Registry, logger *slog.Logger) (kalshiComposition, error) {
 	if len(cfg.Kalshi.LiveAccounts) == 0 {
-		router, err := executionrouter.New(repository, primary, nil)
+		router, err := executionrouter.NewWithMaintenance(repository, primary, nil, optionalMaintenance(maintenance))
 		return kalshiComposition{execution: router}, err
 	}
 	if !cfg.Kalshi.MarketDataEnabled {
 		return kalshiComposition{}, fmt.Errorf("Kalshi live accounts require KALSHI_MARKET_DATA_ENABLED=true")
 	}
+	ledgerSync := resolveKalshiLedgerSync(ctx, cfg, database, logger)
 	routes := make([]executionrouter.Route, 0, len(cfg.Kalshi.LiveAccounts))
 	active := make([]string, 0, len(cfg.Kalshi.LiveAccounts))
 	settlements := make([]*kalshisettlement.Service, 0, len(cfg.Kalshi.LiveAccounts))
@@ -49,27 +51,42 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 		if !ok {
 			return kalshiComposition{}, fmt.Errorf("Kalshi live account %q is not a KALSHI decision account", liveAccount.ExecutionAccountID)
 		}
-		built, err := buildKalshiLiveRoute(ctx, cfg, account, liveAccount, database, repository, guard, ledger)
+		built, err := buildKalshiLiveRoute(ctx, cfg, account, liveAccount, database, repository, guard, ledger, ledgerSync)
 		if err != nil {
-			needsMaintenance, maintenanceErr := kalshiAccountNeedsMaintenance(ctx, database, account.ExecutionAccountID)
+			needsMaintenance, maintenanceErr := kalshiProtectedAssets(ctx, database, account.ExecutionAccountID)
 			if maintenanceErr != nil {
 				return kalshiComposition{}, fmt.Errorf("inspect failed Kalshi route maintenance state: %w", maintenanceErr)
 			}
 			if needsMaintenance {
-				// Never start without the only route capable of recovering an owned
-				// order or releasing protected assets. A bad local key/configuration
-				// must be repaired instead of silently orphaning durable trading state.
-				return kalshiComposition{}, fmt.Errorf("Kalshi account with unresolved protected assets cannot enter maintenance mode: %w", err)
+				// Without a client there is no route able to recover an owned order
+				// or release protected assets. The account is frozen: no route, no
+				// order recovery, no settlement, and its reservations, orders, and
+				// lots stay exactly as they are (nothing is released or decided).
+				// Repairing the credential and restarting resumes the normal
+				// recovery path. Polymarket and other Kalshi accounts keep running.
+				detail := "protected assets frozen until credentials are repaired and the service restarts: " + err.Error()
+				logger.Error("Kalshi account with unresolved protected assets frozen in maintenance",
+					"strategy_id", account.StrategyID, "execution_account_id", account.ExecutionAccountID, "error", err)
+				enterAccountMaintenance(logger, maintenance, account.ExecutionAccountID,
+					accountmaintenance.ReasonKalshiRouteUnavailable, detail)
+				continue
 			}
 			// Kalshi is an additive venue. A credential/API failure downgrades only
 			// an account with no durable work to dry-run; it must never take
 			// Polymarket offline merely because a Kalshi account is unavailable.
 			logger.Error("Kalshi live account disabled after preflight", "strategy_id", account.StrategyID,
 				"execution_account_id", account.ExecutionAccountID, "error", err)
+			enterAccountMaintenance(logger, maintenance, account.ExecutionAccountID,
+				accountmaintenance.ReasonKalshiRouteUnavailable, "Kalshi route unavailable until restart: "+err.Error())
 			continue
 		}
 		routes = append(routes, built.route)
 		active = append(active, account.ExecutionAccountID)
+		if built.maintenanceOnly {
+			enterAccountMaintenance(logger, maintenance, account.ExecutionAccountID,
+				accountmaintenance.ReasonKalshiRouteUnavailable,
+				"Kalshi remote preflight failed; maintenance-only route until restart: "+built.preflightError)
+		}
 		if built.settlement != nil {
 			settlements = append(settlements, built.settlement)
 		}
@@ -78,11 +95,19 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 			"buy_funded", built.buyFunded, "maintenance_only", built.maintenanceOnly,
 			"balance_sync_deferred", built.balanceSyncDeferred)
 	}
-	router, err := executionrouter.New(repository, primary, routes)
+	router, err := executionrouter.NewWithMaintenance(repository, primary, routes, optionalMaintenance(maintenance))
 	if err != nil {
 		return kalshiComposition{}, err
 	}
 	return kalshiComposition{execution: router, activeAccounts: active, settlements: settlements}, nil
+}
+
+// optionalMaintenance keeps a nil registry from becoming a non-nil interface.
+func optionalMaintenance(registry *accountmaintenance.Registry) executionrouter.Maintenance {
+	if registry == nil {
+		return nil
+	}
+	return registry
 }
 
 type builtKalshiLiveRoute struct {
@@ -91,10 +116,40 @@ type builtKalshiLiveRoute struct {
 	settlement          *kalshisettlement.Service
 	maintenanceOnly     bool
 	balanceSyncDeferred bool
+	// preflightError explains a maintenance-only route.
+	preflightError string
+}
+
+// kalshiLedgerSync is what the running cash sync and position check may do in
+// this process.
+type kalshiLedgerSync struct {
+	balance   bool
+	positions bool
+}
+
+// resolveKalshiLedgerSync turns the configuration into the effective switches.
+// A database without migration 0045 turns both off and keeps the drift-only
+// check: the process keeps running rather than refusing to start.
+func resolveKalshiLedgerSync(ctx context.Context, cfg config.Config, database *sql.DB, logger *slog.Logger) kalshiLedgerSync {
+	switches := kalshiLedgerSync{
+		balance:   cfg.Kalshi.BalanceSyncEnabled,
+		positions: cfg.Kalshi.BalanceSyncEnabled && cfg.Kalshi.PositionCheckEnabled,
+	}
+	if !cfg.Kalshi.SettlementEnabled || !switches.balance {
+		return switches
+	}
+	present, err := postgresadapter.KalshiLedgerSyncTablesPresent(ctx, database)
+	if err != nil || !present {
+		logger.Error("Kalshi ledger sync tables from migration 0045 are missing; running cash sync and position check are off, the drift-only balance check continues",
+			"error", err)
+		return kalshiLedgerSync{}
+	}
+	return switches
 }
 
 func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config.DecisionAccount, credential config.KalshiLiveAccount,
-	database *sql.DB, repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger) (builtKalshiLiveRoute, error) {
+	database *sql.DB, repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger,
+	ledgerSync kalshiLedgerSync) (builtKalshiLiveRoute, error) {
 	client, err := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, APIKeyID: credential.APIKeyID,
 		PrivateKeyPath: credential.PrivateKeyPath, HTTPClient: noRedirectHTTPClient(cfg.Kalshi.RequestTimeout), LiveTradingEnabled: true})
 	if err != nil {
@@ -102,6 +157,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 	}
 	internalID := account.ExecutionAccountID
 	maintenanceOnly := false
+	preflightErrorText := ""
 	balanceSyncDeferred := false
 	cashBalance := domain.Decimal("0")
 	capabilities, preflightErr := retryKalshiRateLimit(ctx, sleepContext, client.ProbeCapabilities)
@@ -134,6 +190,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 		// Keep a maintenance route for refresh/fill/finality recovery. BUY is
 		// disabled until a clean restart completes the remote preflight.
 		maintenanceOnly = true
+		preflightErrorText = preflightErr.Error()
 	}
 	venue, err := kalshi.NewVenue(client)
 	if err != nil {
@@ -167,6 +224,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 	service, err := execution.New(execution.Params{Repository: repository, Venue: venue, Guard: guard, MarketValidator: validator,
 		Reservations: reservations, FillSynchronizer: processor, AuthoritativeFills: true, AccountScope: scope,
 		RequirePreparedPlacement: true, MaxReconcileAttempts: cfg.Polymarket.MaxReconcileAttempts,
+		SubmitAttemptTimeout: cfg.Execution.SubmitAttemptTimeout, SubmitInFlightGrace: cfg.Execution.SubmitInFlightGrace,
 		CancelFillFinalityGrace: cfg.Polymarket.CancelFillFinalityGrace, EntrySubmissionDisabled: cfg.DecisionCycle.EntrySubmissionDisabled,
 		EntryDisabledAccounts: entryDisabledAccounts})
 	if err != nil {
@@ -183,6 +241,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 		settlement, err = kalshisettlement.New(kalshisettlement.Params{
 			ExecutionAccountID: internalID, Source: client, Store: settlementStore,
 			Interval: cfg.Kalshi.SettlementInterval, BalanceDriftThreshold: cfg.Kalshi.BalanceDriftThreshold,
+			BalanceSyncEnabled: ledgerSync.balance, PositionCheckEnabled: ledgerSync.positions,
 		})
 		if err != nil {
 			return builtKalshiLiveRoute{}, err
@@ -194,6 +253,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 			MaintenanceOnly: maintenanceOnly},
 		buyFunded: cashSign > 0, settlement: settlement,
 		maintenanceOnly: maintenanceOnly, balanceSyncDeferred: balanceSyncDeferred,
+		preflightError: preflightErrorText,
 	}, nil
 }
 
@@ -282,6 +342,9 @@ func kalshiExecutionAccountExists(ctx context.Context, database *sql.DB, account
 	}
 	return exists, nil
 }
+
+// kalshiProtectedAssets is replaced only by tests that cannot reach PostgreSQL.
+var kalshiProtectedAssets = kalshiAccountNeedsMaintenance
 
 func kalshiAccountNeedsMaintenance(ctx context.Context, database *sql.DB, accountID string) (bool, error) {
 	if database == nil {

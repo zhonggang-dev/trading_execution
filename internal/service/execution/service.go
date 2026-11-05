@@ -22,6 +22,17 @@ var (
 	ErrIntentExpired         = errors.New("order intent has expired")
 	ErrOrderNotCancelable    = errors.New("order is not in a cancelable state")
 	ErrCancelFinalityPending = port.ErrCancelFinalityPending
+	ErrSubmitInFlight        = port.ErrSubmitInFlight
+)
+
+const (
+	// defaultSubmitAttemptTimeout bounds every venue call of one placement
+	// (pre-POST eligibility/funding checks, the POST, the fill read and the
+	// emulated-IOC cancel) once SUBMITTING is durable.
+	defaultSubmitAttemptTimeout = 60 * time.Second
+	// defaultSubmitInFlightGrace is how long recovery leaves a SUBMITTING
+	// order started by this process alone. It must exceed the submit timeout.
+	defaultSubmitInFlightGrace = 90 * time.Second
 )
 
 const (
@@ -60,8 +71,20 @@ type Params struct {
 	// RequirePreparedPlacement is mandatory for live composition. Paper and
 	// legacy in-memory tests may keep the one-step Venue contract.
 	RequirePreparedPlacement bool
-	Now                      func() time.Time
-	NewID                    func() string
+	// SubmitAttemptTimeout bounds the venue calls of one placement after the
+	// durable SUBMITTING write (default 60s). Ledger writes that record the
+	// outcome use a separate, uncancelled context.
+	SubmitAttemptTimeout time.Duration
+	// SubmitInFlightGrace keeps Refresh from forcing a SUBMITTING order that
+	// this process started less than this long ago (default 90s). Attempts
+	// started before this process was created are taken over at once.
+	SubmitInFlightGrace time.Duration
+	// UnacceptedResolver, when set, may cancel an UNKNOWN order whose venue
+	// read returns no order and release its reservation once every no-fill
+	// evidence source agrees. Nil keeps such orders frozen (Kalshi, paper).
+	UnacceptedResolver port.UnacceptedOrderResolver
+	Now                func() time.Time
+	NewID              func() string
 }
 
 // Service 表示后端使用的 Service 类型。
@@ -81,6 +104,10 @@ type Service struct {
 	entrySubmissionDisabled  bool
 	entryDisabledAccountSet  map[string]struct{}
 	requirePreparedPlacement bool
+	submitAttemptTimeout     time.Duration
+	submitInFlightGrace      time.Duration
+	unacceptedResolver       port.UnacceptedOrderResolver
+	processStartedAt         time.Time
 	now                      func() time.Time
 	newID                    func() string
 }
@@ -122,6 +149,18 @@ func New(params Params) (*Service, error) {
 	if params.MaxReconcileAttempts < 1 || params.MaxReconcileAttempts > 100 {
 		return nil, fmt.Errorf("max reconcile attempts must be between 1 and 100")
 	}
+	if params.SubmitAttemptTimeout == 0 {
+		params.SubmitAttemptTimeout = defaultSubmitAttemptTimeout
+	}
+	if params.SubmitInFlightGrace == 0 {
+		params.SubmitInFlightGrace = defaultSubmitInFlightGrace
+	}
+	if params.SubmitAttemptTimeout < time.Second || params.SubmitAttemptTimeout > 10*time.Minute {
+		return nil, fmt.Errorf("submit attempt timeout must be between one second and 10 minutes")
+	}
+	if params.SubmitInFlightGrace <= params.SubmitAttemptTimeout || params.SubmitInFlightGrace > 10*time.Minute {
+		return nil, fmt.Errorf("submit in-flight grace must exceed the submit attempt timeout and be at most 10 minutes")
+	}
 	if params.Now == nil {
 		params.Now = time.Now
 	}
@@ -148,6 +187,10 @@ func New(params Params) (*Service, error) {
 		entrySubmissionDisabled:  params.EntrySubmissionDisabled,
 		entryDisabledAccountSet:  entryDisabledAccountSet,
 		requirePreparedPlacement: params.RequirePreparedPlacement,
+		submitAttemptTimeout:     params.SubmitAttemptTimeout,
+		submitInFlightGrace:      params.SubmitInFlightGrace,
+		unacceptedResolver:       params.UnacceptedResolver,
+		processStartedAt:         params.Now().UTC(),
 		now:                      params.Now,
 		newID:                    params.NewID,
 	}, nil
@@ -255,6 +298,7 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 		return SubmitResult{Order: stored, Created: created}, errors.Join(cause, releaseErr)
 	}
 	var prepared port.PreparedPlacement
+	var venueExpiresAt *time.Time
 	preparedVenue, supportsPrepared := service.venue.(port.PreparedVenue)
 	if service.requirePreparedPlacement && !supportsPrepared {
 		// New rejects this configuration, but keep the runtime check as a
@@ -281,8 +325,13 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 		// both execution_orders and execution_order_attempts before PlacePrepared
 		// can issue the POST. Some venues later replace it with an authoritative ID.
 		stored.VenueOrderID = expectedVenueOrderID
+		// A venue-enforced expiry (GTD) is recorded with the same attempt so
+		// a later no-fill decision can rely on it.
+		if expiresAt, ok := port.PreparedVenueExpiry(prepared); ok {
+			venueExpiresAt = &expiresAt
+		}
 	}
-	attempt, err := service.startAttempt(ctx, &stored, domain.OrderStatusSubmitting, domain.OrderAttemptSubmit, domain.TransitionTriggerSubmit)
+	attempt, err := service.startAttemptWithExpiry(ctx, &stored, domain.OrderStatusSubmitting, domain.OrderAttemptSubmit, domain.TransitionTriggerSubmit, venueExpiresAt)
 	if err != nil {
 		var localRejection *port.Rejection
 		if errors.As(err, &localRejection) {
@@ -301,13 +350,23 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 		uncertainErr := service.reservations.MarkUncertain(ctx, stored, "SUBMIT_ATTEMPT_PERSIST_FAILED: "+err.Error())
 		return SubmitResult{Order: stored, Created: created}, errors.Join(fmt.Errorf("start submit attempt: %w", err), uncertainErr)
 	}
+	// Every venue call of this placement shares one deadline, so a hanging
+	// upstream cannot keep the attempt STARTED (and the order SUBMITTING)
+	// longer than recovery's in-flight grace. The outcome is recorded with an
+	// uncancelled context: a deadline or caller cancellation right after the
+	// POST must still persist UNKNOWN rather than leave SUBMITTING behind.
+	venueCtx, cancelVenue := context.WithTimeout(ctx, service.submitAttemptTimeout)
+	defer cancelVenue()
 	var venueOrder port.VenueOrder
 	var placeErr error
 	if supportsPrepared {
-		venueOrder, placeErr = preparedVenue.PlacePrepared(ctx, stored, prepared)
+		venueOrder, placeErr = preparedVenue.PlacePrepared(venueCtx, stored, prepared)
 	} else {
-		venueOrder, placeErr = service.venue.Place(ctx, stored)
+		venueOrder, placeErr = service.venue.Place(venueCtx, stored)
 	}
+	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), service.submitAttemptTimeout)
+	defer cancelPersist()
+	ctx = persistCtx
 	if placeErr != nil {
 		return service.finishSubmitError(ctx, stored, attempt, placeErr, created)
 	}
@@ -347,7 +406,7 @@ func (service *Service) submitReserved(ctx context.Context, stored domain.Order,
 			return SubmitResult{Order: stored, Created: created}, errors.Join(err, unknownErr, uncertainErr)
 		}
 	}
-	if completed, acted, err := service.completeEmulatedIOC(ctx, stored, venueOrder); acted {
+	if completed, acted, err := service.completeEmulatedIOC(ctx, venueCtx, stored, venueOrder); acted {
 		return SubmitResult{Order: completed, Created: created}, err
 	}
 	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &stored, venueOrder)
@@ -407,7 +466,7 @@ func restingVenueState(state port.VenueOrderState) bool {
 // issued before any fill-evidence wait so pending CLOB trade details can never
 // leave the remainder on the book. The boolean reports whether the caller's
 // own post-observation handling was replaced by the cancel flow.
-func (service *Service) completeEmulatedIOC(ctx context.Context, order domain.Order, observed port.VenueOrder) (domain.Order, bool, error) {
+func (service *Service) completeEmulatedIOC(ctx, venueCtx context.Context, order domain.Order, observed port.VenueOrder) (domain.Order, bool, error) {
 	if !service.emulatesImmediateOrCancel(order) || !restingVenueState(observed.State) {
 		return order, false, nil
 	}
@@ -416,7 +475,7 @@ func (service *Service) completeEmulatedIOC(ctx context.Context, order domain.Or
 	default:
 		return order, false, nil
 	}
-	cancelled, err := service.Cancel(ctx, order.ID)
+	cancelled, err := service.cancel(ctx, venueCtx, order.ID)
 	if err != nil {
 		return cancelled, true, fmt.Errorf("cancel emulated IOC remainder: %w", err)
 	}
@@ -611,6 +670,12 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 	if order.Terminal() {
 		return order, nil
 	}
+	if order.Status == domain.OrderStatusSubmitting && service.submitInFlight(ctx, order) {
+		// The placement may still be running in this process. Forcing UNKNOWN
+		// now would make its own outcome write lose the revision race and turn
+		// an ordinary order into a recovery case.
+		return order, ErrSubmitInFlight
+	}
 	if order.Status == domain.OrderStatusSubmitting || order.Status == domain.OrderStatusReconciling {
 		if err := service.forceUnknown(ctx, &order, "INCOMPLETE_SUBMIT_ATTEMPT", errors.New("process recovered while submit attempt was still STARTED"), order.VenueOrderID); err != nil {
 			return order, err
@@ -692,6 +757,17 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 				if syncErr == nil && reloadErr == nil && order.Status == domain.OrderStatusFilled {
 					return order, nil
 				}
+				// Only a clean fill synchronization lets the no-fill resolver
+				// look at the order; it re-checks every source itself and keeps
+				// the order UNKNOWN unless all of them agree.
+				if syncErr == nil && reloadErr == nil && service.unacceptedResolver != nil &&
+					order.Status == domain.OrderStatusUnknown {
+					resolved, released, resolveErr := service.unacceptedResolver.ResolveUnaccepted(ctx, order)
+					if resolveErr == nil && released {
+						service.triggerReconciliation(resolved, domain.ReconciliationTriggerAssetDrift)
+						return resolved, nil
+					}
+				}
 				_ = service.reservations.MarkUncertain(ctx, order, "RECONCILE_FAILED: "+getErr.Error())
 				return order, errors.Join(fmt.Errorf("get venue order: %w", getErr), syncErr, reloadErr)
 			}
@@ -709,7 +785,7 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 	}
 	// A crash between placement and the emulated cancel can leave a GTC
 	// remainder resting; recovery completes the IOC instead of letting it rest.
-	if completed, acted, err := service.completeEmulatedIOC(ctx, order, venueOrder); acted {
+	if completed, acted, err := service.completeEmulatedIOC(ctx, ctx, order, venueOrder); acted {
 		return completed, err
 	}
 	pendingFillEvidence, syncErr := service.syncObservedFills(ctx, &order, venueOrder)
@@ -745,6 +821,11 @@ func (service *Service) Refresh(ctx context.Context, orderID string) (domain.Ord
 
 // Cancel 为可撤订单记录撤单尝试并处理明确或不确定的交易所结果。
 func (service *Service) Cancel(ctx context.Context, orderID string) (domain.Order, error) {
+	return service.cancel(ctx, ctx, orderID)
+}
+
+// cancel runs the venue DELETE under venueCtx and every ledger step under ctx.
+func (service *Service) cancel(ctx, venueCtx context.Context, orderID string) (domain.Order, error) {
 	order, err := service.Get(ctx, orderID)
 	if err != nil {
 		return order, err
@@ -762,7 +843,7 @@ func (service *Service) Cancel(ctx context.Context, orderID string) (domain.Orde
 	if err != nil {
 		return order, fmt.Errorf("start cancel attempt: %w", err)
 	}
-	venueOrder, cancelErr := service.venue.Cancel(ctx, order)
+	venueOrder, cancelErr := service.venue.Cancel(venueCtx, order)
 	if cancelErr != nil {
 		placeholder := port.VenueOrder{ID: firstNonEmpty(venueOrderIDFromError(cancelErr), order.VenueOrderID), State: port.VenueOrderUnknown, RawStatus: errorCode(cancelErr, "VENUE_CANCEL_OUTCOME_UNKNOWN"), FilledSize: order.FilledSize, ObservedAt: service.now().UTC()}
 		if err := service.finishAttemptWithOutcome(ctx, &order, &attempt, domain.OrderStatusUnknown, domain.TransitionTriggerCancel, placeholder, errorCode(cancelErr, "VENUE_CANCEL_OUTCOME_UNKNOWN"), cancelErr, domain.AttemptOutcomeUnknown); err != nil {
@@ -1116,6 +1197,11 @@ func (service *Service) transition(ctx context.Context, order *domain.Order, tar
 
 // startAttempt 开始并持久化 Attempt。
 func (service *Service) startAttempt(ctx context.Context, order *domain.Order, target domain.OrderStatus, kind domain.OrderAttemptKind, trigger domain.OrderTransitionTrigger) (domain.OrderAttempt, error) {
+	return service.startAttemptWithExpiry(ctx, order, target, kind, trigger, nil)
+}
+
+// startAttemptWithExpiry also records the venue expiry of a SUBMIT attempt.
+func (service *Service) startAttemptWithExpiry(ctx context.Context, order *domain.Order, target domain.OrderStatus, kind domain.OrderAttemptKind, trigger domain.OrderTransitionTrigger, venueExpiresAt *time.Time) (domain.OrderAttempt, error) {
 	existing, err := service.repository.Attempts(ctx, order.ID)
 	if err != nil {
 		return domain.OrderAttempt{}, err
@@ -1130,6 +1216,7 @@ func (service *Service) startAttempt(ctx context.Context, order *domain.Order, t
 		RequestFingerprint: attemptFingerprint(kind, *order),
 		VenueOrderID:       order.VenueOrderID,
 		StartedAt:          startedAt,
+		VenueExpiresAt:     venueExpiresAt,
 	}).Build()
 	if err != nil {
 		return domain.OrderAttempt{}, err
@@ -1302,6 +1389,32 @@ func (service *Service) forceUnknown(ctx context.Context, order *domain.Order, c
 		},
 		includeVenueData: true,
 	})
+}
+
+// submitInFlight reports whether a SUBMITTING order's placement may still be
+// running in this process: its latest SUBMIT attempt is STARTED, was started
+// by this process, and is younger than the in-flight grace. An unreadable
+// attempt list is treated as in flight; the next poll looks again.
+func (service *Service) submitInFlight(ctx context.Context, order domain.Order) bool {
+	attempts, err := service.repository.Attempts(ctx, order.ID)
+	if err != nil {
+		return true
+	}
+	var last *domain.OrderAttempt
+	for index := range attempts {
+		if attempts[index].Kind == domain.OrderAttemptSubmit {
+			last = &attempts[index]
+		}
+	}
+	if last == nil || last.Outcome != domain.AttemptOutcomeStarted {
+		return false
+	}
+	startedAt := last.StartedAt.UTC()
+	if startedAt.Before(service.processStartedAt) {
+		// Started by an earlier process, whose submission is gone.
+		return false
+	}
+	return service.now().UTC().Sub(startedAt) < service.submitInFlightGrace
 }
 
 // reconcileAttemptCount 对账并处理 Attempt Count。

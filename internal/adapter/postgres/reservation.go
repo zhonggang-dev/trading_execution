@@ -309,208 +309,222 @@ func (manager *ReservationManager) Reconcile(ctx context.Context, order domain.O
 		if err := lockExecutionAccount(ctx, tx, order.Intent.ExecutionAccountID); err != nil {
 			return domain.AssetReservation{}, err
 		}
-		storedReservation, err := selectReservationByOrderID(ctx, tx, order.ID, true)
+		return reconcileReservationTx(ctx, tx, order, fingerprint, now, "")
+	})
+}
+
+// reconcileReservationTx is the body of Reconcile inside a caller-owned
+// transaction that already holds the execution account row lock. details is
+// stored on the reservation event (empty for ordinary reconciliation).
+func reconcileReservationTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	order domain.Order,
+	fingerprint string,
+	now time.Time,
+	details string,
+) (domain.AssetReservation, error) {
+	storedReservation, err := selectReservationByOrderID(ctx, tx, order.ID, true)
+	if err != nil {
+		return domain.AssetReservation{}, err
+	}
+	if err := verifyReservation(storedReservation, order, fingerprint); err != nil {
+		return domain.AssetReservation{}, err
+	}
+	reservation := storedReservation.AssetReservation
+
+	filled := order.FilledSize
+	if filled.IsEmpty() {
+		filled = "0"
+	}
+	if comparison, err := filled.Compare(reservation.SettledShares); err != nil || comparison < 0 {
+		return domain.AssetReservation{}, fmt.Errorf("cumulative filled shares moved backward")
+	}
+	if comparison, err := filled.Compare(reservation.RequestedShares); err != nil || comparison > 0 {
+		if err != nil || !order.AllowsBuySharePriceImprovement() {
+			return domain.AssetReservation{}, fmt.Errorf("cumulative filled shares exceed requested shares")
+		}
+		if settledComparison, compareErr := reservation.SettledShares.Compare(reservation.RequestedShares); compareErr != nil || settledComparison != 0 ||
+			reservation.Status != domain.ReservationStatusSettled || !reservation.RemainingReservedBalance.Equal("0") ||
+			!reservation.SettledNotional.Equal(order.FilledNotional) || !reservation.SettledFees.Equal(order.TotalFees) {
+			return domain.AssetReservation{}, fmt.Errorf("Polymarket BUY price improvement must be applied by the authoritative fill ledger")
+		}
+		// The reservation ledger tracks consumption of the requested minimum
+		// shares. Extra price-improvement shares are already present in the
+		// immutable fill, order, lot, and position ledgers. Once those exact
+		// totals are present, generic reservation reconciliation is a no-op.
+		return reservation, nil
+	}
+	averagePrice := order.AverageFillPrice
+	if sign, _ := filled.Sign(); sign == 0 {
+		averagePrice = "0"
+	}
+
+	deltaShares, cumulativeNotional, deltaNotional, remainingShares, err := settlementNumbers(
+		ctx, tx, filled, reservation.SettledShares, averagePrice,
+		reservation.SettledNotional, reservation.RequestedShares,
+	)
+	if err != nil {
+		return domain.AssetReservation{}, err
+	}
+	if sign, _ := deltaNotional.Sign(); sign < 0 {
+		return domain.AssetReservation{}, fmt.Errorf("cumulative fill notional moved backward")
+	}
+
+	terminal := order.Status == domain.OrderStatusFilled || order.Status == domain.OrderStatusCanceled || order.Status == domain.OrderStatusRejected
+	if (reservation.Status == domain.ReservationStatusReleased || reservation.Status == domain.ReservationStatusSettled) && !terminal {
+		return domain.AssetReservation{}, fmt.Errorf("terminal reservation cannot return to active status")
+	}
+	targetRemainingShares := remainingShares
+	if terminal {
+		targetRemainingShares = "0"
+	}
+
+	switch reservation.Side {
+	case domain.SideBuy:
+		targetBalance, err := numericProduct(ctx, tx, reservation.ReserveUnitPrice, targetRemainingShares)
 		if err != nil {
 			return domain.AssetReservation{}, err
 		}
-		if err := verifyReservation(storedReservation, order, fingerprint); err != nil {
-			return domain.AssetReservation{}, err
-		}
-		reservation := storedReservation.AssetReservation
-
-		filled := order.FilledSize
-		if filled.IsEmpty() {
-			filled = "0"
-		}
-		if comparison, err := filled.Compare(reservation.SettledShares); err != nil || comparison < 0 {
-			return domain.AssetReservation{}, fmt.Errorf("cumulative filled shares moved backward")
-		}
-		if comparison, err := filled.Compare(reservation.RequestedShares); err != nil || comparison > 0 {
-			if err != nil || !order.AllowsBuySharePriceImprovement() {
-				return domain.AssetReservation{}, fmt.Errorf("cumulative filled shares exceed requested shares")
-			}
-			if settledComparison, compareErr := reservation.SettledShares.Compare(reservation.RequestedShares); compareErr != nil || settledComparison != 0 ||
-				reservation.Status != domain.ReservationStatusSettled || !reservation.RemainingReservedBalance.Equal("0") ||
-				!reservation.SettledNotional.Equal(order.FilledNotional) || !reservation.SettledFees.Equal(order.TotalFees) {
-				return domain.AssetReservation{}, fmt.Errorf("Polymarket BUY price improvement must be applied by the authoritative fill ledger")
-			}
-			// The reservation ledger tracks consumption of the requested minimum
-			// shares. Extra price-improvement shares are already present in the
-			// immutable fill, order, lot, and position ledgers. Once those exact
-			// totals are present, generic reservation reconciliation is a no-op.
-			return reservation, nil
-		}
-		averagePrice := order.AverageFillPrice
-		if sign, _ := filled.Sign(); sign == 0 {
-			averagePrice = "0"
-		}
-
-		deltaShares, cumulativeNotional, deltaNotional, remainingShares, err := settlementNumbers(
-			ctx, tx, filled, reservation.SettledShares, averagePrice,
-			reservation.SettledNotional, reservation.RequestedShares,
-		)
+		result, err := tx.ExecContext(ctx, `
+			UPDATE execution_accounts
+			SET total_balance = total_balance - $4::numeric,
+			    reserved_balance = reserved_balance - $2::numeric + $3::numeric,
+			    available_balance = (total_balance - $4::numeric)
+			        - (reserved_balance - $2::numeric + $3::numeric),
+			    version = version + 1,
+			    updated_at = $5
+			WHERE execution_account_id = $1
+			  AND reserved_balance >= $2::numeric
+			  AND total_balance >= $4::numeric
+			  AND (reserved_balance - $2::numeric + $3::numeric) >= 0
+			  AND ((total_balance - $4::numeric)
+			       - (reserved_balance - $2::numeric + $3::numeric)) >= 0`,
+			reservation.ExecutionAccountID, reservation.RemainingReservedBalance.String(),
+			targetBalance.String(), deltaNotional.String(), now)
 		if err != nil {
-			return domain.AssetReservation{}, err
+			return domain.AssetReservation{}, fmt.Errorf("settle buy balance: %w", err)
 		}
-		if sign, _ := deltaNotional.Sign(); sign < 0 {
-			return domain.AssetReservation{}, fmt.Errorf("cumulative fill notional moved backward")
+		if !oneRow(result) {
+			return domain.AssetReservation{}, reject("BUY_SETTLEMENT_EXCEEDS_RESERVATION", "fill cost exceeds protected balance or account state is inconsistent")
 		}
-
-		terminal := order.Status == domain.OrderStatusFilled || order.Status == domain.OrderStatusCanceled || order.Status == domain.OrderStatusRejected
-		if (reservation.Status == domain.ReservationStatusReleased || reservation.Status == domain.ReservationStatusSettled) && !terminal {
-			return domain.AssetReservation{}, fmt.Errorf("terminal reservation cannot return to active status")
-		}
-		targetRemainingShares := remainingShares
-		if terminal {
-			targetRemainingShares = "0"
-		}
-
-		switch reservation.Side {
-		case domain.SideBuy:
-			targetBalance, err := numericProduct(ctx, tx, reservation.ReserveUnitPrice, targetRemainingShares)
+		if sign, _ := deltaShares.Sign(); sign > 0 {
+			result, err = tx.ExecContext(ctx, `
+				INSERT INTO execution_positions (
+					execution_account_id, market_id, token_id,
+					total_shares, available_shares, reserved_shares,
+					created_at, updated_at
+				) VALUES ($1, $2, $3, $4::numeric, $4::numeric, 0, $5, $5)
+				ON CONFLICT (execution_account_id, token_id) DO UPDATE
+				SET total_shares = execution_positions.total_shares + EXCLUDED.total_shares,
+				    available_shares = execution_positions.available_shares + EXCLUDED.available_shares,
+				    version = execution_positions.version + 1,
+				    updated_at = EXCLUDED.updated_at
+				WHERE execution_positions.market_id = EXCLUDED.market_id`,
+				reservation.ExecutionAccountID, reservation.MarketID, reservation.TokenID,
+				deltaShares.String(), now)
 			if err != nil {
-				return domain.AssetReservation{}, err
-			}
-			result, err := tx.ExecContext(ctx, `
-				UPDATE execution_accounts
-				SET total_balance = total_balance - $4::numeric,
-				    reserved_balance = reserved_balance - $2::numeric + $3::numeric,
-				    available_balance = (total_balance - $4::numeric)
-				        - (reserved_balance - $2::numeric + $3::numeric),
-				    version = version + 1,
-				    updated_at = $5
-				WHERE execution_account_id = $1
-				  AND reserved_balance >= $2::numeric
-				  AND total_balance >= $4::numeric
-				  AND (reserved_balance - $2::numeric + $3::numeric) >= 0
-				  AND ((total_balance - $4::numeric)
-				       - (reserved_balance - $2::numeric + $3::numeric)) >= 0`,
-				reservation.ExecutionAccountID, reservation.RemainingReservedBalance.String(),
-				targetBalance.String(), deltaNotional.String(), now)
-			if err != nil {
-				return domain.AssetReservation{}, fmt.Errorf("settle buy balance: %w", err)
+				return domain.AssetReservation{}, fmt.Errorf("credit bought shares: %w", err)
 			}
 			if !oneRow(result) {
-				return domain.AssetReservation{}, reject("BUY_SETTLEMENT_EXCEEDS_RESERVATION", "fill cost exceeds protected balance or account state is inconsistent")
+				return domain.AssetReservation{}, fmt.Errorf("position token is already associated with a different market")
 			}
-			if sign, _ := deltaShares.Sign(); sign > 0 {
-				result, err = tx.ExecContext(ctx, `
-					INSERT INTO execution_positions (
-						execution_account_id, market_id, token_id,
-						total_shares, available_shares, reserved_shares,
-						created_at, updated_at
-					) VALUES ($1, $2, $3, $4::numeric, $4::numeric, 0, $5, $5)
-					ON CONFLICT (execution_account_id, token_id) DO UPDATE
-					SET total_shares = execution_positions.total_shares + EXCLUDED.total_shares,
-					    available_shares = execution_positions.available_shares + EXCLUDED.available_shares,
-					    version = execution_positions.version + 1,
-					    updated_at = EXCLUDED.updated_at
-					WHERE execution_positions.market_id = EXCLUDED.market_id`,
-					reservation.ExecutionAccountID, reservation.MarketID, reservation.TokenID,
-					deltaShares.String(), now)
-				if err != nil {
-					return domain.AssetReservation{}, fmt.Errorf("credit bought shares: %w", err)
-				}
-				if !oneRow(result) {
-					return domain.AssetReservation{}, fmt.Errorf("position token is already associated with a different market")
-				}
-			}
-			reservation.RemainingReservedBalance = targetBalance
-
-		case domain.SideSell:
-			var lockedToken string
-			err := tx.QueryRowContext(ctx, `
-				SELECT token_id FROM execution_positions
-				WHERE execution_account_id = $1 AND token_id = $2
-				FOR UPDATE`, reservation.ExecutionAccountID, reservation.TokenID).Scan(&lockedToken)
-			if err != nil {
-				return domain.AssetReservation{}, fmt.Errorf("lock position for sell settlement: %w", err)
-			}
-			result, err := tx.ExecContext(ctx, `
-				UPDATE execution_positions
-				SET total_shares = total_shares - $5::numeric,
-				    reserved_shares = reserved_shares - $3::numeric + $4::numeric,
-				    available_shares = (total_shares - $5::numeric)
-				        - (reserved_shares - $3::numeric + $4::numeric),
-				    version = version + 1,
-				    updated_at = $6
-				WHERE execution_account_id = $1 AND token_id = $2
-				  AND market_id = $7
-				  AND total_shares >= $5::numeric
-				  AND reserved_shares >= $3::numeric
-				  AND (reserved_shares - $3::numeric + $4::numeric) >= 0
-				  AND ((total_shares - $5::numeric)
-				       - (reserved_shares - $3::numeric + $4::numeric)) >= 0`,
-				reservation.ExecutionAccountID, reservation.TokenID,
-				reservation.RemainingReservedShares.String(), targetRemainingShares.String(),
-				deltaShares.String(), now, reservation.MarketID)
-			if err != nil {
-				return domain.AssetReservation{}, fmt.Errorf("settle sell shares: %w", err)
-			}
-			if !oneRow(result) {
-				return domain.AssetReservation{}, reject("SELL_SETTLEMENT_POSITION_MISMATCH", "settled sell exceeds reserved position or position state is inconsistent")
-			}
-			_, err = tx.ExecContext(ctx, `
-				UPDATE execution_accounts
-				SET total_balance = total_balance + $2::numeric,
-				    available_balance = available_balance + $2::numeric,
-				    version = version + 1,
-				    updated_at = $3
-				WHERE execution_account_id = $1`,
-				reservation.ExecutionAccountID, deltaNotional.String(), now)
-			if err != nil {
-				return domain.AssetReservation{}, fmt.Errorf("credit sell proceeds: %w", err)
-			}
-			reservation.RemainingReservedShares = targetRemainingShares
-		default:
-			return domain.AssetReservation{}, fmt.Errorf("unsupported reservation side %q", reservation.Side)
 		}
+		reservation.RemainingReservedBalance = targetBalance
 
-		reservation.SettledShares = filled
-		reservation.SettledNotional = cumulativeNotional
-		reservation.Status = nextReservationStatus(order.Status)
-		reservation.UncertainReason = ""
-		reservation.UpdatedAt = now
-		reservation.Revision++
-		if terminal {
-			reservation.RemainingReservedBalance = "0"
-			reservation.RemainingReservedShares = "0"
-			reservation.ReleasedAt = &now
+	case domain.SideSell:
+		var lockedToken string
+		err := tx.QueryRowContext(ctx, `
+			SELECT token_id FROM execution_positions
+			WHERE execution_account_id = $1 AND token_id = $2
+			FOR UPDATE`, reservation.ExecutionAccountID, reservation.TokenID).Scan(&lockedToken)
+		if err != nil {
+			return domain.AssetReservation{}, fmt.Errorf("lock position for sell settlement: %w", err)
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE execution_positions
+			SET total_shares = total_shares - $5::numeric,
+			    reserved_shares = reserved_shares - $3::numeric + $4::numeric,
+			    available_shares = (total_shares - $5::numeric)
+			        - (reserved_shares - $3::numeric + $4::numeric),
+			    version = version + 1,
+			    updated_at = $6
+			WHERE execution_account_id = $1 AND token_id = $2
+			  AND market_id = $7
+			  AND total_shares >= $5::numeric
+			  AND reserved_shares >= $3::numeric
+			  AND (reserved_shares - $3::numeric + $4::numeric) >= 0
+			  AND ((total_shares - $5::numeric)
+			       - (reserved_shares - $3::numeric + $4::numeric)) >= 0`,
+			reservation.ExecutionAccountID, reservation.TokenID,
+			reservation.RemainingReservedShares.String(), targetRemainingShares.String(),
+			deltaShares.String(), now, reservation.MarketID)
+		if err != nil {
+			return domain.AssetReservation{}, fmt.Errorf("settle sell shares: %w", err)
+		}
+		if !oneRow(result) {
+			return domain.AssetReservation{}, reject("SELL_SETTLEMENT_POSITION_MISMATCH", "settled sell exceeds reserved position or position state is inconsistent")
 		}
 		_, err = tx.ExecContext(ctx, `
-			UPDATE asset_reservations
-			SET remaining_reserved_balance = $2::numeric,
-			    remaining_reserved_shares = $3::numeric,
-			    settled_shares = $4::numeric,
-			    settled_notional = $5::numeric,
-			    status = $6,
-			    uncertain_reason = '',
-			    last_venue_observed_at = $7,
-			    revision = revision + 1,
-			    updated_at = $8::timestamptz,
-			    released_at = CASE WHEN $9::boolean THEN $8::timestamptz ELSE NULL::timestamptz END
-			WHERE order_id = $1`,
-			reservation.OrderID, reservation.RemainingReservedBalance.String(),
-			reservation.RemainingReservedShares.String(), reservation.SettledShares.String(),
-			reservation.SettledNotional.String(), string(reservation.Status),
-			order.VenueLastObservedAt, now, terminal)
+			UPDATE execution_accounts
+			SET total_balance = total_balance + $2::numeric,
+			    available_balance = available_balance + $2::numeric,
+			    version = version + 1,
+			    updated_at = $3
+			WHERE execution_account_id = $1`,
+			reservation.ExecutionAccountID, deltaNotional.String(), now)
 		if err != nil {
-			return domain.AssetReservation{}, fmt.Errorf("update asset reservation: %w", err)
+			return domain.AssetReservation{}, fmt.Errorf("credit sell proceeds: %w", err)
 		}
-		eventType := "RECONCILED"
-		if terminal && order.Status != domain.OrderStatusFilled {
-			eventType = "RELEASED"
-		}
-		eventKey := strings.Join([]string{string(order.Status), filled.String(), cumulativeNotional.String()}, ":")
-		if err := insertEvent(ctx, tx, reservation, eventKey, eventType, string(order.Status), ""); err != nil {
-			return domain.AssetReservation{}, err
-		}
-		storedReservation, err = selectReservationByOrderID(ctx, tx, order.ID, false)
-		if err != nil {
-			return domain.AssetReservation{}, err
-		}
-		return storedReservation.AssetReservation, nil
-	})
+		reservation.RemainingReservedShares = targetRemainingShares
+	default:
+		return domain.AssetReservation{}, fmt.Errorf("unsupported reservation side %q", reservation.Side)
+	}
+
+	reservation.SettledShares = filled
+	reservation.SettledNotional = cumulativeNotional
+	reservation.Status = nextReservationStatus(order.Status)
+	reservation.UncertainReason = ""
+	reservation.UpdatedAt = now
+	reservation.Revision++
+	if terminal {
+		reservation.RemainingReservedBalance = "0"
+		reservation.RemainingReservedShares = "0"
+		reservation.ReleasedAt = &now
+	}
+	_, err = tx.ExecContext(ctx, `
+		UPDATE asset_reservations
+		SET remaining_reserved_balance = $2::numeric,
+		    remaining_reserved_shares = $3::numeric,
+		    settled_shares = $4::numeric,
+		    settled_notional = $5::numeric,
+		    status = $6,
+		    uncertain_reason = '',
+		    last_venue_observed_at = $7,
+		    revision = revision + 1,
+		    updated_at = $8::timestamptz,
+		    released_at = CASE WHEN $9::boolean THEN $8::timestamptz ELSE NULL::timestamptz END
+		WHERE order_id = $1`,
+		reservation.OrderID, reservation.RemainingReservedBalance.String(),
+		reservation.RemainingReservedShares.String(), reservation.SettledShares.String(),
+		reservation.SettledNotional.String(), string(reservation.Status),
+		order.VenueLastObservedAt, now, terminal)
+	if err != nil {
+		return domain.AssetReservation{}, fmt.Errorf("update asset reservation: %w", err)
+	}
+	eventType := "RECONCILED"
+	if terminal && order.Status != domain.OrderStatusFilled {
+		eventType = "RELEASED"
+	}
+	eventKey := strings.Join([]string{string(order.Status), filled.String(), cumulativeNotional.String()}, ":")
+	if err := insertEvent(ctx, tx, reservation, eventKey, eventType, string(order.Status), details); err != nil {
+		return domain.AssetReservation{}, err
+	}
+	storedReservation, err = selectReservationByOrderID(ctx, tx, order.ID, false)
+	if err != nil {
+		return domain.AssetReservation{}, err
+	}
+	return storedReservation.AssetReservation, nil
 }
 
 // MarkUncertain 将订单资产预占标记为不确定并继续冻结。

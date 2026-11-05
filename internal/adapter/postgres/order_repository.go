@@ -17,6 +17,54 @@ import (
 // OrderRepository 表示后端使用的 OrderRepository 类型。
 type OrderRepository struct {
 	db *sql.DB
+	// submitInFlightGrace excludes SUBMITTING orders whose attempt started
+	// less than this long before the coordinator's selection bound. Zero
+	// keeps the historical selection (tests and read-only callers).
+	submitInFlightGrace time.Duration
+	// venueExpiryColumn enables reading and writing
+	// execution_order_attempts.venue_expires_at (migration 0046). Off by
+	// default so the repository keeps working on a database without it.
+	venueExpiryColumn bool
+}
+
+// OrderRepositoryOption configures optional repository behaviour.
+type OrderRepositoryOption func(*OrderRepository)
+
+// WithSubmitInFlightGrace keeps SUBMITTING orders whose placement may still be
+// running out of coordinator selection. Execution.Refresh enforces the same
+// rule (plus the process generation); this filter only avoids a lease
+// acquire/release cycle every poll for an in-flight submission.
+func WithSubmitInFlightGrace(grace time.Duration) OrderRepositoryOption {
+	return func(repository *OrderRepository) {
+		if grace > 0 {
+			repository.submitInFlightGrace = grace
+		}
+	}
+}
+
+// WithOrderAttemptVenueExpiry enables the venue_expires_at column. Enable it
+// only after OrderAttemptVenueExpiryPresent reported the column.
+func WithOrderAttemptVenueExpiry() OrderRepositoryOption {
+	return func(repository *OrderRepository) { repository.venueExpiryColumn = true }
+}
+
+// OrderAttemptVenueExpiryPresent reports whether migration 0046 added
+// execution_order_attempts.venue_expires_at.
+func OrderAttemptVenueExpiryPresent(ctx context.Context, db *sql.DB) (bool, error) {
+	if db == nil {
+		return false, nil
+	}
+	var present bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = 'execution_order_attempts'
+			  AND column_name = 'venue_expires_at'
+		)`).Scan(&present); err != nil {
+		return false, fmt.Errorf("inspect execution_order_attempts.venue_expires_at: %w", err)
+	}
+	return present, nil
 }
 
 var (
@@ -25,11 +73,17 @@ var (
 )
 
 // NewOrderRepository 创建并初始化 Order Repository。
-func NewOrderRepository(db *sql.DB) (*OrderRepository, error) {
+func NewOrderRepository(db *sql.DB, options ...OrderRepositoryOption) (*OrderRepository, error) {
 	if db == nil {
 		return nil, fmt.Errorf("postgres database is required")
 	}
-	return &OrderRepository{db: db}, nil
+	repository := &OrderRepository{db: db}
+	for _, option := range options {
+		if option != nil {
+			option(repository)
+		}
+	}
+	return repository, nil
 }
 
 // Create 幂等创建并持久化新的订单记录。
@@ -187,7 +241,7 @@ func (repository *OrderRepository) writeTransition(ctx context.Context, order do
 	}
 	if attempt != nil {
 		if start {
-			if err := insertOrderAttempt(ctx, tx, *attempt); err != nil {
+			if err := repository.insertAttempt(ctx, tx, *attempt); err != nil {
 				return err
 			}
 		} else if err := finishOrderAttempt(ctx, tx, *attempt); err != nil {
@@ -275,14 +329,37 @@ func (repository *OrderRepository) Events(ctx context.Context, orderID string) (
 
 // Attempts 查询指定订单的外部操作尝试。
 func (repository *OrderRepository) Attempts(ctx context.Context, orderID string) ([]domain.OrderAttempt, error) {
-	rows, err := repository.db.QueryContext(ctx, `
+	attempts, err := queryOrderAttempts(ctx, repository.db, strings.TrimSpace(orderID), repository.venueExpiryColumn)
+	if err != nil {
+		return nil, err
+	}
+	if len(attempts) == 0 {
+		if _, err := repository.Get(ctx, orderID); err != nil {
+			return nil, err
+		}
+	}
+	return attempts, nil
+}
+
+// attemptQuerier is satisfied by *sql.DB and *sql.Tx.
+type attemptQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+// queryOrderAttempts reads every attempt of one order in sequence order.
+func queryOrderAttempts(ctx context.Context, query attemptQuerier, orderID string, venueExpiry bool) ([]domain.OrderAttempt, error) {
+	venueExpiryColumn := "NULL::timestamptz"
+	if venueExpiry {
+		venueExpiryColumn = "venue_expires_at"
+	}
+	rows, err := query.QueryContext(ctx, `
 		SELECT attempt_id, order_id, sequence, kind, outcome,
 		       request_fingerprint, venue_order_id, venue_status,
 		       COALESCE(http_status, 0), error_code, error_message,
-		       started_at, completed_at
+		       started_at, completed_at, `+venueExpiryColumn+`
 		FROM execution_order_attempts
 		WHERE order_id = $1
-		ORDER BY sequence`, strings.TrimSpace(orderID))
+		ORDER BY sequence`, orderID)
 	if err != nil {
 		return nil, fmt.Errorf("query order attempts: %w", err)
 	}
@@ -291,12 +368,12 @@ func (repository *OrderRepository) Attempts(ctx context.Context, orderID string)
 	for rows.Next() {
 		var attempt domain.OrderAttempt
 		var kind, outcome string
-		var completed sql.NullTime
+		var completed, venueExpires sql.NullTime
 		if err := rows.Scan(
 			&attempt.ID, &attempt.OrderID, &attempt.Sequence, &kind, &outcome,
 			&attempt.RequestFingerprint, &attempt.VenueOrderID, &attempt.VenueStatus,
 			&attempt.HTTPStatus, &attempt.ErrorCode, &attempt.ErrorMessage,
-			&attempt.StartedAt, &completed,
+			&attempt.StartedAt, &completed, &venueExpires,
 		); err != nil {
 			return nil, fmt.Errorf("scan order attempt: %w", err)
 		}
@@ -306,15 +383,14 @@ func (repository *OrderRepository) Attempts(ctx context.Context, orderID string)
 			value := completed.Time.UTC()
 			attempt.CompletedAt = &value
 		}
+		if venueExpires.Valid {
+			value := venueExpires.Time.UTC()
+			attempt.VenueExpiresAt = &value
+		}
 		attempts = append(attempts, attempt)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate order attempts: %w", err)
-	}
-	if len(attempts) == 0 {
-		if _, err := repository.Get(ctx, orderID); err != nil {
-			return nil, err
-		}
 	}
 	return attempts, nil
 }
@@ -352,8 +428,13 @@ func (repository *OrderRepository) listPending(
 	accountClause := ""
 	arguments := []any{before.UTC(), limit}
 	if executionAccountIDs != nil {
-		accountClause = " AND execution_account_id=ANY($3::text[])"
 		arguments = append(arguments, executionAccountIDs)
+		accountClause = fmt.Sprintf(" AND execution_account_id=ANY($%d::text[])", len(arguments))
+	}
+	if repository.submitInFlightGrace > 0 {
+		// updated_at of a SUBMITTING order is the start of its submit attempt.
+		arguments = append(arguments, before.UTC().Add(-repository.submitInFlightGrace))
+		accountClause += fmt.Sprintf(" AND NOT (status = 'SUBMITTING' AND updated_at > $%d)", len(arguments))
 	}
 	rows, err := repository.db.QueryContext(ctx, selectOrderColumns+`
 		WHERE (
@@ -588,6 +669,32 @@ func insertOrderEvent(ctx context.Context, tx *sql.Tx, event domain.OrderEvent) 
 		event.VenueObservedAt, event.OccurredAt)
 	if err != nil {
 		return fmt.Errorf("insert order event: %w", err)
+	}
+	return nil
+}
+
+// insertAttempt writes a new STARTED attempt, including its venue expiry when
+// the column is enabled. Without the column a venue expiry is dropped: the
+// order then simply never qualifies for automatic no-fill release.
+func (repository *OrderRepository) insertAttempt(ctx context.Context, tx *sql.Tx, attempt domain.OrderAttempt) error {
+	if !repository.venueExpiryColumn || attempt.VenueExpiresAt == nil {
+		return insertOrderAttempt(ctx, tx, attempt)
+	}
+	if attempt.Outcome != domain.AttemptOutcomeStarted || attempt.CompletedAt != nil {
+		return fmt.Errorf("new order attempt must be STARTED")
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO execution_order_attempts (
+			attempt_id, order_id, sequence, kind, outcome,
+			request_fingerprint, venue_order_id, venue_status, http_status,
+			error_code, error_message, started_at, completed_at, venue_expires_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, 0), $10, $11, $12, NULL, $13)`,
+		attempt.ID, attempt.OrderID, attempt.Sequence, string(attempt.Kind),
+		string(attempt.Outcome), attempt.RequestFingerprint, attempt.VenueOrderID,
+		attempt.VenueStatus, attempt.HTTPStatus, attempt.ErrorCode,
+		attempt.ErrorMessage, attempt.StartedAt, attempt.VenueExpiresAt.UTC())
+	if err != nil {
+		return fmt.Errorf("insert order attempt: %w", err)
 	}
 	return nil
 }

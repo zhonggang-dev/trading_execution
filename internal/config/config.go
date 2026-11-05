@@ -145,6 +145,12 @@ type Execution struct {
 	OrderRecoveryMaxBackoff    time.Duration
 	OrderRecoveryEscalateAfter time.Duration
 	OrderRecoveryPendingGrace  time.Duration
+	// SubmitAttemptTimeout bounds every venue call of one placement after
+	// SUBMITTING is durable (EXECUTION_SUBMIT_ATTEMPT_TIMEOUT, default 60s).
+	SubmitAttemptTimeout time.Duration
+	// SubmitInFlightGrace is how long recovery leaves a SUBMITTING order of
+	// this process alone (ORDER_SUBMIT_IN_FLIGHT_GRACE, default 90s).
+	SubmitInFlightGrace time.Duration
 }
 
 // OrderRecoveryPolicy 返回订单恢复守卫使用的租约、超时、退避和升级策略。
@@ -208,6 +214,17 @@ type Polymarket struct {
 	ChainCashDepositSources  map[string][]string
 	ChainCashMaxBlocksPerRun int
 	ChainCashLogChunkBlocks  int
+	// IOCOrderType is the CLOB order type that carries an emulated IOC:
+	// GTC (default, unchanged behaviour) or GTD (short-lived, venue-enforced
+	// expiry IOCOrderLifetime after the exchange clock).
+	IOCOrderType     string
+	IOCOrderLifetime time.Duration
+	// UnacceptedAutoResolve is the automatic no-fill release mode for UNKNOWN
+	// orders the venue never shows: off, shadow (default; audit and log only)
+	// or on (cancel and release). UnacceptedResolveGrace is waited after the
+	// venue expiry before any decision.
+	UnacceptedAutoResolve  string
+	UnacceptedResolveGrace time.Duration
 }
 
 // Kalshi keeps authenticated market-data credentials outside the repository.
@@ -227,6 +244,13 @@ type Kalshi struct {
 	// BalanceDriftThreshold is the largest tolerated gap, in dollars, between
 	// the local cash ledger and the exchange balance.
 	BalanceDriftThreshold domain.Decimal
+	// BalanceSyncEnabled books a running deposit or withdrawal into the local
+	// cash in a verified quiet window; false keeps the drift-only check.
+	// PositionCheckEnabled compares the exchange positions read-only and
+	// requires them to match before cash is synced; it has no effect when
+	// BalanceSyncEnabled is false. Both need KALSHI_SETTLEMENT_ENABLED.
+	BalanceSyncEnabled   bool
+	PositionCheckEnabled bool
 }
 
 // KalshiLiveAccount gives one Kalshi execution account (a DECISION_CYCLE
@@ -412,6 +436,22 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	submitAttemptTimeout, err := duration("EXECUTION_SUBMIT_ATTEMPT_TIMEOUT", 60*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	submitInFlightGrace, err := duration("ORDER_SUBMIT_IN_FLIGHT_GRACE", 90*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	iocOrderLifetime, err := duration("POLYMARKET_IOC_ORDER_LIFETIME", 5*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	unacceptedResolveGrace, err := duration("ORDER_UNACCEPTED_RESOLVE_GRACE", 30*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 	liveTradingEnabled, err := boolean("POLYMARKET_LIVE_TRADING_ENABLED", false)
 	if err != nil {
 		return Config{}, err
@@ -455,6 +495,14 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	kalshiBalanceDriftThreshold, err := decimal("KALSHI_BALANCE_DRIFT_THRESHOLD", "0.01")
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiBalanceSyncEnabled, err := boolean("KALSHI_BALANCE_SYNC_ENABLED", true)
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiPositionCheckEnabled, err := boolean("KALSHI_POSITION_CHECK_ENABLED", true)
 	if err != nil {
 		return Config{}, err
 	}
@@ -644,6 +692,8 @@ func Load() (Config, error) {
 			OrderRecoveryMaxBackoff:    orderRecoveryMaxBackoff,
 			OrderRecoveryEscalateAfter: orderRecoveryEscalateAfter,
 			OrderRecoveryPendingGrace:  orderRecoveryPendingGrace,
+			SubmitAttemptTimeout:       submitAttemptTimeout,
+			SubmitInFlightGrace:        submitInFlightGrace,
 		},
 		Polymarket: Polymarket{
 			LiveTradingEnabled: liveTradingEnabled,
@@ -688,6 +738,10 @@ func Load() (Config, error) {
 			ChainCashDepositSources:      chainCashDepositSources,
 			ChainCashMaxBlocksPerRun:     chainCashMaxBlocksPerRun,
 			ChainCashLogChunkBlocks:      chainCashLogChunkBlocks,
+			IOCOrderType:                 strings.ToUpper(env("POLYMARKET_IOC_ORDER_TYPE", "GTC")),
+			IOCOrderLifetime:             iocOrderLifetime,
+			UnacceptedAutoResolve:        strings.ToLower(env("ORDER_UNACCEPTED_AUTO_RESOLVE", "shadow")),
+			UnacceptedResolveGrace:       unacceptedResolveGrace,
 		},
 		Kalshi: Kalshi{
 			MarketDataEnabled: kalshiMarketDataEnabled,
@@ -700,6 +754,8 @@ func Load() (Config, error) {
 			SettlementEnabled:     kalshiSettlementEnabled,
 			SettlementInterval:    kalshiSettlementInterval,
 			BalanceDriftThreshold: kalshiBalanceDriftThreshold,
+			BalanceSyncEnabled:    kalshiBalanceSyncEnabled,
+			PositionCheckEnabled:  kalshiPositionCheckEnabled,
 		},
 		LiveOperations: LiveOperations{
 			Interval: liveOperationsInterval, RefreshTimeout: liveOperationsRefreshTimeout,
@@ -740,6 +796,29 @@ func (config Config) Validate() error {
 	}
 	if config.Execution.OrderRecoveryPendingGrace < 0 {
 		return fmt.Errorf("ORDER_RECOVERY_PENDING_GRACE must not be negative")
+	}
+	if config.Execution.SubmitAttemptTimeout < 10*time.Second || config.Execution.SubmitAttemptTimeout > 10*time.Minute {
+		return fmt.Errorf("EXECUTION_SUBMIT_ATTEMPT_TIMEOUT must be between 10s and 10m")
+	}
+	if config.Execution.SubmitInFlightGrace <= config.Execution.SubmitAttemptTimeout+10*time.Second ||
+		config.Execution.SubmitInFlightGrace > 10*time.Minute {
+		return fmt.Errorf("ORDER_SUBMIT_IN_FLIGHT_GRACE must exceed EXECUTION_SUBMIT_ATTEMPT_TIMEOUT by more than 10s and be at most 10m")
+	}
+	switch config.Polymarket.IOCOrderType {
+	case "GTC", "GTD":
+	default:
+		return fmt.Errorf("POLYMARKET_IOC_ORDER_TYPE must be GTC or GTD")
+	}
+	if config.Polymarket.IOCOrderLifetime < 4*time.Minute || config.Polymarket.IOCOrderLifetime > 15*time.Minute {
+		return fmt.Errorf("POLYMARKET_IOC_ORDER_LIFETIME must be between 4m and 15m")
+	}
+	switch config.Polymarket.UnacceptedAutoResolve {
+	case "off", "shadow", "on":
+	default:
+		return fmt.Errorf("ORDER_UNACCEPTED_AUTO_RESOLVE must be off, shadow or on")
+	}
+	if config.Polymarket.UnacceptedResolveGrace < 15*time.Minute || config.Polymarket.UnacceptedResolveGrace > 24*time.Hour {
+		return fmt.Errorf("ORDER_UNACCEPTED_RESOLVE_GRACE must be between 15m and 24h")
 	}
 	if config.Execution.Mode == "live" {
 		if !config.Polymarket.LiveTradingEnabled {
@@ -792,6 +871,12 @@ func (config Config) Validate() error {
 		}
 		if config.HTTP.WriteTimeout < 4*config.Polymarket.RequestTimeout {
 			return fmt.Errorf("live HTTP_WRITE_TIMEOUT must be at least four times POLYMARKET_REQUEST_TIMEOUT")
+		}
+		if config.Execution.SubmitAttemptTimeout < 2*config.Polymarket.RequestTimeout+10*time.Second {
+			return fmt.Errorf("live EXECUTION_SUBMIT_ATTEMPT_TIMEOUT must be at least twice POLYMARKET_REQUEST_TIMEOUT plus 10s")
+		}
+		if config.Execution.SubmitAttemptTimeout > config.HTTP.WriteTimeout {
+			return fmt.Errorf("live EXECUTION_SUBMIT_ATTEMPT_TIMEOUT must not exceed HTTP_WRITE_TIMEOUT")
 		}
 		if comparison, err := config.Polymarket.MaxBuyFeeRateBPS.Compare("10000"); err != nil || comparison > 0 {
 			return fmt.Errorf("POLYMARKET_MAX_BUY_FEE_RATE_BPS must not exceed 10000")

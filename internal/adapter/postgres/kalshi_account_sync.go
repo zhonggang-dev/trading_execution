@@ -112,9 +112,25 @@ func SyncKalshiExecutionAccount(
 		}
 		return true, balance, nil
 	}
-	// The overwrite below replaces the local cash with the exchange balance, so
-	// whatever the two disagreed by is written down before it disappears.
-	if _, err := tx.ExecContext(ctx, `
+	if _, _, err := bookKalshiBalanceSync(ctx, tx, accountID, balance); err != nil {
+		return false, "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, "", fmt.Errorf("commit Kalshi execution account sync: %w", err)
+	}
+	return false, balance, nil
+}
+
+// bookKalshiBalanceSync replaces the local cash with the exchange balance and
+// writes whatever the two disagreed by as one KALSHI_BALANCE_SYNC account event
+// before it disappears. The startup sync and the running sync share it, so both
+// book with the same SQL. The caller holds the execution_accounts row lock and
+// has checked that no cash is reserved. eventID is empty when nothing differed;
+// the account row is updated (reconciled_at, version) either way.
+func bookKalshiBalanceSync(
+	ctx context.Context, tx *sql.Tx, accountID string, balance domain.Decimal,
+) (eventID string, delta domain.Decimal, err error) {
+	rows, err := tx.QueryContext(ctx, `
 		INSERT INTO execution_account_events (
 			account_event_id, execution_account_id, event_type, total_balance_delta,
 			available_balance_delta, reserved_balance_delta, total_balance_after,
@@ -124,21 +140,32 @@ func SyncKalshiExecutionAccount(
 		       execution_account_id, 'KALSHI_BALANCE_SYNC', $2::numeric - total_balance,
 		       $2::numeric - available_balance, 0, $2::numeric, $2::numeric, reserved_balance, clock_timestamp()
 		FROM execution_accounts
-		WHERE execution_account_id=$1 AND (total_balance <> $2::numeric OR available_balance <> $2::numeric)`,
-		accountID, balance.String()); err != nil {
-		return false, "", fmt.Errorf("record Kalshi balance sync: %w", err)
+		WHERE execution_account_id=$1 AND (total_balance <> $2::numeric OR available_balance <> $2::numeric)
+		RETURNING account_event_id, total_balance_delta::text`,
+		accountID, balance.String())
+	if err != nil {
+		return "", "", fmt.Errorf("record Kalshi balance sync: %w", err)
+	}
+	for rows.Next() {
+		if err := rows.Scan(&eventID, &delta); err != nil {
+			_ = rows.Close()
+			return "", "", fmt.Errorf("record Kalshi balance sync: %w", err)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return "", "", fmt.Errorf("record Kalshi balance sync: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", fmt.Errorf("record Kalshi balance sync: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE execution_accounts
 		SET total_balance=$2::numeric, available_balance=$2::numeric,
 			reconciled_at=clock_timestamp(), updated_at=clock_timestamp(), version=version+1
 		WHERE execution_account_id=$1`, accountID, balance.String()); err != nil {
-		return false, "", fmt.Errorf("sync settled Kalshi execution account: %w", err)
+		return "", "", fmt.Errorf("sync settled Kalshi execution account: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return false, "", fmt.Errorf("commit Kalshi execution account sync: %w", err)
-	}
-	return false, balance, nil
+	return eventID, delta, nil
 }
 
 // kalshiUnappliedSettlement reports whether the account holds open shares in a
