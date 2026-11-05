@@ -124,6 +124,12 @@ func (s *Service) Query(ctx context.Context, account string) (Response, error) {
 	if err != nil {
 		return Response{}, err
 	}
+	return s.queryFacts(ctx, facts)
+}
+
+// queryFacts shares the same bounded quote cache and valuation arithmetic for
+// the legacy whole-account view and opening-cohort read model.
+func (s *Service) queryFacts(ctx context.Context, facts consolev2.CoreMetricFacts) (Response, error) {
 	targets := []Target{}
 	for _, a := range facts.Accounts {
 		for _, asset := range a.Assets {

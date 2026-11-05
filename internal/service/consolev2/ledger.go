@@ -19,7 +19,7 @@ LEFT JOIN execution_orders open ON open.order_id=l.opening_order_id
 `
 
 func (reader *Reader) PositionLots(ctx context.Context, filter ListFilter) (Page[PositionLot], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[PositionLot]{}, err
 	}
@@ -42,6 +42,7 @@ func (reader *Reader) PositionLots(ctx context.Context, filter ListFilter) (Page
 	if filter.ExecutionAccountID != "" {
 		conditions = append(conditions, "l.execution_account_id = "+arg(filter.ExecutionAccountID))
 	}
+	conditions = appendAccountScope(conditions, &args, filter, "l.execution_account_id")
 	if filter.MarketSource != "" {
 		conditions = append(conditions, "open.intent->>'market_source' = "+arg(filter.MarketSource))
 	}
@@ -123,7 +124,7 @@ FROM reconciliation_runs
 `
 
 func (reader *Reader) ReconciliationRuns(ctx context.Context, filter ListFilter) (Page[ReconciliationRun], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[ReconciliationRun]{}, err
 	}
@@ -140,6 +141,7 @@ func (reader *Reader) ReconciliationRuns(ctx context.Context, filter ListFilter)
 	if filter.ExecutionAccountID != "" {
 		conditions = append(conditions, "execution_account_id = "+arg(filter.ExecutionAccountID))
 	}
+	conditions = appendAccountScope(conditions, &args, filter, "execution_account_id")
 	if filter.Status != "" {
 		conditions = append(conditions, "status = "+arg(filter.Status))
 	}
@@ -222,7 +224,7 @@ FROM kalshi_settlements WHERE status='MANUAL_REVIEW'
 `
 
 func (reader *Reader) ReconciliationIssues(ctx context.Context, filter ListFilter) (Page[ReconciliationIssue], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[ReconciliationIssue]{}, err
 	}
@@ -239,6 +241,7 @@ func (reader *Reader) ReconciliationIssues(ctx context.Context, filter ListFilte
 	if filter.ExecutionAccountID != "" {
 		conditions = append(conditions, "issue.execution_account_id = "+arg(filter.ExecutionAccountID))
 	}
+	conditions = appendAccountScope(conditions, &args, filter, "issue.execution_account_id")
 	if filter.Status != "" {
 		conditions = append(conditions, "issue.status = "+arg(filter.Status))
 	}
@@ -327,7 +330,7 @@ FROM polymarket_redemptions
 `
 
 func (reader *Reader) Redemptions(ctx context.Context, filter ListFilter) (Page[Redemption], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[Redemption]{}, err
 	}
@@ -344,6 +347,7 @@ func (reader *Reader) Redemptions(ctx context.Context, filter ListFilter) (Page[
 	if filter.ExecutionAccountID != "" {
 		conditions = append(conditions, "execution_account_id = "+arg(filter.ExecutionAccountID))
 	}
+	conditions = appendAccountScope(conditions, &args, filter, "execution_account_id")
 	if filter.Status != "" {
 		conditions = append(conditions, "status = "+arg(filter.Status))
 	}

@@ -127,6 +127,7 @@ func buildCycleBaseFilter(filter ListFilter, now time.Time) (string, []any) {
 	if filter.ExecutionAccountID != "" {
 		conditions = append(conditions, "r.execution_account_id = "+add(filter.ExecutionAccountID))
 	}
+	conditions = appendAccountScope(conditions, &args, filter, "r.execution_account_id")
 	if filter.Query != "" {
 		placeholder := add("%" + filter.Query + "%")
 		conditions = append(conditions, "(r.cycle_id ILIKE "+placeholder+" OR r.input_id ILIKE "+placeholder+
@@ -144,7 +145,7 @@ func buildCycleBaseFilter(filter ListFilter, now time.Time) (string, []any) {
 }
 
 func (reader *Reader) DecisionCycles(ctx context.Context, filter ListFilter) (Page[DecisionCycle], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[DecisionCycle]{}, err
 	}

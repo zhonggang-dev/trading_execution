@@ -51,6 +51,8 @@ type ListFilter struct {
 	ModelID            string
 	StrategyID         string
 	ExecutionAccountID string
+	AccountScope       string
+	scopedAccountIDs   []string
 	MarketSource       string
 	Status             string
 	Side               string

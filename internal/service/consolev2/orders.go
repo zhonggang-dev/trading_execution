@@ -65,7 +65,7 @@ LEFT JOIN LATERAL (
 `
 
 func (reader *Reader) Orders(ctx context.Context, filter ListFilter) (Page[Order], error) {
-	filter, err := normalizeFilter(filter)
+	filter, err := reader.normalizeScopedFilter(filter)
 	if err != nil {
 		return Page[Order]{}, err
 	}
@@ -88,6 +88,7 @@ func (reader *Reader) Orders(ctx context.Context, filter ListFilter) (Page[Order
 	if filter.ExecutionAccountID != "" {
 		conditions = append(conditions, "o.execution_account_id = "+arg(filter.ExecutionAccountID))
 	}
+	conditions = appendAccountScope(conditions, &args, filter, "o.execution_account_id")
 	if filter.MarketSource != "" {
 		conditions = append(conditions, "o.intent->>'market_source' = "+arg(filter.MarketSource))
 	}
