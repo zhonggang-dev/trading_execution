@@ -35,6 +35,26 @@ func TestLoadSafeDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadKalshiLedgerSyncSwitches(t *testing.T) {
+	clearConfigEnvironment(t)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !config.Kalshi.BalanceSyncEnabled || !config.Kalshi.PositionCheckEnabled {
+		t.Fatalf("Kalshi ledger sync defaults = %#v, want both enabled", config.Kalshi)
+	}
+	t.Setenv("KALSHI_BALANCE_SYNC_ENABLED", "false")
+	t.Setenv("KALSHI_POSITION_CHECK_ENABLED", "false")
+	if config, err = Load(); err != nil || config.Kalshi.BalanceSyncEnabled || config.Kalshi.PositionCheckEnabled {
+		t.Fatalf("disabled switches = %#v, %v", config.Kalshi, err)
+	}
+	t.Setenv("KALSHI_BALANCE_SYNC_ENABLED", "maybe")
+	if _, err := Load(); err == nil {
+		t.Fatal("an invalid KALSHI_BALANCE_SYNC_ENABLED was accepted")
+	}
+}
+
 func TestLoadAutoRedeemMaxSubmitAttempts(t *testing.T) {
 	clearConfigEnvironment(t)
 	config, err := Load()
@@ -798,7 +818,8 @@ func clearConfigEnvironment(t *testing.T) {
 		"CHAIN_CASH_REWARD_SENDERS", "CHAIN_CASH_DEPOSIT_SOURCES", "CHAIN_CASH_MAX_BLOCKS_PER_RUN",
 		"CHAIN_CASH_LOG_CHUNK_BLOCKS",
 		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",
-		"KALSHI_LIVE_ACCOUNTS_JSON",
+		"KALSHI_LIVE_ACCOUNTS_JSON", "KALSHI_SETTLEMENT_ENABLED", "KALSHI_SETTLEMENT_INTERVAL",
+		"KALSHI_BALANCE_DRIFT_THRESHOLD", "KALSHI_BALANCE_SYNC_ENABLED", "KALSHI_POSITION_CHECK_ENABLED",
 		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
 		"DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON", "DECISION_CYCLE_ORDER_REPORT_LOOKBACK",
 		"DECISION_CYCLE_REQUIRE_COMPLETE_MODEL_COVERAGE",

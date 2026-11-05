@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,5 +190,29 @@ func TestRetryKalshiRateLimitStopsWhenContextEnds(t *testing.T) {
 		func(context.Context) (string, error) { calls++; return "", rateLimitedError() })
 	if !kalshiRateLimited(err) || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+// A database without migration 0045 must not stop the process: the running
+// sync and position check are switched off and the drift-only check remains.
+func TestResolveKalshiLedgerSyncFallsBackWithoutTheMigration(t *testing.T) {
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logged, nil))
+	cfg := config.Config{Kalshi: config.Kalshi{SettlementEnabled: true, BalanceSyncEnabled: true, PositionCheckEnabled: true}}
+	if got := resolveKalshiLedgerSync(context.Background(), cfg, nil, logger); got != (kalshiLedgerSync{}) {
+		t.Fatalf("switches without the tables = %#v, want both off", got)
+	}
+	if !strings.Contains(logged.String(), "migration 0045 are missing") || !strings.Contains(logged.String(), "level=ERROR") {
+		t.Fatalf("log = %q, want an error naming the missing migration", logged.String())
+	}
+
+	logged.Reset()
+	cfg.Kalshi.BalanceSyncEnabled = false
+	if got := resolveKalshiLedgerSync(context.Background(), cfg, nil, logger); got != (kalshiLedgerSync{}) || logged.Len() != 0 {
+		t.Fatalf("disabled sync = %#v log %q, want off without a table check", got, logged.String())
+	}
+	cfg.Kalshi.BalanceSyncEnabled, cfg.Kalshi.SettlementEnabled = true, false
+	if got := resolveKalshiLedgerSync(context.Background(), cfg, nil, logger); got != (kalshiLedgerSync{balance: true, positions: true}) || logged.Len() != 0 {
+		t.Fatalf("settlement disabled = %#v log %q, want the configured switches unused and unchecked", got, logged.String())
 	}
 }

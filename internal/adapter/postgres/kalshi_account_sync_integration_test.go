@@ -19,6 +19,18 @@ type fakeKalshiExchange struct {
 	settlements map[string][]domain.KalshiSettlement
 	listErr     error
 	allReads    int
+	// positions is the exchange's position list; nil reads as no holdings.
+	positions    []domain.KalshiMarketPosition
+	positionsErr error
+	positionRead int
+}
+
+func (exchange *fakeKalshiExchange) ListPositions(context.Context) ([]domain.KalshiMarketPosition, error) {
+	exchange.positionRead++
+	if exchange.positionsErr != nil {
+		return nil, exchange.positionsErr
+	}
+	return append([]domain.KalshiMarketPosition{}, exchange.positions...), nil
 }
 
 func (exchange *fakeKalshiExchange) ListSettlements(_ context.Context, ticker string) ([]domain.KalshiSettlement, error) {

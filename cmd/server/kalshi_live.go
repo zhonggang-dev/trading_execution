@@ -41,6 +41,7 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 	if !cfg.Kalshi.MarketDataEnabled {
 		return kalshiComposition{}, fmt.Errorf("Kalshi live accounts require KALSHI_MARKET_DATA_ENABLED=true")
 	}
+	ledgerSync := resolveKalshiLedgerSync(ctx, cfg, database, logger)
 	routes := make([]executionrouter.Route, 0, len(cfg.Kalshi.LiveAccounts))
 	active := make([]string, 0, len(cfg.Kalshi.LiveAccounts))
 	settlements := make([]*kalshisettlement.Service, 0, len(cfg.Kalshi.LiveAccounts))
@@ -49,7 +50,7 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 		if !ok {
 			return kalshiComposition{}, fmt.Errorf("Kalshi live account %q is not a KALSHI decision account", liveAccount.ExecutionAccountID)
 		}
-		built, err := buildKalshiLiveRoute(ctx, cfg, account, liveAccount, database, repository, guard, ledger)
+		built, err := buildKalshiLiveRoute(ctx, cfg, account, liveAccount, database, repository, guard, ledger, ledgerSync)
 		if err != nil {
 			needsMaintenance, maintenanceErr := kalshiAccountNeedsMaintenance(ctx, database, account.ExecutionAccountID)
 			if maintenanceErr != nil {
@@ -93,8 +94,36 @@ type builtKalshiLiveRoute struct {
 	balanceSyncDeferred bool
 }
 
+// kalshiLedgerSync is what the running cash sync and position check may do in
+// this process.
+type kalshiLedgerSync struct {
+	balance   bool
+	positions bool
+}
+
+// resolveKalshiLedgerSync turns the configuration into the effective switches.
+// A database without migration 0045 turns both off and keeps the drift-only
+// check: the process keeps running rather than refusing to start.
+func resolveKalshiLedgerSync(ctx context.Context, cfg config.Config, database *sql.DB, logger *slog.Logger) kalshiLedgerSync {
+	switches := kalshiLedgerSync{
+		balance:   cfg.Kalshi.BalanceSyncEnabled,
+		positions: cfg.Kalshi.BalanceSyncEnabled && cfg.Kalshi.PositionCheckEnabled,
+	}
+	if !cfg.Kalshi.SettlementEnabled || !switches.balance {
+		return switches
+	}
+	present, err := postgresadapter.KalshiLedgerSyncTablesPresent(ctx, database)
+	if err != nil || !present {
+		logger.Error("Kalshi ledger sync tables from migration 0045 are missing; running cash sync and position check are off, the drift-only balance check continues",
+			"error", err)
+		return kalshiLedgerSync{}
+	}
+	return switches
+}
+
 func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config.DecisionAccount, credential config.KalshiLiveAccount,
-	database *sql.DB, repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger) (builtKalshiLiveRoute, error) {
+	database *sql.DB, repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger,
+	ledgerSync kalshiLedgerSync) (builtKalshiLiveRoute, error) {
 	client, err := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, APIKeyID: credential.APIKeyID,
 		PrivateKeyPath: credential.PrivateKeyPath, HTTPClient: noRedirectHTTPClient(cfg.Kalshi.RequestTimeout), LiveTradingEnabled: true})
 	if err != nil {
@@ -183,6 +212,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 		settlement, err = kalshisettlement.New(kalshisettlement.Params{
 			ExecutionAccountID: internalID, Source: client, Store: settlementStore,
 			Interval: cfg.Kalshi.SettlementInterval, BalanceDriftThreshold: cfg.Kalshi.BalanceDriftThreshold,
+			BalanceSyncEnabled: ledgerSync.balance, PositionCheckEnabled: ledgerSync.positions,
 		})
 		if err != nil {
 			return builtKalshiLiveRoute{}, err

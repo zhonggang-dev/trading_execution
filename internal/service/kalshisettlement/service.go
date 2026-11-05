@@ -2,8 +2,10 @@
 // with the exchange. Kalshi credits winners and removes settled positions by
 // itself, so there is nothing to submit: the service reads the exchange's
 // settlement records, has the store apply those that agree exactly with the
-// ledger, and reports the rest. It also watches the cash ledger against the
-// exchange balance without ever rewriting it.
+// ledger, and reports the rest. It also compares the cash ledger with the
+// exchange balance; with BalanceSyncEnabled it books a deposit or withdrawal
+// in a verified quiet window (see postgres.SyncKalshiLedger) and checks the
+// positions read-only, otherwise it only records drift.
 package kalshisettlement
 
 import (
@@ -24,18 +26,27 @@ type Params struct {
 	Store                 port.KalshiSettlementStore
 	Interval              time.Duration
 	BalanceDriftThreshold domain.Decimal
-	Logger                *slog.Logger
-	Now                   func() time.Time
+	// BalanceSyncEnabled replaces the drift-only check with the running cash
+	// sync. PositionCheckEnabled additionally reads the exchange positions in
+	// a quiet window and requires them to match before cash is synced; it has
+	// no effect without BalanceSyncEnabled. Both default to off, which is the
+	// behaviour before migration 0045.
+	BalanceSyncEnabled   bool
+	PositionCheckEnabled bool
+	Logger               *slog.Logger
+	Now                  func() time.Time
 }
 
 type Service struct {
-	account   string
-	source    port.KalshiSettlementSource
-	store     port.KalshiSettlementStore
-	interval  time.Duration
-	threshold domain.Decimal
-	logger    *slog.Logger
-	now       func() time.Time
+	account       string
+	source        port.KalshiSettlementSource
+	store         port.KalshiSettlementStore
+	interval      time.Duration
+	threshold     domain.Decimal
+	syncEnabled   bool
+	positionCheck bool
+	logger        *slog.Logger
+	now           func() time.Time
 }
 
 func New(params Params) (*Service, error) {
@@ -61,6 +72,7 @@ func New(params Params) (*Service, error) {
 	return &Service{
 		account: params.ExecutionAccountID, source: params.Source, store: params.Store,
 		interval: params.Interval, threshold: params.BalanceDriftThreshold,
+		syncEnabled: params.BalanceSyncEnabled, positionCheck: params.BalanceSyncEnabled && params.PositionCheckEnabled,
 		logger: params.Logger.With("execution_account_id", params.ExecutionAccountID), now: params.Now,
 	}, nil
 }
@@ -85,9 +97,70 @@ func (service *Service) Run(ctx context.Context) error {
 }
 
 // Sweep applies every settled market the account still holds, then compares
-// the cash ledger with the exchange. Settlement runs first so a payout that the
-// exchange already credited is not reported as drift.
+// the cash ledger with the exchange.
+//
+// Drift-only mode settles first so a payout the exchange already credited is
+// not reported as drift. Sync mode reads the balance (and positions) before any
+// settlement record instead: a sweep that then sees any settlement record, or
+// fails to read one, does not compare at all, and an applied settlement changes
+// the account version, which the locked sync rejects.
 func (service *Service) Sweep(ctx context.Context) error {
+	if !service.syncEnabled {
+		return service.sweepDriftOnly(ctx)
+	}
+	var failures []error
+	snapshot, snapshotErr := service.store.LedgerSnapshot(ctx, service.account)
+	balance, balanceErr := service.source.AvailableBalance(ctx)
+	observedAt := service.now()
+	var positions []domain.KalshiMarketPosition
+	positionsErr := ""
+	if service.positionCheck && snapshotErr == nil && balanceErr == nil && snapshot.Quiet {
+		read, err := service.source.ListPositions(ctx)
+		if err != nil {
+			positionsErr = err.Error()
+			service.logger.Warn("Kalshi position check could not read the exchange positions", "error", err)
+		} else {
+			positions = read
+			if positions == nil {
+				positions = []domain.KalshiMarketPosition{}
+			}
+		}
+	}
+	tickers, err := service.store.OpenKalshiSettlementTickers(ctx, service.account)
+	if err != nil {
+		return fmt.Errorf("list open Kalshi markets: %w", err)
+	}
+	activity, readFailed := false, false
+	for _, ticker := range tickers {
+		seen, readErr, err := service.settleObserved(ctx, ticker)
+		activity = activity || seen
+		readFailed = readFailed || readErr
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", ticker, err))
+		}
+	}
+	switch {
+	case balanceErr != nil:
+		failures = append(failures, fmt.Errorf("balance check: read exchange balance: %w", balanceErr))
+	case snapshotErr != nil:
+		failures = append(failures, fmt.Errorf("balance check: %w", snapshotErr))
+	default:
+		result, err := service.store.SyncKalshiLedger(ctx, service.account, domain.KalshiLedgerObservation{
+			AccountVersionBefore: snapshot.AccountVersion, ExchangeBalance: balance,
+			PositionCheckEnabled: service.positionCheck, Positions: positions, PositionsError: positionsErr,
+			SettlementActivity: activity, SettlementReadFailed: readFailed,
+			Threshold: service.threshold, ObservedAt: observedAt,
+		})
+		if err != nil {
+			failures = append(failures, fmt.Errorf("balance sync: %w", err))
+		} else {
+			service.logSync(result)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (service *Service) sweepDriftOnly(ctx context.Context) error {
 	var failures []error
 	tickers, err := service.store.OpenKalshiSettlementTickers(ctx, service.account)
 	if err != nil {
@@ -104,16 +177,60 @@ func (service *Service) Sweep(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
+// skipLogCounts are the consecutive-skip counts that are logged even when the
+// reason did not change: the first, about an hour and about a day at 5m.
+var skipLogCounts = map[int64]bool{1: true, 12: true, 288: true}
+
+func (service *Service) logSync(result domain.KalshiLedgerSyncResult) {
+	switch result.BalanceOutcome {
+	case domain.KalshiBalanceSynced:
+		service.logger.Info("Kalshi cash synced to the exchange balance", "delta", result.Difference.String(),
+			"local_before", result.LocalBalance.String(), "exchange_balance", result.ExchangeBalance.String(),
+			"event_id", result.SyncEventID, "first_observed_at", result.FirstObservedAt)
+	case domain.KalshiBalanceSkipped:
+		if result.SkipReason != result.PreviousSkipReason || skipLogCounts[result.ConsecutiveSkips] {
+			service.logger.Info("Kalshi cash sync skipped", "skip_reason", result.SkipReason,
+				"consecutive_skips", result.ConsecutiveSkips, "total_skips", result.TotalSkips)
+		}
+	}
+	if result.Drifted && result.BalanceOutcome != domain.KalshiBalanceSynced {
+		service.logger.Warn("Kalshi cash ledger differs from the exchange balance",
+			"local_balance", result.LocalBalance.String(), "exchange_balance", result.ExchangeBalance.String(),
+			"difference", result.Difference.String(), "threshold", service.threshold.String(),
+			"outcome", result.BalanceOutcome)
+	}
+	if result.OpenPositionDrifts != result.PreviousOpenPositionDrifts {
+		service.logger.Info("Kalshi position differences changed", "open_position_drifts", result.OpenPositionDrifts,
+			"previous_open_position_drifts", result.PreviousOpenPositionDrifts, "positions_outcome", result.PositionsOutcome)
+	}
+}
+
+// settleObserved settles one market and reports whether the exchange had a
+// settlement record for it (seen) or could not be asked (readFailed).
+func (service *Service) settleObserved(ctx context.Context, ticker string) (seen, readFailed bool, err error) {
+	records, err := service.source.ListSettlements(ctx, ticker)
+	if err != nil {
+		return false, true, fmt.Errorf("read settlement: %w", err)
+	}
+	if len(records) == 0 {
+		return false, false, nil
+	}
+	return true, false, service.applyRecords(ctx, ticker, records)
+}
+
 func (service *Service) settle(ctx context.Context, ticker string) error {
 	records, err := service.source.ListSettlements(ctx, ticker)
 	if err != nil {
 		return fmt.Errorf("read settlement: %w", err)
 	}
-	switch len(records) {
-	case 0:
+	if len(records) == 0 {
 		return nil
-	case 1:
-	default:
+	}
+	return service.applyRecords(ctx, ticker, records)
+}
+
+func (service *Service) applyRecords(ctx context.Context, ticker string, records []domain.KalshiSettlement) error {
+	if len(records) != 1 {
 		return fmt.Errorf("exchange returned %d settlement records for one market; none applied", len(records))
 	}
 	outcome, err := service.store.ApplyKalshiSettlement(ctx, service.account, records[0], service.now())

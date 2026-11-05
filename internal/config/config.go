@@ -227,6 +227,13 @@ type Kalshi struct {
 	// BalanceDriftThreshold is the largest tolerated gap, in dollars, between
 	// the local cash ledger and the exchange balance.
 	BalanceDriftThreshold domain.Decimal
+	// BalanceSyncEnabled books a running deposit or withdrawal into the local
+	// cash in a verified quiet window; false keeps the drift-only check.
+	// PositionCheckEnabled compares the exchange positions read-only and
+	// requires them to match before cash is synced; it has no effect when
+	// BalanceSyncEnabled is false. Both need KALSHI_SETTLEMENT_ENABLED.
+	BalanceSyncEnabled   bool
+	PositionCheckEnabled bool
 }
 
 // KalshiLiveAccount gives one Kalshi execution account (a DECISION_CYCLE
@@ -455,6 +462,14 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	kalshiBalanceDriftThreshold, err := decimal("KALSHI_BALANCE_DRIFT_THRESHOLD", "0.01")
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiBalanceSyncEnabled, err := boolean("KALSHI_BALANCE_SYNC_ENABLED", true)
+	if err != nil {
+		return Config{}, err
+	}
+	kalshiPositionCheckEnabled, err := boolean("KALSHI_POSITION_CHECK_ENABLED", true)
 	if err != nil {
 		return Config{}, err
 	}
@@ -700,6 +715,8 @@ func Load() (Config, error) {
 			SettlementEnabled:     kalshiSettlementEnabled,
 			SettlementInterval:    kalshiSettlementInterval,
 			BalanceDriftThreshold: kalshiBalanceDriftThreshold,
+			BalanceSyncEnabled:    kalshiBalanceSyncEnabled,
+			PositionCheckEnabled:  kalshiPositionCheckEnabled,
 		},
 		LiveOperations: LiveOperations{
 			Interval: liveOperationsInterval, RefreshTimeout: liveOperationsRefreshTimeout,

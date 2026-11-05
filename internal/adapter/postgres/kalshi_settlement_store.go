@@ -145,63 +145,16 @@ func (store *KalshiSettlementStore) ApplyKalshiSettlement(
 		return domain.KalshiSettlementOutcome{Result: domain.KalshiSettlementManualReview, Reason: reason}, nil
 	}
 
-	if settlement.MarketResult != "yes" && settlement.MarketResult != "no" {
-		return review(fmt.Sprintf("market result %q is not a binary yes/no result", settlement.MarketResult))
-	}
-	if !settlement.PayoutPerYes.IsEmpty() {
-		want := "0"
-		if settlement.MarketResult == "yes" {
-			want = "1"
-		}
-		if equal, err := numericEqual(ctx, tx, settlement.PayoutPerYes.String(), want); err != nil {
-			return domain.KalshiSettlementOutcome{}, err
-		} else if !equal {
-			return review(fmt.Sprintf("payout per yes contract %s contradicts market result %s", settlement.PayoutPerYes, settlement.MarketResult))
-		}
-	}
-	for _, field := range []domain.Decimal{settlement.YesCount, settlement.NoCount, settlement.Revenue} {
-		if field.IsEmpty() {
-			return review("exchange settlement record is missing a count or revenue")
-		}
-	}
-	localYes, localNo := kalshiLocalShares(holdings, yesToken)
-	if equal, err := numericEqual(ctx, tx, settlement.YesCount.String(), localYes.String()); err != nil {
+	reason, err := validateKalshiSettlementAgainstLedger(ctx, tx, settlement, holdings, yesToken)
+	if err != nil {
 		return domain.KalshiSettlementOutcome{}, err
-	} else if !equal {
-		return review(fmt.Sprintf("exchange held %s YES but the ledger holds %s", settlement.YesCount, localYes))
 	}
-	if equal, err := numericEqual(ctx, tx, settlement.NoCount.String(), localNo.String()); err != nil {
-		return domain.KalshiSettlementOutcome{}, err
-	} else if !equal {
-		return review(fmt.Sprintf("exchange held %s NO but the ledger holds %s", settlement.NoCount, localNo))
-	}
-	winning := localNo
-	if settlement.MarketResult == "yes" {
-		winning = localYes
-	}
-	if equal, err := numericEqual(ctx, tx, settlement.Revenue.String(), winning.String()); err != nil {
-		return domain.KalshiSettlementOutcome{}, err
-	} else if !equal {
-		return review(fmt.Sprintf("exchange paid %s but %s winning shares are held", settlement.Revenue, winning))
-	}
-	for _, holding := range holdings {
-		if err := validateKalshiLots(ctx, tx, holding); err != nil {
-			return review(err.Error())
-		}
+	if reason != "" {
+		return review(reason)
 	}
 
-	realizedTotal := domain.Decimal("0")
-	for _, holding := range holdings {
-		realized, err := closeKalshiHolding(ctx, tx, ticker, holding, settlement, appliedAt)
-		if err != nil {
-			return domain.KalshiSettlementOutcome{}, err
-		}
-		realizedTotal, err = numeric(ctx, tx, `SELECT ($1::numeric+$2::numeric)::text`, realizedTotal.String(), realized.String())
-		if err != nil {
-			return domain.KalshiSettlementOutcome{}, err
-		}
-	}
-	if err := creditKalshiSettlement(ctx, tx, executionAccountID, ticker, settlement.Revenue, appliedAt); err != nil {
+	realizedTotal, err := applyValidatedKalshiSettlement(ctx, tx, executionAccountID, ticker, settlement, holdings, appliedAt)
+	if err != nil {
 		return domain.KalshiSettlementOutcome{}, err
 	}
 	if err := insertKalshiSettlementRow(ctx, tx, executionAccountID, ticker, settlement, holdings, "APPLIED", "", realizedTotal.String(), appliedAt); err != nil {
@@ -211,6 +164,84 @@ func (store *KalshiSettlementStore) ApplyKalshiSettlement(
 		return domain.KalshiSettlementOutcome{}, fmt.Errorf("commit Kalshi settlement: %w", err)
 	}
 	return domain.KalshiSettlementOutcome{Result: domain.KalshiSettlementApplied, Payout: settlement.Revenue, RealizedPnL: realizedTotal}, nil
+}
+
+// validateKalshiSettlementAgainstLedger checks an exchange settlement record
+// against the market's locked holdings. A non-empty reason means the two
+// disagree (or the result is not binary) and nothing may be applied. The
+// running sweep and the review tool use the same rules.
+func validateKalshiSettlementAgainstLedger(
+	ctx context.Context, tx *sql.Tx, settlement domain.KalshiSettlement, holdings []kalshiHolding, yesToken string,
+) (string, error) {
+	if settlement.MarketResult != "yes" && settlement.MarketResult != "no" {
+		return fmt.Sprintf("market result %q is not a binary yes/no result", settlement.MarketResult), nil
+	}
+	if !settlement.PayoutPerYes.IsEmpty() {
+		want := "0"
+		if settlement.MarketResult == "yes" {
+			want = "1"
+		}
+		if equal, err := numericEqual(ctx, tx, settlement.PayoutPerYes.String(), want); err != nil {
+			return "", err
+		} else if !equal {
+			return fmt.Sprintf("payout per yes contract %s contradicts market result %s", settlement.PayoutPerYes, settlement.MarketResult), nil
+		}
+	}
+	for _, field := range []domain.Decimal{settlement.YesCount, settlement.NoCount, settlement.Revenue} {
+		if field.IsEmpty() {
+			return "exchange settlement record is missing a count or revenue", nil
+		}
+	}
+	localYes, localNo := kalshiLocalShares(holdings, yesToken)
+	if equal, err := numericEqual(ctx, tx, settlement.YesCount.String(), localYes.String()); err != nil {
+		return "", err
+	} else if !equal {
+		return fmt.Sprintf("exchange held %s YES but the ledger holds %s", settlement.YesCount, localYes), nil
+	}
+	if equal, err := numericEqual(ctx, tx, settlement.NoCount.String(), localNo.String()); err != nil {
+		return "", err
+	} else if !equal {
+		return fmt.Sprintf("exchange held %s NO but the ledger holds %s", settlement.NoCount, localNo), nil
+	}
+	winning := localNo
+	if settlement.MarketResult == "yes" {
+		winning = localYes
+	}
+	if equal, err := numericEqual(ctx, tx, settlement.Revenue.String(), winning.String()); err != nil {
+		return "", err
+	} else if !equal {
+		return fmt.Sprintf("exchange paid %s but %s winning shares are held", settlement.Revenue, winning), nil
+	}
+	for _, holding := range holdings {
+		if err := validateKalshiLots(ctx, tx, holding); err != nil {
+			return err.Error(), nil
+		}
+	}
+	return "", nil
+}
+
+// applyValidatedKalshiSettlement closes the market's holdings and lots and
+// credits the exchange payout, returning the realized profit or loss. The
+// caller has validated the record and writes the settlement row.
+func applyValidatedKalshiSettlement(
+	ctx context.Context, tx *sql.Tx, accountID, ticker string, settlement domain.KalshiSettlement,
+	holdings []kalshiHolding, at time.Time,
+) (domain.Decimal, error) {
+	realizedTotal := domain.Decimal("0")
+	for _, holding := range holdings {
+		realized, err := closeKalshiHolding(ctx, tx, ticker, holding, settlement, at)
+		if err != nil {
+			return "", err
+		}
+		realizedTotal, err = numeric(ctx, tx, `SELECT ($1::numeric+$2::numeric)::text`, realizedTotal.String(), realized.String())
+		if err != nil {
+			return "", err
+		}
+	}
+	if err := creditKalshiSettlement(ctx, tx, accountID, ticker, settlement.Revenue, at); err != nil {
+		return "", err
+	}
+	return realizedTotal, nil
 }
 
 // loadKalshiHoldings locks the YES and NO positions of one market that still
@@ -574,24 +605,9 @@ func (store *KalshiSettlementStore) CheckKalshiBalance(
 		return domain.KalshiBalanceCheck{}, err
 	}
 	if drifted {
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO kalshi_balance_drift (
-				execution_account_id, status, local_balance, exchange_balance, difference,
-				observations, first_seen_at, last_seen_at
-			) VALUES ($1,'OPEN',$2::numeric,$3::numeric,$4::numeric,1,$5,$5)
-			ON CONFLICT (execution_account_id) DO UPDATE SET
-				first_seen_at = CASE WHEN kalshi_balance_drift.status='OPEN' THEN kalshi_balance_drift.first_seen_at ELSE EXCLUDED.first_seen_at END,
-				observations = CASE WHEN kalshi_balance_drift.status='OPEN' THEN kalshi_balance_drift.observations+1 ELSE 1 END,
-				status='OPEN', local_balance=EXCLUDED.local_balance, exchange_balance=EXCLUDED.exchange_balance,
-				difference=EXCLUDED.difference, last_seen_at=EXCLUDED.last_seen_at, resolved_at=NULL`,
-			executionAccountID, local.String(), exchangeBalance.String(), difference.String(), observedAt)
+		err = recordKalshiBalanceDrift(ctx, tx, executionAccountID, local, exchangeBalance, difference, observedAt)
 	} else {
-		_, err = tx.ExecContext(ctx, `
-			UPDATE kalshi_balance_drift
-			SET status='RESOLVED', local_balance=$2::numeric, exchange_balance=$3::numeric, difference=$4::numeric,
-			    last_seen_at=$5, resolved_at=$5
-			WHERE execution_account_id=$1 AND status='OPEN'`,
-			executionAccountID, local.String(), exchangeBalance.String(), difference.String(), observedAt)
+		err = resolveKalshiBalanceDrift(ctx, tx, executionAccountID, local, exchangeBalance, difference, observedAt)
 	}
 	if err != nil {
 		return domain.KalshiBalanceCheck{}, err
@@ -600,4 +616,35 @@ func (store *KalshiSettlementStore) CheckKalshiBalance(
 		return domain.KalshiBalanceCheck{}, err
 	}
 	return domain.KalshiBalanceCheck{LocalBalance: local, ExchangeBalance: exchangeBalance, Difference: difference, Drifted: drifted}, nil
+}
+
+// recordKalshiBalanceDrift opens or extends the account's drift row.
+func recordKalshiBalanceDrift(
+	ctx context.Context, tx *sql.Tx, accountID string, local, exchange, difference domain.Decimal, at time.Time,
+) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO kalshi_balance_drift (
+			execution_account_id, status, local_balance, exchange_balance, difference,
+			observations, first_seen_at, last_seen_at
+		) VALUES ($1,'OPEN',$2::numeric,$3::numeric,$4::numeric,1,$5,$5)
+		ON CONFLICT (execution_account_id) DO UPDATE SET
+			first_seen_at = CASE WHEN kalshi_balance_drift.status='OPEN' THEN kalshi_balance_drift.first_seen_at ELSE EXCLUDED.first_seen_at END,
+			observations = CASE WHEN kalshi_balance_drift.status='OPEN' THEN kalshi_balance_drift.observations+1 ELSE 1 END,
+			status='OPEN', local_balance=EXCLUDED.local_balance, exchange_balance=EXCLUDED.exchange_balance,
+			difference=EXCLUDED.difference, last_seen_at=EXCLUDED.last_seen_at, resolved_at=NULL`,
+		accountID, local.String(), exchange.String(), difference.String(), at)
+	return err
+}
+
+// resolveKalshiBalanceDrift closes an open drift row once the two agree.
+func resolveKalshiBalanceDrift(
+	ctx context.Context, tx *sql.Tx, accountID string, local, exchange, difference domain.Decimal, at time.Time,
+) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE kalshi_balance_drift
+		SET status='RESOLVED', local_balance=$2::numeric, exchange_balance=$3::numeric, difference=$4::numeric,
+		    last_seen_at=$5, resolved_at=$5
+		WHERE execution_account_id=$1 AND status='OPEN'`,
+		accountID, local.String(), exchange.String(), difference.String(), at)
+	return err
 }
