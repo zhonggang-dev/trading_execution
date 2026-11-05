@@ -345,6 +345,48 @@ func TestLoadDecisionCycleDeliveryConcurrency(t *testing.T) {
 	}
 }
 
+func TestLoadDecisionCycleCallTimeouts(t *testing.T) {
+	t.Run("defaults keep an unchanged env file working", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		setCompleteLiveEnvironment(t)
+		setCompleteDecisionCycleEnvironment(t)
+		config, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if config.DecisionCycle.StrategyTimeout != 90*time.Second || config.DecisionCycle.PredictionTimeout != 30*time.Second {
+			t.Fatalf("timeouts = %s/%s, want 90s/30s", config.DecisionCycle.StrategyTimeout, config.DecisionCycle.PredictionTimeout)
+		}
+	})
+	t.Run("custom values apply", func(t *testing.T) {
+		clearConfigEnvironment(t)
+		setCompleteLiveEnvironment(t)
+		setCompleteDecisionCycleEnvironment(t)
+		t.Setenv("DECISION_CYCLE_STRATEGY_TIMEOUT", "2m")
+		t.Setenv("DECISION_CYCLE_PREDICTION_TIMEOUT", "10s")
+		config, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if config.DecisionCycle.StrategyTimeout != 2*time.Minute || config.DecisionCycle.PredictionTimeout != 10*time.Second {
+			t.Fatalf("timeouts = %s/%s", config.DecisionCycle.StrategyTimeout, config.DecisionCycle.PredictionTimeout)
+		}
+	})
+	for _, key := range []string{"DECISION_CYCLE_STRATEGY_TIMEOUT", "DECISION_CYCLE_PREDICTION_TIMEOUT"} {
+		for _, value := range []string{"0", "-1s", "8m", "9m", "soon"} {
+			t.Run("rejects "+key+"="+value, func(t *testing.T) {
+				clearConfigEnvironment(t)
+				setCompleteLiveEnvironment(t)
+				setCompleteDecisionCycleEnvironment(t)
+				t.Setenv(key, value)
+				if _, err := Load(); err == nil || !strings.Contains(err.Error(), key) {
+					t.Fatalf("Load() error = %v, want %s rejection", err, key)
+				}
+			})
+		}
+	}
+}
+
 func TestLoadDecisionCycleOrderReport(t *testing.T) {
 	t.Run("defaults to disabled with a 24h lookback", func(t *testing.T) {
 		clearConfigEnvironment(t)
@@ -763,6 +805,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"DECISION_CYCLE_PREDICTION_INFRA_URL", "DECISION_CYCLE_PREDICTION_INFRA_TOKEN",
 		"DECISION_CYCLE_STRATEGY_URL", "DECISION_CYCLE_STRATEGY_TOKEN",
 		"DECISION_CYCLE_INTERVAL", "DECISION_CYCLE_STARTUP_DELAY", "DECISION_CYCLE_MAX_START_LATENESS", "DECISION_CYCLE_TIMEOUT",
+		"DECISION_CYCLE_STRATEGY_TIMEOUT", "DECISION_CYCLE_PREDICTION_TIMEOUT",
 		"DECISION_CYCLE_PREDICTION_LOOKBACK", "DECISION_CYCLE_MID_PRICE_LOOKBACK",
 		"DECISION_CYCLE_PREDICTION_MODEL_ID", "DECISION_CYCLE_PREDICTION_SOURCE_MODE", "DECISION_CYCLE_ACCOUNTS_JSON",
 		"DECISION_CYCLE_DELIVERY_CONCURRENCY",

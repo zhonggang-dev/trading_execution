@@ -33,6 +33,11 @@ var (
 	ErrOrderRecoveryLeaseHeld    = errors.New("order recovery lease is held by another worker")
 	ErrOrderRecoveryBackoff      = errors.New("order recovery retry is not due yet")
 	ErrOrderRecoveryStaleView    = errors.New("order recovery snapshot revision is stale")
+	// ErrPredictionSourceUnavailable marks an availability failure of the
+	// prediction source (transport error, timeout, interrupted body, HTTP 429
+	// or 5xx). A decision cycle degrades to exit-only on it; authentication
+	// failures and invalid data never carry it.
+	ErrPredictionSourceUnavailable = errors.New("prediction source unavailable")
 )
 
 // ExecutionAccountScope is the process-owned account boundary for live

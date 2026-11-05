@@ -84,9 +84,12 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 			return nil, fmt.Errorf("build Kalshi orderbook source: %w", buildErr)
 		}
 	}
+	// Each venue's capture has its own budget (marketbooks.DefaultVenueTimeout);
+	// a venue that fails as a whole is marked ERROR without failing the other.
 	orderBooks, err := marketbooks.New(marketbooks.Params{
 		Polymarket: params.orderBooks,
 		Kalshi:     kalshiOrderBooks,
+		Logger:     params.logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build venue orderbook router: %w", err)
@@ -137,6 +140,8 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		DeliveryStaleAge:             cycleConfig.Timeout,
 		DeliveryConcurrency:          cycleConfig.DeliveryConcurrency,
 		NotSubmittedReporter:         notSubmittedReporter,
+		StrategyTimeout:              cycleConfig.StrategyTimeout,
+		PredictionTimeout:            cycleConfig.PredictionTimeout,
 		Logger:                       params.logger,
 	})
 	if err != nil {

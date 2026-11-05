@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/port"
 )
 
 const maxResponseBytes = 32 << 20
@@ -64,12 +65,14 @@ func (client *Client) Snapshot(ctx context.Context, decisionAt time.Time, lookba
 	request.Header.Set("Accept", "application/json")
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return domain.PredictionSnapshot{}, fmt.Errorf("request prediction snapshot: %w", err)
+		// Transport failures (refused, DNS, TLS, reset, timeout) are availability
+		// failures; the original error stays wrapped for context checks.
+		return domain.PredictionSnapshot{}, fmt.Errorf("%w: request prediction snapshot: %w", port.ErrPredictionSourceUnavailable, err)
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
-		return domain.PredictionSnapshot{}, fmt.Errorf("read prediction snapshot response: %w", err)
+		return domain.PredictionSnapshot{}, fmt.Errorf("%w: read prediction snapshot response: %w", port.ErrPredictionSourceUnavailable, err)
 	}
 	if len(body) > maxResponseBytes {
 		return domain.PredictionSnapshot{}, fmt.Errorf("prediction snapshot response exceeds %d bytes", maxResponseBytes)
@@ -80,7 +83,12 @@ func (client *Client) Snapshot(ctx context.Context, decisionAt time.Time, lookba
 			Message string `json:"message"`
 		}
 		_ = json.Unmarshal(body, &failure)
-		return domain.PredictionSnapshot{}, fmt.Errorf("prediction snapshot HTTP %d: %s: %s", response.StatusCode, failure.Code, failure.Message)
+		statusErr := fmt.Errorf("prediction snapshot HTTP %d: %s: %s", response.StatusCode, failure.Code, failure.Message)
+		if unavailableStatus(response.StatusCode) {
+			return domain.PredictionSnapshot{}, fmt.Errorf("%w: %w", port.ErrPredictionSourceUnavailable, statusErr)
+		}
+		// 401/403 and every other 4xx are configuration or contract errors.
+		return domain.PredictionSnapshot{}, statusErr
 	}
 	var envelope struct {
 		Code string                    `json:"code"`
@@ -100,4 +108,10 @@ func (client *Client) Snapshot(ctx context.Context, decisionAt time.Time, lookba
 		return domain.PredictionSnapshot{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}
 	return envelope.Data, nil
+}
+
+// unavailableStatus reports the HTTP statuses that mean the prediction source is
+// temporarily unavailable: rate limiting and server-side failures.
+func unavailableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
 }

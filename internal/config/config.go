@@ -101,7 +101,15 @@ type DecisionCycle struct {
 	StartupDelay                 time.Duration
 	MaxStartLateness             time.Duration
 	Timeout                      time.Duration
-	PredictionLookback           time.Duration
+	// StrategyTimeout bounds one account's strategy call
+	// (DECISION_CYCLE_STRATEGY_TIMEOUT, default 90s); it must be shorter
+	// than Timeout. A timeout fails only that account.
+	StrategyTimeout time.Duration
+	// PredictionTimeout bounds the prediction snapshot request
+	// (DECISION_CYCLE_PREDICTION_TIMEOUT, default 30s); it must be shorter
+	// than Timeout. A timeout makes the cycle exit-only.
+	PredictionTimeout  time.Duration
+	PredictionLookback time.Duration
 	// DeliveryConcurrency is how many intents of one wallet's batch are submitted
 	// at once. 1 (the default) is strictly sequential. Asset reservation stays
 	// in strategy order at every value.
@@ -868,6 +876,12 @@ func (config Config) Validate() error {
 		if config.DecisionCycle.Timeout <= 0 || config.DecisionCycle.Timeout >= config.DecisionCycle.Interval {
 			return fmt.Errorf("DECISION_CYCLE_TIMEOUT must be positive and less than DECISION_CYCLE_INTERVAL")
 		}
+		if config.DecisionCycle.StrategyTimeout <= 0 || config.DecisionCycle.StrategyTimeout >= config.DecisionCycle.Timeout {
+			return fmt.Errorf("DECISION_CYCLE_STRATEGY_TIMEOUT must be positive and less than DECISION_CYCLE_TIMEOUT")
+		}
+		if config.DecisionCycle.PredictionTimeout <= 0 || config.DecisionCycle.PredictionTimeout >= config.DecisionCycle.Timeout {
+			return fmt.Errorf("DECISION_CYCLE_PREDICTION_TIMEOUT must be positive and less than DECISION_CYCLE_TIMEOUT")
+		}
 		if config.DecisionCycle.PredictionLookback < 10*time.Minute || config.DecisionCycle.PredictionLookback > 24*time.Hour {
 			return fmt.Errorf("DECISION_CYCLE_PREDICTION_LOOKBACK must be between 10m and 24h")
 		}
@@ -937,6 +951,14 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	strategyTimeout, err := duration("DECISION_CYCLE_STRATEGY_TIMEOUT", 90*time.Second)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	predictionTimeout, err := duration("DECISION_CYCLE_PREDICTION_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	predictionLookback, err := duration("DECISION_CYCLE_PREDICTION_LOOKBACK", 3*time.Hour)
 	if err != nil {
 		return DecisionCycle{}, err
@@ -976,6 +998,7 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		StrategyToken:                strings.TrimSpace(os.Getenv("DECISION_CYCLE_STRATEGY_TOKEN")),
 		Interval:                     interval, StartupDelay: startupDelay,
 		MaxStartLateness: maxStartLateness, Timeout: timeout,
+		StrategyTimeout: strategyTimeout, PredictionTimeout: predictionTimeout,
 		PredictionLookback:     predictionLookback,
 		DeliveryConcurrency:    deliveryConcurrency,
 		OrderReportStrategyIDs: orderReportStrategyIDs,

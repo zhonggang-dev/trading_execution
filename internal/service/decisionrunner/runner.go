@@ -260,9 +260,17 @@ func (runner *Runner) runAfterCycle(ctx context.Context) {
 
 func (runner *Runner) logResult(boundary time.Time, result decisioncycle.RunResult, runErr error) {
 	bindings, intents, submitted, disabled, failed := summarize(result)
+	accountsOK, accountsFailed, accountsSkipped := summarizeAccounts(result)
 	attributes := []any{
 		"decision_at", boundary,
 		"snapshot_id", result.PredictionSnapshotID,
+		"prediction_source_unavailable", result.PredictionSourceUnavailable,
+		"degraded_venues", result.DegradedVenues,
+		"recovered_rejected", result.Recovery.Rejected,
+		"recovered_unknown", result.Recovery.Unknown,
+		"accounts_ok", accountsOK,
+		"accounts_failed", accountsFailed,
+		"accounts_skipped", accountsSkipped,
 		"bindings", bindings,
 		"intents", intents,
 		"submitted", submitted,
@@ -291,6 +299,10 @@ type bindingRunSummary struct {
 	EntrySubmissionEnabled    bool   `json:"entry_submission_enabled"`
 	EntryBlockReason          string `json:"entry_block_reason,omitempty"`
 	RouteUnavailable          bool   `json:"route_unavailable,omitempty"`
+	InputUnavailable          bool   `json:"input_unavailable,omitempty"`
+	VenueBooksUnavailable     bool   `json:"venue_books_unavailable,omitempty"`
+	NotRun                    bool   `json:"not_run,omitempty"`
+	FailureStage              string `json:"failure_stage,omitempty"`
 	Failed                    bool   `json:"failed"`
 }
 
@@ -311,10 +323,31 @@ func bindingRunSummaries(result decisioncycle.RunResult) []bindingRunSummary {
 			EntrySubmissionEnabled:    run.EntrySubmissionEnabled,
 			EntryBlockReason:          run.EntryBlockReason,
 			RouteUnavailable:          run.RouteUnavailable,
+			InputUnavailable:          run.InputUnavailable,
+			VenueBooksUnavailable:     run.VenueBooksUnavailable,
+			NotRun:                    run.NotRun,
+			FailureStage:              run.FailureStage,
 			Failed:                    run.Error != nil || run.EntryBlockReason != "",
 		})
 	}
 	return summaries
+}
+
+// summarizeAccounts counts accounts that ran cleanly, failed (any error,
+// including exclusion, degraded venue, not run), or were skipped by
+// configuration or an untradable route.
+func summarizeAccounts(result decisioncycle.RunResult) (ok, failed, skipped int) {
+	for _, run := range result.Runs {
+		switch {
+		case run.Error != nil:
+			failed++
+		case run.AccountSubmissionDisabled || run.AccountStrategyDisabled || run.RouteUnavailable:
+			skipped++
+		default:
+			ok++
+		}
+	}
+	return ok, failed, skipped
 }
 
 func summarize(result decisioncycle.RunResult) (bindings, intents, submitted, disabled, failed int) {
