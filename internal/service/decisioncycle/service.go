@@ -194,7 +194,10 @@ type IntentResult struct {
 	DeliveryStatus     domain.DecisionIntentDeliveryStatus
 	DeliveryAttempt    int
 	SubmissionDisabled bool
-	Error              error
+	// AwaitingFillEvidence marks a delivery completed as UNKNOWN only because
+	// the venue-reported execution is still waiting for confirmed trades.
+	AwaitingFillEvidence bool
+	Error                error
 }
 
 // BindingRunResult 表示后端使用的 BindingRunResult 类型。
@@ -1126,7 +1129,9 @@ func (service *Service) processDelivery(ctx context.Context, delivery domain.Dec
 			intentResult.Error = errors.Join(intentResult.Error, fmt.Errorf("complete durable strategy intent: %w", completeErr))
 		} else {
 			intentResult.DeliveryStatus = completion.Status
-			if completion.Status == domain.DecisionIntentFailed || completion.Status == domain.DecisionIntentUnknown {
+			intentResult.AwaitingFillEvidence = intentResult.Error == nil && intentResult.Result.Order.AwaitingFillEvidence()
+			if !intentResult.AwaitingFillEvidence &&
+				(completion.Status == domain.DecisionIntentFailed || completion.Status == domain.DecisionIntentUnknown) {
 				intentResult.Error = errors.Join(intentResult.Error, fmt.Errorf(
 					"execution order %s completed durable delivery as %s (%s)",
 					completion.OrderID, completion.Status, completion.OrderStatus,
