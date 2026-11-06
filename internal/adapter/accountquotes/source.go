@@ -546,11 +546,10 @@ func (s *Source) kalshi(ctx context.Context, targets []core.Target, emit func(ma
 				}
 				// Kalshi markets expose no last-trade time (updated_time is non-trading
 				// metadata time), so SourceAt stays unknown for both live sources.
-				// Order: last trade when volume_24h_fp > 0 shows a trade in the last
-				// 24 hours; otherwise a valid book midpoint; otherwise the older last
-				// trade (closed or very thin markets), and only then the mid reason.
+				// Prefer a valid official last trade regardless of recent volume.
+				// Only a missing, invalid or never-traded last price uses the book.
 				last, hasLast := kalshiLastTrade(m, yes)
-				if hasLast && positiveDecimal(m.Volume24h) {
+				if hasLast {
 					result[k] = core.Priced(last, "KALSHI_LAST_TRADE", observed, nil)
 					continue
 				}
@@ -558,8 +557,6 @@ func (s *Source) kalshi(ctx context.Context, targets []core.Target, emit func(ma
 				switch {
 				case reason == "":
 					result[k] = core.Priced(mid, "KALSHI_BOOK_MID", observed, nil)
-				case hasLast:
-					result[k] = core.Priced(last, "KALSHI_LAST_TRADE", observed, nil)
 				default:
 					result[k] = core.Unknown(reason)
 				}
