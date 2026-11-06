@@ -2179,6 +2179,45 @@ func TestDeliverPendingSurfacesReplayedRejectedAndUnknownOrders(t *testing.T) {
 	}
 }
 
+func TestDeliverPendingOnlyForgivesUnknownAwaitingFillEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		status    domain.OrderStatus
+		code      string
+		submitErr error
+		want      bool
+		stored    domain.DecisionIntentDeliveryStatus
+	}{
+		{name: "fill evidence pending", status: domain.OrderStatusUnknown, code: "VENUE_FILL_EVIDENCE_PENDING", want: true, stored: domain.DecisionIntentUnknown},
+		{name: "fill details unavailable", status: domain.OrderStatusUnknown, code: "CLOB_FILL_DETAILS_UNAVAILABLE", want: true, stored: domain.DecisionIntentUnknown},
+		{name: "venue server error", status: domain.OrderStatusUnknown, code: "CLOB_SERVER_ERROR", stored: domain.DecisionIntentUnknown},
+		{name: "incomplete submit", status: domain.OrderStatusUnknown, code: "INCOMPLETE_SUBMIT_ATTEMPT", stored: domain.DecisionIntentUnknown},
+		{name: "order not found", status: domain.OrderStatusUnknown, code: "CLOB_ORDER_NOT_FOUND", stored: domain.DecisionIntentUnknown},
+		{name: "no reason", status: domain.OrderStatusUnknown, stored: domain.DecisionIntentUnknown},
+		{name: "pending code with submit error", status: domain.OrderStatusUnknown, code: "VENUE_FILL_EVIDENCE_PENDING", submitErr: errors.New("retain reservation failed"), stored: domain.DecisionIntentUnknown},
+		{name: "manual review keeps failing", status: domain.OrderStatusManualReview, code: "VENUE_FILL_EVIDENCE_PENDING", stored: domain.DecisionIntentUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			intent := domain.OrderIntent{ClientOrderID: "client-1", ExecutionAccountID: "account-active"}
+			recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{{
+				CycleID: "cycle-1", ClientOrderID: intent.ClientOrderID,
+				Intent: intent, Status: domain.DecisionIntentPending,
+			}}}
+			service := &Service{recorder: recorder, executor: fixedResultExecutor{
+				result: port.OrderSubmitResult{Order: domain.Order{ID: "order-1", Status: test.status, FailureCode: test.code}},
+				err:    test.submitErr,
+			}, activeExecutionAccountIDs: []string{"account-active"}, entryEnabledExecutionAccountIDs: []string{"account-active"}}
+			results, err := service.deliverPending(context.Background(), "cycle-1")
+			if len(results) != 1 || recorder.deliveries[0].Status != test.stored {
+				t.Fatalf("results=%#v stored=%s", results, recorder.deliveries[0].Status)
+			}
+			if results[0].AwaitingFillEvidence != test.want || (err == nil) != test.want || (results[0].Error == nil) != test.want {
+				t.Fatalf("awaiting=%v result error=%v deliver error=%v, want forgiven=%v", results[0].AwaitingFillEvidence, results[0].Error, err, test.want)
+			}
+		})
+	}
+}
+
 func TestDeliverPendingLeavesMissingOrderOwnershipLeasedAndUnhealthy(t *testing.T) {
 	intent := domain.OrderIntent{ClientOrderID: "client-1", ExecutionAccountID: "account-active"}
 	recorder := &fakeRecorder{deliveries: []domain.DecisionIntentDelivery{{

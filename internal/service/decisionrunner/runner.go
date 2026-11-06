@@ -358,6 +358,8 @@ func summarize(result decisioncycle.RunResult) (bindings, intents, submitted, di
 			switch {
 			case intent.SubmissionDisabled:
 				disabled++
+			case intent.AwaitingFillEvidence:
+				submitted++
 			case intent.Error != nil || (intent.DeliveryStatus != "" && intent.DeliveryStatus != domain.DecisionIntentSubmitted):
 				failed++
 			default:

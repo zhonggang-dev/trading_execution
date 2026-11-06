@@ -319,6 +319,20 @@ type Order struct {
 	Revision            int64             `json:"revision"`
 }
 
+// AwaitingFillEvidence reports an order the venue already reported executed
+// while the authoritative fill ledger waits for the confirmed trades. It is a
+// normal propagation state, unlike an UNKNOWN whose venue outcome is uncertain.
+func (order Order) AwaitingFillEvidence() bool {
+	if order.Status != OrderStatusUnknown {
+		return false
+	}
+	switch strings.TrimSpace(order.FailureCode) {
+	case "VENUE_FILL_EVIDENCE_PENDING", "CLOB_FILL_DETAILS_UNAVAILABLE":
+		return true
+	}
+	return false
+}
+
 // AllowsBuySharePriceImprovement reports the venue-specific case where a BUY
 // fixes the maximum collateral spend and minimum shares in the signed order.
 // Polymarket may settle more outcome shares at a better effective price while

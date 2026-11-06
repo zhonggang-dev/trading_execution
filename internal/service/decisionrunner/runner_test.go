@@ -122,6 +122,19 @@ func TestNextScheduleUsesUTCBoundaryAndSkipsExpiredWindow(t *testing.T) {
 	}
 }
 
+func TestSummarizeCountsAwaitingFillEvidenceAsSubmitted(t *testing.T) {
+	_, intents, submitted, _, failed := summarize(decisioncycle.RunResult{Runs: []decisioncycle.BindingRunResult{{
+		Intents: []decisioncycle.IntentResult{
+			{DeliveryStatus: domain.DecisionIntentUnknown, AwaitingFillEvidence: true},
+			{DeliveryStatus: domain.DecisionIntentUnknown, Error: errors.New("venue outcome is uncertain")},
+			{DeliveryStatus: domain.DecisionIntentSubmitted},
+		},
+	}}})
+	if intents != 3 || submitted != 2 || failed != 1 {
+		t.Fatalf("intents=%d submitted=%d failed=%d", intents, submitted, failed)
+	}
+}
+
 func TestBindingRunSummariesExposePredictionRoutingAndCounts(t *testing.T) {
 	summaries := bindingRunSummaries(decisioncycle.RunResult{Runs: []decisioncycle.BindingRunResult{{
 		Context: domain.StrategyExecutionContext{
