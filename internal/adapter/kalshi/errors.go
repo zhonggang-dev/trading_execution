@@ -109,6 +109,10 @@ func classifyKalshiError(status int, apiCode, message string) string {
 		return "KALSHI_FOK_NOT_FILLED"
 	case status == http.StatusConflict:
 		return "KALSHI_ORDER_CONFLICT"
+	case strings.Contains(combined, "insufficient shard balance"):
+		// Kalshi checks collateral per exchange shard (Crypto/Commodities live on
+		// shard 2); this 404 is an unfunded shard, not a missing order.
+		return "KALSHI_INSUFFICIENT_SHARD_BALANCE"
 	case strings.Contains(combined, "available_balance_too_low") || strings.Contains(combined, "insufficient balance"):
 		return "KALSHI_INSUFFICIENT_BALANCE"
 	case strings.Contains(combined, "invalid_order_size"):

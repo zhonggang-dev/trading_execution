@@ -85,7 +85,7 @@ func (s *PipelineMonitorSource) venueFailures(ctx context.Context, tx *sql.Tx, n
 	rows, err := tx.QueryContext(ctx, `SELECT order_id,failure_code,updated_at FROM execution_orders
  WHERE execution_account_id=$1 AND updated_at >= $2 AND failure_code IN
  ('CLOB_TRADING_PAUSED','CLOB_AUTH_FAILED','CLOB_INVALID_SIGNATURE','CLOB_INSUFFICIENT_BALANCE_ALLOWANCE','CLOB_RATE_LIMITED','CLOB_SERVER_ERROR',
-  'KALSHI_AUTH_FAILED','KALSHI_RATE_LIMITED','KALSHI_SERVER_ERROR','KALSHI_TRANSPORT_FAILED')
+  'KALSHI_AUTH_FAILED','KALSHI_RATE_LIMITED','KALSHI_SERVER_ERROR','KALSHI_TRANSPORT_FAILED','KALSHI_INSUFFICIENT_SHARD_BALANCE')
  ORDER BY updated_at DESC LIMIT 101`, accountID, now.Add(-15*time.Minute))
 	if err != nil {
 		return check, fmt.Errorf("read bounded venue failure evidence: %w", err)

@@ -34,6 +34,7 @@ func TestKnownFamiliesShowOperationalImpactAndChineseEvidence(t *testing.T) {
 		{"order.recovery", "wallet-7", map[string]string{"stalled_sample_rows": "5", "sample_state": "MANUAL_REVIEW"}, []string{"钱包 7", "采样超时项 5", "待人工核查"}, "本次订单恢复采样"},
 		{"fill.application", "wallet-6", map[string]string{"stalled_sample_rows": "4", "sample_state": "CONFIRMED"}, []string{"钱包 6", "已确认成交", "采样超时项 4", "已确认待应用"}, "本次采样"},
 		{"venue.execution_errors", "kalshi:main", map[string]string{"sampled_orders": "7", "window": "15m", "sample_failure_code": "KALSHI_AUTH_FAILED", "last_failure_at": "2026-10-30T06:25:00Z"}, []string{"Kalshi 主账户", "最新异常样本", "近15分钟采样异常订单 7", "最新样本 认证失败"}, "阈值内"},
+		{"venue.execution_errors", "kalshi:main", map[string]string{"sampled_orders": "3", "window": "15m", "sample_failure_code": "KALSHI_INSUFFICIENT_SHARD_BALANCE", "last_failure_at": "2026-11-08T21:10:00Z"}, []string{"Kalshi 主账户", "分片资金不足", "对应分片转入资金"}, "阈值内"},
 		{"worker.predictor.execution", "liang/live", map[string]string{"recent_failures": "2", "recent_error_retries": "3", "over_budget_running": "4"}, []string{"本批概率", "近期失败 2", "异常重试 3", "超预算在途 4"}, "本次执行采样"},
 		{"worker.predictor.inputs", "liang/live", map[string]string{"expired_inputs": "6", "recent_rows": "30"}, []string{"将被跳过", "近期采样过期输入 6", "近期采样输入 30"}, "近期输入采样"},
 		{"worker.predictor.sources", "liang/live", map[string]string{"allowed": "polymarket", "expected": "polymarket,kalshi"}, []string{"不会产生本轮结果", "已允许 Polymarket", "应包含 Polymarket、Kalshi"}, "来源准入"},

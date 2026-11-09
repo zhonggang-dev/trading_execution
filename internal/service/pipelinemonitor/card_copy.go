@@ -102,6 +102,8 @@ func issueImpact(issue cardIssue, recovery bool) string {
 				return subject + "最新异常样本的认证或签名未通过，相关提交可能被拒绝。"
 			case "CLOB_INSUFFICIENT_BALANCE_ALLOWANCE":
 				return subject + "最新异常样本提示余额或授权不足，相关买入可能受阻。"
+			case "KALSHI_INSUFFICIENT_SHARD_BALANCE":
+				return subject + "最新异常样本提示交易所分片资金不足，该分片市场的买入会被拒绝，需要向对应分片转入资金。"
 			}
 		}
 		if c.ID == "decision.schedule" && c.Status == Warning {
@@ -443,6 +445,8 @@ func reasonChinese(s string) string {
 		return "签名无效"
 	case "CLOB_INSUFFICIENT_BALANCE_ALLOWANCE":
 		return "余额或授权不足"
+	case "KALSHI_INSUFFICIENT_SHARD_BALANCE":
+		return "分片资金不足"
 	case "CLOB_RATE_LIMITED", "KALSHI_RATE_LIMITED":
 		return "请求限流"
 	case "CLOB_SERVER_ERROR", "KALSHI_SERVER_ERROR":
