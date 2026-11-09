@@ -13,8 +13,9 @@ import (
 func completeFixture(at time.Time) CohortMetrics {
 	dd, sh, zero := "3", "2.5", 0
 	from := at.Add(-72 * time.Hour)
-	day := at.Truncate(24 * time.Hour)
-	return CohortMetrics{Metrics: Metrics{ExecutionAccountID: "pm", MarketSource: "POLYMARKET"}, OpenedAssetCount: 1, MaxDrawdown: &dd, DrawdownState: "available", DrawdownCoverage: &DrawdownCoverage{From: &from, To: &at, ComputedAt: &at, FidelitySeconds: 3600, MissingAssetCount: &zero, MissingPointCount: &zero}, SharpAnnual: &sh, SharpAnnualCoverage: &SharpeCoverage{From: &from, To: &day, ComputedAt: &at, PeriodSeconds: 86400, SampleDays: 2}}
+	day := sharpeDayStart(at)
+	dailyFrom := day.Add(-72 * time.Hour)
+	return CohortMetrics{Metrics: Metrics{ExecutionAccountID: "pm", MarketSource: "POLYMARKET"}, OpenedAssetCount: 1, MaxDrawdown: &dd, DrawdownState: "available", DrawdownCoverage: &DrawdownCoverage{From: &from, To: &at, ComputedAt: &at, FidelitySeconds: 3600, MissingAssetCount: &zero, MissingPointCount: &zero}, SharpAnnual: &sh, SharpAnnualCoverage: &SharpeCoverage{DayTimezone: sharpeDayTimezone, From: &dailyFrom, To: &day, ComputedAt: &at, PeriodSeconds: 86400, SampleDays: 2}}
 }
 func incompleteFixture(at time.Time) CohortMetrics {
 	c := completeFixture(at)
@@ -63,7 +64,7 @@ func TestLastCompleteRetainsExactScopeAndDeepCopiesResults(t *testing.T) {
 	}
 }
 func TestLastCompleteNeverUsesFutureOrMathematicallyUndefinedValues(t *testing.T) {
-	at := drawdownStart.Add(96 * time.Hour)
+	at := sharpeStart.Add(96 * time.Hour)
 	s := New(nil, nil)
 	s.now = func() time.Time { return at }
 	filter := consolev2.CohortFilter{}
@@ -114,9 +115,9 @@ func TestColdCacheRecoversPriorCompleteHourWithoutCurrentPrices(t *testing.T) {
 	}
 }
 func TestColdCacheRecoversPriorCompleteDailySharpe(t *testing.T) {
-	asOf := drawdownStart.Add(4*24*time.Hour + time.Hour)
-	lots := []consolev2.CohortReplayLot{replayLot("one", "a", "10", "5", "10", drawdownStart)}
-	data := sharpData(lots, map[string]map[time.Time]string{"a": {drawdownStart: "0.5", drawdownStart.Add(24 * time.Hour): "0.55", drawdownStart.Add(48 * time.Hour): "0.66", drawdownStart.Add(72 * time.Hour): "0.594"}})
+	asOf := sharpeStart.Add(4*24*time.Hour + time.Hour)
+	lots := []consolev2.CohortReplayLot{replayLot("one", "a", "10", "5", "10", sharpeStart)}
+	data := sharpData(lots, map[string]map[time.Time]string{"a": {sharpeStart: "0.5", sharpeStart.Add(24 * time.Hour): "0.55", sharpeStart.Add(48 * time.Hour): "0.66", sharpeStart.Add(72 * time.Hour): "0.594"}})
 	replay := sharpReplay(t, lots, asOf)
 	s := New(nil, nil, historyFixture{data: data})
 	s.now = func() time.Time { return asOf }
@@ -127,7 +128,7 @@ func TestColdCacheRecoversPriorCompleteDailySharpe(t *testing.T) {
 	}
 	s.recoverCompleteHistory(context.Background(), &item, replay, data, nil, asOf)
 	sharpNumber(t, item.SharpAnnual, 8.33809387832792)
-	if !item.SharpAnnualCoverage.LastComplete || !item.SharpAnnualCoverage.To.Equal(drawdownStart.Add(72*time.Hour)) {
+	if !item.SharpAnnualCoverage.LastComplete || item.SharpAnnualCoverage.DayTimezone != sharpeDayTimezone || !item.SharpAnnualCoverage.To.Equal(sharpeStart.Add(72*time.Hour)) {
 		t.Fatal(item)
 	}
 }
