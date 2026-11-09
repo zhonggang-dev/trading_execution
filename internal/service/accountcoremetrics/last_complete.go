@@ -53,7 +53,7 @@ func copySharpeCoverage(c *SharpeCoverage) *SharpeCoverage {
 	return &v
 }
 func completeMetricKey(item *CohortMetrics, filter consolev2.CohortFilter) string {
-	raw, _ := json.Marshal([]any{item.ExecutionAccountID, item.MarketSource, filter.OpeningFrom, filter.OpeningTo, "gross-hourly-dd-and-daily-twr-v1"})
+	raw, _ := json.Marshal([]any{item.ExecutionAccountID, item.MarketSource, filter.OpeningFrom, filter.OpeningTo, "gross-hourly-dd-and-shanghai-daily-twr-v2"})
 	return string(raw)
 }
 func transientMetricReason(reason *string) bool {
@@ -164,7 +164,7 @@ func (s *Service) recoverCompleteHistory(ctx context.Context, item *CohortMetric
 	}
 	if item.SharpAnnual == nil && item.SharpAnnualCoverage != nil && transientMetricReason(item.SharpAnnualCoverage.Reason) && ctx.Err() == nil {
 		candidate := *item
-		s.finishSharpe(ctx, &candidate, replay, data, nil, asOf.UTC().Truncate(24*time.Hour).Add(-24*time.Hour))
+		s.finishSharpe(ctx, &candidate, replay, data, nil, sharpeDayStart(asOf).Add(-24*time.Hour))
 		if candidate.SharpAnnual != nil {
 			item.SharpAnnual = copyMetricPointer(candidate.SharpAnnual)
 			item.SharpAnnualCoverage = copySharpeCoverage(candidate.SharpAnnualCoverage)

@@ -12,9 +12,19 @@ import (
 )
 
 const annualSharpeDays = 365
+const sharpeDayTimezone = "Asia/Shanghai"
+const sharpeDayOffset = 8 * time.Hour
+
+// Shanghai calendar days use the fixed UTC+8 boundary for this account history.
+// Keep wire timestamps as UTC instants, so Beijing midnight is 16:00Z.
+func sharpeDayStart(at time.Time) time.Time {
+	return at.UTC().Add(sharpeDayOffset).Truncate(24 * time.Hour).Add(-sharpeDayOffset)
+}
+
 const maxSharpeSamples = 2_000_000
 
 type SharpeCoverage struct {
+	DayTimezone   string     `json:"day_timezone"`
 	LastComplete  bool       `json:"last_complete,omitempty"`
 	Reason        *string    `json:"reason"`
 	PeriodSeconds int        `json:"period_seconds"`
@@ -66,7 +76,7 @@ type sharpeReplayResult struct {
 	reason  string
 }
 
-// Each completed UTC day links returns at the cohort's cash-flow instants.
+// Each completed Beijing calendar day links returns at the cohort's cash-flow instants.
 // Opening principal is an inflow immediately before a trade; gross exit cash
 // is an outflow immediately after it. Cash and assets outside the selected lots
 // are excluded. Entirely unfunded days are not invented as zero-return samples.
@@ -75,11 +85,11 @@ func dailyCohortReturns(ctx context.Context, replay drawdownReplay, data account
 	if len(replay.lots) == 0 || replay.from.IsZero() {
 		return result
 	}
-	start := replay.from.UTC().Truncate(24 * time.Hour)
+	start := sharpeDayStart(replay.from)
 	if start.Before(replay.from) {
 		start = start.Add(24 * time.Hour)
 	}
-	end = end.UTC().Truncate(24 * time.Hour)
+	end = sharpeDayStart(end)
 	if !start.Before(end) {
 		return result
 	}
@@ -220,8 +230,8 @@ func dailyCohortReturns(ctx context.Context, replay drawdownReplay, data account
 }
 
 func (s *Service) finishSharpe(ctx context.Context, item *CohortMetrics, replay drawdownReplay, data accountpricehistory.Dataset, historyErr error, asOf time.Time) {
-	now, end := s.now().UTC(), asOf.UTC().Truncate(24*time.Hour)
-	coverage := &SharpeCoverage{PeriodSeconds: 86400, To: &end, ComputedAt: &now}
+	now, end := s.now().UTC(), sharpeDayStart(asOf)
+	coverage := &SharpeCoverage{DayTimezone: sharpeDayTimezone, PeriodSeconds: 86400, To: &end, ComputedAt: &now}
 	item.SharpAnnual, item.SharpAnnualCoverage = nil, coverage
 	unavailable := func(reason string) { coverage.Reason = &reason }
 	if item.OpenedAssetCount == 0 {
@@ -229,7 +239,7 @@ func (s *Service) finishSharpe(ctx context.Context, item *CohortMetrics, replay 
 		return
 	}
 	if !replay.from.IsZero() {
-		start := replay.from.UTC().Truncate(24 * time.Hour)
+		start := sharpeDayStart(replay.from)
 		if start.Before(replay.from) {
 			start = start.Add(24 * time.Hour)
 		}
