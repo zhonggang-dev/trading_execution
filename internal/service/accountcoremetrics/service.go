@@ -103,6 +103,8 @@ type Service struct {
 	history       accountpricehistory.Reader
 	drawdownMu    sync.Mutex
 	drawdownCache map[string]drawdownCacheEntry
+	completeMu    sync.Mutex
+	completeCache map[string]completeMetricEntry
 }
 type entry struct {
 	quote   Quote
