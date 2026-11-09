@@ -15,15 +15,17 @@ type CohortFactsReader interface {
 
 type CohortMetrics struct {
 	Metrics
-	OpenedAssetCount  int               `json:"opened_asset_count"`
-	HoldingAssetCount int               `json:"holding_asset_count"`
-	ClosedAssetCount  int               `json:"closed_asset_count"`
-	ROI               *string           `json:"roi"`
-	BuyFees           string            `json:"buy_fees"`
-	SellFees          string            `json:"sell_fees"`
-	MaxDrawdown       *string           `json:"max_drawdown"`
-	DrawdownState     string            `json:"drawdown_state"`
-	DrawdownCoverage  *DrawdownCoverage `json:"drawdown_coverage,omitempty"`
+	OpenedAssetCount    int               `json:"opened_asset_count"`
+	HoldingAssetCount   int               `json:"holding_asset_count"`
+	ClosedAssetCount    int               `json:"closed_asset_count"`
+	ROI                 *string           `json:"roi"`
+	BuyFees             string            `json:"buy_fees"`
+	SellFees            string            `json:"sell_fees"`
+	MaxDrawdown         *string           `json:"max_drawdown"`
+	DrawdownState       string            `json:"drawdown_state"`
+	DrawdownCoverage    *DrawdownCoverage `json:"drawdown_coverage,omitempty"`
+	SharpAnnual         *string           `json:"sharp_annual"`
+	SharpAnnualCoverage *SharpeCoverage   `json:"sharp_annual_coverage"`
 }
 
 type CohortResponse struct {
@@ -115,6 +117,10 @@ func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter
 		}
 		item := CohortMetrics{Metrics: m, OpenedAssetCount: c.OpenedAssetCount, HoldingAssetCount: c.HoldingAssetCount, ClosedAssetCount: c.ClosedAssetCount, BuyFees: c.BuyFees, SellFees: c.SellFees, MaxDrawdown: c.MaxDrawdown, DrawdownState: c.DrawdownState}
 		s.finishDrawdown(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, facts.ObservedAt)
+		s.finishSharpe(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, facts.ObservedAt)
+		s.retainCompleteMetrics(&item, filter, facts.ObservedAt)
+		s.recoverCompleteHistory(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, facts.ObservedAt)
+		s.retainCompleteMetrics(&item, filter, facts.ObservedAt)
 		if m.TotalPnL != nil {
 			invested, e := number(m.CumulativeInvestedCost)
 			if e != nil || invested.Sign() < 0 {

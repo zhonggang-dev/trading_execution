@@ -19,6 +19,7 @@ const maxDrawdownTimelinePoints = 100_000
 const maxDrawdownCacheEntries = 128
 
 type DrawdownCoverage struct {
+	LastComplete      bool       `json:"last_complete,omitempty"`
 	Reason            *string    `json:"reason"`
 	FidelitySeconds   int        `json:"fidelity_seconds"`
 	From              *time.Time `json:"from"`
