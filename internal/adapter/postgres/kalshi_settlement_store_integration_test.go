@@ -252,6 +252,81 @@ func TestKalshiSettlementHoldsDisagreeingRecordsForReviewPostgresIntegration(t *
 	}
 }
 
+// 交易所对两边都买过的市场会按对抵消，但结算记录里仍是两边的毛数：
+// 16 YES / 4 NO、收入 0 的 NO 结果，实际是净持有 12 YES 且全部作废。账本也是净仓位。
+func TestKalshiSettlementAppliesHedgedMarketWhenLedgerHoldsTheNetPostgresIntegration(t *testing.T) {
+	database := kalshiSettlementDatabase(t)
+	ctx := context.Background()
+	for _, test := range []struct {
+		name, account, ticker, side, shares, cost string
+		record                                    domain.KalshiSettlement
+		wantPayout, wantPnL, wantCash             string
+	}{
+		{"netted YES loses", "kalshi:hedge-no", "KXHEDGE-1", "YES", "12", "4",
+			kalshiRecord("KXHEDGE-1", "no", "16", "4", "0", "0"), "0", "-4", "50"},
+		{"netted YES wins", "kalshi:hedge-yes", "KXHEDGE-2", "YES", "12", "4",
+			kalshiRecord("KXHEDGE-2", "yes", "16", "4", "12", "1"), "12", "8", "62"},
+		{"netted NO wins", "kalshi:hedge-nowin", "KXHEDGE-3", "NO", "7", "2",
+			kalshiRecord("KXHEDGE-3", "no", "3", "10", "7", "0"), "7", "5", "57"},
+	} {
+		seedKalshiSettlementAccount(t, database, test.account, "50")
+		seedKalshiHolding(t, database, test.account, test.ticker, test.side, test.shares, test.cost)
+		store, err := NewKalshiSettlementStore(database, []string{test.account})
+		if err != nil {
+			t.Fatal(err)
+		}
+		outcome, err := store.ApplyKalshiSettlement(ctx, test.account, test.record, time.Now().UTC())
+		if err != nil || outcome.Result != domain.KalshiSettlementApplied ||
+			!outcome.Payout.Equal(domain.Decimal(test.wantPayout)) || !outcome.RealizedPnL.Equal(domain.Decimal(test.wantPnL)) {
+			t.Fatalf("%s: outcome = %#v, %v; want applied payout %s pnl %s", test.name, outcome, err, test.wantPayout, test.wantPnL)
+		}
+		if got := scalar(t, database, `SELECT (total_balance = $2::numeric AND available_balance = $2::numeric)::text FROM execution_accounts WHERE execution_account_id=$1`,
+			test.account, test.wantCash); got != "true" {
+			t.Fatalf("%s: cash after settlement is not %s", test.name, test.wantCash)
+		}
+		if got := scalar(t, database, `SELECT lifecycle_status FROM execution_positions WHERE token_id=$1`, "kalshi:"+test.ticker+":"+test.side); got != "CLOSED" {
+			t.Fatalf("%s: position lifecycle = %s, want CLOSED", test.name, got)
+		}
+	}
+}
+
+// 净数比对只放行"净数恰好相等且收入对得上"的记录，其余仍然交给人工复核。
+func TestKalshiSettlementStillHoldsHedgedRecordsThatDoNotNetToTheLedgerPostgresIntegration(t *testing.T) {
+	database := kalshiSettlementDatabase(t)
+	ctx := context.Background()
+	account := "kalshi:hedge-review"
+	seedKalshiSettlementAccount(t, database, account, "100")
+	for index, test := range []struct {
+		name   string
+		shares string // 本地 YES 张数
+		extra  string // 本地另有的 NO 张数，空表示没有
+		record domain.KalshiSettlement
+		want   string
+	}{
+		{"ledger holds fewer than the net", "11", "", kalshiRecord("KXHR-1", "no", "16", "4", "0", "0"), "exchange held 16 YES but the ledger holds 11"},
+		{"ledger holds more than the net", "13", "", kalshiRecord("KXHR-2", "no", "16", "4", "0", "0"), "exchange held 16 YES but the ledger holds 13"},
+		{"payout does not match the netted winners", "12", "", kalshiRecord("KXHR-3", "no", "16", "4", "4", "0"), "exchange paid 4 but 0 winning shares"},
+		{"ledger still holds an opposite side", "12", "1", kalshiRecord("KXHR-4", "no", "16", "4", "0", "0"), "exchange held 16 YES"},
+	} {
+		ticker := fmt.Sprintf("KXHR-%d", index+1)
+		seedKalshiHolding(t, database, account, ticker, "YES", test.shares, "4")
+		if test.extra != "" {
+			seedKalshiHolding(t, database, account, ticker, "NO", test.extra, "0.5")
+		}
+		store, _ := NewKalshiSettlementStore(database, []string{account})
+		outcome, err := store.ApplyKalshiSettlement(ctx, account, test.record, time.Now().UTC())
+		if err != nil || outcome.Result != domain.KalshiSettlementManualReview || !strings.Contains(outcome.Reason, test.want) {
+			t.Fatalf("%s: outcome = %#v, %v; want review containing %q", test.name, outcome, err, test.want)
+		}
+		if got := scalar(t, database, `SELECT lifecycle_status FROM execution_positions WHERE token_id=$1`, "kalshi:"+ticker+":YES"); got != "OPEN" {
+			t.Fatalf("%s: position lifecycle = %s, want it left OPEN", test.name, got)
+		}
+	}
+	if got := scalar(t, database, `SELECT (total_balance = 100)::text FROM execution_accounts WHERE execution_account_id=$1`, account); got != "true" {
+		t.Fatal("a held settlement must not change cash")
+	}
+}
+
 func TestKalshiSettlementWaitsWhileSharesAreReservedPostgresIntegration(t *testing.T) {
 	database := kalshiSettlementDatabase(t)
 	account := "kalshi:settle-reserved"

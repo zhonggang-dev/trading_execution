@@ -193,15 +193,8 @@ func validateKalshiSettlementAgainstLedger(
 		}
 	}
 	localYes, localNo := kalshiLocalShares(holdings, yesToken)
-	if equal, err := numericEqual(ctx, tx, settlement.YesCount.String(), localYes.String()); err != nil {
-		return "", err
-	} else if !equal {
-		return fmt.Sprintf("exchange held %s YES but the ledger holds %s", settlement.YesCount, localYes), nil
-	}
-	if equal, err := numericEqual(ctx, tx, settlement.NoCount.String(), localNo.String()); err != nil {
-		return "", err
-	} else if !equal {
-		return fmt.Sprintf("exchange held %s NO but the ledger holds %s", settlement.NoCount, localNo), nil
+	if reason, err := validateKalshiSettlementCounts(ctx, tx, settlement, localYes, localNo); err != nil || reason != "" {
+		return reason, err
 	}
 	winning := localNo
 	if settlement.MarketResult == "yes" {
@@ -218,6 +211,54 @@ func validateKalshiSettlementAgainstLedger(
 		}
 	}
 	return "", nil
+}
+
+// validateKalshiSettlementCounts checks the YES/NO counts of the exchange's
+// settlement record against the ledger's holdings. A market that was bought on
+// both sides is netted by the exchange (each YES+NO pair is paid out as 1 at
+// the time of the second buy) and by the ledger, but the settlement record
+// still lists the gross counts: 16 YES and 4 NO with revenue 0 is a net holding
+// of 12 YES that lost. So the counts match when the ledger holds either the
+// record's counts as they are (a ledger that kept both sides) or the record's
+// counts with the opposite pairs removed. Either way the payout is then checked
+// against the winning shares the ledger holds, so a wrong netting cannot pass.
+func validateKalshiSettlementCounts(
+	ctx context.Context, tx *sql.Tx, settlement domain.KalshiSettlement, localYes, localNo domain.Decimal,
+) (string, error) {
+	yesEqual, err := numericEqual(ctx, tx, settlement.YesCount.String(), localYes.String())
+	if err != nil {
+		return "", err
+	}
+	noEqual, err := numericEqual(ctx, tx, settlement.NoCount.String(), localNo.String())
+	if err != nil {
+		return "", err
+	}
+	if yesEqual && noEqual {
+		return "", nil
+	}
+	netYes, err := numeric(ctx, tx, `SELECT GREATEST($1::numeric-$2::numeric, 0)::text`, settlement.YesCount.String(), settlement.NoCount.String())
+	if err != nil {
+		return "", err
+	}
+	netNo, err := numeric(ctx, tx, `SELECT GREATEST($1::numeric-$2::numeric, 0)::text`, settlement.NoCount.String(), settlement.YesCount.String())
+	if err != nil {
+		return "", err
+	}
+	netYesEqual, err := numericEqual(ctx, tx, netYes.String(), localYes.String())
+	if err != nil {
+		return "", err
+	}
+	netNoEqual, err := numericEqual(ctx, tx, netNo.String(), localNo.String())
+	if err != nil {
+		return "", err
+	}
+	if netYesEqual && netNoEqual {
+		return "", nil
+	}
+	if !yesEqual {
+		return fmt.Sprintf("exchange held %s YES but the ledger holds %s", settlement.YesCount, localYes), nil
+	}
+	return fmt.Sprintf("exchange held %s NO but the ledger holds %s", settlement.NoCount, localNo), nil
 }
 
 // applyValidatedKalshiSettlement closes the market's holdings and lots and
