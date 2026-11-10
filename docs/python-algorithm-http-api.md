@@ -125,6 +125,10 @@ type Prediction = {
   completed_at: UTCDateTime;
   available_at: UTCDateTime;
   model: PredictionModel;
+  // 期限档，由中台按当前轮次成员的期限标注给出：
+  // short(3–14 天) / mid(14–30) / mid_long(30–60) / long(60–90) /
+  // ultra_long(>90) / unknown(无结算时间)。中台没有标注时省略。
+  horizon_tier?: string;
 };
 
 type PriceLevel = {
