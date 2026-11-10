@@ -2,6 +2,7 @@ package evmrpc
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -89,6 +90,12 @@ const unknownBlockBody = `{"id":1,"jsonrpc":"2.0","error":{"message":"Unknown bl
 // unknownCalls eth_call requests with the load-balancer "Unknown block" error.
 func unknownBlockClient(t *testing.T, unknownCalls int, ethCalls *int) *ERC20BalanceClient {
 	t.Helper()
+	return laggingNodeClient(t, http.StatusBadRequest, unknownBlockBody, unknownCalls, ethCalls)
+}
+
+// laggingNodeClient is unknownBlockClient with the provider's exact status and error body.
+func laggingNodeClient(t *testing.T, errorStatus int, errorBody string, unknownCalls int, ethCalls *int) *ERC20BalanceClient {
+	t.Helper()
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		body, _ := io.ReadAll(request.Body)
 		if strings.Contains(string(body), `"method":"eth_blockNumber"`) {
@@ -100,7 +107,7 @@ func unknownBlockClient(t *testing.T, unknownCalls int, ethCalls *int) *ERC20Bal
 		*ethCalls++
 		if *ethCalls <= unknownCalls {
 			return &http.Response{
-				StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(unknownBlockBody)), Request: request,
+				StatusCode: errorStatus, Body: io.NopCloser(strings.NewReader(errorBody)), Request: request,
 			}, nil
 		}
 		return &http.Response{
@@ -156,5 +163,56 @@ func TestERC20BalanceClientStopsWaitingWhenContextEnds(t *testing.T) {
 	_, err := client.GetExternalBalance(context.Background(), "0x1111111111111111111111111111111111111111", "USDC")
 	if err == nil || ethCalls != 1 {
 		t.Fatalf("GetExternalBalance() error = %v, eth_call=%d; want one attempt then stop", err, ethCalls)
+	}
+}
+
+// drpcUnsupportedBlockBody is what polygon.drpc.org returned, with HTTP 200, from 2026-11-09 23:25 CST.
+const drpcUnsupportedBlockBody = `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unsupported block number"}}`
+
+// TestERC20BalanceClientWaitsOutDrpcUnsupportedBlockNumber 验证 drpc 的 -32000 unsupported block number 与其他"未知区块"一样退避重试。
+func TestERC20BalanceClientWaitsOutDrpcUnsupportedBlockNumber(t *testing.T) {
+	ethCalls := 0
+	client := laggingNodeClient(t, http.StatusOK, drpcUnsupportedBlockBody, 4, &ethCalls)
+	var delays []time.Duration
+	client.sleep = func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		return nil
+	}
+	balance, err := client.GetExternalBalance(context.Background(), "0x1111111111111111111111111111111111111111", "USDC")
+	if err != nil || balance.Amount != "123.456789" || balance.BlockNumber != 100 || ethCalls != 5 {
+		t.Fatalf("GetExternalBalance() = %#v, %v, eth_call=%d; want recovery on the 5th attempt", balance, err, ethCalls)
+	}
+	if len(delays) != 4 || delays[0] != rpcUnknownBlockRetryDelay || delays[3] != 4*rpcUnknownBlockRetryDelay {
+		t.Fatalf("delays = %v; want growing waits between attempts", delays)
+	}
+}
+
+// TestERC20BalanceClientStillFailsWhenDrpcBlockStaysUnsupported 验证该错误持续时仍在上限后返回未知结果而不是零。
+func TestERC20BalanceClientStillFailsWhenDrpcBlockStaysUnsupported(t *testing.T) {
+	ethCalls := 0
+	client := laggingNodeClient(t, http.StatusOK, drpcUnsupportedBlockBody, 1000, &ethCalls)
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+	balance, err := client.GetExternalBalance(context.Background(), "0x1111111111111111111111111111111111111111", "USDC")
+	if err == nil || !balance.Amount.IsEmpty() || ethCalls != rpcUnknownBlockAttempts ||
+		!strings.Contains(err.Error(), "unsupported block number") {
+		t.Fatalf("GetExternalBalance() = %#v, %v, eth_call=%d; want failure after %d attempts", balance, err, ethCalls, rpcUnknownBlockAttempts)
+	}
+}
+
+// TestIsUnknownBlockError 验证各家节点"区块还没见到"的措辞都被识别，且不会把其他错误当成它。
+func TestIsUnknownBlockError(t *testing.T) {
+	for message, want := range map[string]bool{
+		`RPC HTTP 400: {"error":{"message":"Unknown block","code":26}}`: true,
+		"RPC error -32000: header not found":                            true,
+		"RPC error -32000: block not found":                             true,
+		"RPC error -32000: unsupported block number":                    true,
+		"RPC error -32000: Unsupported Block Number":                    true,
+		"RPC error -32000: execution reverted":                          false,
+		"RPC error -32602: invalid argument 0: hex string without 0x":   false,
+		"RPC HTTP 503: unavailable":                                     false,
+	} {
+		if got := isUnknownBlockError(errors.New(message)); got != want {
+			t.Errorf("isUnknownBlockError(%q) = %v, want %v", message, got, want)
+		}
 	}
 }
