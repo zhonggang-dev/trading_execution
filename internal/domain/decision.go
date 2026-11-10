@@ -60,6 +60,12 @@ type Prediction struct {
 	CompletedAt    time.Time           `json:"completed_at"`
 	AvailableAt    time.Time           `json:"available_at"`
 	Model          PredictionModel     `json:"model"`
+	// HorizonTier is set by prediction_infra from the market's current
+	// domain-round member: short, mid, mid_long, long, ultra_long or unknown.
+	// Trading treats it as opaque and forwards it to the strategy service,
+	// which decides whether it uses that horizon's data. Omitted when the
+	// producer has no tier for the record.
+	HorizonTier string `json:"horizon_tier,omitempty"`
 }
 
 // PredictionSourceMode fixes the trusted result channel for one upstream
