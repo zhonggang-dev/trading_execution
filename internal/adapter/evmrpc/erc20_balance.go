@@ -174,10 +174,13 @@ func (client *ERC20BalanceClient) rpcOnce(ctx context.Context, payload []byte) (
 }
 
 // isUnknownBlockError reports whether the node has not seen the requested block yet.
+// Providers word it differently: geth says "header not found", others
+// "unknown block" / "block not found", and drpc answers -32000
+// "unsupported block number" when the eth_call lands on a lagging node.
 func isUnknownBlockError(err error) bool {
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "unknown block") || strings.Contains(message, "header not found") ||
-		strings.Contains(message, "block not found")
+		strings.Contains(message, "block not found") || strings.Contains(message, "unsupported block number")
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {
