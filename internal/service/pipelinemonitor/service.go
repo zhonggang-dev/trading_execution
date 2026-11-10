@@ -24,9 +24,11 @@ type BuildParams struct {
 	Logger     *slog.Logger
 }
 type alertState struct {
-	Level  string    `json:"level"`
-	SentAt time.Time `json:"sent_at"`
-	Active bool      `json:"active"`
+	Level       string    `json:"level"`
+	SentAt      time.Time `json:"sent_at"`
+	Active      bool      `json:"active"`
+	RepeatCount int       `json:"repeat_count,omitempty"`
+	IncidentKey string    `json:"incident_key,omitempty"`
 }
 type Service struct {
 	config              Config
@@ -233,12 +235,12 @@ func (s *Service) notify(ctx context.Context, snapshot Snapshot) {
 	}
 	var selected []pending
 	ordered := append([]Check(nil), snapshot.Checks...)
-	sort.SliceStable(ordered, func(i, j int) bool { return rank(ordered[i].Status) > rank(ordered[j].Status) })
+	sort.SliceStable(ordered, func(i, j int) bool { return alertBefore(ordered[i], ordered[j]) })
 	for _, c := range ordered {
 		key := s.component + "\x00" + c.ID + "\x00" + c.Scope
 		old := s.states[key]
 		recovery := c.Status == Healthy && old.Active
-		if !recovery && (rank(c.Status) == 0 || (old.Active && rank(c.Status) <= rank(old.Level) && snapshot.SampledAt.Sub(old.SentAt) < s.config.Cooldown)) {
+		if !recovery && (rank(c.Status) == 0 || (old.Active && sameIncident(old, c) && rank(c.Status) <= rank(old.Level) && snapshot.SampledAt.Sub(old.SentAt) < reminderCooldown(s.config.Cooldown, old.RepeatCount))) {
 			continue
 		}
 		selected = append(selected, pending{key: key, check: c, recovery: recovery})
@@ -279,7 +281,7 @@ func (s *Service) notify(ctx context.Context, snapshot Snapshot) {
 		}
 		s.lastDeliverySuccess = snapshot.SampledAt
 		for _, item := range group {
-			s.states[item.key] = alertState{Level: item.check.Status, SentAt: snapshot.SampledAt, Active: !item.recovery}
+			s.states[item.key] = deliveredState(s.states[item.key], item.check, snapshot.SampledAt, item.recovery)
 		}
 		if err := s.persist(); err != nil {
 			s.persistError = true
