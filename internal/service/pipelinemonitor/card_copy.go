@@ -49,6 +49,9 @@ var cardCopies = []cardCopy{
 	{"worker.uploader.state", "已发现近期回传阻塞或失败，本地结果仍需确认是否入库。", "本次采样未再发现近期回传异常，waiting 仍需等待本地结果。", "无法读取概率回传账本，PUT 是否成功尚未确认。", "查看近期回传错误与接口状态"},
 	{"worker.builder.state", "原始或脱敏构建采样发现近期失败，下一批预测输入可能延后。", "本次构建采样未再发现近期失败，在途构建与上传仍需完成。", "无法读取 Sandbox 构建账本，实际构建和上传状态尚未确认。", "检查构建失败和上传记录"},
 	{"worker.qa.state", "QA 构建采样发现近期失败，QA 包更新可能延后。", "本次 QA 构建采样未再发现近期失败。", "无法读取 QA 构建状态，实际产出尚未确认。", "检查 QA 构建失败记录"},
+	{"worker.observation", "Worker 观测已中断，关键服务停止或任务异常可能无法及时发现。", "Worker 状态重新获得新鲜观测，具体服务和任务仍独立检查。", "无法确认俊杰构建及李昂预测、回传服务的当前状态，服务停止可能未被发现。", "检查宿主探针、timer 与独立发布目录"},
+	{"worker.round.execution", "{s}的选盘或任务发布未完成，新一轮 Sandbox 与预测输入可能延迟。", "{s}重新获得成功执行记录，构建与预测仍须分别完成。", "无法确认{s}最近一次执行结果，不能将旧空轮记录当作本次成功。", "检查该领域轮次执行与上游请求"},
+	{"worker.round.observation", "当日轮次执行证据不完整，漏执行与正常空轮可能无法区分。", "当日轮次执行日志恢复可读，各轮交付仍按数据库与调度检查。", "无法读取完整的当日轮次执行证据，正常空轮与交付缺口暂不能区分。", "检查宿主探针与轮次日志读取"},
 	{"monitor.delivery", "{s}告警可能无法送达，需要恢复通知通道。", "最近一次飞书通知已成功发送，送达通道恢复观测。", "{s}通知送达未获确认；业务执行开关不会因此改变。", "检查飞书机器人与发送返回"},
 	{"monitor.state", "{s}告警历史状态无法读取，去重和恢复判断不可靠。", "告警历史状态重新可读，去重和恢复判断可继续。", "无法读取告警历史状态，监控未盲目丢弃去重信息。", "修复状态文件权限或损坏内容"},
 	{"monitor.persistence", "{s}告警状态无法落盘，重启后可能重复通知。", "告警状态已重新持久化，当前成功发送记录可保存。", "无法持久化告警状态，本进程内记录仍保留。", "检查告警状态目录的可写性"},
@@ -136,6 +139,12 @@ func issueImpact(issue cardIssue, recovery bool) string {
 
 func impactSubject(issue cardIssue) string {
 	c := issue.alerts[0].Check
+	if subject := roundSubject(c); subject != "" {
+		if strings.HasPrefix(c.ID, "sandbox.") {
+			return subject + "本轮输入"
+		}
+		return subject + "轮次"
+	}
 	if actors := issueActors(issue); actors != "" {
 		return actors
 	}
@@ -197,6 +206,12 @@ func impactSubject(issue cardIssue) string {
 }
 func foregroundContext(issue cardIssue) string {
 	c := issue.alerts[0].Check
+	if context := roundContext(c); context != "" {
+		if model := c.Evidence["model"]; model != "" && strings.HasPrefix(c.ID, "sandbox.") {
+			context += " · 模型 " + model
+		}
+		return context
+	}
 	if c.ID == "prediction.coverage" {
 		return issueScope(issue)
 	}
@@ -213,6 +228,48 @@ func foregroundContext(issue cardIssue) string {
 		}
 	}
 	return ""
+}
+
+// Domain and model may both contain '/', so new round Checks use explicit
+// evidence rather than guessing their boundary from a slash-delimited scope.
+func roundSubject(c Check) string {
+	if !strings.HasPrefix(c.ID, "publication.") && !strings.HasPrefix(c.ID, "sandbox.") && c.ID != "worker.round.execution" {
+		return ""
+	}
+	domain := c.Evidence["domain"]
+	if domain == "" && c.ID == "worker.round.execution" {
+		_, domain, _ = strings.Cut(c.Scope, "/")
+	}
+	if domain == "" {
+		return ""
+	}
+	source := c.Evidence["source"]
+	if source == "" {
+		source, _, _ = strings.Cut(c.Scope, "/")
+	}
+	if source != "POLYMARKET" && source != "KALSHI" {
+		return ""
+	}
+	return sourceChinese(source) + " · " + domain
+}
+
+func roundContext(c Check) string {
+	subject := roundSubject(c)
+	if subject == "" {
+		return ""
+	}
+	parts := []string{subject}
+	day := c.Evidence["expected_business_date"]
+	if day == "" {
+		day = c.Evidence["business_date"]
+	}
+	if day != "" {
+		parts = append(parts, "业务日 "+day)
+	}
+	if index, err := strconv.Atoi(c.Evidence["round_index"]); err == nil && index > 0 {
+		parts = append(parts, fmt.Sprintf("第%d轮", index))
+	}
+	return strings.Join(parts, " · ")
 }
 func suggestedAction(c Check) string {
 	if r, ok := findCardCopy(c.ID); ok {
@@ -252,9 +309,15 @@ func keyMetrics(c Check, now time.Time) string {
 		timeField("last_input_expires_at", "最晚失效")
 		add("pending_direct_tasks", "待回传任务", false)
 	case c.ID == "publication.schedule":
-		timeField("last_published_at", "最近发布")
-		age("last_published_at", "距今")
-		duration("maximum_age", "允许间隔")
+		if c.Evidence["scheduled_at"] != "" {
+			timeField("scheduled_at", "计划执行")
+			timeField("deadline_at", "交付宽限至")
+			timeField("last_published_at", "最近发布")
+		} else {
+			timeField("last_published_at", "最近发布")
+			age("last_published_at", "距今")
+			duration("maximum_age", "允许间隔")
+		}
 	case c.ID == "publication.dispatch":
 		add("expected_members", "应预测市场", true)
 		add("dispatched_members", "已登记市场", true)
@@ -344,6 +407,16 @@ func keyMetrics(c Check, now time.Time) string {
 	case c.ID == "worker.uploader.state":
 		add("recent_errors", "近期采样回传异常", true)
 		add("sampled_rows", "采样结果", false)
+	case c.ID == "worker.observation":
+		timeField("sampled_at", "最近 Worker 采样")
+		age("sampled_at", "已停更")
+	case c.ID == "worker.round.execution":
+		timeField("observed_at", "执行记录")
+		if reason := reasonChinese(c.Evidence["error_code"]); reason != "" {
+			out = append(out, "失败原因 "+reason)
+		}
+	case c.ID == "worker.round.observation":
+		add("sampled_rows", "匹配执行记录", true)
 	case c.ID == "host.clock_sync":
 		if v := c.Evidence["ntp_synchronized"]; v != "" {
 			out = append(out, "时间同步 "+flagChinese(v, "已同步", "未同步"))
@@ -459,6 +532,10 @@ func reasonChinese(s string) string {
 		return "余额差异"
 	case "SOURCE_UNAVAILABLE":
 		return "权威数据不可用"
+	case "UPSTREAM_RATE_LIMITED":
+		return "上游请求限流"
+	case "ROUND_FAILED":
+		return "轮次执行失败"
 	case "ORDER_RECOVERY_STALLED":
 		return "订单恢复停滞"
 	}
@@ -507,6 +584,11 @@ func specificProblemTitle(c Check) string {
 		return "输入准入时间窗与全天预期需要核对"
 	case c.ID == "worker.predictor.execution" && c.Status != Healthy:
 		return "预测执行出现失败、重试或超时"
+	case c.ID == "worker.round.execution" && c.Evidence["outcome"] == "failed":
+		if c.Evidence["error_code"] == "UPSTREAM_RATE_LIMITED" {
+			return "选盘上游请求被限流"
+		}
+		return "选盘轮次执行失败"
 	case c.ID == "host.service" && c.Status == Critical:
 		return impactSubject(cardIssue{alerts: []Alert{{Check: c}}}) + "已停止或未加载"
 	}

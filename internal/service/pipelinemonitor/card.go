@@ -148,7 +148,7 @@ func cardMarkdown(content, size string) map[string]any {
 
 func groupCardIssues(alerts []Alert) []cardIssue {
 	ordered := append([]Alert(nil), alerts...)
-	sort.SliceStable(ordered, func(i, j int) bool { return rank(ordered[i].Check.Status) > rank(ordered[j].Check.Status) })
+	sort.SliceStable(ordered, func(i, j int) bool { return alertBefore(ordered[i].Check, ordered[j].Check) })
 	var groups []cardIssue
 	indices := map[string]int{}
 	for _, a := range ordered {
@@ -170,8 +170,11 @@ func groupCardIssues(alerts []Alert) []cardIssue {
 		groups = append(groups, issue)
 	}
 	sort.SliceStable(groups, func(i, j int) bool {
-		left, right := rank(groups[i].alerts[0].Check.Status), rank(groups[j].alerts[0].Check.Status)
+		left, right := alertDisplayRank(groups[i].alerts[0].Check), alertDisplayRank(groups[j].alerts[0].Check)
 		if left != right {
+			return left > right
+		}
+		if left, right := alertPriority(groups[i].alerts[0].Check), alertPriority(groups[j].alerts[0].Check); left != right {
 			return left > right
 		}
 		coverage := func(x cardIssue) int {
@@ -211,6 +214,13 @@ func coverageGroupKey(a Alert) (string, string) {
 }
 
 func problemTitle(c Check) string {
+	if scope := roundSubject(c); scope != "" && c.Summary != "" {
+		title := c.Summary
+		if specific := specificProblemTitle(c); specific != "" {
+			title = specific
+		}
+		return scope + "｜" + title
+	}
 	if c.ID == "prediction.coverage" && c.Status == Critical && c.Evidence["effective_markets"] == "0" {
 		return "没有可用预测结果"
 	}
@@ -229,6 +239,9 @@ func problemTitle(c Check) string {
 
 func issueScope(issue cardIssue) string {
 	c := issue.alerts[0].Check
+	if context := roundContext(c); context != "" {
+		return context
+	}
 	if _, model, mode, ok := coverageRoute(c); c.ID == "prediction.coverage" && ok {
 		if mode == "SANDBOX" {
 			mode = "脱敏包预测"
