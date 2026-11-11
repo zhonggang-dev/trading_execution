@@ -76,13 +76,15 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 	if params.cfg.Kalshi.MarketDataEnabled {
 		var buildErr error
 		kalshiClient, buildErr = kalshi.NewClient(kalshi.ClientParams{
-			BaseURL: params.cfg.Kalshi.APIURL, APIKeyID: params.cfg.Kalshi.APIKeyID,
-			PrivateKeyPath: params.cfg.Kalshi.PrivateKeyPath,
-			HTTPClient:     noRedirectHTTPClient(params.cfg.Kalshi.RequestTimeout),
+			BaseURL: params.cfg.Kalshi.APIURL, ReadBaseURLs: params.cfg.Kalshi.ReadAPIURLs,
+			APIKeyID: params.cfg.Kalshi.APIKeyID, PrivateKeyPath: params.cfg.Kalshi.PrivateKeyPath,
+			HTTPClient: noRedirectHTTPClient(params.cfg.Kalshi.RequestTimeout), Logger: params.logger,
 		})
 		if buildErr != nil {
 			buildErr = fmt.Errorf("build Kalshi authenticated client: %w", buildErr)
-		} else if kalshiOrderBooks, buildErr = kalshi.NewOrderBookSource(kalshi.OrderBookParams{Client: kalshiClient}); buildErr != nil {
+		} else if kalshiOrderBooks, buildErr = kalshi.NewOrderBookSource(kalshi.OrderBookParams{
+			Client: kalshiClient, Logger: params.logger,
+		}); buildErr != nil {
 			buildErr = fmt.Errorf("build Kalshi orderbook source: %w", buildErr)
 		}
 		if buildErr != nil {

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -29,12 +30,31 @@ import (
 
 const maxAuthenticatedResponseBytes = 8 << 20
 
+const (
+	defaultReadIdleTimeout    = 10 * time.Second
+	defaultReadAttemptTimeout = 30 * time.Second
+)
+
 type ClientParams struct {
-	BaseURL            string
-	APIKeyID           string
-	PrivateKeyPath     string
-	PrivateKey         *rsa.PrivateKey
-	HTTPClient         *http.Client
+	// BaseURL serves every state-changing request (POST/DELETE).
+	BaseURL string
+	// ReadBaseURLs serve GET requests in order; a GET whose attempt fails
+	// transiently is retried once on the next host. Empty means BaseURL only.
+	ReadBaseURLs   []string
+	APIKeyID       string
+	PrivateKeyPath string
+	PrivateKey     *rsa.PrivateKey
+	// HTTPClient sends the writes; its Timeout bounds a whole write. GETs use
+	// a copy without that Timeout, bounded by the two read limits below.
+	HTTPClient *http.Client
+	// ReadIdleTimeout is how long one GET attempt may go without progress:
+	// waiting for the response headers, or between two reads of the body.
+	// Zero uses HTTPClient.Timeout, or 10s when that is unset too.
+	ReadIdleTimeout time.Duration
+	// ReadAttemptTimeout caps one GET attempt that keeps receiving bytes.
+	// Zero means 30s.
+	ReadAttemptTimeout time.Duration
+	Logger             *slog.Logger
 	Now                func() time.Time
 	LiveTradingEnabled bool
 }
@@ -44,9 +64,14 @@ type ClientParams struct {
 // independent configuration gate.
 type Client struct {
 	baseURL            *url.URL
+	readBaseURLs       []*url.URL
 	apiKeyID           string
 	privateKey         *rsa.PrivateKey
 	httpClient         *http.Client
+	readHTTPClient     *http.Client
+	readIdleTimeout    time.Duration
+	readAttemptTimeout time.Duration
+	logger             *slog.Logger
 	now                func() time.Time
 	liveTradingEnabled bool
 }
@@ -170,16 +195,67 @@ func NewClient(params ClientParams) (*Client, error) {
 	if err := privateKey.Validate(); err != nil {
 		return nil, fmt.Errorf("validate Kalshi private key: %w", err)
 	}
+	readBaseURLs, err := parseReadBaseURLs(baseURL, params.ReadBaseURLs)
+	if err != nil {
+		return nil, err
+	}
 	if params.HTTPClient == nil {
 		params.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+	}
+	if params.ReadIdleTimeout < 0 || params.ReadAttemptTimeout < 0 {
+		return nil, fmt.Errorf("Kalshi read timeouts must not be negative")
+	}
+	if params.ReadIdleTimeout == 0 {
+		params.ReadIdleTimeout = params.HTTPClient.Timeout
+	}
+	if params.ReadIdleTimeout <= 0 {
+		params.ReadIdleTimeout = defaultReadIdleTimeout
+	}
+	if params.ReadAttemptTimeout == 0 {
+		params.ReadAttemptTimeout = defaultReadAttemptTimeout
+	}
+	params.ReadIdleTimeout = min(params.ReadIdleTimeout, params.ReadAttemptTimeout)
+	if params.Logger == nil {
+		params.Logger = slog.Default()
 	}
 	if params.Now == nil {
 		params.Now = time.Now
 	}
 	return &Client{
-		baseURL: baseURL, apiKeyID: params.APIKeyID, privateKey: privateKey,
-		httpClient: params.HTTPClient, now: params.Now, liveTradingEnabled: params.LiveTradingEnabled,
+		baseURL: baseURL, readBaseURLs: readBaseURLs, apiKeyID: params.APIKeyID, privateKey: privateKey,
+		httpClient: params.HTTPClient, readHTTPClient: readHTTPClient(params.HTTPClient),
+		readIdleTimeout: params.ReadIdleTimeout, readAttemptTimeout: params.ReadAttemptTimeout,
+		logger: params.Logger, now: params.Now, liveTradingEnabled: params.LiveTradingEnabled,
 	}, nil
+}
+
+func parseReadBaseURLs(writeBaseURL *url.URL, raw []string) ([]*url.URL, error) {
+	if len(raw) == 0 {
+		return []*url.URL{writeBaseURL}, nil
+	}
+	result := make([]*url.URL, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, value := range raw {
+		parsed, err := url.Parse(strings.TrimSpace(value))
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return nil, fmt.Errorf("Kalshi read API base URL is invalid")
+		}
+		if _, duplicate := seen[parsed.String()]; duplicate {
+			return nil, fmt.Errorf("Kalshi read API base URLs repeat %s", parsed.Host)
+		}
+		seen[parsed.String()] = struct{}{}
+		result = append(result, parsed)
+	}
+	return result, nil
+}
+
+// readHTTPClient keeps the transport and redirect policy of the write client
+// but drops its whole-request Timeout, which would also cut off a response
+// body that is still arriving; reads are bounded per attempt instead.
+func readHTTPClient(writeClient *http.Client) *http.Client {
+	copied := *writeClient
+	copied.Timeout = 0
+	return &copied
 }
 
 func (client *Client) GetBalance(ctx context.Context) (Balance, error) {
@@ -813,29 +889,12 @@ func classifyPreparedSubmitError(order PreparedOrder, err error) error {
 }
 
 func (client *Client) doAuthenticated(ctx context.Context, method, requestPath string, body []byte, target any) error {
-	endpoint, err := client.baseURL.Parse(requestPath)
-	if err != nil {
-		return kalshiLocalFailure("KALSHI_INVALID_REQUEST_PATH", "Kalshi API request path is invalid", err)
+	if method == http.MethodGet && len(body) == 0 {
+		return client.doRead(ctx, requestPath, target)
 	}
-	timestamp := fmt.Sprintf("%d", client.now().UTC().UnixMilli())
-	message := timestamp + method + endpoint.EscapedPath()
-	digest := sha256.Sum256([]byte(message))
-	signature, err := rsa.SignPSS(rand.Reader, client.privateKey, crypto.SHA256, digest[:], &rsa.PSSOptions{
-		SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA256,
-	})
+	request, err := client.signedRequest(ctx, client.baseURL, method, requestPath, body)
 	if err != nil {
-		return kalshiLocalFailure("KALSHI_SIGN_FAILED", "sign Kalshi request", err)
-	}
-	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), bytes.NewReader(body))
-	if err != nil {
-		return kalshiLocalFailure("KALSHI_REQUEST_BUILD_FAILED", "build Kalshi API request", err)
-	}
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("KALSHI-ACCESS-KEY", client.apiKeyID)
-	request.Header.Set("KALSHI-ACCESS-TIMESTAMP", timestamp)
-	request.Header.Set("KALSHI-ACCESS-SIGNATURE", base64.StdEncoding.EncodeToString(signature))
-	if len(body) != 0 {
-		request.Header.Set("Content-Type", "application/json")
+		return err
 	}
 	response, err := client.httpClient.Do(request)
 	if err != nil {
@@ -860,6 +919,34 @@ func (client *Client) doAuthenticated(ctx context.Context, method, requestPath s
 		return kalshiResponseFailure(method, "KALSHI_INVALID_RESPONSE", "decode Kalshi response", err)
 	}
 	return nil
+}
+
+func (client *Client) signedRequest(ctx context.Context, base *url.URL, method, requestPath string, body []byte) (*http.Request, error) {
+	endpoint, err := base.Parse(requestPath)
+	if err != nil {
+		return nil, kalshiLocalFailure("KALSHI_INVALID_REQUEST_PATH", "Kalshi API request path is invalid", err)
+	}
+	timestamp := fmt.Sprintf("%d", client.now().UTC().UnixMilli())
+	message := timestamp + method + endpoint.EscapedPath()
+	digest := sha256.Sum256([]byte(message))
+	signature, err := rsa.SignPSS(rand.Reader, client.privateKey, crypto.SHA256, digest[:], &rsa.PSSOptions{
+		SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA256,
+	})
+	if err != nil {
+		return nil, kalshiLocalFailure("KALSHI_SIGN_FAILED", "sign Kalshi request", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, kalshiLocalFailure("KALSHI_REQUEST_BUILD_FAILED", "build Kalshi API request", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("KALSHI-ACCESS-KEY", client.apiKeyID)
+	request.Header.Set("KALSHI-ACCESS-TIMESTAMP", timestamp)
+	request.Header.Set("KALSHI-ACCESS-SIGNATURE", base64.StdEncoding.EncodeToString(signature))
+	if len(body) != 0 {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	return request, nil
 }
 
 func loadPrivateKey(path string) (*rsa.PrivateKey, error) {

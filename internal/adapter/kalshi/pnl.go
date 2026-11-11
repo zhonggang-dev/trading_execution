@@ -40,9 +40,10 @@ func NewPnLSource(client *Client, userID string) (*PnLSource, error) {
 		return nil, fmt.Errorf("Kalshi PnL client and official user id are required")
 	}
 	isolated := *client
-	httpClient := *client.httpClient
-	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
-	isolated.httpClient = &httpClient
+	noRedirect := func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	httpClient, readClient := *client.httpClient, *client.readHTTPClient
+	httpClient.CheckRedirect, readClient.CheckRedirect = noRedirect, noRedirect
+	isolated.httpClient, isolated.readHTTPClient = &httpClient, &readClient
 	return &PnLSource{client: &isolated, userID: userID}, nil
 }
 

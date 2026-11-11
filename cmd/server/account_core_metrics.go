@@ -27,7 +27,9 @@ func buildAccountCoreMetrics(reader *consolev2.Reader, cfg config.Config, histor
 		key, path = cfg.Kalshi.LiveAccounts[0].APIKeyID, cfg.Kalshi.LiveAccounts[0].PrivateKeyPath
 	}
 	if key != "" && path != "" {
-		k, e := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, APIKeyID: key, PrivateKeyPath: path, HTTPClient: client, LiveTradingEnabled: false})
+		// Console valuation keeps its 2s budget per attempt on the read hosts.
+		k, e := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, ReadBaseURLs: cfg.Kalshi.ReadAPIURLs,
+			APIKeyID: key, PrivateKeyPath: path, HTTPClient: client, ReadAttemptTimeout: client.Timeout, LiveTradingEnabled: false})
 		if e == nil {
 			source.Kalshi = k
 		}
