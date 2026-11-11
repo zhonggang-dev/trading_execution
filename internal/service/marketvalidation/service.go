@@ -104,7 +104,9 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 		return domain.MarketValidation{}, err
 	}
 	if !sellExit {
-		if err := service.validateMarketTradable(market, now); err != nil {
+		// The universe fetches metadata live and stamps ObservedAt when the
+		// response arrives; judge it against the clock read after the lookup.
+		if err := service.validateMarketTradable(market, service.now().UTC()); err != nil {
 			return domain.MarketValidation{}, err
 		}
 	}
