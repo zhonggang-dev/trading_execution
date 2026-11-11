@@ -181,8 +181,12 @@ func (service *Service) Validate(ctx context.Context, intent domain.OrderIntent)
 	// SELL exits carry the fresh book as evidence only: no capture-age gate and
 	// no worst_price drift gate. The venue fills inside the strategy limit or
 	// leaves the FOK/IOC unfilled.
+	// The capture stamps ObservedAt when the response arrives, so a slow CLOB
+	// response lands after the `now` read before the capture. Judge the
+	// capture against the clock read after it, not before.
 	if !sellExit {
-		if err := validateAge("LATEST_BOOK_OBSERVATION", book.ObservedAt, now, service.maxLatestBookAge, service.maxFutureSkew); err != nil {
+		capturedNow := service.now().UTC()
+		if err := validateAge("LATEST_BOOK_OBSERVATION", book.ObservedAt, capturedNow, service.maxLatestBookAge, service.maxFutureSkew); err != nil {
 			return domain.MarketValidation{}, err
 		}
 		if err := validateWorstPrice(intent.Side, intent.WorstPrice, bestBid, bestAsk); err != nil {
