@@ -230,6 +230,41 @@ func TestValidateAcceptsSlowLatestBookCapture(t *testing.T) {
 	}
 }
 
+// slowUniverse 模拟一次耗时的市场元数据查询：返回前把时钟拨快，元数据按返回时刻打观察时间。
+type slowUniverse struct {
+	market  domain.MarketSnapshot
+	clock   *time.Time
+	elapsed time.Duration
+}
+
+// FindByCondition 实现当前测试场景所需的辅助行为。
+func (universe slowUniverse) FindByCondition(context.Context, string) (domain.MarketSnapshot, bool, error) {
+	*universe.clock = universe.clock.Add(universe.elapsed)
+	market := universe.market
+	market.ObservedAt = *universe.clock
+	return market, true, nil
+}
+
+// TestValidateAcceptsSlowMarketMetadataLookup 验证元数据现场查询超过允许时钟偏差时，
+// 刚查到的元数据不会被当成来自未来而拒单（11-12 02:50 wallet-7 被误拒一次）。
+func TestValidateAcceptsSlowMarketMetadataLookup(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	clock := now
+	book.ObservedAt = now.Add(5 * time.Second)
+	service, err := New(Params{
+		Universe:   slowUniverse{market: market, clock: &clock, elapsed: 5 * time.Second},
+		OrderBooks: &fakeBooks{books: []domain.OrderBookSnapshot{book}},
+		Now:        func() time.Time { return clock },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if _, err := service.Validate(context.Background(), intent); err != nil {
+		t.Fatalf("Validate() error = %v, want slow metadata lookup accepted", err)
+	}
+}
+
 // fakeFeeSchedules 模拟 venue 官方费率读取。
 type fakeFeeSchedules struct {
 	schedule domain.MarketFeeSchedule
