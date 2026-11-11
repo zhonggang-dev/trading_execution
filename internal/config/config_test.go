@@ -817,7 +817,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"POLYMARKET_REQUESTS_PER_SECOND", "POLYMARKET_BURST",
 		"CHAIN_CASH_REWARD_SENDERS", "CHAIN_CASH_DEPOSIT_SOURCES", "CHAIN_CASH_MAX_BLOCKS_PER_RUN",
 		"CHAIN_CASH_LOG_CHUNK_BLOCKS",
-		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",
+		"KALSHI_MARKET_DATA_ENABLED", "KALSHI_API_URL", "KALSHI_READ_API_URLS", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_REQUEST_TIMEOUT",
 		"KALSHI_LIVE_ACCOUNTS_JSON", "KALSHI_SETTLEMENT_ENABLED", "KALSHI_SETTLEMENT_INTERVAL",
 		"KALSHI_BALANCE_DRIFT_THRESHOLD", "KALSHI_BALANCE_SYNC_ENABLED", "KALSHI_POSITION_CHECK_ENABLED",
 		"DECISION_CYCLE_ENABLED", "DECISION_CYCLE_ORDER_SUBMISSION_ENABLED", "DECISION_CYCLE_ENTRY_SUBMISSION_DISABLED",
@@ -890,4 +890,28 @@ func setCompleteLiveEnvironment(t *testing.T) {
 		{"execution_account_id":"wallet-6","market_source":"POLYMARKET","strategy_id":"multfactor_v1","mode":"ACTIVE"},
 		{"execution_account_id":"wallet-7","market_source":"POLYMARKET","strategy_id":"multfactor_v2","mode":"ACTIVE"}
 	]`)
+}
+
+func TestLoadKalshiReadAPIURLs(t *testing.T) {
+	clearConfigEnvironment(t)
+	config, err := Load()
+	if err != nil || len(config.Kalshi.ReadAPIURLs) != 0 {
+		t.Fatalf("default read URLs = %#v, %v; want none (reads use KALSHI_API_URL)", config.Kalshi.ReadAPIURLs, err)
+	}
+	t.Setenv("KALSHI_READ_API_URLS", " https://api.elections.kalshi.com , https://external-api.kalshi.com/ ")
+	config, err = Load()
+	if err != nil || strings.Join(config.Kalshi.ReadAPIURLs, "|") != "https://api.elections.kalshi.com|https://external-api.kalshi.com/" {
+		t.Fatalf("read URLs = %#v, %v", config.Kalshi.ReadAPIURLs, err)
+	}
+	for _, invalid := range []string{
+		"http://api.elections.kalshi.com",
+		"https://api.elections.kalshi.com/trade-api/v2",
+		"https://api.elections.kalshi.com?x=1",
+		"https://api.elections.kalshi.com,https://API.elections.kalshi.com",
+	} {
+		t.Setenv("KALSHI_READ_API_URLS", invalid)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "KALSHI_READ_API_URLS") {
+			t.Fatalf("KALSHI_READ_API_URLS=%q error = %v", invalid, err)
+		}
+	}
 }

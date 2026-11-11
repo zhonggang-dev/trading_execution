@@ -3,6 +3,7 @@ package kalshi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -15,21 +16,32 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 )
 
+// defaultMarketCaptureBudget bounds the metadata and orderbook reads of one
+// market together. A BUY needs a book observed within 10s, and the
+// observation time is taken before the reads, so a capture must finish well
+// inside it; the budget is shared so a stalled host leaves the fallback time.
+const defaultMarketCaptureBudget = 8 * time.Second
+
 type OrderBookParams struct {
 	Client  *Client
 	Depth   int
 	Workers int
-	Now     func() time.Time
+	// MarketBudget bounds both reads of one market; zero means 8s.
+	MarketBudget time.Duration
+	Logger       *slog.Logger
+	Now          func() time.Time
 }
 
 // OrderBookSource converts Kalshi's YES-bid/NO-bid representation into a
 // conventional bid/ask book for each outcome. Requests are authenticated but
 // read-only; this source never invokes a state-changing endpoint.
 type OrderBookSource struct {
-	client  *Client
-	depth   int
-	workers int
-	now     func() time.Time
+	client       *Client
+	depth        int
+	workers      int
+	marketBudget time.Duration
+	logger       *slog.Logger
+	now          func() time.Time
 }
 
 type marketEnvelope struct {
@@ -68,10 +80,22 @@ func NewOrderBookSource(params OrderBookParams) (*OrderBookSource, error) {
 	if params.Workers < 1 || params.Workers > 64 {
 		return nil, fmt.Errorf("Kalshi orderbook workers must be between 1 and 64")
 	}
+	if params.MarketBudget < 0 {
+		return nil, fmt.Errorf("Kalshi orderbook market budget must not be negative")
+	}
+	if params.MarketBudget == 0 {
+		params.MarketBudget = defaultMarketCaptureBudget
+	}
+	if params.Logger == nil {
+		params.Logger = slog.Default()
+	}
 	if params.Now == nil {
 		params.Now = time.Now
 	}
-	return &OrderBookSource{client: params.Client, depth: params.Depth, workers: params.Workers, now: params.Now}, nil
+	return &OrderBookSource{
+		client: params.Client, depth: params.Depth, workers: params.Workers,
+		marketBudget: params.MarketBudget, logger: params.Logger, now: params.Now,
+	}, nil
 }
 
 func (source *OrderBookSource) Capture(ctx context.Context, _ time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, error) {
@@ -84,6 +108,7 @@ func (source *OrderBookSource) Capture(ctx context.Context, _ time.Time, targets
 		indicesByTicker[target.MarketID] = append(indicesByTicker[target.MarketID], index)
 	}
 	jobs := make(chan string)
+	var failures readFailures
 	var workers sync.WaitGroup
 	workerCount := min(source.workers, len(indicesByTicker))
 	for worker := 0; worker < workerCount; worker++ {
@@ -92,7 +117,10 @@ func (source *OrderBookSource) Capture(ctx context.Context, _ time.Time, targets
 			defer workers.Done()
 			for ticker := range jobs {
 				indices := indicesByTicker[ticker]
-				marketBooks := source.captureMarket(ctx, ticker, targets, indices)
+				marketBooks, failure := source.captureMarket(ctx, ticker, targets, indices)
+				if failure != "" {
+					failures.add(ticker, failure)
+				}
 				for offset, index := range indices {
 					books[index] = marketBooks[offset]
 				}
@@ -110,13 +138,45 @@ func (source *OrderBookSource) Capture(ctx context.Context, _ time.Time, targets
 	}
 	close(jobs)
 	workers.Wait()
+	failures.log(source.logger, len(indicesByTicker))
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return books, nil
 }
 
-func (source *OrderBookSource) captureMarket(ctx context.Context, ticker string, targets []domain.BookTarget, indices []int) []domain.OrderBookSnapshot {
+// readFailures tallies the underlying error codes behind the generic
+// *_REQUEST_FAILED book codes, so a rate limit can be told from a timeout.
+type readFailures struct {
+	mutex   sync.Mutex
+	codes   map[string]int
+	tickers []string
+}
+
+func (failures *readFailures) add(ticker, code string) {
+	failures.mutex.Lock()
+	defer failures.mutex.Unlock()
+	if failures.codes == nil {
+		failures.codes = make(map[string]int)
+	}
+	failures.codes[code]++
+	failures.tickers = append(failures.tickers, ticker)
+}
+
+func (failures *readFailures) log(logger *slog.Logger, markets int) {
+	if len(failures.tickers) == 0 {
+		return
+	}
+	sort.Strings(failures.tickers)
+	logger.Warn("Kalshi orderbook reads failed", "failed_markets", len(failures.tickers), "markets", markets,
+		"error_codes", failures.codes, "sample_tickers", failures.tickers[:min(5, len(failures.tickers))])
+}
+
+// captureMarket returns the market's books and, when a read failed, the
+// underlying error code for the round's failure summary.
+func (source *OrderBookSource) captureMarket(ctx context.Context, ticker string, targets []domain.BookTarget, indices []int) ([]domain.OrderBookSnapshot, string) {
+	ctx, cancel := context.WithTimeout(ctx, source.marketBudget)
+	defer cancel()
 	observedAt := source.now().UTC()
 	books := make([]domain.OrderBookSnapshot, len(indices))
 	for offset, index := range indices {
@@ -130,35 +190,35 @@ func (source *OrderBookSource) captureMarket(ctx context.Context, ticker string,
 	}
 	var market marketEnvelope
 	if err := source.getJSON(ctx, "/trade-api/v2/markets/"+url.PathEscape(ticker), &market); err != nil {
-		return withError(books, "KALSHI_MARKET_REQUEST_FAILED")
+		return withError(books, "KALSHI_MARKET_REQUEST_FAILED"), "market: " + errorCode(err)
 	}
 	if market.Market.Ticker != ticker || market.Market.MarketType != "binary" || market.Market.Status != "active" || strings.TrimSpace(market.Market.Result) != "" {
-		return withError(books, "KALSHI_MARKET_NOT_TRADABLE")
+		return withError(books, "KALSHI_MARKET_NOT_TRADABLE"), ""
 	}
 	tickSize, err := marketTickSize(market)
 	if err != nil {
-		return withError(books, "KALSHI_TICK_SIZE_INVALID")
+		return withError(books, "KALSHI_TICK_SIZE_INVALID"), ""
 	}
 	var payload orderBookEnvelope
 	bookPath := "/trade-api/v2/markets/" + url.PathEscape(ticker) + "/orderbook?depth=" + strconv.Itoa(source.depth)
 	if err := source.getJSON(ctx, bookPath, &payload); err != nil {
-		return withError(books, "KALSHI_ORDERBOOK_REQUEST_FAILED")
+		return withError(books, "KALSHI_ORDERBOOK_REQUEST_FAILED"), "orderbook: " + errorCode(err)
 	}
 	yesBids, err := parseBidLevels(payload.OrderBook.Yes)
 	if err != nil {
-		return withError(books, "KALSHI_YES_BIDS_INVALID")
+		return withError(books, "KALSHI_YES_BIDS_INVALID"), ""
 	}
 	noBids, err := parseBidLevels(payload.OrderBook.No)
 	if err != nil {
-		return withError(books, "KALSHI_NO_BIDS_INVALID")
+		return withError(books, "KALSHI_NO_BIDS_INVALID"), ""
 	}
 	yesAsks, err := complementAsks(noBids)
 	if err != nil {
-		return withError(books, "KALSHI_YES_ASK_INVALID")
+		return withError(books, "KALSHI_YES_ASK_INVALID"), ""
 	}
 	noAsks, err := complementAsks(yesBids)
 	if err != nil {
-		return withError(books, "KALSHI_NO_ASK_INVALID")
+		return withError(books, "KALSHI_NO_ASK_INVALID"), ""
 	}
 	for index := range books {
 		books[index].SourceAt = observedAt
@@ -183,7 +243,7 @@ func (source *OrderBookSource) captureMarket(ctx context.Context, ticker string,
 		books[index].BestBid = books[index].Bids[0].Price
 		books[index].BestAsk = books[index].Asks[0].Price
 	}
-	return books
+	return books, ""
 }
 
 func (source *OrderBookSource) getJSON(ctx context.Context, requestPath string, target any) error {

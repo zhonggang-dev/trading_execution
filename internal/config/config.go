@@ -231,10 +231,14 @@ type Polymarket struct {
 // Order submission is intentionally not controlled by these read-path fields.
 type Kalshi struct {
 	MarketDataEnabled bool
-	APIURL            string
-	APIKeyID          string
-	PrivateKeyPath    string
-	RequestTimeout    time.Duration
+	// APIURL serves every state-changing request (order submit and cancel).
+	APIURL string
+	// ReadAPIURLs serve GET requests in order, each GET retried once on the
+	// next host; empty means APIURL only. Writes never use these hosts.
+	ReadAPIURLs    []string
+	APIKeyID       string
+	PrivateKeyPath string
+	RequestTimeout time.Duration
 	// LiveAccounts gives each Kalshi execution account its own credential.
 	LiveAccounts []KalshiLiveAccount
 	// SettlementEnabled applies Kalshi's own settlement records to the ledger
@@ -746,6 +750,7 @@ func Load() (Config, error) {
 		Kalshi: Kalshi{
 			MarketDataEnabled: kalshiMarketDataEnabled,
 			APIURL:            env("KALSHI_API_URL", "https://external-api.kalshi.com"),
+			ReadAPIURLs:       urlList(os.Getenv("KALSHI_READ_API_URLS")),
 			APIKeyID:          strings.TrimSpace(os.Getenv("KALSHI_API_KEY_ID")),
 			PrivateKeyPath:    strings.TrimSpace(os.Getenv("KALSHI_PRIVATE_KEY_PATH")),
 			RequestTimeout:    kalshiRequestTimeout,
@@ -933,6 +938,9 @@ func (config Config) Validate() error {
 		if config.Kalshi.RequestTimeout <= 0 || config.Kalshi.RequestTimeout > time.Minute {
 			return fmt.Errorf("KALSHI_REQUEST_TIMEOUT must be positive and at most 1m")
 		}
+	}
+	if err := validateKalshiReadAPIURLs(config.Kalshi.ReadAPIURLs); err != nil {
+		return err
 	}
 	if config.Kalshi.SettlementEnabled {
 		if config.Kalshi.SettlementInterval < 30*time.Second || config.Kalshi.SettlementInterval > time.Hour {
@@ -1407,6 +1415,36 @@ func nonNegativeDecimal(key, fallback string) (domain.Decimal, error) {
 		return "", fmt.Errorf("%s must be non-negative", key)
 	}
 	return value, nil
+}
+
+// urlList splits a comma-separated URL list, keeping each entry's case.
+func urlList(value string) []string {
+	var result []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+// validateKalshiReadAPIURLs accepts bare HTTPS origins only: request paths
+// are signed as /trade-api/v2/..., so a base path would break the signature.
+func validateKalshiReadAPIURLs(values []string) error {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		parsed, err := url.Parse(value)
+		if err != nil || !secureExternalURL(value) || (parsed.Path != "" && parsed.Path != "/") ||
+			parsed.RawQuery != "" || parsed.Fragment != "" {
+			return fmt.Errorf("KALSHI_READ_API_URLS entries must be bare absolute HTTPS origins")
+		}
+		key := strings.ToLower(parsed.Host)
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("KALSHI_READ_API_URLS repeats %s", parsed.Host)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
 }
 
 func commaSeparated(value string) []string {

@@ -51,7 +51,7 @@ func composeKalshiExecution(ctx context.Context, cfg config.Config, database *sq
 		if !ok {
 			return kalshiComposition{}, fmt.Errorf("Kalshi live account %q is not a KALSHI decision account", liveAccount.ExecutionAccountID)
 		}
-		built, err := buildKalshiLiveRoute(ctx, cfg, account, liveAccount, database, repository, guard, ledger, ledgerSync)
+		built, err := buildKalshiLiveRoute(ctx, cfg, account, liveAccount, database, repository, guard, ledger, ledgerSync, logger)
 		if err != nil {
 			needsMaintenance, maintenanceErr := kalshiProtectedAssets(ctx, database, account.ExecutionAccountID)
 			if maintenanceErr != nil {
@@ -149,9 +149,10 @@ func resolveKalshiLedgerSync(ctx context.Context, cfg config.Config, database *s
 
 func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config.DecisionAccount, credential config.KalshiLiveAccount,
 	database *sql.DB, repository port.OrderRepository, guard port.Guard, ledger *postgresadapter.FillLedger,
-	ledgerSync kalshiLedgerSync) (builtKalshiLiveRoute, error) {
-	client, err := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, APIKeyID: credential.APIKeyID,
-		PrivateKeyPath: credential.PrivateKeyPath, HTTPClient: noRedirectHTTPClient(cfg.Kalshi.RequestTimeout), LiveTradingEnabled: true})
+	ledgerSync kalshiLedgerSync, logger *slog.Logger) (builtKalshiLiveRoute, error) {
+	client, err := kalshi.NewClient(kalshi.ClientParams{BaseURL: cfg.Kalshi.APIURL, ReadBaseURLs: cfg.Kalshi.ReadAPIURLs,
+		APIKeyID: credential.APIKeyID, PrivateKeyPath: credential.PrivateKeyPath,
+		HTTPClient: noRedirectHTTPClient(cfg.Kalshi.RequestTimeout), Logger: logger, LiveTradingEnabled: true})
 	if err != nil {
 		return builtKalshiLiveRoute{}, err
 	}
@@ -196,7 +197,7 @@ func buildKalshiLiveRoute(ctx context.Context, cfg config.Config, account config
 	if err != nil {
 		return builtKalshiLiveRoute{}, err
 	}
-	books, err := kalshi.NewOrderBookSource(kalshi.OrderBookParams{Client: client})
+	books, err := kalshi.NewOrderBookSource(kalshi.OrderBookParams{Client: client, Logger: logger})
 	if err != nil {
 		return builtKalshiLiveRoute{}, err
 	}
