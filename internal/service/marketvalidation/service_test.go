@@ -192,6 +192,44 @@ func TestValidateAcceptsQuietBookWithOldVenueTimestamp(t *testing.T) {
 	}
 }
 
+// slowBooks 模拟一次耗时的盘口抓取：返回前把时钟拨快，盘口按返回时刻打观察时间。
+type slowBooks struct {
+	book    domain.OrderBookSnapshot
+	clock   *time.Time
+	elapsed time.Duration
+}
+
+// Capture 返回模拟行情快照。
+func (source *slowBooks) Capture(context.Context, time.Time, []domain.BookTarget) ([]domain.OrderBookSnapshot, error) {
+	*source.clock = source.clock.Add(source.elapsed)
+	book := source.book
+	book.ObservedAt = *source.clock
+	return []domain.OrderBookSnapshot{book}, nil
+}
+
+// TestValidateAcceptsSlowLatestBookCapture 验证盘口抓取超过允许时钟偏差时，
+// 刚抓到的盘口不会被当成来自未来而拒单（11-11、11-12 夜里 wallet-7 各被误拒一次）。
+func TestValidateAcceptsSlowLatestBookCapture(t *testing.T) {
+	now, intent, market, book := validFixtures()
+	clock := now
+	service, err := New(Params{
+		Universe:   fakeUniverse{market: market, found: true},
+		OrderBooks: &slowBooks{book: book, clock: &clock, elapsed: 5 * time.Second},
+		Now:        func() time.Time { return clock },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	validation, err := service.Validate(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Validate() error = %v, want slow capture accepted", err)
+	}
+	if !validation.LatestBookObservedAt.Equal(now.Add(5 * time.Second)) {
+		t.Fatalf("LatestBookObservedAt = %s", validation.LatestBookObservedAt)
+	}
+}
+
 // fakeFeeSchedules 模拟 venue 官方费率读取。
 type fakeFeeSchedules struct {
 	schedule domain.MarketFeeSchedule
