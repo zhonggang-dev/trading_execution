@@ -2,9 +2,11 @@ package accountprices
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -121,5 +123,123 @@ func TestRequiredKalshiNeverExtendsMidWithNoTradeProof(t *testing.T) {
 	}
 	if calls.Load() != 0 || result.Series.Coverage[0].State != "missing" {
 		t.Fatal(result, calls.Load())
+	}
+}
+
+// A quiet market has no hourly bucket, so the official as-of answer is older
+// than one hour. Reproduces market 6766351 at 2026-11-10 13:00 UTC.
+func TestRequiredPMCarriesOfficialAsOfAcrossAQuietGap(t *testing.T) {
+	at := time.Date(2026, 11, 10, 13, 0, 0, 0, time.UTC)
+	later := at.Add(30 * time.Minute)
+	observed := time.Date(2026, 11, 10, 11, 10, 52, 0, time.UTC)
+	var asOfCalls, resolutionCalls atomic.Int32
+	source, close := fixtureSource(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/resolutions" {
+			resolutionCalls.Add(1)
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		asOfCalls.Add(1)
+		fmt.Fprintf(w, `{"data":[{"timestamp":%d,"price":0.51,"resolution_seconds":0}],"pagination":{"has_more":false}}`, observed.Unix())
+	})
+	defer close()
+	seed := h.Series{Points: []h.Point{{At: observed.Add(-time.Hour), Price: "0.5", ResolutionSeconds: 3600, Source: "PM_HISTORY"}}}
+	result, err := source.FetchWithSeries(context.Background(), h.Window{Asset: pmAsset(), From: at, To: later, RequiredAt: []time.Time{at, later}}, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Series.Coverage[0].State != "complete" || result.Series.Coverage[0].Reason != "" {
+		t.Fatalf("coverage = %+v", result.Series.Coverage)
+	}
+	for _, sample := range []time.Time{at, later} {
+		if point, ok := h.PriceAt(result.Series, sample); !ok || point.Price != "0.51" || !point.At.Equal(observed) {
+			t.Fatalf("%s: point=%+v ok=%v", sample, point, ok)
+		}
+	}
+	if resolutionCalls.Load() != 1 || asOfCalls.Load() != 2 {
+		t.Fatalf("resolutions=%d asOf=%d, want settlement checked once and each instant asked", resolutionCalls.Load(), asOfCalls.Load())
+	}
+	if _, ok := h.PriceAt(seed, at); ok {
+		t.Fatal("repair mutated the loaded series")
+	}
+}
+
+func TestRequiredPMDoesNotCarryBeyondTheLimitOrWithoutAnAnswer(t *testing.T) {
+	at := time.Date(2026, 11, 10, 13, 0, 0, 0, time.UTC)
+	for name, body := range map[string]string{
+		"too old":   fmt.Sprintf(`{"data":[{"timestamp":%d,"price":0.51,"resolution_seconds":0}],"pagination":{"has_more":false}}`, at.Add(-pmMaxAsOfCarry-time.Second).Unix()),
+		"no answer": `{"data":[],"pagination":{"has_more":false}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			source, close := fixtureSource(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v2/resolutions" {
+					fmt.Fprint(w, `{"data":[]}`)
+					return
+				}
+				fmt.Fprint(w, body)
+			})
+			defer close()
+			seed := h.Series{Points: []h.Point{{At: at.Add(-48 * time.Hour), Price: "0.5", ResolutionSeconds: 3600, Source: "PM_HISTORY"}}}
+			result, err := source.FetchWithSeries(context.Background(), h.Window{Asset: pmAsset(), From: at, To: at, RequiredAt: []time.Time{at}}, seed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Series.Coverage[0].State != "missing" || result.Series.Coverage[0].Reason != "missing_prices" {
+				t.Fatalf("coverage = %+v, want a reported gap", result.Series.Coverage)
+			}
+		})
+	}
+}
+
+// Settlement wins: a market resolved before the instant must be valued at its
+// payout, never at the stale as-of price.
+func TestRequiredPMPrefersSettlementOverCarry(t *testing.T) {
+	at := time.Date(2026, 11, 10, 13, 0, 0, 0, time.UTC)
+	known := h.Settlement{EffectiveAt: at.Add(-time.Minute), Price: "1", Source: "OFFICIAL_SETTLEMENT", SourceReference: "0xabc:1", FetchedAt: at}
+	source, close := fixtureSource(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("a settled instant needs no request", r.URL.String())
+		http.Error(w, "unexpected", 400)
+	})
+	defer close()
+	result, err := source.FetchWithSeries(context.Background(), h.Window{Asset: pmAsset(), From: at, To: at, RequiredAt: []time.Time{at}}, h.Series{Settlements: []h.Settlement{known}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if point, ok := h.PriceAt(result.Series, at); !ok || point.Price != "1" || point.Source != "OFFICIAL_SETTLEMENT" {
+		t.Fatalf("point=%+v ok=%v, want the settlement", point, ok)
+	}
+}
+
+// The stale as-of answer must not hide a resolution only the settlement lookup
+// can reveal.
+func TestRequiredPMLooksUpSettlementBeforeCarrying(t *testing.T) {
+	at := time.Date(2026, 11, 10, 13, 0, 0, 0, time.UTC)
+	resolved := at.Add(-time.Minute)
+	source, close := fixtureSource(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/prices-history":
+			fmt.Fprintf(w, `{"data":[{"timestamp":%d,"price":0.51,"resolution_seconds":0}],"pagination":{"has_more":false}}`, at.Add(-2*time.Hour).Unix())
+		case "/v2/resolutions":
+			fmt.Fprintf(w, `{"data":[{"condition_id":"condition","status":"resolved","transaction_hash":"0x%s","log_index":"1","last_update_timestamp":"%d"}]}`, strings.Repeat("a", 64), resolved.Unix())
+		case "/markets/1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "1", "conditionId": "condition", "closed": true, "umaResolutionStatus": "resolved", "clobTokenIds": `["yes-token","no-token"]`, "outcomePrices": `["0","1"]`, "outcomes": `["Yes","No"]`})
+		default:
+			t.Error(r.URL.String())
+			http.Error(w, "bad path", 400)
+		}
+	})
+	defer close()
+	seed := h.Series{Points: []h.Point{{At: at.Add(-3 * time.Hour), Price: "0.5", ResolutionSeconds: 3600, Source: "PM_HISTORY"}}}
+	result, err := source.FetchWithSeries(context.Background(), h.Window{Asset: pmAsset(), From: at, To: at, RequiredAt: []time.Time{at}}, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if point, ok := h.PriceAt(result.Series, at); !ok || point.Price != "1" || point.Source != "OFFICIAL_SETTLEMENT" {
+		t.Fatalf("point=%+v ok=%v, want the settlement payout", point, ok)
+	}
+	for _, p := range result.Series.Points {
+		if p.ValidUntil != nil {
+			t.Fatalf("carried a settled market: %+v", p)
+		}
 	}
 }
