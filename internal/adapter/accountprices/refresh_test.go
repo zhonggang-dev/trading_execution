@@ -107,3 +107,23 @@ func TestCompletedHourKalshiRefreshReadsTheOfficialHourEvenWithSeed(t *testing.T
 		t.Fatal(result, p, candles.Load())
 	}
 }
+
+func TestCompletedHourPMRefreshCarriesTheOfficialAsOfAcrossAQuietGap(t *testing.T) {
+	at := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	observed := at.Add(-110 * time.Minute)
+	source, close := fixtureSource(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/resolutions" {
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		fmt.Fprintf(w, `{"data":[{"timestamp":%d,"price":0.51,"resolution_seconds":0}],"pagination":{"has_more":false}}`, observed.Unix())
+	})
+	defer close()
+	result, err := source.FetchWithSeries(context.Background(), h.Window{Asset: pmAsset(), From: at, To: at, RefreshAt: &at}, h.Series{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if point, ok := h.PriceAt(result.Series, at); !ok || point.Price != "0.51" || result.Series.Coverage[0].State != "complete" || result.Series.Coverage[0].Reason != "hourly_refresh" {
+		t.Fatalf("point=%+v ok=%v coverage=%+v", point, ok, result.Series.Coverage)
+	}
+}

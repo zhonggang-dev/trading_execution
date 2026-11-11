@@ -228,7 +228,7 @@ func (s *Source) polymarket(ctx context.Context, w h.Window, series *h.Series) e
 		if _, ok := h.PriceAt(*series, at); ok {
 			continue
 		}
-		if err := s.pmAsOf(ctx, w, at, series); err != nil {
+		if _, err := s.pmAsOf(ctx, w, at, series); err != nil {
 			return err
 		}
 		h.SortSeries(series)

@@ -58,15 +58,8 @@ func (s *Source) FetchWithSeries(ctx context.Context, w h.Window, seed h.Series)
 			if _, ok := h.PriceAt(combined, at); ok {
 				continue
 			}
-			if err = s.pmAsOf(ctx, w, at, &combined); err != nil {
+			if err = s.pmSample(ctx, w, at, &combined, &triedSettlement); err != nil {
 				return h.Result{}, err
-			}
-			h.SortSeries(&combined)
-			if _, ok := h.PriceAt(combined, at); !ok && !triedSettlement {
-				triedSettlement = true
-				if err = s.pmSettlement(ctx, w, &combined); err != nil {
-					return h.Result{}, err
-				}
 			}
 		}
 	} else if need {

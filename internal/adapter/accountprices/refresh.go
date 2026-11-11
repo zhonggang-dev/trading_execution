@@ -28,13 +28,8 @@ func (s *Source) refreshCompletedHour(ctx context.Context, w h.Window, known []h
 	sampleWindow := w
 	sampleWindow.RequiredAt = []time.Time{at}
 	if w.Asset.MarketSource == "POLYMARKET" {
-		err = s.pmAsOf(ctx, sampleWindow, at, &fresh)
-		if err == nil {
-			h.SortSeries(&fresh)
-			if _, ok := h.PriceAt(fresh, at); !ok {
-				err = s.pmSettlement(ctx, sampleWindow, &fresh)
-			}
-		}
+		triedSettlement := false
+		err = s.pmSample(ctx, sampleWindow, at, &fresh, &triedSettlement)
 	} else {
 		err = s.kalshi(ctx, sampleWindow, &fresh)
 	}
