@@ -30,6 +30,7 @@ type CohortMetrics struct {
 
 type CohortResponse struct {
 	ObservedAt          time.Time                            `json:"observed_at"`
+	AsOf                time.Time                            `json:"as_of"`
 	OpeningFrom         *time.Time                           `json:"opening_from"`
 	OpeningTo           *time.Time                           `json:"opening_to"`
 	Items               []CohortMetrics                      `json:"items"`
@@ -54,9 +55,14 @@ func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter
 		return CohortResponse{}, err
 	}
 	replays := map[string]drawdownReplay{}
+	asOf := facts.AsOf
+	if asOf.IsZero() {
+		asOf = facts.ObservedAt
+	}
+	historical := asOf.Before(facts.ObservedAt)
 	if s.history != nil {
 		for account, replay := range facts.Replay {
-			r, e := prepareDrawdown(ctx, replay.Lots, account, facts.ObservedAt)
+			r, e := prepareDrawdown(ctx, replay.Lots, account, asOf)
 			if e != nil {
 				return CohortResponse{}, e
 			}
@@ -79,20 +85,35 @@ func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter
 	} else {
 		history <- historyResult{}
 	}
-	priced, err := s.queryFacts(ctx, facts.CoreMetricFacts)
+	var priced Response
+	var loaded historyResult
+	wait := func() {
+		select {
+		case loaded = <-history:
+		case <-historyCtx.Done():
+			loaded.err = historyCtx.Err()
+		}
+	}
+	if historical {
+		// A past snapshot is valued only from durable history at that instant.
+		wait()
+		available := s.history != nil && loaded.err == nil
+		priced, err = s.assemble(facts.CoreMetricFacts, func(a consolev2.CoreAssetFact, _ string) Quote {
+			return historicalQuote(a, loaded.data, available, asOf)
+		})
+	} else {
+		priced, err = s.queryFacts(ctx, facts.CoreMetricFacts)
+		if err == nil {
+			wait()
+		}
+	}
 	if err != nil {
 		return CohortResponse{}, err
-	}
-	var loaded historyResult
-	select {
-	case loaded = <-history:
-	case <-historyCtx.Done():
-		loaded.err = historyCtx.Err()
 	}
 	if ctx.Err() != nil {
 		return CohortResponse{}, ctx.Err()
 	}
-	result := CohortResponse{ObservedAt: priced.ObservedAt, OpeningFrom: facts.OpeningFrom, OpeningTo: facts.OpeningTo, Items: make([]CohortMetrics, 0, len(priced.Items)), UnavailableAccounts: append([]consolev2.CohortUnavailableAccount{}, facts.UnavailableAccounts...)}
+	result := CohortResponse{ObservedAt: priced.ObservedAt, AsOf: asOf, OpeningFrom: facts.OpeningFrom, OpeningTo: facts.OpeningTo, Items: make([]CohortMetrics, 0, len(priced.Items)), UnavailableAccounts: append([]consolev2.CohortUnavailableAccount{}, facts.UnavailableAccounts...)}
 	seen := map[string]bool{}
 	for _, a := range facts.UnavailableAccounts {
 		if a.Reason != "missing_disposition_evidence" || (a.MarketSource != "POLYMARKET" && a.MarketSource != "KALSHI") || a.ExecutionAccountID == "" || seen[a.ExecutionAccountID] || consolev2.ValidatePerformanceAccountID(a.ExecutionAccountID) != nil || (filter.ExecutionAccountID != "" && a.ExecutionAccountID != filter.ExecutionAccountID) {
@@ -116,11 +137,11 @@ func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter
 			}
 		}
 		item := CohortMetrics{Metrics: m, OpenedAssetCount: c.OpenedAssetCount, HoldingAssetCount: c.HoldingAssetCount, ClosedAssetCount: c.ClosedAssetCount, BuyFees: c.BuyFees, SellFees: c.SellFees, MaxDrawdown: c.MaxDrawdown, DrawdownState: c.DrawdownState}
-		s.finishDrawdown(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, facts.ObservedAt)
-		s.finishSharpe(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, facts.ObservedAt)
-		s.retainCompleteMetrics(&item, filter, facts.ObservedAt)
-		s.recoverCompleteHistory(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, facts.ObservedAt)
-		s.retainCompleteMetrics(&item, filter, facts.ObservedAt)
+		s.finishDrawdown(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, asOf)
+		s.finishSharpe(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, asOf)
+		s.retainCompleteMetrics(&item, filter, asOf)
+		s.recoverCompleteHistory(ctx, &item, replays[m.ExecutionAccountID], loaded.data, loaded.err, asOf)
+		s.retainCompleteMetrics(&item, filter, asOf)
 		if m.TotalPnL != nil {
 			invested, e := number(m.CumulativeInvestedCost)
 			if e != nil || invested.Sign() < 0 {
@@ -145,4 +166,32 @@ func (s *Service) QueryCohort(ctx context.Context, filter consolev2.CohortFilter
 		return CohortResponse{}, consolev2.ErrUnavailable
 	}
 	return result, nil
+}
+
+// historicalQuote values one asset at a past snapshot from durable hourly
+// history only. It never looks ahead or substitutes a current quote.
+func historicalQuote(a consolev2.CoreAssetFact, data accountpricehistory.Dataset, available bool, asOf time.Time) Quote {
+	if a.SettlementPrice != nil {
+		return Priced(*a.SettlementPrice, "OFFICIAL_SETTLEMENT", asOf, a.SettlementAt)
+	}
+	if !available {
+		return Unknown("history_not_synced")
+	}
+	asset := accountpricehistory.Asset{MarketSource: a.MarketSource, MarketID: a.MarketID, ConditionID: a.ConditionID, TokenID: a.TokenID, OutcomeIndex: a.OutcomeIndex, OutcomeName: a.OutcomeName}
+	series := data.Series[asset.Key()]
+	p, ok := accountpricehistory.PriceAt(series, asOf)
+	if !ok {
+		// Only a completed fetch covering the instant proves a real source gap.
+		for _, c := range series.Coverage {
+			if !asOf.Before(c.From) && !asOf.After(c.To) && (c.State == "complete" || c.State == "missing") {
+				return Unknown("history_missing")
+			}
+		}
+		return Unknown("history_not_synced")
+	}
+	source := "HISTORY_HOURLY"
+	if p.Source == "OFFICIAL_SETTLEMENT" {
+		source = "OFFICIAL_SETTLEMENT"
+	}
+	return Priced(p.Price, source, p.At.UTC(), p.SourceAt)
 }

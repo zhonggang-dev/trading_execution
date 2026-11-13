@@ -14,13 +14,22 @@ import (
 const MaxCohortLots = 100000
 const MaxCohortClosures = 200000
 
-// CohortFilter selects opening lots, not the dates of subsequent cash flows.
-// The opening interval is half-open; all subsequent accounting is read to now.
+// CohortFilter selects opening lots by a half-open opening interval. A past
+// OpeningTo is also the snapshot instant: holdings, dispositions, fees and
+// valuation are read as of that instant, never after it.
 type CohortFilter struct {
 	ExecutionAccountID string
 	AccountScope       string
 	OpeningFrom        *time.Time
 	OpeningTo          *time.Time
+}
+
+// CohortAsOf is the snapshot instant. Without a past range end it is now.
+func CohortAsOf(f CohortFilter, now time.Time) time.Time {
+	if f.OpeningTo != nil && f.OpeningTo.Before(now) {
+		return f.OpeningTo.UTC()
+	}
+	return now
 }
 
 type CohortAccountFact struct {
@@ -36,6 +45,7 @@ type CohortMetricFacts struct {
 	CoreMetricFacts
 	OpeningFrom         *time.Time
 	OpeningTo           *time.Time
+	AsOf                time.Time
 	Cohorts             map[string]CohortAccountFact
 	Replay              map[string]CohortReplayFact
 	UnavailableAccounts []CohortUnavailableAccount
@@ -70,7 +80,7 @@ type cohortLot struct {
 	asset                                              CoreAssetFact
 	originalShares, remainingShares, principal, buyFee *big.Rat
 	opened                                             time.Time
-	closedShares, realized, sellFees                   *big.Rat
+	closedShares, closedAsOf, realized, sellFees       *big.Rat
 	dispositions                                       []CohortReplayDisposition
 	originalText, remainingText, principalText         string
 }
@@ -117,11 +127,12 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 	}
 	defer tx.Rollback()
 	now := reader.now().UTC()
+	asOf := CohortAsOf(filter, now)
 	accounts, err := reader.selectedManagedAccountsInTx(ctx, tx, filter.ExecutionAccountID, filter.AccountScope)
 	if err != nil {
 		return CohortMetricFacts{}, err
 	}
-	result := CohortMetricFacts{CoreMetricFacts: CoreMetricFacts{ObservedAt: now, Accounts: make([]CoreAccountFact, 0, len(accounts))}, OpeningFrom: filter.OpeningFrom, OpeningTo: filter.OpeningTo, Cohorts: map[string]CohortAccountFact{}, Replay: map[string]CohortReplayFact{}, UnavailableAccounts: []CohortUnavailableAccount{}}
+	result := CohortMetricFacts{CoreMetricFacts: CoreMetricFacts{ObservedAt: now, Accounts: make([]CoreAccountFact, 0, len(accounts))}, OpeningFrom: filter.OpeningFrom, OpeningTo: filter.OpeningTo, AsOf: asOf, Cohorts: map[string]CohortAccountFact{}, Replay: map[string]CohortReplayFact{}, UnavailableAccounts: []CohortUnavailableAccount{}}
 	accountIndices := map[string]int{}
 	for _, a := range accounts {
 		f := CoreAccountFact{Metrics: AccountPerformance{ExecutionAccountID: a.ExecutionAccountID, MarketSource: a.MarketSource, CurrentCost: "0", PeakHoldingCost: "0", CumulativeInvestedCost: "0", RealizedPnL: "0", RealizedDrawdown14D: "0", DrawdownFrom: now, DrawdownTo: now}, Assets: []CoreAssetFact{}}
@@ -202,7 +213,7 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 		}
 		l.originalShares, l.remainingShares, l.principal, l.buyFee = ns[0], ns[1], ns[2], ns[3]
 		l.originalText, l.remainingText, l.principalText = original.String, remaining.String, principal.String
-		l.closedShares, l.realized, l.sellFees = new(big.Rat), new(big.Rat), new(big.Rat)
+		l.closedShares, l.closedAsOf, l.realized, l.sellFees = new(big.Rat), new(big.Rat), new(big.Rat), new(big.Rat)
 		l.asset.RemainingShares = remaining.String
 		l.asset.RemainingCost = cohortText(new(big.Rat).Quo(new(big.Rat).Mul(l.principal, l.remainingShares), l.originalShares))
 		l.asset.FirstOpenedAt, l.asset.LastOpenedAt = l.opened, l.opened
@@ -302,6 +313,12 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 			rows.Close()
 			return CohortMetricFacts{}, ErrUnavailable
 		}
+		// Every flow through now is validated above; only flows up to the
+		// snapshot instant contribute to the snapshot.
+		if at.After(asOf) {
+			continue
+		}
+		l.closedAsOf.Add(l.closedAsOf, qty)
 		cost := new(big.Rat).Quo(new(big.Rat).Mul(l.principal, qty), l.originalShares)
 		l.realized.Add(l.realized, new(big.Rat).Sub(new(big.Rat).Add(cash, sellFee), cost))
 		l.sellFees.Add(l.sellFees, sellFee)
@@ -347,6 +364,14 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 	for id, l := range lots {
 		if missingDisposition[l.asset.ExecutionAccountID] {
 			delete(lots, id)
+			continue
+		}
+		// Shares disposed after the snapshot were still held at the snapshot.
+		if l.closedAsOf.Cmp(l.closedShares) != 0 {
+			l.remainingShares = new(big.Rat).Sub(l.originalShares, l.closedAsOf)
+			l.remainingText = cohortText(l.remainingShares)
+			l.asset.RemainingShares = l.remainingText
+			l.asset.RemainingCost = cohortText(new(big.Rat).Quo(new(big.Rat).Mul(l.principal, l.remainingShares), l.originalShares))
 		}
 	}
 	availableEvents := events[:0]
@@ -474,7 +499,7 @@ func (reader *Reader) CohortMetricFacts(ctx context.Context, filter CohortFilter
 		rows, err = tx.QueryContext(ctx, `SELECT p.execution_account_id,p.market_id,p.condition_id,p.token_id,p.outcome_index,NULLIF(p.outcome_name,''),p.settlement_price::text,p.settled_at
   FROM jsonb_to_recordset($1::jsonb) AS a(account text,market text,condition text,token text,index integer,name text)
   JOIN execution_positions p ON p.execution_account_id=a.account AND p.market_id=a.market AND p.condition_id=a.condition AND p.token_id=a.token AND p.outcome_index IS NOT DISTINCT FROM a.index AND NULLIF(p.outcome_name,'') IS NOT DISTINCT FROM a.name
-  WHERE p.lifecycle_status='SETTLED_PENDING_REDEEM' AND p.settlement_source<>'' AND p.settled_at<=$2 AND p.settlement_price IN(0,1)`, string(raw), now)
+  WHERE p.lifecycle_status='SETTLED_PENDING_REDEEM' AND p.settlement_source<>'' AND p.settled_at<=$2 AND p.settlement_price IN(0,1)`, string(raw), asOf)
 		if err != nil {
 			return CohortMetricFacts{}, dbUnavailable("cohort settlement prices", err)
 		}

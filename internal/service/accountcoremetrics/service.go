@@ -164,6 +164,20 @@ func (s *Service) queryFacts(ctx context.Context, facts consolev2.CoreMetricFact
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return Response{}, ctx.Err()
 	}
+	return s.assemble(facts, func(a consolev2.CoreAssetFact, address string) Quote {
+		q, ok := quotes[Key(Target{Asset: a, Address: address})]
+		if !ok {
+			q = Unknown("timeout")
+		}
+		if a.SettlementPrice != nil {
+			q = Priced(*a.SettlementPrice, "OFFICIAL_SETTLEMENT", facts.ObservedAt, a.SettlementAt)
+		}
+		return validateQuote(q, s.now().UTC())
+	})
+}
+
+// assemble applies one valuation arithmetic to already validated quotes.
+func (s *Service) assemble(facts consolev2.CoreMetricFacts, quoteFor func(consolev2.CoreAssetFact, string) Quote) (Response, error) {
 	result := Response{ObservedAt: facts.ObservedAt, Items: make([]Metrics, 0, len(facts.Accounts))}
 	for _, f := range facts.Accounts {
 		for _, raw := range []string{f.Metrics.PeakHoldingCost, f.Metrics.CumulativeInvestedCost, f.Metrics.RealizedPnL, f.Metrics.RealizedDrawdown14D} {
@@ -183,14 +197,7 @@ func (s *Service) queryFacts(ctx context.Context, facts consolev2.CoreMetricFact
 				return Response{}, consolev2.ErrUnavailable
 			}
 			cost.Add(cost, c)
-			q, ok := quotes[Key(Target{Asset: a, Address: f.FundingAddress})]
-			if !ok {
-				q = Unknown("timeout")
-			}
-			if a.SettlementPrice != nil {
-				q = Priced(*a.SettlementPrice, "OFFICIAL_SETTLEMENT", facts.ObservedAt, a.SettlementAt)
-			}
-			q = validateQuote(q, s.now().UTC())
+			q := quoteFor(a, f.FundingAddress)
 			item := Asset{ExecutionAccountID: a.ExecutionAccountID, MarketSource: a.MarketSource, MarketID: a.MarketID, ConditionID: a.ConditionID, TokenID: a.TokenID, OutcomeIndex: a.OutcomeIndex, OutcomeName: a.OutcomeName, MarketQuestion: a.MarketQuestion, RemainingShares: a.RemainingShares, RemainingCost: a.RemainingCost, State: "unpriced", Reason: q.Reason}
 			if q.Price != nil {
 				p, _ := number(*q.Price)

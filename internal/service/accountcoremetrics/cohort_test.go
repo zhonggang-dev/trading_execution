@@ -78,3 +78,60 @@ func TestCohortUnavailableAccountsHaveNoGuessedFinancialValues(t *testing.T) {
 		t.Fatal("duplicate warnings accepted", err)
 	}
 }
+
+func TestCohortPastSnapshotValuesFromHistoryAtRangeEnd(t *testing.T) {
+	asOf := drawdownStart.Add(3 * time.Hour)
+	lot := replayLot("one", "a", "10", "5", "10", drawdownStart)
+	asset := lot.Asset
+	asset.RemainingShares, asset.RemainingCost = "10", "5"
+	facts := consolev2.CohortMetricFacts{
+		CoreMetricFacts: consolev2.CoreMetricFacts{ObservedAt: drawdownStart.Add(10 * time.Hour), Accounts: []consolev2.CoreAccountFact{{Metrics: consolev2.AccountPerformance{ExecutionAccountID: "pm", MarketSource: "POLYMARKET", PeakHoldingCost: "5", CumulativeInvestedCost: "5", RealizedPnL: "0", RealizedDrawdown14D: "0"}, Assets: []consolev2.CoreAssetFact{asset}}}},
+		AsOf:            asOf,
+		Cohorts:         map[string]consolev2.CohortAccountFact{"pm": {OpenedAssetCount: 1, HoldingAssetCount: 1, BuyFees: "0", SellFees: "0", DrawdownState: "history_unavailable"}},
+		Replay:          map[string]consolev2.CohortReplayFact{"pm": {Lots: []consolev2.CohortReplayLot{lot}}},
+	}
+	live := quotesFunc(func(context.Context, []Target) map[string]Quote {
+		t.Fatal("a past snapshot read a current quote")
+		return nil
+	})
+	data := replayDataset([]consolev2.CohortReplayLot{lot}, map[string][]string{"a": {"0.5", "0.9", "0.8", "0.6", "0.99"}})
+	s := New(cohortReaderFixture{facts: facts}, live, historyFixture{data: data})
+	s.now = func() time.Time { return facts.ObservedAt }
+	got, err := s.QueryCohort(context.Background(), consolev2.CohortFilter{})
+	if err != nil || !got.AsOf.Equal(asOf) || len(got.Items) != 1 {
+		t.Fatal(got, err)
+	}
+	m := got.Items[0]
+	a := m.ValuationAssets[0]
+	if a.PriceSource == nil || *a.PriceSource != "HISTORY_HOURLY" || !a.ObservedAt.Equal(asOf) {
+		t.Fatal("snapshot price was not the hourly history at the range end", a)
+	}
+	drawdownAmount(t, *m.MarketValue, "6")
+	drawdownAmount(t, *m.TotalPnL, "1")
+	// Peak +4 at hour 1, then +1 at the range end; the later 0.99 is ignored.
+	if m.MaxDrawdown == nil || m.DrawdownCoverage == nil || !m.DrawdownCoverage.To.Equal(asOf) {
+		t.Fatal(m.DrawdownCoverage)
+	}
+	drawdownAmount(t, *m.MaxDrawdown, "3")
+
+	// No eligible point within an hour of a fetched instant is a real gap.
+	facts.AsOf = drawdownStart.Add(6 * time.Hour)
+	s = New(cohortReaderFixture{facts: facts}, live, historyFixture{data: data})
+	s.now = func() time.Time { return facts.ObservedAt }
+	gap, err := s.QueryCohort(context.Background(), consolev2.CohortFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := gap.Items[0]
+	if g.TotalPnL != nil || g.MarketValue != nil || g.ValuationAssets[0].Reason == nil || *g.ValuationAssets[0].Reason != "history_missing" || g.RealizedPnL != "0" {
+		t.Fatal("missing history must leave valuation unknown", g)
+	}
+
+	// Without history the snapshot is unknown, never a current quote.
+	s = New(cohortReaderFixture{facts: facts}, live)
+	s.now = func() time.Time { return facts.ObservedAt }
+	unsynced, err := s.QueryCohort(context.Background(), consolev2.CohortFilter{})
+	if err != nil || unsynced.Items[0].ValuationAssets[0].Reason == nil || *unsynced.Items[0].ValuationAssets[0].Reason != "history_not_synced" {
+		t.Fatal(unsynced, err)
+	}
+}
