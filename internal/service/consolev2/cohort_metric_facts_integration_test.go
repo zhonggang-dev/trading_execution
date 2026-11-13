@@ -36,9 +36,9 @@ func TestCohortMetricFactsOpeningBoundsDistinctPartialAndSource(t *testing.T) {
 	f.cohortLot(t, "included", "10", "6", "4", "0.1", from)
 	f.cohortLot(t, "fully-closed", "5", "0", "1", "0.05", from.Add(time.Hour))
 	f.cohortLot(t, "at-end", "3", "3", "1.5", "0.03", to)
-	f.cohortSell(t, "included", "sold", "4", "3", "0.1", f.now.Add(-time.Hour))
-	f.cohortSell(t, "fully-closed", "sold-all", "5", "2", "0.05", f.now.Add(-time.Hour))
-	f.exec(t, `INSERT INTO execution_positions(execution_account_id,market_id,condition_id,token_id,outcome_index,outcome_name,lifecycle_status,settlement_price,settlement_source,settled_at) VALUES('pm','m','c','t',0,'Yes','SETTLED_PENDING_REDEEM',1,'official',$1)`, f.now.Add(-time.Hour))
+	f.cohortSell(t, "included", "sold", "4", "3", "0.1", to.Add(-time.Hour))
+	f.cohortSell(t, "fully-closed", "sold-all", "5", "2", "0.05", to.Add(-time.Hour))
+	f.exec(t, `INSERT INTO execution_positions(execution_account_id,market_id,condition_id,token_id,outcome_index,outcome_name,lifecycle_status,settlement_price,settlement_source,settled_at) VALUES('pm','m','c','t',0,'Yes','SETTLED_PENDING_REDEEM',1,'official',$1)`, to.Add(-time.Hour))
 	got, err := f.reader.CohortMetricFacts(context.Background(), CohortFilter{ExecutionAccountID: "pm", OpeningFrom: &from, OpeningTo: &to})
 	if err != nil {
 		t.Fatal(err)
@@ -114,6 +114,66 @@ func TestCohortMetricFactsAllClosedZeroPayoutAndExternalSell(t *testing.T) {
 	if err != nil || len(missing.Accounts) != 0 || len(missing.Cohorts) != 0 || len(missing.UnavailableAccounts) != 1 || missing.UnavailableAccounts[0].Reason != "missing_disposition_evidence" {
 		t.Fatal("missing zero flow was presented as complete accounting", missing, err)
 	}
+}
+
+func TestCohortMetricFactsSnapshotsAtPastRangeEnd(t *testing.T) {
+	f := cohortFixture(t)
+	from, to := f.now.Add(-24*time.Hour), f.now.Add(-12*time.Hour)
+	f.cohortLot(t, "partial", "10", "0", "4", "0.1", from)
+	f.cohortLot(t, "later-closed", "5", "0", "1", "0.05", from.Add(time.Hour))
+	f.cohortLot(t, "closed-in-range", "2", "0", "1", "0.02", from.Add(2*time.Hour))
+	f.cohortSell(t, "partial", "before-end", "4", "3", "0.1", to.Add(-time.Hour))
+	f.cohortSell(t, "partial", "after-end", "6", "5", "0.2", f.now.Add(-time.Hour))
+	f.cohortSell(t, "later-closed", "after-end-all", "5", "2", "0.05", f.now.Add(-time.Hour))
+	f.cohortSell(t, "closed-in-range", "in-range-all", "2", "1.5", "0.01", to.Add(-2*time.Hour))
+	// Settled only after the snapshot, so the snapshot cannot use its payout.
+	f.exec(t, `INSERT INTO execution_positions(execution_account_id,market_id,condition_id,token_id,outcome_index,outcome_name,lifecycle_status,settlement_price,settlement_source,settled_at) VALUES('pm','m','c','t',0,'Yes','SETTLED_PENDING_REDEEM',1,'official',$1)`, f.now.Add(-time.Hour))
+	got, err := f.reader.CohortMetricFacts(context.Background(), CohortFilter{ExecutionAccountID: "pm", OpeningFrom: &from, OpeningTo: &to})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.AsOf.Equal(to) || !got.ObservedAt.Equal(f.now) {
+		t.Fatal("snapshot instant", got.AsOf, got.ObservedAt)
+	}
+	c := got.Cohorts["pm"]
+	if c.OpenedAssetCount != 1 || c.HoldingAssetCount != 1 || c.ClosedAssetCount != 0 {
+		t.Fatal(c)
+	}
+	m := got.Accounts[0]
+	if len(m.Assets) != 1 || m.Assets[0].SettlementPrice != nil {
+		t.Fatal("later settlement leaked into the snapshot", m.Assets)
+	}
+	// partial: 6 of 10 held (cost 2.4); later-closed: all 5 held (cost 1).
+	performanceAmount(t, m.Assets[0].RemainingShares, "11")
+	performanceAmount(t, m.Assets[0].RemainingCost, "3.4")
+	// partial sold 4 for 3 gross vs 1.6 cost; closed-in-range 1.5 vs 1.
+	performanceAmount(t, m.Metrics.RealizedPnL, "1.9")
+	performanceAmount(t, m.Metrics.PeakHoldingCost, "6")
+	performanceAmount(t, m.Metrics.CumulativeInvestedCost, "6")
+	performanceAmount(t, c.BuyFees, "0.17")
+	performanceAmount(t, c.SellFees, "0.11")
+	for _, l := range got.Replay["pm"].Lots {
+		for _, d := range l.Dispositions {
+			if d.At.After(to) {
+				t.Fatal("replay contains a disposition after the snapshot", l)
+			}
+		}
+		switch l.LotID {
+		case "partial":
+			performanceAmount(t, l.RemainingShares, "6")
+		case "later-closed":
+			performanceAmount(t, l.RemainingShares, "5")
+		case "closed-in-range":
+			performanceAmount(t, l.RemainingShares, "0")
+		}
+	}
+	// A range ending now keeps tracking every disposition through now.
+	end := f.now
+	current, err := f.reader.CohortMetricFacts(context.Background(), CohortFilter{ExecutionAccountID: "pm", OpeningFrom: &from, OpeningTo: &end})
+	if err != nil || !current.AsOf.Equal(f.now) || current.Cohorts["pm"].HoldingAssetCount != 0 || current.Cohorts["pm"].ClosedAssetCount != 1 {
+		t.Fatal("current range changed", current.Cohorts, err)
+	}
+	performanceAmount(t, current.Accounts[0].Metrics.RealizedPnL, "5.5")
 }
 
 func TestCohortReplayPreservesFullAllocationPrecision(t *testing.T) {
