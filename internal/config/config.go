@@ -120,6 +120,20 @@ type DecisionCycle struct {
 	OrderReportStrategyIDs []string
 	// OrderReportLookback bounds how far back each report pass re-reads orders.
 	OrderReportLookback time.Duration
+	// DelayedAccountIDs (DECISION_CYCLE_DELAYED_ACCOUNTS_JSON) moves accounts
+	// of Accounts into the delayed decision lane: a second scheduler in the
+	// same process that runs them at T+DelayedStartupDelay with the same
+	// decision_at T. The primary lane then runs every other account. Empty
+	// (the default) builds no delayed lane and leaves the primary lane exactly
+	// as before. The account's venue, strategy and mode stay in Accounts.
+	DelayedAccountIDs []string
+	// DelayedStartupDelay (DECISION_CYCLE_DELAYED_STARTUP_DELAY, default
+	// 5m15s) is when the delayed lane runs, measured from the boundary T.
+	DelayedStartupDelay time.Duration
+	// DelayedTimeout (DECISION_CYCLE_DELAYED_TIMEOUT, default 4m30s) bounds
+	// one delayed-lane cycle. The lane must end before the next primary
+	// capture at T+Interval+StartupDelay.
+	DelayedTimeout time.Duration
 }
 
 // Database 表示后端使用的 Database 类型。
@@ -348,6 +362,93 @@ func (cycle DecisionCycle) AccountsForSource(source domain.MarketSource) []Decis
 	result := make([]DecisionAccount, 0, len(cycle.Accounts))
 	for _, account := range cycle.Accounts {
 		if account.MarketSource.Normalize() == source.Normalize() {
+			result = append(result, account)
+		}
+	}
+	return result
+}
+
+// HasDelayedLane reports whether any account runs in the delayed lane.
+func (cycle DecisionCycle) HasDelayedLane() bool {
+	return len(cycle.DelayedAccountIDs) > 0
+}
+
+// IsDelayedAccount reports whether the account runs in the delayed lane.
+func (cycle DecisionCycle) IsDelayedAccount(executionAccountID string) bool {
+	for _, id := range cycle.DelayedAccountIDs {
+		if id == executionAccountID {
+			return true
+		}
+	}
+	return false
+}
+
+// PrimaryLane returns the configuration of the primary (T+StartupDelay)
+// lane: every account outside DelayedAccountIDs, in configuration order.
+// Without a delayed lane it is the configuration itself, so every derived
+// value (Bindings, EntryDisabledAccounts, ...) is identical to the
+// unsplit one.
+func (cycle DecisionCycle) PrimaryLane() DecisionCycle {
+	if !cycle.HasDelayedLane() {
+		return cycle
+	}
+	lane := cycle
+	lane.Accounts = cycle.laneAccounts(false)
+	lane.DelayedAccountIDs = nil
+	return lane
+}
+
+// DelayedLane returns the configuration of the delayed lane: only the
+// accounts of DelayedAccountIDs, in configuration order, scheduled at
+// DelayedStartupDelay with DelayedTimeout. It has no accounts when there is
+// no delayed lane.
+func (cycle DecisionCycle) DelayedLane() DecisionCycle {
+	lane := cycle
+	lane.Accounts = cycle.laneAccounts(true)
+	lane.StartupDelay = cycle.DelayedStartupDelay
+	lane.Timeout = cycle.DelayedTimeout
+	lane.DelayedAccountIDs = nil
+	return lane
+}
+
+// PrimaryBindings returns the bindings run by the primary lane.
+func (cycle DecisionCycle) PrimaryBindings() []domain.StrategyExecutionBinding {
+	return cycle.PrimaryLane().Bindings()
+}
+
+// DelayedBindings returns the bindings run by the delayed lane.
+func (cycle DecisionCycle) DelayedBindings() []domain.StrategyExecutionBinding {
+	return cycle.DelayedLane().Bindings()
+}
+
+// PrimaryEntryDisabledAccounts returns the primary-lane accounts that may not
+// buy.
+func (cycle DecisionCycle) PrimaryEntryDisabledAccounts() []string {
+	return cycle.PrimaryLane().EntryDisabledAccounts()
+}
+
+// PrimaryStrategyDisabledAccounts returns the primary-lane accounts that are
+// not sent to the strategy.
+func (cycle DecisionCycle) PrimaryStrategyDisabledAccounts() []string {
+	return cycle.PrimaryLane().StrategyDisabledAccounts()
+}
+
+// DelayedEntryDisabledAccounts returns the delayed-lane accounts that may not
+// buy.
+func (cycle DecisionCycle) DelayedEntryDisabledAccounts() []string {
+	return cycle.DelayedLane().EntryDisabledAccounts()
+}
+
+// DelayedStrategyDisabledAccounts returns the delayed-lane accounts that are
+// not sent to the strategy.
+func (cycle DecisionCycle) DelayedStrategyDisabledAccounts() []string {
+	return cycle.DelayedLane().StrategyDisabledAccounts()
+}
+
+func (cycle DecisionCycle) laneAccounts(delayed bool) []DecisionAccount {
+	result := make([]DecisionAccount, 0, len(cycle.Accounts))
+	for _, account := range cycle.Accounts {
+		if cycle.IsDelayedAccount(account.ExecutionAccountID) == delayed {
 			result = append(result, account)
 		}
 	}
@@ -1008,6 +1109,67 @@ func (config Config) Validate() error {
 			return err
 		}
 	}
+	if config.DecisionCycle.HasDelayedLane() {
+		if err := validateDelayedLane(config.DecisionCycle); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateDelayedLane checks DECISION_CYCLE_DELAYED_ACCOUNTS_JSON and its
+// timing. It runs only when the list is not empty, so an environment without
+// the delayed lane is validated exactly as before.
+func validateDelayedLane(cycle DecisionCycle) error {
+	configured := make(map[string]struct{}, len(cycle.Accounts))
+	for _, account := range cycle.Accounts {
+		configured[account.ExecutionAccountID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(cycle.DelayedAccountIDs))
+	for index, accountID := range cycle.DelayedAccountIDs {
+		if accountID == "" {
+			return fmt.Errorf("DECISION_CYCLE_DELAYED_ACCOUNTS_JSON account %d is empty", index)
+		}
+		if _, duplicate := seen[accountID]; duplicate {
+			return fmt.Errorf("DECISION_CYCLE_DELAYED_ACCOUNTS_JSON repeats account %q", accountID)
+		}
+		seen[accountID] = struct{}{}
+		if _, exists := configured[accountID]; !exists {
+			return fmt.Errorf("DECISION_CYCLE_DELAYED_ACCOUNTS_JSON account %q is not in DECISION_CYCLE_ACCOUNTS_JSON", accountID)
+		}
+	}
+	// The primary decision service refuses an instance whose every account is
+	// PAUSED; the delayed lane alone may be fully paused.
+	primaryNotPaused := 0
+	for _, account := range cycle.PrimaryLane().Accounts {
+		if account.Mode != DecisionAccountPaused {
+			primaryNotPaused++
+		}
+	}
+	if primaryNotPaused == 0 {
+		return fmt.Errorf("DECISION_CYCLE_DELAYED_ACCOUNTS_JSON must leave at least one account that is not PAUSED in the primary lane")
+	}
+	if !cycle.Enabled {
+		return nil
+	}
+	if cycle.DelayedStartupDelay <= cycle.StartupDelay || cycle.DelayedStartupDelay >= cycle.Interval {
+		return fmt.Errorf("DECISION_CYCLE_DELAYED_STARTUP_DELAY must be greater than DECISION_CYCLE_STARTUP_DELAY and less than the interval")
+	}
+	if cycle.DelayedTimeout <= 0 || cycle.DelayedTimeout >= cycle.Interval {
+		return fmt.Errorf("DECISION_CYCLE_DELAYED_TIMEOUT must be positive and less than DECISION_CYCLE_INTERVAL")
+	}
+	// The delayed lane, even when it starts as late as allowed and runs to its
+	// timeout, ends before the next primary cycle captures its books.
+	if cycle.DelayedStartupDelay+cycle.DelayedTimeout+cycle.MaxStartLateness > cycle.Interval+cycle.StartupDelay {
+		return fmt.Errorf("DECISION_CYCLE_DELAYED_STARTUP_DELAY + DECISION_CYCLE_DELAYED_TIMEOUT + DECISION_CYCLE_MAX_START_LATENESS " +
+			"must not exceed DECISION_CYCLE_INTERVAL + DECISION_CYCLE_STARTUP_DELAY")
+	}
+	if cycle.StrategyTimeout >= cycle.DelayedTimeout {
+		return fmt.Errorf("DECISION_CYCLE_STRATEGY_TIMEOUT must be less than DECISION_CYCLE_DELAYED_TIMEOUT")
+	}
+	if cycle.PredictionTimeout >= cycle.DelayedTimeout {
+		return fmt.Errorf("DECISION_CYCLE_PREDICTION_TIMEOUT must be less than DECISION_CYCLE_DELAYED_TIMEOUT")
+	}
 	return nil
 }
 
@@ -1078,6 +1240,21 @@ func loadDecisionCycle() (DecisionCycle, error) {
 	if err != nil {
 		return DecisionCycle{}, err
 	}
+	delayedAccountIDs, err := decodeStringList(
+		"DECISION_CYCLE_DELAYED_ACCOUNTS_JSON",
+		os.Getenv("DECISION_CYCLE_DELAYED_ACCOUNTS_JSON"),
+	)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	delayedStartupDelay, err := duration("DECISION_CYCLE_DELAYED_STARTUP_DELAY", 5*time.Minute+15*time.Second)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
+	delayedTimeout, err := duration("DECISION_CYCLE_DELAYED_TIMEOUT", 4*time.Minute+30*time.Second)
+	if err != nil {
+		return DecisionCycle{}, err
+	}
 	return DecisionCycle{
 		Enabled: enabled, OrderSubmissionEnabled: submitEnabled,
 		EntrySubmissionDisabled:      entrySubmissionDisabled,
@@ -1096,6 +1273,9 @@ func loadDecisionCycle() (DecisionCycle, error) {
 		DeliveryConcurrency:    deliveryConcurrency,
 		OrderReportStrategyIDs: orderReportStrategyIDs,
 		OrderReportLookback:    orderReportLookback,
+		DelayedAccountIDs:      delayedAccountIDs,
+		DelayedStartupDelay:    delayedStartupDelay,
+		DelayedTimeout:         delayedTimeout,
 	}, nil
 }
 

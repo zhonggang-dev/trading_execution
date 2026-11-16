@@ -43,16 +43,19 @@ const reconciliationAccountTimeout = 6 * time.Minute
 
 // liveRuntime 保存已经通过预检的实盘依赖图和后台服务。
 type liveRuntime struct {
-	repository        *postgresadapter.OrderRepository
-	execution         executionrouter.Execution
-	readiness         *readiness.All
-	heartbeat         *clobheartbeat.Service
-	runner            *reconciliation.Runner
-	operations        *liveoperations.Service
-	decisionRunner    *decisionrunner.Runner
-	autoRedeem        *autoredeem.Service
-	kalshiSettlements []*kalshisettlement.Service
-	activeAccounts    []string
+	repository     *postgresadapter.OrderRepository
+	execution      executionrouter.Execution
+	readiness      *readiness.All
+	heartbeat      *clobheartbeat.Service
+	runner         *reconciliation.Runner
+	operations     *liveoperations.Service
+	decisionRunner *decisionrunner.Runner
+	// delayedDecisionRunner is the optional delayed lane. It is not part of
+	// readiness and its failures never stop the process or decisionRunner.
+	delayedDecisionRunner *decisionrunner.Runner
+	autoRedeem            *autoredeem.Service
+	kalshiSettlements     []*kalshisettlement.Service
+	activeAccounts        []string
 	// polymarketAccounts is the already validated Polymarket subset. Keep it
 	// separate from activeAccounts, which also includes Kalshi execution.
 	polymarketAccounts []string
@@ -582,9 +585,16 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The delayed lane stores its books in migration 0048's tables; without
+	// them it must not start. Nothing is checked when the lane is not configured.
+	if cfg.DecisionCycle.Enabled && cfg.DecisionCycle.HasDelayedLane() {
+		if err := postgresadapter.CheckDelayedOrderBookSnapshotMigration(ctx, database); err != nil {
+			return nil, err
+		}
+	}
 	// Every account, Polymarket or Kalshi, reads its own lots straight from the
 	// ledger: a Kalshi account is no longer merged into a Polymarket wallet.
-	decisionRunner, err := buildDecisionRunner(buildDecisionRunnerParams{
+	lanes, err := buildDecisionLanes(buildDecisionRunnerParams{
 		cfg: cfg, database: database, positionSource: fillLedger, orderBooks: orderBooks,
 		executor: kalshiRuntime.execution, accountIDs: accountIDs, logger: logger,
 		submissionPolicy: kalshiRuntime.execution, routeInputPolicy: kalshiRuntime.execution, accountGate: decisionAccountGate,
@@ -593,6 +603,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	decisionRunner := lanes.primary
 
 	readinessChecks := []readiness.NamedChecker{
 		readiness.NamedChecker{Name: "postgres", Checker: databaseReadiness},
@@ -605,7 +616,10 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		)
 	}
 	if decisionRunner != nil {
-		if err := runner.BindDecisionActivity(decisionRunner); err != nil {
+		// Scheduled reconciliation yields to either lane; without a delayed
+		// lane this is the primary runner itself. Only the primary lane is
+		// part of readiness.
+		if err := runner.BindDecisionActivity(lanes.decisionActivity()); err != nil {
 			return nil, err
 		}
 		readinessChecks = append(readinessChecks, readiness.NamedChecker{Name: "decision_cycle", Checker: decisionRunner})
@@ -650,14 +664,15 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		repository: repository, execution: kalshiRuntime.execution,
 		readiness: combinedReadiness,
 		heartbeat: heartbeat, runner: runner, operations: operations, decisionRunner: decisionRunner,
-		autoRedeem:         autoRedeemService,
-		kalshiSettlements:  kalshiRuntime.settlements,
-		activeAccounts:     append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
-		polymarketAccounts: append([]string(nil), reconciliationAccountIDs...),
-		kalshiAccounts:     append([]string(nil), kalshiRuntime.activeAccounts...),
-		recovery:           recoveryGuard,
-		maintenance:        maintenance,
-		maintenanceProbe:   maintenanceProbe,
+		delayedDecisionRunner: lanes.delayed,
+		autoRedeem:            autoRedeemService,
+		kalshiSettlements:     kalshiRuntime.settlements,
+		activeAccounts:        append(append([]string(nil), reconciliationAccountIDs...), kalshiRuntime.activeAccounts...),
+		polymarketAccounts:    append([]string(nil), reconciliationAccountIDs...),
+		kalshiAccounts:        append([]string(nil), kalshiRuntime.activeAccounts...),
+		recovery:              recoveryGuard,
+		maintenance:           maintenance,
+		maintenanceProbe:      maintenanceProbe,
 	}, nil
 }
 
@@ -1166,6 +1181,14 @@ func (runtime *liveRuntime) startBackground(ctx context.Context, logger *slog.Lo
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	// The delayed lane starts only after the primary lane is ready and is not
+	// awaited: its startup recovery or loop failure is logged and retried and
+	// never fails startup or the primary lane.
+	if runtime.delayedDecisionRunner != nil {
+		delayedLogger := logger.With("lane", delayedLaneLogAttribute)
+		delayedLogger.Info("delayed decision lane starting")
+		go runDelayedDecisionLane(ctx, runtime.delayedDecisionRunner.Run, delayedLogger, time.After)
 	}
 	go func() {
 		if err := <-runnerErrors; err != nil && ctx.Err() == nil {

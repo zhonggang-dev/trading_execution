@@ -209,6 +209,66 @@ intent；`exits[]` 的身份/格式错误仍会使整个策略响应被拒绝。
   （`ORDER_SUBMISSION_DISABLED`）、入口被封（`ENTRY_BLOCKED`）、路由不接单（`VENUE_SUBMISSION_DISABLED`）。
 - 不覆盖：`Decide` 本身超时/出错（策略可能已占位但我们没拿到响应）和 `ClaimOutput` 出错，仍需人工重置占位。
 
+## 延后决策通道（可选）
+
+用途：让一部分账户（首批 Polymarket `wallet-1` 和一个新的 Kalshi 账户，示例名 `kalshi:delayed`）
+比现有账户晚约 5 分钟调用策略和下单，避免大仓位账户干扰现有账户当轮的盘口和判断。
+它们和现有账户用**同一个决策时点 T**（同一份预测、轮次编号仍是 `<账户>:<T>`），只是触发时刻不同。
+
+```text
+T          决策时点（UTC 整 10 分钟）
+T+15s      现有通道：取预测(as_of=T) → 抓盘口 → 调策略 → 下单     （账户 = 全部 − 延后名单）
+T+3m30s    Polymarket 定时对账（:x3:30）
+T+5m15s    延后通道：取预测(as_of=T) → 抓盘口 → 调策略 → 下单     （账户 = 延后名单）
+T+8m30s    Polymarket 定时对账（:x8:30）
+T+9m45s    延后通道最晚结束（5m15s + 超时 4m30s，再加最多 30s 迟到也不越过下一轮 T+10m15s）
+T+10m15s   下一轮现有通道
+```
+
+配置（三项都可省略；名单为空 = 不构建延后通道，现有通道的装配、调度、SQL、对账协调、就绪和监控与以前完全一样）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DECISION_CYCLE_DELAYED_ACCOUNTS_JSON` | 空 | 延后通道账户 ID 的 JSON 数组，如 `["wallet-1","kalshi:delayed"]` |
+| `DECISION_CYCLE_DELAYED_STARTUP_DELAY` | `5m15s` | 延后通道相对 T 的触发时刻 |
+| `DECISION_CYCLE_DELAYED_TIMEOUT` | `4m30s` | 延后通道单轮超时 |
+
+- 账户的平台、策略和 `mode` 仍只在 `DECISION_CYCLE_ACCOUNTS_JSON` 里定义；名单只决定"哪条通道跑它"。
+  名单里的账户必须存在、不能重复；现有通道至少保留一个非 `PAUSED` 账户；延后通道可以全部 `PAUSED`。
+- 时序校验（仅名单非空时）：`STARTUP_DELAY < DELAYED_STARTUP_DELAY < INTERVAL`，
+  `DELAYED_STARTUP_DELAY + DELAYED_TIMEOUT + MAX_START_LATENESS ≤ INTERVAL + STARTUP_DELAY`，
+  `STRATEGY_TIMEOUT` 与 `PREDICTION_TIMEOUT` 都小于 `DELAYED_TIMEOUT`。
+- 名单非空时启动会检查迁移 `0048_delayed_orderbook_snapshots.sql` 的两张表存在、且应用账号对两张表都有
+  `SELECT, INSERT`，缺任一项都拒绝启动（迁移由管理员账号执行，漏 GRANT 会让延后通道每轮写盘口失败、从不调策略）。
+  延后通道抓到的盘口整批冻结在 `delayed_orderbook_snapshot_batches` / `delayed_orderbook_snapshots`
+  （结构、约束、只追加触发器与原两张表一一对应），按 `decision_at` 查询；原 `strategy_orderbook_snapshot_*` 不变。
+- 两条通道共享预测/策略客户端、盘口路由、决策记录、执行器、账户锁、Kalshi 维护名单；各自有独立的
+  `decisioncycle.Service`、调度器和订单回报（回报名单里的策略只要在任一通道有账户即可，每条通道只回报自己的账户）。
+  待投递意图的恢复与领取按各自账户集合过滤，两条通道不会接管对方的订单。
+- 隔离：延后通道不进全局 readiness；它的启动恢复失败或循环退出只记 ERROR（日志带 `lane=delayed`），
+  1 分钟后自动重启循环，不影响进程和现有通道。定时对账在任一通道运行或临近运行（60 秒内）时延后。
+  流水线监控只观察现有通道的账户；延后通道状态看日志。
+- 共享的 Polymarket 请求令牌桶：延后通道大批量投递会占用令牌，所以要求它在下一轮现有通道抓盘口前结束。
+  （本轮结束后的订单回报另有 30 秒上限，只访问策略服务和数据库，不占 Polymarket 令牌。）
+- 重启窗口：启用延后通道后，T+5m15s～T+9m45s 是延后通道的运行窗口，重启会打断它的投递（下次启动恢复会接着投递，
+  但该轮不会重跑）。原有的 :x4:30 前后切换仍可用；不要在 :x5:15～:x9:45 之间重启。
+- 控制台（已知边界，未改）：控制台的决策周期详情和账户估值只读原 `strategy_orderbook_snapshot_*`。
+  延后账户的周期详情会显示现有通道 T+15s 的盘口，而不是它自己 T+5m15s 的盘口；延后账户持有、但不在预测集合
+  也不被现有通道账户持有的 token，在账户估值里会显示为缺报价（`missing_quote`）。按 SQL 查延后通道盘口请直接查 0048 两张表。
+
+停用与回滚（不设通道开关，沿用账户级暂停）：
+
+| 目的 | 操作 | 是否重启 | 效果 |
+|---|---|---|---|
+| 紧急拦单 | `execution_risk_controls` 该账户 ACCOUNT 行 `paused=TRUE` | 否 | 该账户新单全拦（买卖都拦），策略仍被调用 |
+| 停调策略 | `DECISION_CYCLE_ACCOUNTS_JSON` 中该账户 `mode=PAUSED` | 是 | 不再调用策略；已持久化意图照常投递 |
+| 撤掉通道 | 先把账户设 `PAUSED`，再从延后名单移除 | 是 | 回到单通道 |
+| 回滚二进制 | 先把延后账户设 `PAUSED`，再切回旧 release | 是 | 旧版本不认识新变量 |
+
+**注意**：账户从延后名单移除但仍是 `ACTIVE` 时，会被并入现有通道、在 T+15s 和 main 一起下单；
+旧二进制同样会把这些账户当现有通道账户。所以撤通道、回滚前必须先把它们设为 `PAUSED`。
+0048 的两张表留着无害。
+
 ## 审计和失败语义
 
 - 概率快照失败：整个周期失败，不使用上一次内存数据；

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/kalshi"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/marketbooks"
@@ -19,6 +20,7 @@ import (
 	"github.com/UniPat-AI/trading_execution/internal/service/accountmaintenance"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisioncycle"
 	"github.com/UniPat-AI/trading_execution/internal/service/decisionrunner"
+	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
 	"github.com/UniPat-AI/trading_execution/internal/service/strategyreport"
 )
 
@@ -40,36 +42,83 @@ type buildDecisionRunnerParams struct {
 	maintenance *accountmaintenance.Registry
 }
 
-// buildDecisionRunner composes the pull-based production workflow without
-// starting it. All configuration and durable dependencies are validated before
-// the CLOB heartbeat is activated.
+// decisionLanes holds the runners of the decision cycle. delayed is nil unless
+// DECISION_CYCLE_DELAYED_ACCOUNTS_JSON lists at least one account.
+type decisionLanes struct {
+	primary *decisionrunner.Runner
+	delayed *decisionrunner.Runner
+}
+
+// delayedLaneLogAttribute marks every log line of the delayed lane. The
+// primary lane's logger is left untouched so its lines stay byte-identical.
+const delayedLaneLogAttribute = "delayed"
+
+// buildDecisionRunner returns the primary lane's runner. Live composition uses
+// buildDecisionLanes, which also builds the optional delayed lane.
 func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runner, error) {
+	lanes, err := buildDecisionLanes(params)
+	if err != nil {
+		return nil, err
+	}
+	return lanes.primary, nil
+}
+
+// decisionLaneShared are the dependencies built once and used by both lanes.
+type decisionLaneShared struct {
+	params          buildDecisionRunnerParams
+	prediction      *predictioninfra.Client
+	strategy        *strategyhttp.Client
+	orderBooks      port.OrderBookSource
+	recorder        *postgresadapter.DecisionRecorder
+	orderRepository strategyreport.OrderSource
+}
+
+// decisionLaneSpec is what differs between the two lanes.
+type decisionLaneSpec struct {
+	// cycle is the lane's view of the configuration: its accounts and its
+	// StartupDelay/Timeout.
+	cycle            config.DecisionCycle
+	snapshotRecorder port.OrderBookSnapshotRecorder
+	// allowAllStrategyDisabled is set only for the delayed lane, whose
+	// accounts may all be PAUSED.
+	allowAllStrategyDisabled bool
+	logger                   *slog.Logger
+}
+
+// buildDecisionLanes composes the pull-based production workflow without
+// starting it. All configuration and durable dependencies are validated before
+// the CLOB heartbeat is activated. Without a delayed account list it builds
+// exactly the one runner it always built. With one, a second runner runs only
+// the delayed accounts at T+DECISION_CYCLE_DELAYED_STARTUP_DELAY for the same
+// decision_at T; the lanes share every dependency except their snapshot tables
+// and order reporters, and their account sets are disjoint.
+func buildDecisionLanes(params buildDecisionRunnerParams) (decisionLanes, error) {
 	cycleConfig := params.cfg.DecisionCycle
 	if !cycleConfig.Enabled {
-		return nil, nil
+		return decisionLanes{}, nil
 	}
 	if params.database == nil || params.positionSource == nil || params.orderBooks == nil || params.executor == nil {
-		return nil, fmt.Errorf("decision cycle requires postgres, position, orderbook, and execution dependencies")
+		return decisionLanes{}, fmt.Errorf("decision cycle requires postgres, position, orderbook, and execution dependencies")
 	}
 	if cycleConfig.OrderSubmissionEnabled && params.accountGate == nil {
-		return nil, fmt.Errorf("live decision-cycle submission requires a shared execution account gate")
+		return decisionLanes{}, fmt.Errorf("live decision-cycle submission requires a shared execution account gate")
 	}
 	if err := validateDecisionAccounts(cycleConfig, params.accountIDs); err != nil {
-		return nil, err
+		return decisionLanes{}, err
 	}
 	predictionClient, err := predictioninfra.New(predictioninfra.Params{
 		BaseURL: cycleConfig.PredictionInfraBaseURL, BearerToken: cycleConfig.PredictionInfraToken,
 		HTTPClient: noRedirectHTTPClient(cycleConfig.Timeout),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("build prediction_infra decision client: %w", err)
+		return decisionLanes{}, fmt.Errorf("build prediction_infra decision client: %w", err)
 	}
 	strategyClient, err := strategyhttp.New(strategyhttp.Params{
 		BaseURL: cycleConfig.StrategyBaseURL, BearerToken: cycleConfig.StrategyToken,
 		HTTPClient: noRedirectHTTPClient(cycleConfig.Timeout),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("build strategy decision client: %w", err)
+		return decisionLanes{}, fmt.Errorf("build strategy decision client: %w", err)
 	}
 	var kalshiClient *kalshi.Client
 	var kalshiOrderBooks port.OrderBookSource
@@ -112,23 +161,74 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		Logger:     params.logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("build venue orderbook router: %w", err)
+		return decisionLanes{}, fmt.Errorf("build venue orderbook router: %w", err)
 	}
 	recorder, err := postgresadapter.NewDecisionRecorder(params.database, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build strategy decision recorder: %w", err)
+		return decisionLanes{}, fmt.Errorf("build strategy decision recorder: %w", err)
 	}
 	snapshotRecorder, err := postgresadapter.NewOrderBookSnapshotRecorder(params.database, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build orderbook snapshot recorder: %w", err)
+		return decisionLanes{}, fmt.Errorf("build orderbook snapshot recorder: %w", err)
 	}
-	var orderReporter *strategyreport.Reporter
+	shared := decisionLaneShared{
+		params: params, prediction: predictionClient, strategy: strategyClient,
+		orderBooks: orderBooks, recorder: recorder,
+	}
 	if len(cycleConfig.OrderReportStrategyIDs) > 0 {
 		orderRepository, repositoryErr := postgresadapter.NewOrderRepository(params.database)
 		if repositoryErr != nil {
-			return nil, fmt.Errorf("build order repository for strategy order reports: %w", repositoryErr)
+			return decisionLanes{}, fmt.Errorf("build order repository for strategy order reports: %w", repositoryErr)
 		}
-		orderReporter, err = buildOrderReporter(cycleConfig, orderRepository, strategyClient, params.logger)
+		shared.orderRepository = orderRepository
+	}
+	primarySpec, delayedSpec := planDecisionLanes(cycleConfig, params.logger)
+	primarySpec.snapshotRecorder = snapshotRecorder
+	primary, err := buildDecisionLane(shared, primarySpec)
+	if err != nil {
+		return decisionLanes{}, err
+	}
+	if delayedSpec == nil {
+		return decisionLanes{primary: primary}, nil
+	}
+	delayedRecorder, err := postgresadapter.NewDelayedOrderBookSnapshotRecorder(params.database, nil)
+	if err != nil {
+		return decisionLanes{}, fmt.Errorf("build delayed orderbook snapshot recorder: %w", err)
+	}
+	delayedSpec.snapshotRecorder = delayedRecorder
+	delayed, err := buildDecisionLane(shared, *delayedSpec)
+	if err != nil {
+		return decisionLanes{}, fmt.Errorf("delayed decision lane: %w", err)
+	}
+	return decisionLanes{primary: primary, delayed: delayed}, nil
+}
+
+// planDecisionLanes splits the configuration into the primary lane and, when
+// DECISION_CYCLE_DELAYED_ACCOUNTS_JSON is set, the delayed lane. Snapshot
+// recorders are attached by the caller. Without a delayed list the primary
+// lane is the unchanged configuration with the unchanged logger.
+func planDecisionLanes(cycleConfig config.DecisionCycle, logger *slog.Logger) (decisionLaneSpec, *decisionLaneSpec) {
+	primary := decisionLaneSpec{cycle: cycleConfig.PrimaryLane(), logger: logger}
+	if !cycleConfig.HasDelayedLane() {
+		return primary, nil
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return primary, &decisionLaneSpec{
+		cycle: cycleConfig.DelayedLane(), allowAllStrategyDisabled: true,
+		logger: logger.With("lane", delayedLaneLogAttribute),
+	}
+}
+
+// buildDecisionLane builds one lane's decision service and runner.
+func buildDecisionLane(shared decisionLaneShared, lane decisionLaneSpec) (*decisionrunner.Runner, error) {
+	params, cycleConfig := shared.params, lane.cycle
+	var orderReporter *strategyreport.Reporter
+	if shared.orderRepository != nil {
+		var err error
+		orderReporter, err = buildOrderReporter(params.cfg.DecisionCycle, cycleConfig.Bindings(),
+			shared.orderRepository, shared.strategy, lane.logger)
 		if err != nil {
 			return nil, err
 		}
@@ -137,13 +237,33 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 	if orderReporter != nil {
 		notSubmittedReporter = orderReporter
 	}
-	cycle, err := decisioncycle.New(decisioncycle.Params{
-		PredictionSource:             predictionClient,
+	cycle, err := decisioncycle.New(decisionCycleParams(shared, lane, notSubmittedReporter))
+	if err != nil {
+		return nil, fmt.Errorf("build decision cycle: %w", err)
+	}
+	runner, err := decisionrunner.New(decisionRunnerParams(cycle, lane, orderReporter))
+	if err != nil {
+		return nil, fmt.Errorf("build decision cycle runner: %w", err)
+	}
+	return runner, nil
+}
+
+// decisionCycleParams derives one lane's decision-service parameters. For the
+// primary lane without a delayed list they are the parameters the single
+// decision cycle always had.
+func decisionCycleParams(
+	shared decisionLaneShared,
+	lane decisionLaneSpec,
+	notSubmittedReporter decisioncycle.NotSubmittedReporter,
+) decisioncycle.Params {
+	params, cycleConfig := shared.params, lane.cycle
+	return decisioncycle.Params{
+		PredictionSource:             shared.prediction,
 		PositionSource:               params.positionSource,
-		OrderBookSource:              orderBooks,
-		SnapshotRecorder:             snapshotRecorder,
-		Strategy:                     strategyClient,
-		Recorder:                     recorder,
+		OrderBookSource:              shared.orderBooks,
+		SnapshotRecorder:             lane.snapshotRecorder,
+		Strategy:                     shared.strategy,
+		Recorder:                     shared.recorder,
 		Executor:                     params.executor,
 		AccountGate:                  params.accountGate,
 		SubmissionPolicy:             params.submissionPolicy,
@@ -162,27 +282,33 @@ func buildDecisionRunner(params buildDecisionRunnerParams) (*decisionrunner.Runn
 		NotSubmittedReporter:         notSubmittedReporter,
 		StrategyTimeout:              cycleConfig.StrategyTimeout,
 		PredictionTimeout:            cycleConfig.PredictionTimeout,
-		Logger:                       params.logger,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("build decision cycle: %w", err)
+		Logger:                       lane.logger,
+		AllowAllStrategyDisabled:     lane.allowAllStrategyDisabled,
 	}
-	runner, err := decisionrunner.New(decisionrunner.Params{
-		Cycle: cycle, Interval: cycleConfig.Interval, StartupDelay: cycleConfig.StartupDelay,
-		MaxStartLateness: cycleConfig.MaxStartLateness,
-		Timeout:          cycleConfig.Timeout, Logger: params.logger,
-		AfterCycle: orderReportHook(orderReporter),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("build decision cycle runner: %w", err)
-	}
-	return runner, nil
 }
 
-// buildOrderReporter wires strategy order reporting to the accounts bound to
-// the configured strategies. A configured strategy with no binding is a typo.
+// decisionRunnerParams derives one lane's scheduler parameters.
+func decisionRunnerParams(
+	cycle decisionrunner.Cycle,
+	lane decisionLaneSpec,
+	orderReporter *strategyreport.Reporter,
+) decisionrunner.Params {
+	cycleConfig := lane.cycle
+	return decisionrunner.Params{
+		Cycle: cycle, Interval: cycleConfig.Interval, StartupDelay: cycleConfig.StartupDelay,
+		MaxStartLateness: cycleConfig.MaxStartLateness,
+		Timeout:          cycleConfig.Timeout, Logger: lane.logger,
+		AfterCycle: orderReportHook(orderReporter),
+	}
+}
+
+// buildOrderReporter wires strategy order reporting to the accounts of one lane
+// bound to the configured strategies. A configured strategy with no binding in
+// the whole configuration is a typo; a lane without any reported account gets
+// no reporter (nil).
 func buildOrderReporter(
 	cycleConfig config.DecisionCycle,
+	laneBindings []domain.StrategyExecutionBinding,
 	orders strategyreport.OrderSource,
 	sink strategyreport.Sink,
 	logger *slog.Logger,
@@ -192,22 +318,29 @@ func buildOrderReporter(
 		configured[id] = struct{}{}
 	}
 	bound := make(map[string]struct{}, len(configured))
-	accounts := make([]string, 0)
-	seenAccounts := make(map[string]struct{})
 	for _, binding := range cycleConfig.Bindings() {
-		if _, reported := configured[binding.StrategyID]; !reported {
-			continue
-		}
-		bound[binding.StrategyID] = struct{}{}
-		if _, seen := seenAccounts[binding.ExecutionAccountID]; !seen {
-			seenAccounts[binding.ExecutionAccountID] = struct{}{}
-			accounts = append(accounts, binding.ExecutionAccountID)
+		if _, reported := configured[binding.StrategyID]; reported {
+			bound[binding.StrategyID] = struct{}{}
 		}
 	}
 	for id := range configured {
 		if _, ok := bound[id]; !ok {
 			return nil, fmt.Errorf("DECISION_CYCLE_ORDER_REPORT_STRATEGY_IDS_JSON strategy %q has no decision binding", id)
 		}
+	}
+	accounts := make([]string, 0)
+	seenAccounts := make(map[string]struct{})
+	for _, binding := range laneBindings {
+		if _, reported := configured[binding.StrategyID]; !reported {
+			continue
+		}
+		if _, seen := seenAccounts[binding.ExecutionAccountID]; !seen {
+			seenAccounts[binding.ExecutionAccountID] = struct{}{}
+			accounts = append(accounts, binding.ExecutionAccountID)
+		}
+	}
+	if len(accounts) == 0 {
+		return nil, nil
 	}
 	reporter, err := strategyreport.New(strategyreport.Params{
 		Orders: orders, Sink: sink, StrategyIDs: cycleConfig.OrderReportStrategyIDs, AccountIDs: accounts,
@@ -226,6 +359,58 @@ func orderReportHook(reporter *strategyreport.Reporter) func(context.Context) er
 		return nil
 	}
 	return reporter.Sync
+}
+
+// laneDecisionActivity tells scheduled reconciliation that a decision cycle is
+// running or due when either lane is.
+type laneDecisionActivity struct {
+	lanes []reconciliation.DecisionActivity
+}
+
+func (activity laneDecisionActivity) DecisionBusy(now time.Time, lead time.Duration) bool {
+	for _, lane := range activity.lanes {
+		if lane.DecisionBusy(now, lead) {
+			return true
+		}
+	}
+	return false
+}
+
+// decisionActivity returns what reconciliation defers to. Without a delayed
+// lane it is the primary runner itself, exactly as before.
+func (lanes decisionLanes) decisionActivity() reconciliation.DecisionActivity {
+	if lanes.delayed == nil {
+		return lanes.primary
+	}
+	return laneDecisionActivity{lanes: []reconciliation.DecisionActivity{lanes.primary, lanes.delayed}}
+}
+
+// delayedLaneRestartDelay is how long the delayed lane waits before it starts
+// again after its loop stopped (for example a failed startup recovery).
+const delayedLaneRestartDelay = time.Minute
+
+// runDelayedDecisionLane keeps the delayed lane's loop running until ctx ends.
+// It never returns an error: a delayed-lane failure is logged and retried and
+// never stops the process or the primary lane.
+func runDelayedDecisionLane(
+	ctx context.Context,
+	run func(context.Context) error,
+	logger *slog.Logger,
+	restartAfter func(time.Duration) <-chan time.Time,
+) {
+	for {
+		err := run(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		logger.Error("delayed decision lane loop stopped; restarting", "error", err,
+			"restart_after", delayedLaneRestartDelay)
+		select {
+		case <-ctx.Done():
+			return
+		case <-restartAfter(delayedLaneRestartDelay):
+		}
+	}
 }
 
 // validateDecisionAccounts proves that the Polymarket wallet file holds

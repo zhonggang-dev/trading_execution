@@ -19,6 +19,25 @@ to `POLYMARKET`. The strategy request retains its existing omitted wire field,
 so this database projection does not change the Strategy HTTP contract or its
 input hash.
 
+## Delayed decision lane tables
+
+The optional delayed decision lane (`DECISION_CYCLE_DELAYED_ACCOUNTS_JSON`, see
+`decision-cycle.md`) captures books again for the same `decision_at` about five
+minutes later. Because the tables above are first-write-wins per `decision_at`,
+that capture is stored in its own pair from migration
+`0048_delayed_orderbook_snapshots.sql`: `delayed_orderbook_snapshot_batches` and
+`delayed_orderbook_snapshots`. Columns, constraints, indexes, the
+complete-batch trigger and the append-only trigger mirror 0026 one to one; the
+recorder runs the same four statements with only the table names replaced
+(code constants). Query them exactly like the primary pair, for example
+`WHERE decision_at = '2026-11-16T08:20:00Z'`. Grant `SELECT, INSERT` on both
+tables to the application role after applying the migration; with a delayed
+lane configured, startup refuses to run unless both tables exist and the
+application role holds both privileges on each. Without a delayed lane nothing
+reads or writes them, and startup does not check them. The console reads only
+the primary pair, so a delayed account's cycle detail shows the primary lane's
+books for that `decision_at`.
+
 ## Failure and replay
 
 The header and every token row commit in one `READ COMMITTED` transaction. A

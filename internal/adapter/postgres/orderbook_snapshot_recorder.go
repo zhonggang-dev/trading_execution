@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/UniPat-AI/trading_execution/internal/domain"
@@ -13,22 +14,169 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// The four statements on the shared decision-cycle tables, verbatim from the
+// original recorder. Another table pair is derived from them by replacing the
+// two table names with code constants, never with external input.
+const (
+	strategyOrderBookBatchInsertSQL = `
+		INSERT INTO strategy_orderbook_snapshot_batches (
+			decision_at, prediction_snapshot_id, snapshot_set_id,
+			target_count, snapshot_count, ok_count, empty_count,
+			missing_count, error_count, created_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		ON CONFLICT (decision_at) DO NOTHING`
+	strategyOrderBookSnapshotInsertSQL = `
+			INSERT INTO strategy_orderbook_snapshots (
+				decision_at, market_source, market_id, condition_id, token_id,
+				outcome_index, outcome_id, status, error_code, source_at, observed_at,
+				tick_size, min_order_size, best_bid, best_ask, depth_limit,
+				bids, asks, created_at
+			) VALUES (
+				$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+				$12::numeric,$13::numeric,$14::numeric,$15::numeric,$16,
+				$17::jsonb,$18::jsonb,$19
+			)`
+	strategyOrderBookSnapshotSelectSQL = `
+		SELECT market_source, market_id, condition_id, token_id, outcome_index,
+			outcome_id, status, error_code, source_at, observed_at,
+			tick_size::text, min_order_size::text, best_bid::text, best_ask::text,
+			depth_limit, bids, asks
+		FROM strategy_orderbook_snapshots
+		WHERE decision_at=$1
+		ORDER BY market_source, condition_id, outcome_index, token_id`
+	strategyOrderBookBatchSelectSQL = `
+		SELECT decision_at, prediction_snapshot_id, snapshot_set_id,
+			target_count, snapshot_count, ok_count, empty_count,
+			missing_count, error_count, created_at
+		FROM strategy_orderbook_snapshot_batches
+		WHERE decision_at=$1 FOR UPDATE`
+)
+
+const (
+	strategyOrderBookSnapshotBatchesTable = "strategy_orderbook_snapshot_batches"
+	strategyOrderBookSnapshotsTable       = "strategy_orderbook_snapshots"
+	// The delayed decision lane stores its own capture of the same decision_at
+	// in this identically shaped pair (migration 0048).
+	delayedOrderBookSnapshotBatchesTable = "delayed_orderbook_snapshot_batches"
+	delayedOrderBookSnapshotsTable       = "delayed_orderbook_snapshots"
+)
+
+// orderBookSnapshotStatements are the four statements of one table pair.
+type orderBookSnapshotStatements struct {
+	insertBatch     string
+	insertSnapshot  string
+	selectSnapshots string
+	selectBatch     string
+}
+
+// strategyOrderBookSnapshotStatements are the original statements, unchanged.
+var strategyOrderBookSnapshotStatements = orderBookSnapshotStatements{
+	insertBatch:     strategyOrderBookBatchInsertSQL,
+	insertSnapshot:  strategyOrderBookSnapshotInsertSQL,
+	selectSnapshots: strategyOrderBookSnapshotSelectSQL,
+	selectBatch:     strategyOrderBookBatchSelectSQL,
+}
+
+// delayedOrderBookSnapshotStatements target the delayed-lane pair. The two
+// shared names are distinct substrings ("snapshot_batches" vs "snapshots"),
+// so each replacement touches only its own table.
+var delayedOrderBookSnapshotStatements = func() orderBookSnapshotStatements {
+	replacer := strings.NewReplacer(
+		strategyOrderBookSnapshotBatchesTable, delayedOrderBookSnapshotBatchesTable,
+		strategyOrderBookSnapshotsTable, delayedOrderBookSnapshotsTable,
+	)
+	return orderBookSnapshotStatements{
+		insertBatch:     replacer.Replace(strategyOrderBookBatchInsertSQL),
+		insertSnapshot:  replacer.Replace(strategyOrderBookSnapshotInsertSQL),
+		selectSnapshots: replacer.Replace(strategyOrderBookSnapshotSelectSQL),
+		selectBatch:     replacer.Replace(strategyOrderBookBatchSelectSQL),
+	}
+}()
+
 // OrderBookSnapshotRecorder stores one complete shared capture per decision boundary.
 type OrderBookSnapshotRecorder struct {
-	db  *sql.DB
-	now func() time.Time
+	db         *sql.DB
+	now        func() time.Time
+	statements orderBookSnapshotStatements
 }
 
 var _ port.OrderBookSnapshotRecorder = (*OrderBookSnapshotRecorder)(nil)
 
+// NewOrderBookSnapshotRecorder stores the primary decision cycle's capture in
+// strategy_orderbook_snapshot_batches / strategy_orderbook_snapshots.
 func NewOrderBookSnapshotRecorder(db *sql.DB, now func() time.Time) (*OrderBookSnapshotRecorder, error) {
+	return newOrderBookSnapshotRecorder(db, now, strategyOrderBookSnapshotStatements)
+}
+
+// NewDelayedOrderBookSnapshotRecorder stores the delayed decision lane's
+// capture in delayed_orderbook_snapshot_batches / delayed_orderbook_snapshots,
+// so both lanes keep their own first-write-wins batch for the same
+// decision_at. Call CheckDelayedOrderBookSnapshotMigration first.
+func NewDelayedOrderBookSnapshotRecorder(db *sql.DB, now func() time.Time) (*OrderBookSnapshotRecorder, error) {
+	return newOrderBookSnapshotRecorder(db, now, delayedOrderBookSnapshotStatements)
+}
+
+func newOrderBookSnapshotRecorder(
+	db *sql.DB,
+	now func() time.Time,
+	statements orderBookSnapshotStatements,
+) (*OrderBookSnapshotRecorder, error) {
 	if db == nil {
 		return nil, fmt.Errorf("postgres database is required")
 	}
 	if now == nil {
 		now = time.Now
 	}
-	return &OrderBookSnapshotRecorder{db: db, now: now}, nil
+	return &OrderBookSnapshotRecorder{db: db, now: now, statements: statements}, nil
+}
+
+// CheckDelayedOrderBookSnapshotMigration fails closed unless migration 0048
+// created both delayed-lane snapshot tables and the application role may
+// SELECT and INSERT them. 0048 is applied by an administrative role, so a
+// forgotten grant would otherwise only surface as a failed snapshot claim on
+// every delayed cycle. Only a process with a delayed lane calls it.
+func CheckDelayedOrderBookSnapshotMigration(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("postgres is required")
+	}
+	return checkDelayedOrderBookSnapshotMigration(ctx, db)
+}
+
+// rowQueryer is satisfied by *sql.DB and *sql.Conn.
+type rowQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func checkDelayedOrderBookSnapshotMigration(ctx context.Context, db rowQueryer) error {
+	var batches, snapshots bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT to_regclass('delayed_orderbook_snapshot_batches') IS NOT NULL,
+		       to_regclass('delayed_orderbook_snapshots') IS NOT NULL`).Scan(&batches, &snapshots); err != nil {
+		return fmt.Errorf("inspect delayed orderbook snapshot tables: %w", err)
+	}
+	if !batches || !snapshots {
+		return fmt.Errorf("migration 0048_delayed_orderbook_snapshots.sql is not applied; " +
+			"apply it (and grant SELECT, INSERT to the application role) before configuring DECISION_CYCLE_DELAYED_ACCOUNTS_JSON")
+	}
+	var missingPrivileges int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM (VALUES
+			('delayed_orderbook_snapshot_batches', 'SELECT'),
+			('delayed_orderbook_snapshot_batches', 'INSERT'),
+			('delayed_orderbook_snapshots', 'SELECT'),
+			('delayed_orderbook_snapshots', 'INSERT')
+		) AS required(relation_name, privilege)
+		WHERE NOT has_table_privilege(current_user, to_regclass(required.relation_name), required.privilege)`).
+		Scan(&missingPrivileges); err != nil {
+		return fmt.Errorf("inspect delayed orderbook snapshot privileges: %w", err)
+	}
+	if missingPrivileges != 0 {
+		return fmt.Errorf("the application role lacks %d SELECT/INSERT privilege(s) on the delayed orderbook snapshot tables; "+
+			"grant SELECT, INSERT on delayed_orderbook_snapshot_batches and delayed_orderbook_snapshots "+
+			"before configuring DECISION_CYCLE_DELAYED_ACCOUNTS_JSON", missingPrivileges)
+	}
+	return nil
 }
 
 // ClaimBatch implements atomic first-write-wins persistence. An equal replay
@@ -58,13 +206,7 @@ func (recorder *OrderBookSnapshotRecorder) ClaimBatch(
 	}()
 
 	createdAt := recorder.now().UTC()
-	result, err := tx.ExecContext(ctx, `
-		INSERT INTO strategy_orderbook_snapshot_batches (
-			decision_at, prediction_snapshot_id, snapshot_set_id,
-			target_count, snapshot_count, ok_count, empty_count,
-			missing_count, error_count, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		ON CONFLICT (decision_at) DO NOTHING`,
+	result, err := tx.ExecContext(ctx, recorder.statements.insertBatch,
 		validated.DecisionAt, validated.PredictionSnapshotID, validated.SnapshotSetID,
 		validated.TargetCount, validated.SnapshotCount, validated.OKCount, validated.EmptyCount,
 		validated.MissingCount, validated.ErrorCount, createdAt)
@@ -75,14 +217,14 @@ func (recorder *OrderBookSnapshotRecorder) ClaimBatch(
 		return domain.OrderBookSnapshotBatch{}, false, fmt.Errorf("claim orderbook snapshot batch: %w", err)
 	}
 	if !oneRow(result) {
-		existing, err := loadOrderBookSnapshotBatchHeader(ctx, tx, validated.DecisionAt)
+		existing, err := loadOrderBookSnapshotBatchHeader(ctx, tx, recorder.statements, validated.DecisionAt)
 		if err != nil {
 			return domain.OrderBookSnapshotBatch{}, false, err
 		}
 		if !sameOrderBookSnapshotBatch(existing, validated) {
 			return domain.OrderBookSnapshotBatch{}, false, port.ErrOrderBookSnapshotConflict
 		}
-		storedSnapshots, err := loadOrderBookSnapshots(ctx, tx, validated.DecisionAt)
+		storedSnapshots, err := loadOrderBookSnapshots(ctx, tx, recorder.statements, validated.DecisionAt)
 		if err != nil {
 			return domain.OrderBookSnapshotBatch{}, false, err
 		}
@@ -105,17 +247,7 @@ func (recorder *OrderBookSnapshotRecorder) ClaimBatch(
 		if err != nil {
 			return domain.OrderBookSnapshotBatch{}, false, fmt.Errorf("encode orderbook snapshot %d asks: %w", index, err)
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO strategy_orderbook_snapshots (
-				decision_at, market_source, market_id, condition_id, token_id,
-				outcome_index, outcome_id, status, error_code, source_at, observed_at,
-				tick_size, min_order_size, best_bid, best_ask, depth_limit,
-				bids, asks, created_at
-			) VALUES (
-				$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-				$12::numeric,$13::numeric,$14::numeric,$15::numeric,$16,
-				$17::jsonb,$18::jsonb,$19
-			)`,
+		if _, err := tx.ExecContext(ctx, recorder.statements.insertSnapshot,
 			validated.DecisionAt, snapshot.MarketSource, snapshot.MarketID, snapshot.ConditionID, snapshot.TokenID,
 			snapshot.OutcomeIndex, snapshot.OutcomeID, snapshot.Status, snapshot.ErrorCode,
 			nullTime(snapshot.SourceAt), snapshot.ObservedAt, nullableOrderBookDecimal(snapshot.TickSize),
@@ -134,15 +266,8 @@ func (recorder *OrderBookSnapshotRecorder) ClaimBatch(
 	return validated, true, nil
 }
 
-func loadOrderBookSnapshots(ctx context.Context, tx *sql.Tx, decisionAt time.Time) ([]domain.OrderBookSnapshot, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT market_source, market_id, condition_id, token_id, outcome_index,
-			outcome_id, status, error_code, source_at, observed_at,
-			tick_size::text, min_order_size::text, best_bid::text, best_ask::text,
-			depth_limit, bids, asks
-		FROM strategy_orderbook_snapshots
-		WHERE decision_at=$1
-		ORDER BY market_source, condition_id, outcome_index, token_id`, decisionAt.UTC())
+func loadOrderBookSnapshots(ctx context.Context, tx *sql.Tx, statements orderBookSnapshotStatements, decisionAt time.Time) ([]domain.OrderBookSnapshot, error) {
+	rows, err := tx.QueryContext(ctx, statements.selectSnapshots, decisionAt.UTC())
 	if err != nil {
 		return nil, fmt.Errorf("list stored orderbook snapshots: %w", err)
 	}
@@ -227,14 +352,9 @@ func sameStoredTime(left, right time.Time) bool {
 	return left.UTC().Truncate(time.Microsecond).Equal(right.UTC().Truncate(time.Microsecond))
 }
 
-func loadOrderBookSnapshotBatchHeader(ctx context.Context, tx *sql.Tx, decisionAt time.Time) (domain.OrderBookSnapshotBatch, error) {
+func loadOrderBookSnapshotBatchHeader(ctx context.Context, tx *sql.Tx, statements orderBookSnapshotStatements, decisionAt time.Time) (domain.OrderBookSnapshotBatch, error) {
 	var batch domain.OrderBookSnapshotBatch
-	err := tx.QueryRowContext(ctx, `
-		SELECT decision_at, prediction_snapshot_id, snapshot_set_id,
-			target_count, snapshot_count, ok_count, empty_count,
-			missing_count, error_count, created_at
-		FROM strategy_orderbook_snapshot_batches
-		WHERE decision_at=$1 FOR UPDATE`, decisionAt.UTC()).Scan(
+	err := tx.QueryRowContext(ctx, statements.selectBatch, decisionAt.UTC()).Scan(
 		&batch.DecisionAt, &batch.PredictionSnapshotID, &batch.SnapshotSetID,
 		&batch.TargetCount, &batch.SnapshotCount, &batch.OKCount, &batch.EmptyCount,
 		&batch.MissingCount, &batch.ErrorCount, &batch.CreatedAt,

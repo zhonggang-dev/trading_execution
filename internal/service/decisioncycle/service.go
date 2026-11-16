@@ -130,6 +130,13 @@ type Params struct {
 	// PredictionTimeout bounds the prediction snapshot request; zero uses
 	// 30s. A timeout makes the cycle exit-only.
 	PredictionTimeout time.Duration
+	// AllowAllStrategyDisabled lets an instance be built whose every active
+	// account is strategy-disabled (PAUSED). Only the delayed decision lane
+	// sets it: its accounts may all be paused while their persisted intents
+	// still have to be delivered. Such an instance's Run only recovers durable
+	// deliveries; it fetches no predictions, captures no books and calls no
+	// strategy. False (the default) keeps the rejection unchanged.
+	AllowAllStrategyDisabled bool
 }
 
 // NotSubmittedReporter reports SUBMIT decisions that were not turned into
@@ -185,6 +192,9 @@ type Service struct {
 	notSubmittedReporter             NotSubmittedReporter
 	strategyTimeout                  time.Duration
 	predictionTimeout                time.Duration
+	// recoveryOnly is set when AllowAllStrategyDisabled admitted an instance
+	// whose every account is strategy-disabled; Run then only recovers.
+	recoveryOnly bool
 }
 
 // IntentResult 表示后端使用的 IntentResult 类型。
@@ -311,7 +321,7 @@ func New(params Params) (*Service, error) {
 		return nil, fmt.Errorf("entry-disabled accounts do not partition every active decision binding")
 	}
 	strategyBindings := filterSubmissionEnabledBindings(activeBindings, strategyDisabledAccountSet)
-	if len(strategyBindings) == 0 {
+	if len(strategyBindings) == 0 && !params.AllowAllStrategyDisabled {
 		return nil, fmt.Errorf("strategy-disabled accounts cannot exclude every active decision binding")
 	}
 	strategyEntryEnabledBindings := filterSubmissionEnabledBindings(entryEnabledBindings, strategyDisabledAccountSet)
@@ -386,6 +396,7 @@ func New(params Params) (*Service, error) {
 		notSubmittedReporter:             params.NotSubmittedReporter,
 		strategyTimeout:                  params.StrategyTimeout,
 		predictionTimeout:                params.PredictionTimeout,
+		recoveryOnly:                     len(strategyBindings) == 0,
 	}, nil
 }
 
@@ -413,6 +424,12 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	runErrors := make([]error, 0)
 	if recovery.BusinessErr != nil {
 		runErrors = append(runErrors, fmt.Errorf("recover pending strategy intents: %w", recovery.BusinessErr))
+	}
+	if service.recoveryOnly {
+		// Only reachable with AllowAllStrategyDisabled: every account is
+		// paused, so nothing new is asked of predictions, books or strategy.
+		result.Runs = service.strategyDisabledRuns()
+		return result, errors.Join(runErrors...)
 	}
 	predictions, err := service.loadPredictions(ctx, decisionAt)
 	if err != nil {
@@ -569,6 +586,22 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		}
 	}
 	return result, errors.Join(runErrors...)
+}
+
+// strategyDisabledRuns reports every binding as skipped by configuration for
+// a cycle in which no account is sent to the strategy.
+func (service *Service) strategyDisabledRuns() []BindingRunResult {
+	runs := make([]BindingRunResult, 0, len(service.bindings))
+	for _, binding := range service.bindings {
+		run := BindingRunResult{Context: binding.Context(), PredictionModelID: binding.PredictionModelID}
+		if _, disabled := service.submissionDisabledAccountSet[binding.ExecutionAccountID]; disabled {
+			run.AccountSubmissionDisabled = true
+		} else {
+			run.AccountStrategyDisabled = true
+		}
+		runs = append(runs, run)
+	}
+	return runs
 }
 
 // bindingRunError names the account so a partly failed cycle says which
