@@ -220,7 +220,7 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 		return out, err
 	}
 	defer rows.Close()
-	points, other, payloadBytes := 0, 0, 0
+	points, payloadBytes := 0, 0
 	digests := [][32]byte{}
 	for rows.Next() {
 		var key, kind, payload string
@@ -247,16 +247,14 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 				return out, fmt.Errorf("invalid history settlement projection")
 			}
 			series.Settlements = append(series.Settlements, p)
-			other++
 		case "coverage":
 			var p history.Coverage
 			if err = json.Unmarshal([]byte(payload), &p); err != nil {
 				return out, fmt.Errorf("invalid history coverage projection")
 			}
 			series.Coverage = append(series.Coverage, p)
-			other++
 		}
-		if points > history.MaxPoints || other > 20000 {
+		if points > history.MaxPoints {
 			return out, fmt.Errorf("history effective input budget exceeded")
 		}
 		out.Series[key] = series
@@ -282,8 +280,7 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 		out.Series[key] = series
 		encoded, _ := json.Marshal(merged)
 		payloadBytes += len(encoded)
-		other += len(values)
-		if payloadBytes > 64<<20 || other > 20000 {
+		if payloadBytes > 64<<20 {
 			return out, fmt.Errorf("history settlement input budget exceeded")
 		}
 		digests = append(digests, sha256.Sum256([]byte(key+"\x00local_settlement\x00"+string(encoded))))
