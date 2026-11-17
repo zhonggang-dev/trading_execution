@@ -218,6 +218,12 @@ func (reader *ERC20TransferLogReader) BlockHeader(ctx context.Context, blockNumb
 	return rpcBlockHeader(ctx, reader.rpc, blockNumber)
 }
 
+// BlockTimestamp returns the timestamp of one canonical block.
+func (reader *OrderFilledEvidenceReader) BlockTimestamp(ctx context.Context, blockNumber uint64) (time.Time, error) {
+	_, timestamp, err := rpcBlockHeader(ctx, reader, blockNumber)
+	return timestamp, err
+}
+
 // rpcBlockHeader reads the canonical hash and timestamp of one block and
 // fails when the backend does not serve it yet.
 func rpcBlockHeader(ctx context.Context, rpc *OrderFilledEvidenceReader, blockNumber uint64) (string, time.Time, error) {
