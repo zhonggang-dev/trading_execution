@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/UniPat-AI/trading_execution/internal/adapter/evmrpc"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/memory"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/paper"
 	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarketdata"
@@ -272,7 +273,36 @@ func buildWalletPnLService(database *sql.DB, cfg config.Config, live *liveRuntim
 	if err != nil {
 		return nil, err
 	}
-	return walletpnl.New(walletpnl.Params{Addresses: addresses, Source: source, Accounts: live.polymarketAccounts, TTL: 5 * time.Minute})
+	corrector, err := buildWalletPnLCorrector(cfg, source)
+	if err != nil {
+		// 展示用配置写错不能拖垮交易：只停用官方盈亏曲线（前端显示暂不可用），
+		// 不回退成未修正的官方值。
+		slog.Error("wallet PnL disabled: invalid corrections", "error", err)
+		return nil, nil
+	}
+	return walletpnl.New(walletpnl.Params{Addresses: addresses, Source: source, Accounts: live.polymarketAccounts, TTL: 5 * time.Minute, Corrector: corrector})
+}
+
+// buildWalletPnLCorrector 解析 WALLET_PNL_CORRECTIONS_JSON。未配置时返回 nil，
+// 曲线保持官方原值。
+func buildWalletPnLCorrector(cfg config.Config, prices walletpnl.PriceReader) (*walletpnl.Corrector, error) {
+	corrections, err := walletpnl.ParseCorrections(cfg.Polymarket.WalletPnLCorrectionsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("WALLET_PNL_CORRECTIONS_JSON: %w", err)
+	}
+	if len(corrections) == 0 {
+		return nil, nil
+	}
+	blocks, err := evmrpc.NewOrderFilledEvidenceReader(evmrpc.OrderFilledEvidenceParams{
+		RPCURL:                cfg.Polymarket.PolygonRPCURL,
+		RequiredConfirmations: uint64(cfg.Polymarket.OrderFilledConfirmations),
+		HTTPClient:            noRedirectHTTPClient(cfg.Polymarket.RequestTimeout),
+		RequestTimeout:        cfg.Polymarket.RequestTimeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("WALLET_PNL_CORRECTIONS_JSON requires a valid POLYGON_RPC_URL: %w", err)
+	}
+	return walletpnl.NewCorrector(corrections, prices, blocks, nil)
 }
 
 // consoleV2RuntimeConfig builds the browser-safe runtime projection. It keeps
