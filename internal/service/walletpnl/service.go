@@ -68,6 +68,7 @@ type Service struct {
 	allowed   map[string]struct{}
 	now       func() time.Time
 	ttl       time.Duration
+	corrector *Corrector
 	mu        sync.Mutex
 	cache     map[string]cacheEntry
 	inflight  map[string]*pending
@@ -79,6 +80,8 @@ type Params struct {
 	Accounts  []string
 	TTL       time.Duration
 	Now       func() time.Time
+	// Corrector 可选：扣掉已知幽灵持仓（WALLET_PNL_CORRECTIONS_JSON）。
+	Corrector *Corrector
 }
 
 type cacheEntry struct {
@@ -116,7 +119,7 @@ func New(params Params) (*Service, error) {
 	if params.Now == nil {
 		params.Now = time.Now
 	}
-	return &Service{addresses: params.Addresses, source: params.Source, allowed: allowed, now: params.Now, ttl: params.TTL, cache: make(map[string]cacheEntry), inflight: make(map[string]*pending)}, nil
+	return &Service{addresses: params.Addresses, source: params.Source, allowed: allowed, now: params.Now, ttl: params.TTL, corrector: params.Corrector, cache: make(map[string]cacheEntry), inflight: make(map[string]*pending)}, nil
 }
 
 // ListAccounts reads the authoritative registrations for the managed
@@ -185,6 +188,9 @@ func (service *Service) Query(ctx context.Context, query Query) (Result, error) 
 			result := Result{ExecutionAccountID: query.ExecutionAccountID, WalletAddress: address, Metric: "trade_pnl", Interval: query.Interval, Fidelity: query.Fidelity, FetchedAt: service.now().UTC(), SourceFidelity: series.SourceFidelity, Points: make([]Point, 0, len(series.Points))}
 			for _, point := range series.Points {
 				result.Points = append(result.Points, Point{Timestamp: point.Timestamp, TradePnL: point.TradePnL, SourceBlock: point.SourceBlock})
+			}
+			if fetchErr == nil {
+				fetchErr = service.corrector.Apply(shared, address, result.Points)
 			}
 			if fetchErr != nil && !errors.Is(fetchErr, context.Canceled) && !errors.Is(fetchErr, context.DeadlineExceeded) {
 				fetchErr = fmt.Errorf("%w: query Data API", ErrUnavailable)

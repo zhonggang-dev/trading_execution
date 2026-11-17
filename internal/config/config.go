@@ -190,6 +190,9 @@ type Polymarket struct {
 	GammaURL                 string
 	DataAPIURL               string
 	PolygonRPCURL            string
+	// WalletPnLCorrectionsJSON 是官方钱包盈亏曲线的已知错账修正（原样 JSON，
+	// 由 walletpnl.ParseCorrections 校验）。为空表示不修正。
+	WalletPnLCorrectionsJSON string
 	RequestTimeout           time.Duration
 	StartupTimeout           time.Duration
 	MaxClockSkew             time.Duration
@@ -814,6 +817,7 @@ func Load() (Config, error) {
 			GammaURL:                     env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"),
 			DataAPIURL:                   env("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com"),
 			PolygonRPCURL:                strings.TrimSpace(os.Getenv("POLYGON_RPC_URL")),
+			WalletPnLCorrectionsJSON:     strings.TrimSpace(os.Getenv("WALLET_PNL_CORRECTIONS_JSON")),
 			RequestTimeout:               polymarketRequestTimeout,
 			StartupTimeout:               startupTimeout,
 			MaxClockSkew:                 maxClockSkew,
