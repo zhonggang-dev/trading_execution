@@ -637,6 +637,50 @@ func TestLoadDecisionAccountsDerivesTheProductionTopology(t *testing.T) {
 	}
 }
 
+// TestLoadDecisionAccountsPerAccountPredictionModel: a row may name its own
+// prediction model; rows without one keep DECISION_CYCLE_PREDICTION_MODEL_ID,
+// and the source-mode map lists exactly the models the accounts use.
+func TestLoadDecisionAccountsPerAccountPredictionModel(t *testing.T) {
+	clearConfigEnvironment(t)
+	setCompleteLiveEnvironment(t)
+	setCompleteDecisionCycleEnvironment(t)
+	t.Setenv("DECISION_CYCLE_PREDICTION_MODEL_ID", "v4.1 flash")
+	t.Setenv("DECISION_CYCLE_ACCOUNTS_JSON", `[
+		{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"},
+		{"execution_account_id":"wallet-1","market_source":"POLYMARKET","prediction_model_id":" qwen3.8-27b ","strategy_id":"brier_mid_edge_once","mode":"PAUSED"},
+		{"execution_account_id":"wallet-6","market_source":"POLYMARKET","prediction_model_id":"qwen3.8-27b","strategy_id":"multfactor_v2","mode":"ACTIVE"},
+		{"execution_account_id":"wallet-7","market_source":"POLYMARKET","prediction_model_id":"","strategy_id":"multfactor_v2","mode":"ACTIVE"}
+	]`)
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	cycle := config.DecisionCycle
+	want := []domain.StrategyExecutionBinding{
+		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "qwen3.8-27b", ModelID: "qwen3.8-27b", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "wallet-1", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "qwen3.8-27b", ModelID: "qwen3.8-27b", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-6", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7", MarketSource: domain.MarketSourcePolymarket},
+	}
+	if got := cycle.Bindings(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("Bindings() =\n%#v\nwant\n%#v", got, want)
+	}
+	modes := cycle.PredictionSourceModes()
+	if len(modes) != 2 || modes["v4.1 flash"] != domain.PredictionSourceModeSandbox || modes["qwen3.8-27b"] != domain.PredictionSourceModeSandbox {
+		t.Fatalf("PredictionSourceModes() = %v", modes)
+	}
+
+	// Every account on another model: the unused default is not a configured model.
+	t.Setenv("DECISION_CYCLE_ACCOUNTS_JSON", `[{"execution_account_id":"wallet-6","market_source":"POLYMARKET","prediction_model_id":"qwen3.8-27b","strategy_id":"multfactor_v2","mode":"ACTIVE"}]`)
+	config, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if modes := config.DecisionCycle.PredictionSourceModes(); len(modes) != 1 || modes["qwen3.8-27b"] != domain.PredictionSourceModeSandbox {
+		t.Fatalf("PredictionSourceModes() = %v", modes)
+	}
+}
+
 func TestLoadDecisionAccountsHaveNoFixedTopology(t *testing.T) {
 	for name, accounts := range map[string]string{
 		"single account": `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"}]`,
@@ -722,6 +766,7 @@ func TestLoadRejectsInvalidDecisionAccounts(t *testing.T) {
 		{name: "every account paused", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"s","mode":"PAUSED"}]`, want: "cannot pause every account"},
 		{name: "missing model", model: " ", want: "DECISION_CYCLE_PREDICTION_MODEL_ID must contain 1-200 bytes"},
 		{name: "model too long", model: strings.Repeat("m", 201), want: "DECISION_CYCLE_PREDICTION_MODEL_ID must contain 1-200 bytes"},
+		{name: "account model too long", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","prediction_model_id":"` + strings.Repeat("m", 201) + `","strategy_id":"s","mode":"ACTIVE"}]`, want: `account "main" prediction_model_id must contain at most 200 bytes`},
 		{name: "unknown source mode", mode: "REDIS", want: "DECISION_CYCLE_PREDICTION_SOURCE_MODE must be exactly DIRECT or SANDBOX"},
 		{name: "Kalshi account without credential", accounts: `[` + kalshiRow + `]`, kalshi: `[]`, want: `KALSHI account "kalshi:main" has no credential`},
 		{name: "credential for unknown account", kalshi: `[{"execution_account_id":"kalshi:wallet-7","api_key_id":"k","private_key_path":"/k.pem"}]`, want: `"kalshi:wallet-7" is not a KALSHI account`},

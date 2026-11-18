@@ -81,13 +81,14 @@ type DecisionCycle struct {
 	// account. It blocks BUY intents without blocking validated exits from
 	// managed position lots. Per-account sell-only is DecisionAccount.Mode.
 	EntrySubmissionDisabled bool
-	// PredictionModelID is the one prediction model every account trades on.
-	// It selects the PIT snapshot rows and is also the model_id sent to the
-	// strategy and written on orders and lots. There is no separate internal
-	// model name: lots belong to their account, so changing the model never
-	// strands an open position.
+	// PredictionModelID is the default prediction model of every account row
+	// that does not name its own prediction_model_id. A row's model selects the
+	// PIT snapshot rows and is also the model_id sent to the strategy and
+	// written on orders and lots. There is no separate internal model name:
+	// lots belong to their account, so changing the model never strands an
+	// open position.
 	PredictionModelID string
-	// PredictionSourceMode fixes the trusted result channel of that model.
+	// PredictionSourceMode fixes the trusted result channel of every model.
 	PredictionSourceMode domain.PredictionSourceMode
 	// Accounts lists every execution account the decision cycle owns, one row
 	// per account. An account trades exactly one venue.
@@ -289,12 +290,23 @@ const (
 )
 
 // DecisionAccount is one row of DECISION_CYCLE_ACCOUNTS_JSON: which venue the
-// account trades, which strategy runs it, and its operator mode.
+// account trades, which prediction model and strategy run it, and its
+// operator mode.
 type DecisionAccount struct {
 	ExecutionAccountID string              `json:"execution_account_id"`
 	MarketSource       domain.MarketSource `json:"market_source"`
-	StrategyID         string              `json:"strategy_id"`
-	Mode               DecisionAccountMode `json:"mode"`
+	// PredictionModelID is optional; empty uses DECISION_CYCLE_PREDICTION_MODEL_ID.
+	PredictionModelID string              `json:"prediction_model_id,omitempty"`
+	StrategyID        string              `json:"strategy_id"`
+	Mode              DecisionAccountMode `json:"mode"`
+}
+
+// accountPredictionModel returns the prediction model of one account row.
+func (cycle DecisionCycle) accountPredictionModel(account DecisionAccount) string {
+	if modelID := strings.TrimSpace(account.PredictionModelID); modelID != "" {
+		return modelID
+	}
+	return strings.TrimSpace(cycle.PredictionModelID)
 }
 
 // legacyDecisionVariables were replaced by DECISION_CYCLE_PREDICTION_MODEL_ID,
@@ -312,11 +324,11 @@ var legacyDecisionVariables = []string{
 }
 
 // Bindings returns one strategy binding per configured account. Prediction
-// and strategy model are the same configured model.
+// and strategy model are the account's prediction model.
 func (cycle DecisionCycle) Bindings() []domain.StrategyExecutionBinding {
 	bindings := make([]domain.StrategyExecutionBinding, 0, len(cycle.Accounts))
-	modelID := strings.TrimSpace(cycle.PredictionModelID)
 	for _, account := range cycle.Accounts {
+		modelID := cycle.accountPredictionModel(account)
 		bindings = append(bindings, domain.StrategyExecutionBinding{
 			PredictionModelID: modelID, ModelID: modelID,
 			StrategyID: account.StrategyID, ExecutionAccountID: account.ExecutionAccountID,
@@ -326,11 +338,14 @@ func (cycle DecisionCycle) Bindings() []domain.StrategyExecutionBinding {
 	return bindings
 }
 
-// PredictionSourceModes returns the source-mode map of the configured model.
+// PredictionSourceModes returns the source mode of every model the accounts
+// use. All models share DECISION_CYCLE_PREDICTION_SOURCE_MODE.
 func (cycle DecisionCycle) PredictionSourceModes() map[string]domain.PredictionSourceMode {
-	return map[string]domain.PredictionSourceMode{
-		strings.TrimSpace(cycle.PredictionModelID): cycle.PredictionSourceMode,
+	modes := make(map[string]domain.PredictionSourceMode, len(cycle.Accounts))
+	for _, account := range cycle.Accounts {
+		modes[cycle.accountPredictionModel(account)] = cycle.PredictionSourceMode
 	}
+	return modes
 }
 
 // EntryDisabledAccounts returns the accounts that may not buy: SELL_ONLY and
@@ -1164,6 +1179,7 @@ func decodeDecisionAccounts(value string) ([]DecisionAccount, error) {
 		account := &accounts[index]
 		account.ExecutionAccountID = strings.TrimSpace(account.ExecutionAccountID)
 		account.MarketSource = domain.MarketSource(strings.ToUpper(strings.TrimSpace(string(account.MarketSource))))
+		account.PredictionModelID = strings.TrimSpace(account.PredictionModelID)
 		account.StrategyID = domain.CanonicalStrategyID(account.StrategyID)
 		account.Mode = DecisionAccountMode(strings.ToUpper(strings.TrimSpace(string(account.Mode))))
 	}
@@ -1255,8 +1271,12 @@ func validateDecisionAccounts(cycle DecisionCycle, kalshiAccounts []KalshiLiveAc
 		default:
 			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON account %q mode must be ACTIVE, SELL_ONLY or PAUSED", account.ExecutionAccountID)
 		}
+		if len(account.PredictionModelID) > 200 {
+			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON account %q prediction_model_id must contain at most 200 bytes", account.ExecutionAccountID)
+		}
+		accountModelID := cycle.accountPredictionModel(account)
 		binding := domain.StrategyExecutionBinding{
-			PredictionModelID: modelID, ModelID: modelID, StrategyID: account.StrategyID,
+			PredictionModelID: accountModelID, ModelID: accountModelID, StrategyID: account.StrategyID,
 			ExecutionAccountID: account.ExecutionAccountID, MarketSource: account.MarketSource,
 		}
 		if err := binding.Validate(); err != nil {
