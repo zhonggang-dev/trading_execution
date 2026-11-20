@@ -39,7 +39,51 @@ type WalletLoadParams struct {
 
 // LoadTradingAccounts 从钱包文件加载并构建隔离交易账户。
 func LoadTradingAccounts(ctx context.Context, params WalletLoadParams) ([]TradingAccount, error) {
-	path := strings.TrimSpace(params.Path)
+	specs, err := readWalletAccountSpecs(params.Path)
+	if err != nil {
+		return nil, err
+	}
+	accounts := make([]TradingAccount, 0, len(specs))
+	for _, spec := range specs {
+		account, buildErr := buildTradingAccount(ctx, spec, params)
+		if buildErr != nil {
+			return nil, fmt.Errorf("execution account %q: %w", spec.ExecutionAccountID, buildErr)
+		}
+		accounts = append(accounts, account)
+	}
+	return accounts, nil
+}
+
+// LoadTradingAccount applies the same file safety checks as
+// LoadTradingAccounts but builds only the named account, so an operator tool
+// can use a file whose other entries lack API credentials. Credential
+// bootstrap, when enabled, runs for that account only.
+func LoadTradingAccount(ctx context.Context, params WalletLoadParams, executionAccountID string) (TradingAccount, error) {
+	executionAccountID = strings.TrimSpace(executionAccountID)
+	if executionAccountID == "" {
+		return TradingAccount{}, fmt.Errorf("execution account id is required")
+	}
+	specs, err := readWalletAccountSpecs(params.Path)
+	if err != nil {
+		return TradingAccount{}, err
+	}
+	for _, spec := range specs {
+		if spec.ExecutionAccountID != executionAccountID {
+			continue
+		}
+		account, buildErr := buildTradingAccount(ctx, spec, params)
+		if buildErr != nil {
+			return TradingAccount{}, fmt.Errorf("execution account %q: %w", spec.ExecutionAccountID, buildErr)
+		}
+		return account, nil
+	}
+	return TradingAccount{}, fmt.Errorf("execution account %q is not in the Polymarket accounts file", executionAccountID)
+}
+
+// readWalletAccountSpecs opens the private accounts file with the ownership,
+// permission and symlink checks and decodes every account spec.
+func readWalletAccountSpecs(rawPath string) ([]WalletAccountSpec, error) {
+	path := strings.TrimSpace(rawPath)
 	if path == "" {
 		return nil, fmt.Errorf("Polymarket accounts file path is required")
 	}
@@ -80,20 +124,7 @@ func LoadTradingAccounts(ctx context.Context, params WalletLoadParams) ([]Tradin
 	if len(payload) > maxWalletFileBytes {
 		return nil, fmt.Errorf("Polymarket accounts file exceeds %d bytes", maxWalletFileBytes)
 	}
-	specs, err := decodeWalletAccountSpecs(payload)
-	if err != nil {
-		return nil, err
-	}
-
-	accounts := make([]TradingAccount, 0, len(specs))
-	for _, spec := range specs {
-		account, buildErr := buildTradingAccount(ctx, spec, params)
-		if buildErr != nil {
-			return nil, fmt.Errorf("execution account %q: %w", spec.ExecutionAccountID, buildErr)
-		}
-		accounts = append(accounts, account)
-	}
-	return accounts, nil
+	return decodeWalletAccountSpecs(payload)
 }
 
 // decodeWalletAccountSpecs 解码并校验 Wallet Account Specs。

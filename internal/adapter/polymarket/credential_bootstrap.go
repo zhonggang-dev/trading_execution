@@ -28,6 +28,10 @@ type CredentialBootstrapParams struct {
 	HTTPClient *http.Client
 	Timeout    time.Duration
 	Now        func() time.Time
+	// DeriveOnly skips POST /auth/api-key and only reads the deterministic key
+	// with GET /auth/derive-api-key, so a dry-run never changes remote
+	// credential state. The service keeps the default create-then-derive flow.
+	DeriveOnly bool
 }
 
 // CredentialBootstrapper 实现 Polymarket L1 认证；创建 API Key 会修改远端凭证状态，因此与 TradingClient 分离并要求运维显式启用。
@@ -36,6 +40,7 @@ type CredentialBootstrapper struct {
 	httpClient *http.Client
 	timeout    time.Duration
 	now        func() time.Time
+	deriveOnly bool
 }
 
 // NewCredentialBootstrapper 创建并初始化 Credential Bootstrapper。
@@ -61,6 +66,7 @@ func NewCredentialBootstrapper(params CredentialBootstrapParams) (*CredentialBoo
 		httpClient: params.HTTPClient,
 		timeout:    params.Timeout,
 		now:        params.Now,
+		deriveOnly: params.DeriveOnly,
 	}, nil
 }
 
@@ -68,6 +74,13 @@ func NewCredentialBootstrapper(params CredentialBootstrapParams) (*CredentialBoo
 func (bootstrapper *CredentialBootstrapper) CreateOrDerive(ctx context.Context, signer DigestSigner, nonce uint64) (APICredentials, error) {
 	if signer == nil {
 		return APICredentials{}, fmt.Errorf("signer is required")
+	}
+	if bootstrapper.deriveOnly {
+		credentials, err := bootstrapper.request(ctx, signer, nonce, http.MethodGet, "/auth/derive-api-key")
+		if err != nil {
+			return APICredentials{}, fmt.Errorf("derive failed (%w)", err)
+		}
+		return credentials, nil
 	}
 	credentials, createErr := bootstrapper.request(ctx, signer, nonce, http.MethodPost, "/auth/api-key")
 	if createErr == nil {

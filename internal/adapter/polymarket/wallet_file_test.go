@@ -182,3 +182,32 @@ func writeWalletFile(t *testing.T, contents string) string {
 	}
 	return path
 }
+
+func TestLoadTradingAccountBuildsOnlyTheNamedAccount(t *testing.T) {
+	path := writeWalletFile(t, `{
+		"wallet-2": {
+			"private_key": "`+testPrivateKey+`",
+			"api_key": "key",
+			"api_secret": "c2VjcmV0",
+			"api_passphrase": "passphrase"
+		},
+		"wallet-9": {"private_key": "`+testPrivateKey+`"}
+	}`)
+	account, err := LoadTradingAccount(context.Background(), WalletLoadParams{Path: path}, "wallet-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.ExecutionAccountID != "wallet-2" || account.FunderAddress != testEOAAddress || account.SignatureType != SignatureTypeEOA {
+		t.Fatalf("account = %#v", account)
+	}
+	if _, err := LoadTradingAccount(context.Background(), WalletLoadParams{Path: path}, "wallet-9"); err == nil ||
+		!strings.Contains(err.Error(), "credentials are missing") {
+		t.Fatalf("account without credentials error = %v", err)
+	}
+	if _, err := LoadTradingAccount(context.Background(), WalletLoadParams{Path: path}, "wallet-404"); err == nil {
+		t.Fatal("unknown account must fail")
+	}
+	if _, err := LoadTradingAccounts(context.Background(), WalletLoadParams{Path: path}); err == nil {
+		t.Fatal("loading every account must still fail on the account without credentials")
+	}
+}
