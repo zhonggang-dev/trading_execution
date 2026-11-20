@@ -31,7 +31,6 @@ func RenderCard(cfg Config, sample Sample, peak *Sample, followUp bool) (map[str
 		}
 		elements = append(elements, markdown(lines.String(), "normal"))
 	}
-	elements = append(elements, markdown("<font color='grey'>总资产 = 链上 pUSD + Data API 持仓市值（中间价）。窗口内如有充值或提现，回撤会不准。</font>", "notation"))
 	return map[string]any{
 		"schema": "2.0",
 		"config": map[string]any{"update_multi": true, "width_mode": "default",
