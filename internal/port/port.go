@@ -542,6 +542,12 @@ type MarketUniverse interface {
 	FindByCondition(ctx context.Context, conditionID string) (market domain.MarketSnapshot, found bool, err error)
 }
 
+// MarketLister 分页列出正在接受下单的二元市场及其成交量、流动性，页间按流动性升序。
+// 仅用于只读筛选；返回的市场不代表已通过执行前校验。
+type MarketLister interface {
+	ListMarkets(ctx context.Context, filter domain.MarketListFilter) (domain.MarketListingPage, error)
+}
+
 // MarketValidator 在订单被接收前完成 Market 身份、状态、tick、快照和实时价格的最终校验。
 type MarketValidator interface {
 	Validate(ctx context.Context, intent domain.OrderIntent) (domain.MarketValidation, error)
