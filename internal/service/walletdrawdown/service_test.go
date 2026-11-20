@@ -8,15 +8,38 @@ import (
 	"testing"
 	"time"
 
-	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarketdata"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountcoremetrics"
 )
 
 type memStore struct {
-	samples []Sample
+	samples    []Sample
+	operations map[string]string
+	auditErr   error
 }
 
-func (m *memStore) WalletAddress(context.Context, string) (string, error) { return "0xwallet", nil }
+func (m *memStore) RecordOrderOperation(_ context.Context, _ time.Time, _ int, intent domain.OrderIntent) error {
+	if m.auditErr != nil {
+		return m.auditErr
+	}
+	if m.operations == nil {
+		m.operations = make(map[string]string)
+	}
+	m.operations[intent.ClientOrderID] = "prepared"
+	return nil
+}
+
+func (m *memStore) FinishOrderOperation(_ context.Context, clientOrderID string, orderRecorded bool) error {
+	if m.operations[clientOrderID] != "prepared" {
+		return errors.New("order operation was not recorded before submission")
+	}
+	m.operations[clientOrderID] = "unconfirmed"
+	if orderRecorded {
+		m.operations[clientOrderID] = "recorded"
+	}
+	return nil
+}
+
 func (m *memStore) LoadSample(_ context.Context, account string, slot time.Time) (Sample, bool, error) {
 	for _, s := range m.samples {
 		if s.AccountID == account && s.SlotAt.Equal(slot) {
@@ -70,21 +93,42 @@ func (m *memStore) MarkNotified(_ context.Context, account string, slot time.Tim
 }
 
 type fakeSources struct {
-	cash      string
-	marks     []polymarketdata.PositionMark
-	chain     map[string]domain.Decimal
-	chainRead []string
+	realized   string
+	marks      []testMark
+	incomplete bool
 }
 
-func (f *fakeSources) Cash(context.Context, string) (domain.ExternalBalance, error) {
-	return domain.ExternalBalance{Asset: "pUSD", Amount: domain.Decimal(f.cash), BlockNumber: 7}, nil
+type testMark struct {
+	token, title, shares, cost string
+	CurrentPrice               string
 }
-func (f *fakeSources) Positions(context.Context, string) ([]polymarketdata.PositionMark, error) {
-	return f.marks, nil
-}
-func (f *fakeSources) ChainShares(_ context.Context, _ string, token string) (domain.Decimal, error) {
-	f.chainRead = append(f.chainRead, token)
-	return f.chain[token], nil
+
+func (f *fakeSources) Query(_ context.Context, account string) (accountcoremetrics.Response, error) {
+	realized := f.realized
+	if realized == "" {
+		realized = "0"
+	}
+	metrics := accountcoremetrics.Metrics{ExecutionAccountID: account, RealizedPnL: realized, ValuationState: "complete"}
+	if f.incomplete {
+		metrics.ValuationState = "incomplete"
+		return accountcoremetrics.Response{Items: []accountcoremetrics.Metrics{metrics}}, nil
+	}
+	value, unrealized := new(big.Rat), new(big.Rat)
+	for _, mark := range f.marks {
+		marked, _ := domain.Decimal(mark.shares).Multiply(domain.Decimal(mark.CurrentPrice))
+		cost, _ := ratOf(mark.cost)
+		value.Add(value, marked)
+		unrealized.Add(unrealized, new(big.Rat).Sub(marked, cost))
+		outcome, markedText := "No", money(marked)
+		metrics.ValuationAssets = append(metrics.ValuationAssets, accountcoremetrics.Asset{
+			TokenID: mark.token, ConditionID: "c-" + mark.token, MarketQuestion: &mark.title, OutcomeName: &outcome,
+			RemainingShares: mark.shares, RemainingCost: mark.cost, Price: &mark.CurrentPrice, MarketValue: &markedText,
+		})
+	}
+	r, _ := ratOf(realized)
+	valueText, unrealizedText, total := money(value), money(unrealized), money(new(big.Rat).Add(r, unrealized))
+	metrics.MarketValue, metrics.UnrealizedPnL, metrics.TotalPnL = &valueText, &unrealizedText, &total
+	return accountcoremetrics.Response{Items: []accountcoremetrics.Metrics{metrics}}, nil
 }
 
 type fakeNotifier struct {
@@ -104,15 +148,15 @@ func testConfig() Config {
 	return Config{AccountID: "main", Threshold: big.NewRat(50, 1), RenotifyStep: big.NewRat(20, 1), Window: time.Hour, Slot: 10 * time.Minute}
 }
 
-func mark(token, title, shares, price string) polymarketdata.PositionMark {
-	return polymarketdata.PositionMark{TokenID: token, ConditionID: "c-" + token, Title: title, Outcome: "No", Shares: domain.Decimal(shares), CurrentPrice: domain.Decimal(price)}
+func mark(token, title, shares, price string) testMark {
+	return testMark{token: token, title: title, shares: shares, cost: "0", CurrentPrice: price}
 }
 
 var base = time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)
 
 func runAt(t *testing.T, store *memStore, src *fakeSources, n *fakeNotifier, at time.Time) Report {
 	t.Helper()
-	report, err := Run(context.Background(), testConfig(), store, src, n, at, false)
+	report, err := Run(context.Background(), testConfig(), store, src, n, nil, at, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,22 +165,22 @@ func runAt(t *testing.T, store *memStore, src *fakeSources, n *fakeNotifier, at 
 
 func TestFirstSampleOnlyRecords(t *testing.T) {
 	store, n := &memStore{}, &fakeNotifier{}
-	src := &fakeSources{cash: "100", marks: []polymarketdata.PositionMark{mark("t1", "A", "100", "0.5")}}
+	src := &fakeSources{realized: "100", marks: []testMark{mark("t1", "A", "100", "0.5")}}
 	report := runAt(t, store, src, n, base.Add(30*time.Second))
 	s := report.Sample
-	if s.Equity != "150.000000" || s.Drawdown != nil || s.Exceeded || len(n.cards) != 0 || !s.SlotAt.Equal(base) {
+	if s.TotalPnL != "150.000000" || s.Drawdown != nil || s.Exceeded || len(n.cards) != 0 || !s.SlotAt.Equal(base) {
 		t.Fatalf("sample = %#v", s)
 	}
 }
 
 func TestDrawdownUsesWindowPeakAndNotifiesOnceThenOnStep(t *testing.T) {
 	store, n := &memStore{}, &fakeNotifier{}
-	src := &fakeSources{cash: "100", marks: []polymarketdata.PositionMark{mark("t1", "APEC Ukraine", "100", "0.90")}}
-	runAt(t, store, src, n, base) // equity 190
-	src.marks[0].CurrentPrice = "1.10"
-	runAt(t, store, src, n, base.Add(10*time.Minute)) // 210 peak
-	src.marks[0].CurrentPrice = "0.50"
-	r := runAt(t, store, src, n, base.Add(20*time.Minute)) // 150: drawdown 60
+	src := &fakeSources{realized: "100", marks: []testMark{mark("t1", "APEC Ukraine", "100", "0.80")}}
+	runAt(t, store, src, n, base)
+	src.marks[0].CurrentPrice = "1"
+	runAt(t, store, src, n, base.Add(10*time.Minute)) // 200 peak
+	src.marks[0].CurrentPrice = "0.40"
+	r := runAt(t, store, src, n, base.Add(20*time.Minute)) // 140: drawdown 60
 	if *r.Sample.Drawdown != "60.000000" || !r.Sample.Exceeded || r.Notify != "sent" || len(n.cards) != 1 {
 		t.Fatalf("report = %#v", r)
 	}
@@ -148,13 +192,13 @@ func TestDrawdownUsesWindowPeakAndNotifiesOnceThenOnStep(t *testing.T) {
 	if !strings.Contains(text, "回撤 60.00 美元") || !strings.Contains(text, "APEC Ukraine") || !strings.Contains(text, "-60.00") {
 		t.Fatalf("card = %s", text)
 	}
-	src.marks[0].CurrentPrice = "0.40"
-	r = runAt(t, store, src, n, base.Add(30*time.Minute)) // 140: drawdown 70 < 60+20
+	src.marks[0].CurrentPrice = "0.30"
+	r = runAt(t, store, src, n, base.Add(30*time.Minute)) // 130: drawdown 70 < 60+20
 	if r.Notify != "suppressed_same_episode" || len(n.cards) != 1 {
 		t.Fatalf("second = %#v", r)
 	}
-	src.marks[0].CurrentPrice = "0.29"
-	r = runAt(t, store, src, n, base.Add(40*time.Minute)) // 129: drawdown 81 >= 80
+	src.marks[0].CurrentPrice = "0.19"
+	r = runAt(t, store, src, n, base.Add(40*time.Minute)) // 119: drawdown 81 >= 80
 	if r.Notify != "sent" || len(n.cards) != 2 || !strings.Contains(flatten(n.cards[1]), "继续扩大") {
 		t.Fatalf("third = %#v", r)
 	}
@@ -162,7 +206,7 @@ func TestDrawdownUsesWindowPeakAndNotifiesOnceThenOnStep(t *testing.T) {
 
 func TestEpisodeEndsWhenBackUnderThreshold(t *testing.T) {
 	store, n := &memStore{}, &fakeNotifier{}
-	src := &fakeSources{cash: "0", marks: []polymarketdata.PositionMark{mark("t1", "A", "100", "1")}}
+	src := &fakeSources{realized: "0", marks: []testMark{mark("t1", "A", "100", "1")}}
 	runAt(t, store, src, n, base)
 	src.marks[0].CurrentPrice = "0.4"
 	runAt(t, store, src, n, base.Add(10*time.Minute)) // drawdown 60, sent
@@ -177,7 +221,7 @@ func TestEpisodeEndsWhenBackUnderThreshold(t *testing.T) {
 
 func TestPeakOutsideWindowIsIgnored(t *testing.T) {
 	store, n := &memStore{}, &fakeNotifier{}
-	src := &fakeSources{cash: "0", marks: []polymarketdata.PositionMark{mark("t1", "A", "100", "1")}}
+	src := &fakeSources{realized: "0", marks: []testMark{mark("t1", "A", "100", "1")}}
 	runAt(t, store, src, n, base) // 100
 	src.marks[0].CurrentPrice = "0.6"
 	runAt(t, store, src, n, base.Add(50*time.Minute)) // 60: drawdown 40
@@ -188,27 +232,35 @@ func TestPeakOutsideWindowIsIgnored(t *testing.T) {
 	}
 }
 
-func TestRedeemableWinnerUsesChainShares(t *testing.T) {
+func TestRealizingMarkedGainKeepsPnLContinuous(t *testing.T) {
 	store, n := &memStore{}, &fakeNotifier{}
-	winner := mark("w", "Settled", "10", "1")
-	winner.Redeemable = true
-	loser := mark("l", "Lost", "8", "0")
-	loser.Redeemable = true
-	src := &fakeSources{cash: "50", marks: []polymarketdata.PositionMark{winner, loser}, chain: map[string]domain.Decimal{"w": "0"}}
-	r := runAt(t, store, src, n, base)
-	// Already redeemed on chain: the 10 pUSD is in cash, not double counted.
-	if r.Sample.Equity != "50.000000" || r.Sample.PositionsValue != "0.000000" || len(src.chainRead) != 1 || src.chainRead[0] != "w" {
-		t.Fatalf("sample = %#v reads=%v", r.Sample, src.chainRead)
+	position := testMark{token: "winning", title: "Winning position", shares: "100", cost: "40", CurrentPrice: "1"}
+	src := &fakeSources{marks: []testMark{position}}
+	before := runAt(t, store, src, n, base)
+	src.marks, src.realized = nil, "60"
+	after := runAt(t, store, src, n, base.Add(10*time.Minute))
+	if before.Sample.UnrealizedPnL != "60.000000" || after.Sample.RealizedPnL != "60" ||
+		after.Sample.TotalPnL != before.Sample.TotalPnL || *after.Sample.Drawdown != "0.000000" {
+		t.Fatalf("before %+v, after %+v", before.Sample, after.Sample)
+	}
+}
+
+func TestIncompleteValuationDoesNotCreateBaseline(t *testing.T) {
+	store := &memStore{}
+	src := &fakeSources{realized: "75", incomplete: true}
+	report, err := Run(context.Background(), testConfig(), store, src, nil, nil, base, false)
+	if err == nil || report.Sample != nil || len(store.samples) != 0 {
+		t.Fatalf("report %+v, samples %d, error %v", report, len(store.samples), err)
 	}
 }
 
 func TestRerunSameSlotDoesNotResampleAndRetriesFailedDelivery(t *testing.T) {
 	store, n := &memStore{}, &fakeNotifier{}
-	src := &fakeSources{cash: "0", marks: []polymarketdata.PositionMark{mark("t1", "A", "100", "1")}}
+	src := &fakeSources{realized: "0", marks: []testMark{mark("t1", "A", "100", "1")}}
 	runAt(t, store, src, n, base)
 	src.marks[0].CurrentPrice = "0.3"
 	n.err = errors.New("feishu down")
-	if _, err := Run(context.Background(), testConfig(), store, src, n, base.Add(10*time.Minute), false); err == nil {
+	if _, err := Run(context.Background(), testConfig(), store, src, n, nil, base.Add(10*time.Minute), false); err == nil {
 		t.Fatal("want delivery error")
 	}
 	n.err = nil
@@ -225,8 +277,8 @@ func TestRerunSameSlotDoesNotResampleAndRetriesFailedDelivery(t *testing.T) {
 
 func TestDryRunWritesNothing(t *testing.T) {
 	store, n := &memStore{}, &fakeNotifier{}
-	src := &fakeSources{cash: "1", marks: nil}
-	r, err := Run(context.Background(), testConfig(), store, src, n, base, true)
+	src := &fakeSources{realized: "1", marks: nil}
+	r, err := Run(context.Background(), testConfig(), store, src, n, nil, base, true)
 	if err != nil || r.Outcome != "dry_run" || len(store.samples) != 0 {
 		t.Fatalf("report=%#v err=%v", r, err)
 	}

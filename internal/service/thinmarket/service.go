@@ -67,6 +67,7 @@ type Candidate struct {
 	GapValue domain.Decimal `json:"gap_value"`
 	// BestAskCost 是卖一价 × 卖一份额，即吃掉全部卖一的成本。
 	BestAskCost domain.Decimal `json:"best_ask_cost"`
+	ObservedAt  time.Time      `json:"-"`
 }
 
 // Result 是一次筛选的结果与扫描统计。
@@ -262,6 +263,7 @@ func (service *Service) scanPage(ctx context.Context, markets []domain.MarketLis
 			continue
 		}
 		if ok {
+			candidate.ObservedAt = book.ObservedAt
 			result.Candidates = append(result.Candidates, candidate)
 		}
 	}

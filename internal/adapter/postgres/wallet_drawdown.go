@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"strings"
 	"time"
 
+	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/walletdrawdown"
 )
 
-// WalletDrawdownStore persists read-only drawdown monitoring samples.
+// WalletDrawdownStore persists samples and their order operations.
 type WalletDrawdownStore struct {
 	db *sql.DB
 }
@@ -28,36 +28,55 @@ func NewWalletDrawdownStore(db *sql.DB) (*WalletDrawdownStore, error) {
 	return &WalletDrawdownStore{db: db}, nil
 }
 
-// WalletAddress returns the account's Polymarket wallet.
-func (s *WalletDrawdownStore) WalletAddress(ctx context.Context, accountID string) (string, error) {
-	var wallet sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT lower(wallet_address) FROM execution_accounts WHERE execution_account_id=$1`, accountID).Scan(&wallet)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("execution account %s not found", accountID)
-	}
+// RecordOrderOperation claims and records a candidate before the execution call.
+func (s *WalletDrawdownStore) RecordOrderOperation(ctx context.Context, slot time.Time, attempt int, intent domain.OrderIntent) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO wallet_drawdown_order_operations
+			(client_order_id, execution_account_id, slot_at, attempt, market_id, condition_id,
+			 token_id, side, time_in_force, price, size)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::numeric, $11::numeric)`,
+		intent.ClientOrderID, intent.ExecutionAccountID, slot, attempt, intent.MarketID, intent.ConditionID,
+		intent.TokenID, intent.Side, intent.TimeInForce, intent.WorstPrice.String(), intent.Size.String())
 	if err != nil {
-		return "", fmt.Errorf("load wallet address: %w", err)
+		return fmt.Errorf("record drawdown order operation %s: %w", intent.ClientOrderID, err)
 	}
-	if !wallet.Valid || strings.TrimSpace(wallet.String) == "" {
-		return "", fmt.Errorf("execution account %s has no wallet address", accountID)
-	}
-	return wallet.String, nil
+	return nil
 }
 
-const drawdownColumns = `execution_account_id,slot_at,sampled_at,cash_pusd::text,cash_block,positions_value::text,equity::text,
- window_minutes,window_peak_equity::text,window_peak_at,drawdown::text,threshold_usd::text,exceeded,notified,positions`
+// FinishOrderOperation records whether the execution API identified a local order.
+func (s *WalletDrawdownStore) FinishOrderOperation(ctx context.Context, clientOrderID string, orderRecorded bool) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE wallet_drawdown_order_operations
+		SET submission_state = CASE WHEN $2::boolean THEN 'ORDER_RECORDED' ELSE 'SUBMIT_UNCONFIRMED' END,
+		    submit_finished_at = clock_timestamp()
+		WHERE client_order_id = $1 AND submission_state = 'PREPARED'`, clientOrderID, orderRecorded)
+	if err != nil {
+		return fmt.Errorf("finish drawdown order operation %s: %w", clientOrderID, err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return fmt.Errorf("no pending drawdown order operation %s", clientOrderID)
+	}
+	return nil
+}
+
+const drawdownColumns = `execution_account_id,slot_at,sampled_at,positions_value::text,realized_pnl::text,unrealized_pnl::text,total_pnl::text,
+ window_minutes,window_peak_pnl::text,window_peak_at,drawdown::text,threshold_usd::text,exceeded,notified,positions`
 
 func scanDrawdownSample(row interface{ Scan(...any) error }) (walletdrawdown.Sample, error) {
 	var s walletdrawdown.Sample
 	var peak, drawdown sql.NullString
 	var peakAt sql.NullTime
 	var positions []byte
-	if err := row.Scan(&s.AccountID, &s.SlotAt, &s.SampledAt, &s.CashPUSD, &s.CashBlock, &s.PositionsValue, &s.Equity,
+	if err := row.Scan(&s.AccountID, &s.SlotAt, &s.SampledAt, &s.PositionsValue, &s.RealizedPnL, &s.UnrealizedPnL, &s.TotalPnL,
 		&s.WindowMinutes, &peak, &peakAt, &drawdown, &s.Threshold, &s.Exceeded, &s.Notified, &positions); err != nil {
 		return s, err
 	}
 	if peak.Valid {
-		s.PeakEquity = &peak.String
+		s.PeakPnL = &peak.String
 	}
 	if peakAt.Valid {
 		t := peakAt.Time.UTC()
@@ -76,7 +95,8 @@ func scanDrawdownSample(row interface{ Scan(...any) error }) (walletdrawdown.Sam
 // LoadSample reads one slot.
 func (s *WalletDrawdownStore) LoadSample(ctx context.Context, accountID string, slot time.Time) (walletdrawdown.Sample, bool, error) {
 	sample, err := scanDrawdownSample(s.db.QueryRowContext(ctx,
-		`SELECT `+drawdownColumns+` FROM wallet_drawdown_samples WHERE execution_account_id=$1 AND slot_at=$2`, accountID, slot))
+		`SELECT `+drawdownColumns+` FROM wallet_drawdown_samples
+		  WHERE execution_account_id=$1 AND slot_at=$2 AND total_pnl IS NOT NULL`, accountID, slot))
 	if errors.Is(err, sql.ErrNoRows) {
 		return walletdrawdown.Sample{}, false, nil
 	}
@@ -89,7 +109,7 @@ func (s *WalletDrawdownStore) LoadSample(ctx context.Context, accountID string, 
 // WindowSamples reads samples in [from, ...) taken in slots before `before`.
 func (s *WalletDrawdownStore) WindowSamples(ctx context.Context, accountID string, from, before time.Time) ([]walletdrawdown.Sample, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+drawdownColumns+` FROM wallet_drawdown_samples
-		WHERE execution_account_id=$1 AND sampled_at>=$2 AND slot_at<$3 ORDER BY slot_at`, accountID, from, before)
+		WHERE execution_account_id=$1 AND sampled_at>=$2 AND slot_at<$3 AND total_pnl IS NOT NULL ORDER BY slot_at`, accountID, from, before)
 	if err != nil {
 		return nil, fmt.Errorf("load drawdown window: %w", err)
 	}
@@ -111,9 +131,9 @@ func (s *WalletDrawdownStore) LastNotifiedDrawdown(ctx context.Context, accountI
 	var drawdown sql.NullString
 	err := s.db.QueryRowContext(ctx, `
 		SELECT drawdown::text FROM wallet_drawdown_samples
-		WHERE execution_account_id=$1 AND slot_at<$2 AND notified
+		WHERE execution_account_id=$1 AND slot_at<$2 AND notified AND total_pnl IS NOT NULL
 		  AND slot_at>COALESCE((SELECT max(slot_at) FROM wallet_drawdown_samples
-		                       WHERE execution_account_id=$1 AND slot_at<$2 AND NOT exceeded),'-infinity'::timestamptz)
+		                       WHERE execution_account_id=$1 AND slot_at<$2 AND NOT exceeded AND total_pnl IS NOT NULL),'-infinity'::timestamptz)
 		ORDER BY slot_at DESC LIMIT 1`, accountID, before).Scan(&drawdown)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -142,12 +162,12 @@ func (s *WalletDrawdownStore) InsertSample(ctx context.Context, sample walletdra
 		peakAt = *sample.PeakAt
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO wallet_drawdown_samples
-		(execution_account_id,slot_at,sampled_at,cash_pusd,cash_block,positions_value,equity,window_minutes,
-		 window_peak_equity,window_peak_at,drawdown,threshold_usd,exceeded,notified,positions)
+		(execution_account_id,slot_at,sampled_at,positions_value,realized_pnl,unrealized_pnl,total_pnl,window_minutes,
+		 window_peak_pnl,window_peak_at,drawdown,threshold_usd,exceeded,notified,positions)
 		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,FALSE,$14)
 		ON CONFLICT(execution_account_id,slot_at) DO NOTHING`,
-		sample.AccountID, sample.SlotAt, sample.SampledAt, sample.CashPUSD, int64(sample.CashBlock), sample.PositionsValue,
-		sample.Equity, sample.WindowMinutes, sample.PeakEquity, peakAt, sample.Drawdown, sample.Threshold, sample.Exceeded, positions)
+		sample.AccountID, sample.SlotAt, sample.SampledAt, sample.PositionsValue, sample.RealizedPnL, sample.UnrealizedPnL,
+		sample.TotalPnL, sample.WindowMinutes, sample.PeakPnL, peakAt, sample.Drawdown, sample.Threshold, sample.Exceeded, positions)
 	if err != nil {
 		return false, fmt.Errorf("insert drawdown sample: %w", err)
 	}

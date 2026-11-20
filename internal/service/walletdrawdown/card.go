@@ -11,7 +11,7 @@ var beijing = time.FixedZone("CST", 8*3600)
 
 // RenderCard builds the Feishu card for one exceeded sample.
 func RenderCard(cfg Config, sample Sample, peak *Sample, followUp bool) (map[string]any, error) {
-	if sample.Drawdown == nil || sample.PeakEquity == nil || sample.PeakAt == nil {
+	if sample.Drawdown == nil || sample.PeakPnL == nil || sample.PeakAt == nil {
 		return nil, fmt.Errorf("drawdown card requires an evaluated sample")
 	}
 	heading := cfg.AccountID + " 钱包回撤超阈值"
@@ -20,8 +20,8 @@ func RenderCard(cfg Config, sample Sample, peak *Sample, followUp bool) (map[str
 	}
 	var body strings.Builder
 	fmt.Fprintf(&body, "**过去 %d 分钟回撤 %s 美元**（阈值 %s）\n", sample.WindowMinutes, short(*sample.Drawdown), sample.Threshold)
-	fmt.Fprintf(&body, "窗口高点：%s 美元（%s）\n", short(*sample.PeakEquity), sample.PeakAt.In(beijing).Format("15:04"))
-	fmt.Fprintf(&body, "当前总资产：%s 美元 = 现金 %s + 持仓 %s", short(sample.Equity), short(sample.CashPUSD), short(sample.PositionsValue))
+	fmt.Fprintf(&body, "窗口盈亏高点 %s 美元（%s）\n", short(*sample.PeakPnL), sample.PeakAt.In(beijing).Format("15:04"))
+	fmt.Fprintf(&body, "当前交易盈亏 %s 美元（已实现 %s，未实现 %s）", short(sample.TotalPnL), short(sample.RealizedPnL), short(sample.UnrealizedPnL))
 	elements := []any{markdown(body.String(), "normal")}
 	if list := Contributors(sample, peak, 3); len(list) > 0 {
 		var lines strings.Builder
