@@ -134,17 +134,20 @@ func TestLiveBindingAuthorizesStrategyNotModelPostgresIntegration(t *testing.T) 
 	db := newIntegrationDatabase(t, databaseURL)
 	ctx := context.Background()
 	for _, test := range []struct {
-		name        string
-		modelID     string
-		strategyID  string
-		afterRes    string
-		reserveCode string
-		submitCode  string
+		name            string
+		modelID         string
+		strategyID      string
+		bindingStrategy string
+		afterRes        string
+		reserveCode     string
+		submitCode      string
 	}{
 		{name: "same-model", modelID: "model-a", strategyID: "strategy-v1"},
 		{name: "new-model-name", modelID: "v4.1 flash", strategyID: "strategy-v1"},
 		{name: "another-new-model", modelID: "kimi-k2", strategyID: domain.StrategyIDMultfactorV1},
 		{name: "unbound-strategy", modelID: "model-a", strategyID: "brier_mid_edge_once", reserveCode: "STRATEGY_ACCOUNT_BINDING_DENIED"},
+		{name: "api-only-drawdown-allowed", modelID: "wallet_drawdown", strategyID: "wallet_drawdown", bindingStrategy: "wallet_drawdown"},
+		{name: "api-only-prediction-denied", modelID: "model-a", strategyID: "strategy-v1", bindingStrategy: "wallet_drawdown", reserveCode: "STRATEGY_ACCOUNT_BINDING_DENIED"},
 		{name: "binding-disabled-after-reserve", modelID: "v4.1 flash", strategyID: "strategy-v1",
 			afterRes: "disable", submitCode: "STRATEGY_ACCOUNT_BINDING_DENIED"},
 		{name: "binding-moved-to-other-strategy", modelID: "v4.1 flash", strategyID: "strategy-v1",
@@ -156,6 +159,11 @@ func TestLiveBindingAuthorizesStrategyNotModelPostgresIntegration(t *testing.T) 
 			insertAccount(t, db, accountID, "0xauth-"+test.name, "100", "100", "0")
 			provisionLiveRisk(t, db, liveRiskFixture{accountID: accountID, now: now, binding: true,
 				maxOrder: "100", maxMarket: "100", maxStrategy: "100", maxWallet: "100", maxDaily: "100"})
+			if test.bindingStrategy != "" {
+				if _, err := db.Exec(`UPDATE execution_strategy_bindings SET strategy_id=$2, version=version+1 WHERE execution_account_id=$1`, accountID, test.bindingStrategy); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if _, err := db.Exec(`UPDATE execution_risk_global_control SET kill_switch=FALSE, version=version+1 WHERE singleton=TRUE`); err != nil {
 				t.Fatal(err)
 			}

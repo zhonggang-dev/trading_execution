@@ -71,11 +71,20 @@ placement readiness——都必须透传这个能力接口，否则执行层只�
 
 升级监控前应用 `0052_wallet_drawdown_trading_pnl.sql`。历史总资产采样保存在原表，盈亏监控从首条新采样开始累计基线。
 
-`walletdrawdown` 通过 `WALLET_DRAWDOWN_EXECUTION_URL` 启用交易。该变量使用执行服务的本机 HTTP 地址，命令复用 `EXECUTION_API_TOKEN`。启用前应用迁移 `0049_wallet_drawdown_order_operations.sql`，并按现有实盘风控为 `main` 启用独立的 `wallet_drawdown` 策略绑定。
+`walletdrawdown` 通过 `WALLET_DRAWDOWN_EXECUTION_URL` 启用交易。该变量使用执行服务的本机 HTTP 地址，命令复用 `EXECUTION_API_TOKEN`。启用前应用迁移 `0049_wallet_drawdown_order_operations.sql`，并在交易服务配置中为 `main` 声明 `wallet_drawdown` 下单权限。使用跟买时同时声明跟买账户的权限。
+
+```dotenv
+POLYMARKET_API_ORDER_ACCOUNTS_JSON=[{"execution_account_id":"main","strategy_id":"wallet_drawdown"},{"execution_account_id":"wallet-10","strategy_id":"wallet_drawdown"}]
+```
+
+钱包文件须包含配置中的所有 Polymarket 预测账户与 API 下单账户。若 `wallet-10` 只用于 API 下单，它只出现在钱包文件和 API 下单配置里。预测调度从 `DECISION_CYCLE_ACCOUNTS_JSON` 读账户。两份配置可给同一账户授予不同策略权限，例如 `main` 可同时处理预测订单和回撤订单。
+
+给每项 API 下单权限启用一条 `(strategy_id, execution_account_id)` 风控授权。账户需要有效的实盘风控和账本，启动后按正常流程检查余额、订单与对账状态。以下示例适用于已应用 `0053_account_orderbook_snapshots.sql` 的数据库，且假定每个账户还没有 `wallet_drawdown` 授权。
 
 ```sql
 INSERT INTO execution_strategy_bindings (model_id, strategy_id, execution_account_id, enabled)
-VALUES ('wallet_drawdown', 'wallet_drawdown', 'main', TRUE)
+VALUES ('wallet_drawdown', 'wallet_drawdown', 'main', TRUE),
+       ('wallet_drawdown', 'wallet_drawdown', 'wallet-10', TRUE)
 ON CONFLICT (model_id, strategy_id, execution_account_id) DO UPDATE SET enabled = TRUE;
 ```
 
@@ -106,9 +115,11 @@ ORDER BY op.slot_at DESC, op.attempt;
 
 ### 按回撤卖单报价提交公开买单
 
-应用 `0051_wallet_drawdown_follow_buy_links.sql` 后，在卖出任务环境文件中将 `WALLET_DRAWDOWN_FOLLOW_BUY_ACCOUNT` 设为目标执行账户 ID，例如 `wallet-10`。该账户通过 Trading Execution 的正常账户配置和风控策略绑定授权 `wallet_drawdown`。
+应用 `0051_wallet_drawdown_follow_buy_links.sql` 后，在卖出任务环境文件中将 `WALLET_DRAWDOWN_FOLLOW_BUY_ACCOUNT` 设为目标执行账户 ID，例如 `wallet-10`。该账户使用上面的 API 下单配置及 `wallet_drawdown` 风控授权。
 
 任务每轮检查已进入 `LIVE` 或 `PARTIALLY_FILLED` 的回撤 GTC 卖单，用卖单限价和已入账的剩余份额提交一笔公开 `BUY LIMIT IOC`。交易所根据公开盘口撮合，未成交余量立即撤销。每笔买入先写操作表，用 `source_sell_client_order_id` 关联来源卖单。每笔来源卖单只触发一次买单尝试，提交结果不明确时沿用现有订单对账。通过 `--sell-due --dry-run` 可预览。
+
+回退此配置时先停用任务侧的回撤交易与跟买，确认 API 专用账户的在途单已经收尾。切换服务配置时，同步停用对应的数据库下单授权，并从钱包文件移除只通过该配置接入的账户。保留账本和历史订单。
 
 ## HTTP、限流和错误
 

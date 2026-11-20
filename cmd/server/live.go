@@ -121,11 +121,12 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	for _, account := range accounts {
 		accountIDs = append(accountIDs, account.ExecutionAccountID)
 	}
-	// The wallet file must hold exactly the configured Polymarket accounts.
+	// The wallet file must hold exactly the configured Polymarket execution accounts.
 	// This set equality must be proven before the first authenticated venue
 	// read. A retired wallet left in the secret must never be recovered,
 	// reconciled, or enrolled in a heartbeat.
-	if err := validateDecisionAccounts(cfg.DecisionCycle, accountIDs); err != nil {
+	predictionWalletIDs, err := validatePolymarketWalletAccounts(cfg.DecisionCycle, accountIDs, cfg.Polymarket.APIOrderAccounts)
+	if err != nil {
 		return nil, err
 	}
 	// Account quarantine is no longer configurable: an account that must stop
@@ -157,7 +158,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure live execution account scope: %w", err)
 	}
-	activeAuthorizations, err := liveAccountAuthorizations(reconciliationAccountIDs, cfg.DecisionCycle.Bindings())
+	activeAuthorizations, err := liveAccountAuthorizations(reconciliationAccountIDs, cfg.DecisionCycle.Bindings(), cfg.Polymarket.APIOrderAccounts...)
 	if err != nil {
 		return nil, err
 	}
@@ -586,7 +587,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	// ledger: a Kalshi account is no longer merged into a Polymarket wallet.
 	decisionRunner, err := buildDecisionRunner(buildDecisionRunnerParams{
 		cfg: cfg, database: database, positionSource: fillLedger, orderBooks: orderBooks,
-		executor: kalshiRuntime.execution, accountIDs: accountIDs, logger: logger,
+		executor: kalshiRuntime.execution, accountIDs: predictionWalletIDs, logger: logger,
 		submissionPolicy: kalshiRuntime.execution, routeInputPolicy: kalshiRuntime.execution, accountGate: decisionAccountGate,
 		maintenance: maintenance,
 	})
@@ -725,23 +726,30 @@ func optionalQuarantineReadiness(
 func liveAccountAuthorizations(
 	activeAccountIDs []string,
 	bindings []domain.StrategyExecutionBinding,
+	apiOrderAccounts ...config.APIOrderAccount,
 ) ([]postgresadapter.ExpectedActiveExecutionAccount, error) {
-	routes := make(map[string]postgresadapter.ExpectedActiveExecutionAccount, len(bindings))
+	strategiesByAccount := make(map[string][]string, len(bindings)+len(apiOrderAccounts))
 	for _, rawBinding := range bindings {
 		binding := rawBinding.Normalize()
 		if binding.MarketSource != domain.MarketSourcePolymarket {
 			continue
 		}
-		routes[binding.ExecutionAccountID] = postgresadapter.ExpectedActiveExecutionAccount{
-			ExecutionAccountID: binding.ExecutionAccountID,
-			StrategyID:         binding.StrategyID,
+		strategiesByAccount[binding.ExecutionAccountID] = []string{binding.StrategyID}
+	}
+	for _, account := range apiOrderAccounts {
+		strategies := strategiesByAccount[account.ExecutionAccountID]
+		for _, strategyID := range strategies {
+			if strategyID == account.StrategyID {
+				return nil, fmt.Errorf("execution account %q already has an authorization for strategy %q", account.ExecutionAccountID, strategyID)
+			}
 		}
+		strategiesByAccount[account.ExecutionAccountID] = append(strategies, account.StrategyID)
 	}
 	result := make([]postgresadapter.ExpectedActiveExecutionAccount, 0, len(activeAccountIDs))
 	seen := make(map[string]struct{}, len(activeAccountIDs))
 	for _, raw := range activeAccountIDs {
 		accountID := strings.TrimSpace(raw)
-		route, exists := routes[accountID]
+		strategies, exists := strategiesByAccount[accountID]
 		if !exists {
 			return nil, fmt.Errorf("execution account %q has no configured Polymarket account row", accountID)
 		}
@@ -749,7 +757,12 @@ func liveAccountAuthorizations(
 			return nil, fmt.Errorf("active execution account %q is duplicated", accountID)
 		}
 		seen[accountID] = struct{}{}
-		result = append(result, route)
+		for _, strategyID := range strategies {
+			result = append(result, postgresadapter.ExpectedActiveExecutionAccount{
+				ExecutionAccountID: accountID,
+				StrategyID:         strategyID,
+			})
+		}
 	}
 	if len(result) == 0 {
 		return nil, fmt.Errorf("live execution requires at least one active execution account")
