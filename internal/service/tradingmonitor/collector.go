@@ -208,7 +208,7 @@ func (c *Collector) predictionChecks(snapshot domain.PredictionSnapshot, binding
 		expiresAt := time.Time{}
 		byVenue := map[domain.MarketSource]int{}
 		for _, raw := range snapshot.Predictions {
-			if raw.Model.Name != b.PredictionModelID {
+			if !b.SelectsPrediction(raw) {
 				continue
 			}
 			mode := c.params.SourceModes[b.PredictionModelID]
@@ -217,7 +217,7 @@ func (c *Collector) predictionChecks(snapshot domain.PredictionSnapshot, binding
 			}
 		}
 		for _, p := range effective {
-			if p.Model.Name != b.PredictionModelID {
+			if !b.SelectsPrediction(p) {
 				continue
 			}
 			source := p.MarketSource.Normalize()

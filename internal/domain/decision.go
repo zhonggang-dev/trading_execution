@@ -66,6 +66,22 @@ type Prediction struct {
 	// which decides whether it uses that horizon's data. Omitted when the
 	// producer has no tier for the record.
 	HorizonTier string `json:"horizon_tier,omitempty"`
+	// PredictionRun is which of a model's repeated predictions for one Sandbox
+	// this record is (1, 2 or 3). It only selects records for an account and is
+	// never sent to the strategy or hashed into the strategy input identity.
+	// Zero (a producer without the field) means the first run.
+	PredictionRun int `json:"-"`
+}
+
+// MaxPredictionRun is the largest prediction_run an account may select.
+const MaxPredictionRun = 3
+
+// EffectiveRun returns the prediction run, treating a missing run as 1.
+func (prediction Prediction) EffectiveRun() int {
+	if prediction.PredictionRun <= 0 {
+		return 1
+	}
+	return prediction.PredictionRun
 }
 
 // PredictionSourceMode fixes the trusted result channel for one upstream
@@ -577,12 +593,24 @@ type StrategyExecutionContext struct {
 // 为了兼容旧的三字段配置，留空时它默认等于 ModelID。
 // MarketSource is the one venue the account trades: the account only receives
 // that venue's predictions and holds that venue's lots. Empty means Polymarket.
+// PredictionRun selects which repeated prediction of PredictionModelID the
+// account uses (1-3); zero means 1. Like PredictionModelID it never reaches
+// the strategy.
 type StrategyExecutionBinding struct {
 	PredictionModelID  string       `json:"prediction_model_id,omitempty"`
+	PredictionRun      int          `json:"prediction_run,omitempty"`
 	ModelID            string       `json:"model_id"`
 	StrategyID         string       `json:"strategy_id"`
 	ExecutionAccountID string       `json:"execution_account_id"`
 	MarketSource       MarketSource `json:"market_source,omitempty"`
+}
+
+// SelectsPrediction reports whether the prediction is the one this account
+// uses: same source model and same run. Another run never substitutes.
+func (binding StrategyExecutionBinding) SelectsPrediction(prediction Prediction) bool {
+	binding = binding.Normalize()
+	return strings.TrimSpace(prediction.Model.Name) == binding.PredictionModelID &&
+		prediction.EffectiveRun() == binding.PredictionRun
 }
 
 // KalshiExecutionAccountPrefix marks the execution accounts that trade Kalshi.
@@ -636,6 +664,9 @@ func (binding StrategyExecutionBinding) Normalize() StrategyExecutionBinding {
 	if binding.PredictionModelID == "" {
 		binding.PredictionModelID = binding.ModelID
 	}
+	if binding.PredictionRun == 0 {
+		binding.PredictionRun = 1
+	}
 	return binding
 }
 
@@ -654,6 +685,9 @@ func (binding StrategyExecutionBinding) Validate() error {
 	binding = binding.Normalize()
 	if binding.PredictionModelID == "" {
 		return fmt.Errorf("prediction_model_id is required")
+	}
+	if binding.PredictionRun < 1 || binding.PredictionRun > MaxPredictionRun {
+		return fmt.Errorf("prediction_run must be between 1 and %d", MaxPredictionRun)
 	}
 	switch binding.MarketSource {
 	case MarketSourcePolymarket:

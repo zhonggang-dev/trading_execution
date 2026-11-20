@@ -15,11 +15,14 @@ import (
 // decision cycle does not call the strategy for that venue's accounts.
 const OrderBookErrorVenueCaptureFailed = "VENUE_ORDERBOOK_CAPTURE_FAILED"
 
-// OrderBookSnapshotBatch is the immutable shared market-data evidence for one
-// global decision boundary. Snapshots are canonicalized and sorted before the
-// content identity is computed.
+// OrderBookSnapshotBatch is the immutable market-data evidence one execution
+// account used at a decision boundary. ExecutionAccountID is empty only for the
+// legacy batches captured once per boundary and shared by every account.
+// Snapshots are canonicalized and sorted before the content identity is
+// computed.
 type OrderBookSnapshotBatch struct {
 	DecisionAt           time.Time
+	ExecutionAccountID   string
 	PredictionSnapshotID string
 	SnapshotSetID        string
 	TargetCount          int
@@ -32,15 +35,20 @@ type OrderBookSnapshotBatch struct {
 	CreatedAt            time.Time
 }
 
-// NewOrderBookSnapshotBatch validates, canonicalizes, and freezes a complete
-// shared orderbook capture. Empty captures remain valid evidence.
+// NewOrderBookSnapshotBatch validates, canonicalizes, and freezes one complete
+// orderbook capture. Empty captures remain valid evidence. The account is part
+// of the content identity, so two accounts that captured identical books still
+// get distinct snapshot_set_id values; an empty account keeps the legacy
+// identity unchanged.
 func NewOrderBookSnapshotBatch(
 	decisionAt time.Time,
+	executionAccountID string,
 	predictionSnapshotID string,
 	targetCount int,
 	snapshots []OrderBookSnapshot,
 ) (OrderBookSnapshotBatch, error) {
 	decisionAt = decisionAt.UTC()
+	executionAccountID = strings.TrimSpace(executionAccountID)
 	predictionSnapshotID = strings.TrimSpace(predictionSnapshotID)
 	if decisionAt.IsZero() || predictionSnapshotID == "" {
 		return OrderBookSnapshotBatch{}, fmt.Errorf("orderbook snapshot batch decision and prediction identities are required")
@@ -86,10 +94,12 @@ func NewOrderBookSnapshotBatch(
 
 	identity := struct {
 		DecisionAt           time.Time           `json:"decision_at"`
+		ExecutionAccountID   string              `json:"execution_account_id,omitempty"`
 		PredictionSnapshotID string              `json:"prediction_snapshot_id"`
 		Snapshots            []OrderBookSnapshot `json:"snapshots"`
 	}{
 		DecisionAt:           decisionAt,
+		ExecutionAccountID:   executionAccountID,
 		PredictionSnapshotID: predictionSnapshotID,
 		Snapshots:            canonical,
 	}
@@ -99,7 +109,7 @@ func NewOrderBookSnapshotBatch(
 	}
 	digest := sha256.Sum256(payload)
 	return OrderBookSnapshotBatch{
-		DecisionAt: decisionAt, PredictionSnapshotID: predictionSnapshotID,
+		DecisionAt: decisionAt, ExecutionAccountID: executionAccountID, PredictionSnapshotID: predictionSnapshotID,
 		SnapshotSetID: "orderbook-snapshot-set-" + hex.EncodeToString(digest[:]),
 		TargetCount:   targetCount, SnapshotCount: len(canonical),
 		OKCount: counts[OrderBookStatusOK], EmptyCount: counts[OrderBookStatusEmpty],

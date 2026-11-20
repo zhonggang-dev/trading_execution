@@ -14,11 +14,16 @@ import (
 )
 
 // accountInput is one account's frozen strategy input for a cycle. A failed
-// account keeps its failure and is never sent to the strategy.
+// account keeps its failure and is never sent to the strategy. targets are
+// exactly the books this account captures before its strategy call: its
+// predictions (after the leader gate) plus its lots.
 type accountInput struct {
 	predictions []domain.Prediction
 	positions   []domain.StrategyPositionLot
 	targets     []domain.BookTarget
+	// leaderGated counts the predictions held back because the group leader's
+	// prediction of the same Sandbox has not arrived yet.
+	leaderGated int
 	failure     *accountFailure
 }
 
@@ -28,10 +33,14 @@ type accountFailure struct {
 }
 
 // cyclePredictions is the prediction input of a cycle. unavailable is set
-// (and selected is empty) when the prediction source was unavailable.
+// (and selected is empty) when the prediction source was unavailable. fresh
+// holds every fresh prediction of the configured models before the latest
+// revision per (market, model, run) is chosen; the leader gate uses it to see
+// whether a leader's prediction of a Sandbox has arrived at all.
 type cyclePredictions struct {
 	snapshotID  string
 	selected    []domain.Prediction
+	fresh       []domain.Prediction
 	unavailable error
 }
 
@@ -72,14 +81,18 @@ func (service *Service) loadPredictions(ctx context.Context, decisionAt time.Tim
 	if err := snapshot.Validate(decisionAt); err != nil {
 		return cyclePredictions{}, fmt.Errorf("validate prediction snapshot: %w", err)
 	}
-	selected, err := selectAvailablePredictions(
-		snapshot.Predictions, configuredPredictionModels(service.strategyEntryEnabledBindings),
+	fresh, err := filterAvailablePredictions(
+		snapshot.Predictions, service.predictionModels,
 		service.predictionSourceModes, decisionAt.Add(-service.predictionLookback),
 	)
 	if err != nil {
 		return cyclePredictions{}, err
 	}
-	return cyclePredictions{snapshotID: snapshot.SnapshotID, selected: selected}, nil
+	selected, err := domain.SelectEffectivePredictions(fresh, service.predictionModels)
+	if err != nil {
+		return cyclePredictions{}, err
+	}
+	return cyclePredictions{snapshotID: snapshot.SnapshotID, selected: selected, fresh: fresh}, nil
 }
 
 func predictionSourceUnavailable(err error) bool {
@@ -88,21 +101,37 @@ func predictionSourceUnavailable(err error) bool {
 
 // prepareAccountInputs loads and validates each routed strategy account on its
 // own. A failure excludes only that account; an ended cycle context fails the
-// cycle, because cancellation is not bad account data.
+// cycle, because cancellation is not bad account data. A follower's BUY
+// predictions pass the leader gate here, before its book targets are built.
 func (service *Service) prepareAccountInputs(
 	ctx context.Context,
 	decisionAt time.Time,
 	routedAccounts map[string]struct{},
-	selectedPredictions []domain.Prediction,
+	predictions cyclePredictions,
 ) (map[string]*accountInput, error) {
 	inputs := make(map[string]*accountInput, len(service.strategyBindings))
+	leaderKeys := make(map[string]map[string]struct{})
 	for _, binding := range service.strategyBindings {
 		if _, routed := routedAccounts[binding.ExecutionAccountID]; !routed {
 			continue
 		}
 		input := &accountInput{predictions: make([]domain.Prediction, 0)}
 		if !service.accountEntryDisabled(binding) {
-			input.predictions = predictionsForBinding(selectedPredictions, binding)
+			input.predictions = predictionsForBinding(predictions.selected, binding)
+		}
+		if leader, follower := service.leaders[binding.ExecutionAccountID]; follower && len(input.predictions) > 0 {
+			keys, cached := leaderKeys[leader.ExecutionAccountID]
+			if !cached {
+				keys = leaderPredictionKeys(predictions.fresh, leader)
+				leaderKeys[leader.ExecutionAccountID] = keys
+			}
+			input.predictions, input.leaderGated = gateFollowerPredictions(input.predictions, keys)
+			if input.leaderGated > 0 {
+				service.log().Info("leader_gate_held",
+					"decision_at", decisionAt, "execution_account_id", binding.ExecutionAccountID,
+					"leader_execution_account_id", leader.ExecutionAccountID, "strategy_id", binding.StrategyID,
+					"held", input.leaderGated, "kept", len(input.predictions))
+			}
 		}
 		inputs[binding.ExecutionAccountID] = input
 		lots, err := service.loadAccountLots(ctx, decisionAt, binding)
@@ -180,22 +209,22 @@ func (service *Service) loadAccountLots(
 	return strategyLots, nil
 }
 
-// sharedTargets builds the one capture target set of the cycle: the
-// predictions of every venue a healthy entry account trades, plus the targets
-// of every healthy account. The prediction targets are validated as a whole,
-// so a malformed snapshot still fails the cycle. A lot whose identity differs
-// from the prediction of the same token excludes only that account; two lots
-// with different identities for one token exclude every account holding it.
-func (service *Service) sharedTargets(
+// excludeTargetConflicts checks token identities across accounts before any
+// account captures its books. The prediction targets of every venue a routed
+// entry account trades are validated as a whole, so a malformed snapshot
+// still fails the cycle. A lot whose identity differs from the prediction of
+// the same token excludes only that account; two lots with different
+// identities for one token exclude every account holding it.
+func (service *Service) excludeTargetConflicts(
 	selectedPredictions []domain.Prediction,
 	routedAccounts map[string]struct{},
 	inputs map[string]*accountInput,
-) ([]domain.BookTarget, error) {
+) error {
 	predictionTargets, err := buildInputTargets(
 		predictionsForSources(selectedPredictions, service.entrySources(routedAccounts)), nil,
 	)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	predictionByToken := make(map[string]domain.BookTarget, len(predictionTargets))
 	for _, target := range predictionTargets {
@@ -251,43 +280,57 @@ func (service *Service) sharedTargets(
 			}
 		}
 	}
-	accounts := healthy()
-	// Same rule as entrySources, restricted to healthy accounts.
-	entryVenues := make(map[domain.MarketSource]struct{}, 2)
-	for _, binding := range service.strategyEntryEnabledBindings {
-		if input, exists := inputs[binding.ExecutionAccountID]; exists && input.failure == nil {
-			entryVenues[binding.MarketSource.Normalize()] = struct{}{}
-		}
-	}
-	byToken := make(map[string]domain.BookTarget, len(predictionTargets))
-	for _, target := range predictionTargets {
-		// Predictions of a venue no healthy account can buy on are not captured.
-		if _, wanted := entryVenues[target.MarketSource.Normalize()]; wanted {
-			byToken[target.TokenID] = target
-		}
-	}
-	for _, binding := range accounts {
-		for _, target := range inputs[binding.ExecutionAccountID].targets {
-			byToken[target.TokenID] = target
-		}
-	}
-	targets := make([]domain.BookTarget, 0, len(byToken))
-	for _, target := range byToken {
-		targets = append(targets, target)
-	}
-	sortBookTargets(targets)
-	return targets, nil
+	return nil
 }
 
-// degradedOrderBookVenues returns the venues whose whole capture failed.
-func degradedOrderBookVenues(books []domain.OrderBookSnapshot) map[domain.MarketSource]struct{} {
-	venues := make(map[domain.MarketSource]struct{})
+// venueCaptureFailed reports whether the account's venue capture failed as a
+// whole (error or its own budget expired) this cycle.
+func venueCaptureFailed(books []domain.OrderBookSnapshot) bool {
 	for _, book := range books {
 		if book.Status == domain.OrderBookStatusError && book.ErrorCode == domain.OrderBookErrorVenueCaptureFailed {
-			venues[book.MarketSource.Normalize()] = struct{}{}
+			return true
 		}
 	}
-	return venues
+	return false
+}
+
+// leaderPredictionKeys collects the Sandboxes (DIRECT: market and as-of) for
+// which the leader's own prediction (model, run and venue) is present among
+// the cycle's fresh predictions. Whether the leader may buy, or is sent to the
+// strategy at all, does not matter: only the arrival of its prediction does.
+func leaderPredictionKeys(fresh []domain.Prediction, leader domain.StrategyExecutionBinding) map[string]struct{} {
+	keys := make(map[string]struct{})
+	venue := leader.MarketSource.Normalize()
+	for _, prediction := range fresh {
+		if prediction.MarketSource.Normalize() == venue && leader.SelectsPrediction(prediction) {
+			keys[leaderGateKey(prediction)] = struct{}{}
+		}
+	}
+	return keys
+}
+
+// gateFollowerPredictions keeps the follower predictions whose Sandbox the
+// leader has already predicted and returns how many were held back. It never
+// mutates the caller's slice.
+func gateFollowerPredictions(predictions []domain.Prediction, leaderKeys map[string]struct{}) ([]domain.Prediction, int) {
+	kept := make([]domain.Prediction, 0, len(predictions))
+	for _, prediction := range predictions {
+		if _, arrived := leaderKeys[leaderGateKey(prediction)]; arrived {
+			kept = append(kept, prediction)
+		}
+	}
+	return kept, len(predictions) - len(kept)
+}
+
+// leaderGateKey identifies one prediction target across models and runs: the
+// Sandbox, or for a DIRECT prediction without a Sandbox the market and its
+// prediction_as_of.
+func leaderGateKey(prediction domain.Prediction) string {
+	if sandboxID := strings.TrimSpace(prediction.SandboxID); sandboxID != "" {
+		return "sandbox\x00" + sandboxID + "\x00" + strings.TrimSpace(prediction.MarketID)
+	}
+	return "direct\x00" + strings.TrimSpace(prediction.MarketID) + "\x00" +
+		prediction.PredictionAsOf.UTC().Format(time.RFC3339Nano)
 }
 
 func sortedMarketSources(sources map[domain.MarketSource]struct{}) []domain.MarketSource {

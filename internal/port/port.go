@@ -569,8 +569,9 @@ type FeeScheduleSource interface {
 	MarketFeeSchedule(ctx context.Context, conditionID, tokenID string) (domain.MarketFeeSchedule, error)
 }
 
-// OrderBookSnapshotRecorder atomically freezes the one shared market-data set
-// used by all strategy bindings at a global decision boundary.
+// OrderBookSnapshotRecorder atomically freezes the market-data set one
+// execution account used at a decision boundary. The first batch of a
+// (decision_at, execution_account_id) wins; a different one is a conflict.
 type OrderBookSnapshotRecorder interface {
 	ClaimBatch(ctx context.Context, batch domain.OrderBookSnapshotBatch) (stored domain.OrderBookSnapshotBatch, created bool, err error)
 }
@@ -602,6 +603,10 @@ type PositionExitRecorder interface {
 type DecisionRecorder interface {
 	// ClaimInput 原子创建周期输入或返回已保存的相同输入；同一周期出现不同输入时返回幂等冲突。
 	ClaimInput(ctx context.Context, request domain.StrategyDecisionRequest) (stored domain.StrategyDecisionRequest, created bool, err error)
+	// FindInput returns the input already frozen for a cycle, if any. A replay
+	// of the same boundary reuses it (including its orderbooks) instead of
+	// capturing new market data.
+	FindInput(ctx context.Context, cycleID string) (stored domain.StrategyDecisionRequest, found bool, err error)
 	// ClaimOutput atomically freezes the validated output and, only when
 	// submissionEnabled was true for this first claim, its complete SUBMIT
 	// intent set. Replays must use the same mode and exact intent set.

@@ -62,7 +62,7 @@ func TestOrderBookSnapshotRecorderPostgresIntegration(t *testing.T) {
 
 	changedBooks := append([]domain.OrderBookSnapshot(nil), batch.Snapshots...)
 	changedBooks[0].ObservedAt = changedBooks[0].ObservedAt.Add(time.Second)
-	conflict, err := domain.NewOrderBookSnapshotBatch(decisionAt, batch.PredictionSnapshotID, len(changedBooks), changedBooks)
+	conflict, err := domain.NewOrderBookSnapshotBatch(decisionAt, batch.ExecutionAccountID, batch.PredictionSnapshotID, len(changedBooks), changedBooks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,6 +205,13 @@ func TestOrderBookSnapshotMigrationConstraintsAndIndexesPostgresIntegration(t *t
 
 func integrationOrderBookBatch(t *testing.T, decisionAt time.Time, predictionSnapshotID string) domain.OrderBookSnapshotBatch {
 	t.Helper()
+	return integrationAccountOrderBookBatch(t, decisionAt, "main", predictionSnapshotID)
+}
+
+func integrationAccountOrderBookBatch(
+	t *testing.T, decisionAt time.Time, executionAccountID, predictionSnapshotID string,
+) domain.OrderBookSnapshotBatch {
+	t.Helper()
 	books := []domain.OrderBookSnapshot{
 		{
 			MarketID: "market-1", ConditionID: "condition-1", OutcomeIndex: 0, TokenID: "token-ok",
@@ -221,9 +228,153 @@ func integrationOrderBookBatch(t *testing.T, decisionAt time.Time, predictionSna
 			Bids: []domain.PriceLevel{}, Asks: []domain.PriceLevel{},
 		},
 	}
-	batch, err := domain.NewOrderBookSnapshotBatch(decisionAt, predictionSnapshotID, len(books), books)
+	batch, err := domain.NewOrderBookSnapshotBatch(decisionAt, executionAccountID, predictionSnapshotID, len(books), books)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return batch
+}
+
+// TestOrderBookSnapshotRecorderKeepsOneBatchPerAccountPostgresIntegration:
+// accounts of one boundary each own a batch, identical books included, next
+// to a legacy shared batch; first write wins per account and the deferred
+// completeness check counts only that account's rows.
+func TestOrderBookSnapshotRecorderKeepsOneBatchPerAccountPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	decisionAt := time.Date(2026, 11, 20, 4, 10, 0, 0, time.UTC)
+	recorder, err := NewOrderBookSnapshotRecorder(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := integrationAccountOrderBookBatch(t, decisionAt, "", "predsnap-accounts")
+	main := integrationAccountOrderBookBatch(t, decisionAt, "main", "predsnap-accounts")
+	wallet := integrationAccountOrderBookBatch(t, decisionAt, "wallet-1", "predsnap-accounts")
+	for _, batch := range []domain.OrderBookSnapshotBatch{legacy, main, wallet} {
+		stored, created, err := recorder.ClaimBatch(context.Background(), batch)
+		if err != nil || !created || stored.ExecutionAccountID != batch.ExecutionAccountID {
+			t.Fatalf("ClaimBatch(%q) = created %t, stored %#v, error %v", batch.ExecutionAccountID, created, stored, err)
+		}
+	}
+	if main.SnapshotSetID == wallet.SnapshotSetID || main.SnapshotSetID == legacy.SnapshotSetID {
+		t.Fatal("identical books of two accounts share a snapshot_set_id")
+	}
+	stored, created, err := recorder.ClaimBatch(context.Background(), wallet)
+	if err != nil || created || stored.ExecutionAccountID != "wallet-1" || len(stored.Snapshots) != 2 {
+		t.Fatalf("equal replay = created %t, stored %#v, error %v", created, stored, err)
+	}
+	changed := append([]domain.OrderBookSnapshot(nil), wallet.Snapshots...)
+	changed[0].ObservedAt = changed[0].ObservedAt.Add(time.Second)
+	conflict, err := domain.NewOrderBookSnapshotBatch(decisionAt, "wallet-1", "predsnap-accounts", len(changed), changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := recorder.ClaimBatch(context.Background(), conflict); !errors.Is(err, port.ErrOrderBookSnapshotConflict) {
+		t.Fatalf("conflicting account replay error = %v", err)
+	}
+	var batches, rows int
+	if err := db.QueryRow(`SELECT count(*) FROM strategy_orderbook_snapshot_batches WHERE decision_at=$1`, decisionAt).Scan(&batches); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM strategy_orderbook_snapshots WHERE decision_at=$1`, decisionAt).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if batches != 3 || rows != 6 {
+		t.Fatalf("stored batches/rows = %d/%d, want 3/6", batches, rows)
+	}
+	// A header whose own rows are missing is still incomplete, even though
+	// other accounts of the boundary have rows.
+	if _, err := db.Exec(`
+		INSERT INTO strategy_orderbook_snapshot_batches (
+			decision_at,execution_account_id,prediction_snapshot_id,snapshot_set_id,target_count,snapshot_count,
+			ok_count,empty_count,missing_count,error_count
+		) VALUES ($1,'wallet-2','predsnap-accounts','set-wallet-2-incomplete',2,2,1,0,1,0)`, decisionAt); err == nil ||
+		!strings.Contains(err.Error(), "batch is incomplete") {
+		t.Fatalf("incomplete account batch error = %v", err)
+	}
+	// Child rows must belong to a header of the same account.
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO strategy_orderbook_snapshots (
+			decision_at,execution_account_id,market_source,market_id,condition_id,token_id,outcome_index,status,
+			error_code,observed_at,depth_limit,bids,asks
+		) VALUES ($1,'wallet-9','POLYMARKET','market','condition','token',0,'MISSING','X',$2,15,'[]','[]')`,
+		decisionAt, decisionAt.Add(time.Second)); err == nil {
+		t.Fatal("snapshot row without its account header satisfied the foreign key")
+	}
+	_ = tx.Rollback()
+}
+
+// TestOrderBookSnapshotRollbackScriptPostgresIntegration runs the deploy
+// rollback of 0053: per-account batches are removed, legacy ones kept, the
+// one-batch-per-boundary key, completeness function and binding index are
+// back, readiness of the new release fails, and 0053 can be applied again.
+func TestOrderBookSnapshotRollbackScriptPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	decisionAt := time.Date(2026, 11, 20, 4, 20, 0, 0, time.UTC)
+	recorder, err := NewOrderBookSnapshotRecorder(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range []string{"", "main", "wallet-1"} {
+		at := decisionAt
+		if account == "" {
+			at = decisionAt.Add(-10 * time.Minute)
+		}
+		if _, _, err := recorder.ClaimBatch(context.Background(), integrationAccountOrderBookBatch(t, at, account, "predsnap-rollback")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script, err := os.ReadFile("../../../deploy/rollback_0053_account_orderbook_snapshots.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(script)); err != nil {
+		t.Fatalf("rollback script: %v", err)
+	}
+	var batches, rows int
+	if err := db.QueryRow(`SELECT count(*) FROM strategy_orderbook_snapshot_batches`).Scan(&batches); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM strategy_orderbook_snapshots`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if batches != 1 || rows != 2 {
+		t.Fatalf("after rollback batches/rows = %d/%d, want only the legacy batch", batches, rows)
+	}
+	checker, err := NewHealthChecker(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker.Check(context.Background()); err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("readiness after rollback = %v, want the new release to refuse the old schema", err)
+	}
+	var indexes int
+	if err := db.QueryRow(`SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema()
+		AND indexname='execution_strategy_bindings_enabled_model_strategy_uidx'`).Scan(&indexes); err != nil {
+		t.Fatal(err)
+	}
+	if indexes != 1 {
+		t.Fatal("rollback did not restore the enabled binding unique index")
+	}
+	migration, err := os.ReadFile("../../../migrations/0053_account_orderbook_snapshots.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(migration)); err != nil {
+		t.Fatalf("re-apply 0053: %v", err)
+	}
+	if err := checker.Check(context.Background()); err != nil {
+		t.Fatalf("readiness after re-applying 0053: %v", err)
+	}
 }

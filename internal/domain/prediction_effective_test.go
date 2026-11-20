@@ -128,3 +128,64 @@ func effectiveExpectationFixture(decisionAt time.Time) PredictionExpectation {
 		Status: PredictionExpectationCompleted, ResultAvailableAt: &resultAvailableAt,
 	}
 }
+
+// TestSelectEffectivePredictionsKeepsEachRun keeps one row per run of a model:
+// three runs of one Sandbox with equal timestamps and different probabilities
+// are not ambiguous revisions, and a newer run never replaces another run.
+func TestSelectEffectivePredictionsKeepsEachRun(t *testing.T) {
+	decisionAt := time.Date(2026, 8, 21, 4, 20, 0, 0, time.UTC)
+	runs := make([]Prediction, 0, 3)
+	for run := 1; run <= 3; run++ {
+		prediction := effectivePredictionFixture(decisionAt)
+		prediction.Outcomes = append([]PredictionOutcome(nil), prediction.Outcomes...)
+		prediction.PredictionID = "pred-run-" + string(rune('0'+run))
+		prediction.PredictionRun = run
+		prediction.Outcomes[0].Probability = 0.5 + float64(run)/10
+		prediction.Outcomes[1].Probability = 1 - prediction.Outcomes[0].Probability
+		if run == 3 {
+			prediction.PredictionAsOf = prediction.PredictionAsOf.Add(5 * time.Minute)
+		}
+		runs = append(runs, prediction)
+	}
+	legacy := effectivePredictionFixture(decisionAt) // PredictionRun 0 is run 1
+	legacy.PredictionID = "pred-legacy"
+	legacy.PredictionAsOf = legacy.PredictionAsOf.Add(-time.Minute)
+	selected, err := SelectEffectivePredictions(append([]Prediction{runs[2], legacy, runs[1]}, runs[0]), []string{"producer-a"})
+	if err != nil {
+		t.Fatalf("SelectEffectivePredictions() error = %v", err)
+	}
+	if len(selected) != 3 {
+		t.Fatalf("selected = %#v, want one row per run", selected)
+	}
+	for index, prediction := range selected {
+		if prediction.EffectiveRun() != index+1 || prediction.PredictionID != runs[index].PredictionID {
+			t.Fatalf("selected[%d] = %s run %d, want %s", index, prediction.PredictionID, prediction.EffectiveRun(), runs[index].PredictionID)
+		}
+	}
+}
+
+func TestStrategyExecutionBindingSelectsOnlyItsRun(t *testing.T) {
+	prediction := effectivePredictionFixture(time.Date(2026, 8, 21, 4, 20, 0, 0, time.UTC))
+	binding := StrategyExecutionBinding{PredictionModelID: "producer-a", ModelID: "logical", StrategyID: "s", ExecutionAccountID: "a"}
+	if !binding.SelectsPrediction(prediction) {
+		t.Fatal("default binding must select a prediction without a run (run 1)")
+	}
+	prediction.PredictionRun = 2
+	if binding.SelectsPrediction(prediction) {
+		t.Fatal("run-1 binding selected run 2")
+	}
+	binding.PredictionRun = 2
+	if !binding.SelectsPrediction(prediction) {
+		t.Fatal("run-2 binding did not select run 2")
+	}
+	for _, run := range []int{-1, 4} {
+		binding.PredictionRun = run
+		if err := binding.Validate(); err == nil {
+			t.Fatalf("Validate() accepted prediction_run %d", run)
+		}
+	}
+	binding.PredictionRun = 0
+	if normalized := binding.Normalize(); normalized.PredictionRun != 1 || normalized.Validate() != nil {
+		t.Fatalf("Normalize() = %#v, want run 1", normalized)
+	}
+}

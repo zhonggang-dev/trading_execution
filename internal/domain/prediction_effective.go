@@ -4,13 +4,16 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // SelectEffectivePredictions converts an immutable lookback snapshot into one
-// deterministic PIT row per (market, configured source model). It also proves
-// that models referring to the same Market agree on its execution identity.
+// deterministic PIT row per (market, configured source model, prediction run).
+// Runs of one model are independent: a newer run 2 never replaces run 1. It
+// also proves that models referring to the same Market agree on its execution
+// identity.
 func SelectEffectivePredictions(predictions []Prediction, modelIDs []string) ([]Prediction, error) {
 	models := predictionModelSet(modelIDs)
 	latest := make(map[string]Prediction)
@@ -19,7 +22,8 @@ func SelectEffectivePredictions(predictions []Prediction, modelIDs []string) ([]
 		if _, selected := models[predictionModelID]; !selected {
 			continue
 		}
-		key := strings.TrimSpace(prediction.MarketID) + "\x00" + predictionModelID
+		key := strings.TrimSpace(prediction.MarketID) + "\x00" + predictionModelID + "\x00" +
+			strconv.Itoa(prediction.EffectiveRun())
 		current, exists := latest[key]
 		if !exists {
 			latest[key] = prediction
@@ -28,8 +32,9 @@ func SelectEffectivePredictions(predictions []Prediction, modelIDs []string) ([]
 		newer, err := comparePredictionRecency(prediction, current)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"prediction snapshot has ambiguous revisions for market %q and model %q (%s, %s): %w",
-				prediction.MarketID, predictionModelID, current.PredictionID, prediction.PredictionID, err,
+				"prediction snapshot has ambiguous revisions for market %q, model %q and run %d (%s, %s): %w",
+				prediction.MarketID, predictionModelID, prediction.EffectiveRun(),
+				current.PredictionID, prediction.PredictionID, err,
 			)
 		}
 		if newer {
@@ -46,6 +51,9 @@ func SelectEffectivePredictions(predictions []Prediction, modelIDs []string) ([]
 		}
 		if result[i].Model.Name != result[j].Model.Name {
 			return result[i].Model.Name < result[j].Model.Name
+		}
+		if result[i].EffectiveRun() != result[j].EffectiveRun() {
+			return result[i].EffectiveRun() < result[j].EffectiveRun()
 		}
 		return result[i].PredictionID < result[j].PredictionID
 	})
@@ -142,6 +150,7 @@ func equivalentPredictionPayload(first, second Prediction) bool {
 		prediction.SandboxID = ""
 		prediction.CompletedAt = time.Time{}
 		prediction.AvailableAt = time.Time{}
+		prediction.PredictionRun = 0
 		return prediction
 	}
 	return reflect.DeepEqual(stripDeliveryIdentity(first), stripDeliveryIdentity(second))

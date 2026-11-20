@@ -296,9 +296,12 @@ type DecisionAccount struct {
 	ExecutionAccountID string              `json:"execution_account_id"`
 	MarketSource       domain.MarketSource `json:"market_source"`
 	// PredictionModelID is optional; empty uses DECISION_CYCLE_PREDICTION_MODEL_ID.
-	PredictionModelID string              `json:"prediction_model_id,omitempty"`
-	StrategyID        string              `json:"strategy_id"`
-	Mode              DecisionAccountMode `json:"mode"`
+	PredictionModelID string `json:"prediction_model_id,omitempty"`
+	// PredictionRun is optional (1-3): which repeated prediction of the model
+	// the account uses. Empty or 0 means the first run.
+	PredictionRun int                 `json:"prediction_run,omitempty"`
+	StrategyID    string              `json:"strategy_id"`
+	Mode          DecisionAccountMode `json:"mode"`
 }
 
 // accountPredictionModel returns the prediction model of one account row.
@@ -330,7 +333,7 @@ func (cycle DecisionCycle) Bindings() []domain.StrategyExecutionBinding {
 	for _, account := range cycle.Accounts {
 		modelID := cycle.accountPredictionModel(account)
 		bindings = append(bindings, domain.StrategyExecutionBinding{
-			PredictionModelID: modelID, ModelID: modelID,
+			PredictionModelID: modelID, PredictionRun: account.PredictionRun, ModelID: modelID,
 			StrategyID: account.StrategyID, ExecutionAccountID: account.ExecutionAccountID,
 			MarketSource: account.MarketSource,
 		}.Normalize())
@@ -1274,10 +1277,15 @@ func validateDecisionAccounts(cycle DecisionCycle, kalshiAccounts []KalshiLiveAc
 		if len(account.PredictionModelID) > 200 {
 			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON account %q prediction_model_id must contain at most 200 bytes", account.ExecutionAccountID)
 		}
+		if account.PredictionRun < 0 || account.PredictionRun > domain.MaxPredictionRun {
+			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON account %q prediction_run must be between 1 and %d",
+				account.ExecutionAccountID, domain.MaxPredictionRun)
+		}
 		accountModelID := cycle.accountPredictionModel(account)
 		binding := domain.StrategyExecutionBinding{
-			PredictionModelID: accountModelID, ModelID: accountModelID, StrategyID: account.StrategyID,
-			ExecutionAccountID: account.ExecutionAccountID, MarketSource: account.MarketSource,
+			PredictionModelID: accountModelID, PredictionRun: account.PredictionRun, ModelID: accountModelID,
+			StrategyID: account.StrategyID, ExecutionAccountID: account.ExecutionAccountID,
+			MarketSource: account.MarketSource,
 		}
 		if err := binding.Validate(); err != nil {
 			return fmt.Errorf("DECISION_CYCLE_ACCOUNTS_JSON account %q: %w", account.ExecutionAccountID, err)

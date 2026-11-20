@@ -45,6 +45,13 @@ func TestHealthCheckerRejectsMissingOrderBookSnapshotSchemaPostgresIntegration(t
 		{name: "table", sql: `DROP TABLE strategy_orderbook_snapshots CASCADE`},
 		{name: "constraint", sql: `ALTER TABLE strategy_orderbook_snapshots DROP CONSTRAINT strategy_orderbook_snapshots_status`},
 		{name: "index", sql: `DROP INDEX strategy_orderbook_snapshots_token_time_idx`},
+		{name: "account key", sql: `
+			ALTER TABLE strategy_orderbook_snapshots DROP CONSTRAINT strategy_orderbook_snapshots_batch_fk;
+			ALTER TABLE strategy_orderbook_snapshot_batches DROP CONSTRAINT strategy_orderbook_snapshot_batches_pkey;
+			ALTER TABLE strategy_orderbook_snapshot_batches ADD CONSTRAINT strategy_orderbook_snapshot_batches_pkey PRIMARY KEY (decision_at)`},
+		{name: "account-unaware completeness function", sql: `
+			CREATE OR REPLACE FUNCTION execution_require_complete_strategy_orderbook_snapshot_batch()
+			RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := newIntegrationDatabase(t, databaseURL)

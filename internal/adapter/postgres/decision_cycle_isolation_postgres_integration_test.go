@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,13 +125,17 @@ func (isolationPGBooks) Capture(_ context.Context, decisionAt time.Time, targets
 	return books, nil
 }
 
-// isolationPGStrategy skips every outcome and exits every lot.
+// isolationPGStrategy skips every outcome and exits every lot. The two venue
+// lanes call it concurrently.
 type isolationPGStrategy struct {
+	mu    sync.Mutex
 	calls []string
 }
 
 func (strategy *isolationPGStrategy) Decide(_ context.Context, request domain.StrategyDecisionRequest) (domain.StrategyDecisionResponse, error) {
+	strategy.mu.Lock()
 	strategy.calls = append(strategy.calls, request.Context.ExecutionAccountID)
+	strategy.mu.Unlock()
 	evaluations := make([]domain.StrategyEvaluation, 0)
 	for _, prediction := range request.Predictions {
 		for _, outcome := range prediction.Outcomes {
@@ -260,9 +265,13 @@ func TestDecisionCycleIsolationBrokenLotPostgresIntegration(t *testing.T) {
 	if _, exists := accounts[isolationPGKalshiAccount]; exists {
 		t.Fatalf("decision runs = %#v, the excluded Kalshi account must not have an input", accounts)
 	}
-	var batches int
-	if err := fixture.db.QueryRow(`SELECT count(*) FROM strategy_orderbook_snapshot_batches WHERE decision_at=$1`, isolationPGDecisionAt).Scan(&batches); err != nil || batches != 1 {
-		t.Fatalf("snapshot batches = %d, error %v", batches, err)
+	// One batch per healthy account; the excluded account captured nothing.
+	var batches, kalshiBatches int
+	if err := fixture.db.QueryRow(`
+		SELECT count(*), count(*) FILTER (WHERE execution_account_id=$2)
+		FROM strategy_orderbook_snapshot_batches WHERE decision_at=$1`,
+		isolationPGDecisionAt, isolationPGKalshiAccount).Scan(&batches, &kalshiBatches); err != nil || batches != 3 || kalshiBatches != 0 {
+		t.Fatalf("snapshot batches = %d (Kalshi %d), error %v", batches, kalshiBatches, err)
 	}
 	for _, run := range result.Runs {
 		if run.Context.ExecutionAccountID == isolationPGKalshiAccount && (!run.InputUnavailable || run.FailureStage != decisioncycle.FailureStageTargets) {
@@ -278,9 +287,18 @@ func TestDecisionCycleIsolationExitOnlyReplayPostgresIntegration(t *testing.T) {
 		t.Fatalf("exit-only Run() error = %v", err)
 	}
 	wantSnapshotID := "predsnap-unavailable-20261105T031000Z"
-	var batchSnapshotID string
-	if err := fixture.db.QueryRow(`SELECT prediction_snapshot_id FROM strategy_orderbook_snapshot_batches WHERE decision_at=$1`, isolationPGDecisionAt).Scan(&batchSnapshotID); err != nil || batchSnapshotID != wantSnapshotID {
-		t.Fatalf("batch prediction_snapshot_id = %q, error %v", batchSnapshotID, err)
+	countBatches := func() (int, int) {
+		var batches, exitOnly int
+		if err := fixture.db.QueryRow(`
+			SELECT count(*), count(*) FILTER (WHERE prediction_snapshot_id=$2)
+			FROM strategy_orderbook_snapshot_batches WHERE decision_at=$1`,
+			isolationPGDecisionAt, wantSnapshotID).Scan(&batches, &exitOnly); err != nil {
+			t.Fatal(err)
+		}
+		return batches, exitOnly
+	}
+	if batches, exitOnly := countBatches(); batches != 4 || exitOnly != 4 {
+		t.Fatalf("batches = %d (exit-only %d), want one exit-only batch per account", batches, exitOnly)
 	}
 	var blocked, inputs int
 	if err := fixture.db.QueryRow(`
@@ -306,14 +324,25 @@ func TestDecisionCycleIsolationExitOnlyReplayPostgresIntegration(t *testing.T) {
 		t.Fatalf("deliveries SELL=%d BUY=%d, want three Polymarket exits and no BUY", sells, buys)
 	}
 
-	// The same boundary replayed with predictions available again.
-	calls := len(fixture.strategy.calls)
+	// The same boundary replayed with predictions available again: every
+	// account reuses its stored exit-only input (and books), its stored output
+	// replays unchanged, and no new batch, input or BUY appears.
 	fixture.predictions.err = nil
-	if _, err := fixture.run(t); !errors.Is(err, port.ErrOrderBookSnapshotConflict) {
-		t.Fatalf("replay Run() error = %v, want the snapshot batch conflict", err)
+	result, err := fixture.run(t)
+	if err != nil {
+		t.Fatalf("replay Run() error = %v", err)
 	}
-	if len(fixture.strategy.calls) != calls || countDeliveries(domain.SideBuy) != 0 {
-		t.Fatalf("replay called the strategy %d more times or created BUY deliveries", len(fixture.strategy.calls)-calls)
+	for _, run := range result.Runs {
+		if len(run.Request.Predictions) != 0 || run.Request.PredictionSnapshotID != wantSnapshotID ||
+			run.EntryBlockReason != domain.StrategyEntryBlockPredictionSourceUnavailable {
+			t.Fatalf("replayed run %s = %#v, want the stored exit-only input", run.Context.ExecutionAccountID, run)
+		}
+	}
+	if batches, exitOnly := countBatches(); batches != 4 || exitOnly != 4 {
+		t.Fatalf("replay changed the batches: %d (exit-only %d)", batches, exitOnly)
+	}
+	if countDeliveries(domain.SideBuy) != 0 || countDeliveries(domain.SideSell) != 3 {
+		t.Fatal("replay created new deliveries")
 	}
 	// Even past the batch claim, the account input with predictions conflicts.
 	request, err := (domain.StrategyDecisionRequestParams{

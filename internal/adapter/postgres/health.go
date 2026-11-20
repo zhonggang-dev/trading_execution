@@ -99,6 +99,8 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 			('execution_chain_cash_transfers', 'classification'),
 			('execution_chain_cash_transfers', 'account_event_id'),
 			('strategy_decision_runs', 'order_submission_enabled'),
+			('strategy_orderbook_snapshot_batches', 'execution_account_id'),
+			('strategy_orderbook_snapshots', 'execution_account_id'),
 			('strategy_order_intent_deliveries', 'intent_payload'),
 			('strategy_order_intent_deliveries', 'status'),
 			('strategy_order_intent_deliveries', 'attempt_count'),
@@ -269,13 +271,54 @@ func (checker *HealthChecker) Check(ctx context.Context) error {
 		return fmt.Errorf("postgres live schema is incomplete: %d required constraints are missing or not validated", missingConstraints)
 	}
 
+	// Migration 0053 keys orderbook snapshot batches by account. Without it a
+	// second account of one boundary violates the old key, and without the
+	// account-aware completeness function its batch fails at commit.
+	var missingAccountSnapshotSchema int
+	err = checker.db.QueryRowContext(ctx, `
+		SELECT (
+			SELECT count(*)
+			FROM (VALUES
+				('strategy_orderbook_snapshot_batches_pkey'),
+				('strategy_orderbook_snapshots_pkey'),
+				('strategy_orderbook_snapshots_batch_fk')
+			) AS required(name)
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM pg_constraint constraint_definition
+				JOIN pg_namespace namespace_definition
+				  ON namespace_definition.oid = constraint_definition.connamespace
+				JOIN pg_attribute key_column
+				  ON key_column.attrelid = constraint_definition.conrelid
+				 AND key_column.attnum = ANY (constraint_definition.conkey)
+				WHERE namespace_definition.nspname = current_schema()
+				  AND constraint_definition.conname = required.name
+				  AND key_column.attname = 'execution_account_id'
+			)
+		) + (
+			SELECT CASE WHEN EXISTS (
+				SELECT 1
+				FROM pg_proc function_definition
+				JOIN pg_namespace namespace_definition
+				  ON namespace_definition.oid = function_definition.pronamespace
+				WHERE namespace_definition.nspname = current_schema()
+				  AND function_definition.proname = 'execution_require_complete_strategy_orderbook_snapshot_batch'
+				  AND function_definition.prosrc LIKE '%execution_account_id%'
+			) THEN 0 ELSE 1 END
+		)`).Scan(&missingAccountSnapshotSchema)
+	if err != nil {
+		return fmt.Errorf("inspect postgres account orderbook snapshot schema: %w", err)
+	}
+	if missingAccountSnapshotSchema != 0 {
+		return fmt.Errorf("postgres live schema is incomplete: migration 0053 account orderbook snapshots is not applied")
+	}
+
 	var missingIndexes int
 	err = checker.db.QueryRowContext(ctx, `
 		SELECT count(*)
 		FROM (VALUES
 			('strategy_orderbook_snapshot_batches_set_unique'),
 			('execution_fills_polygon_settlement_event_uidx'),
-			('execution_strategy_bindings_enabled_model_strategy_uidx'),
 			('strategy_decision_runs_account_time_idx'),
 			('strategy_order_intent_deliveries_cycle_sequence_unique'),
 			('execution_external_position_dispositions_accounted_trade_uidx'),

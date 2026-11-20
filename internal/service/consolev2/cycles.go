@@ -20,7 +20,7 @@ WITH cycle_rows AS (
 	       -- evidence, so do not present that logical value as a producer ID.
 	       NULL::text AS prediction_model_id,
 	       COALESCE(r.input_payload->>'prediction_snapshot_id', '') AS prediction_snapshot_id,
-	       COALESCE(batch.snapshot_set_id, '') AS orderbook_snapshot_set_id,
+	       COALESCE(batch.snapshot_set_id, legacy_batch.snapshot_set_id, '') AS orderbook_snapshot_set_id,
 	       CASE
 	         WHEN r.output_payload IS NULL THEN NULL
 	         WHEN r.output_payload->'entry_policy' ? 'enabled' THEN r.output_payload->'entry_policy'->>'enabled'
@@ -49,7 +49,12 @@ WITH cycle_rows AS (
 	         ELSE 'OUTPUT_RECORDED'
 	       END AS status
 	FROM strategy_decision_runs r
-	LEFT JOIN strategy_orderbook_snapshot_batches batch ON batch.decision_at=r.decision_at
+	-- Each account freezes its own batch (0053); older cycles used the one
+	-- batch shared by the boundary (execution_account_id = '').
+	LEFT JOIN strategy_orderbook_snapshot_batches batch
+	  ON batch.decision_at=r.decision_at AND batch.execution_account_id=r.execution_account_id
+	LEFT JOIN strategy_orderbook_snapshot_batches legacy_batch
+	  ON legacy_batch.decision_at=r.decision_at AND legacy_batch.execution_account_id=''
 )
 `
 
@@ -196,7 +201,7 @@ paged_ids AS MATERIALIZED (
 SELECT page.cycle_id, page.input_id, page.decision_at, page.model_id, NULL::text AS prediction_model_id,
        page.strategy_id, page.execution_account_id,
        COALESCE(run.input_payload->>'prediction_snapshot_id', ''),
-       COALESCE(batch.snapshot_set_id, ''), page.created_at, page.decided_at,
+       COALESCE(batch.snapshot_set_id, legacy_batch.snapshot_set_id, ''), page.created_at, page.decided_at,
        page.order_submission_enabled,
        CASE
          WHEN run.output_payload IS NULL THEN NULL
@@ -212,7 +217,10 @@ SELECT page.cycle_id, page.input_id, page.decision_at, page.model_id, NULL::text
        page.intent_count, page.delivery_pending_count, page.delivery_failed_count, page.status
 FROM paged_ids page
 JOIN strategy_decision_runs run ON run.cycle_id=page.cycle_id
-LEFT JOIN strategy_orderbook_snapshot_batches batch ON batch.decision_at=page.decision_at
+LEFT JOIN strategy_orderbook_snapshot_batches batch
+  ON batch.decision_at=page.decision_at AND batch.execution_account_id=page.execution_account_id
+LEFT JOIN strategy_orderbook_snapshot_batches legacy_batch
+  ON legacy_batch.decision_at=page.decision_at AND legacy_batch.execution_account_id=''
 ORDER BY page.decision_at DESC, page.cycle_id DESC`
 	rows, err := tx.QueryContext(ctx, query, listArgs...)
 	if err != nil {
@@ -261,7 +269,7 @@ func (reader *Reader) DecisionCycle(ctx context.Context, cycleID string) (Decisi
 	if err != nil {
 		return DecisionCycleDetail{}, err
 	}
-	detail.OrderbookSnapshots, err = reader.loadOrderbookSnapshots(ctx, item.DecisionAt)
+	detail.OrderbookSnapshots, err = reader.loadOrderbookSnapshots(ctx, item.DecisionAt, item.ExecutionAccountID)
 	if err != nil {
 		return DecisionCycleDetail{}, err
 	}
@@ -362,13 +370,20 @@ func (reader *Reader) loadDeliveries(ctx context.Context, cycleID string) ([]Del
 	return items, nil
 }
 
-func (reader *Reader) loadOrderbookSnapshots(ctx context.Context, decisionAt time.Time) ([]OrderbookSnapshotReference, error) {
+// loadOrderbookSnapshots reads the books the account's cycle froze: its own
+// batch, or for a cycle before per-account batches the shared one.
+func (reader *Reader) loadOrderbookSnapshots(
+	ctx context.Context, decisionAt time.Time, executionAccountID string,
+) ([]OrderbookSnapshotReference, error) {
 	rows, err := reader.db.QueryContext(ctx, `
 		SELECT market_source, market_id, condition_id, token_id, status, error_code, observed_at
 		FROM strategy_orderbook_snapshots
 		WHERE decision_at=$1
+		  AND execution_account_id=COALESCE((
+		      SELECT b.execution_account_id FROM strategy_orderbook_snapshot_batches b
+		      WHERE b.decision_at=$1 AND b.execution_account_id=$2), '')
 		ORDER BY market_source, market_id, token_id
-		LIMIT 200`, decisionAt.UTC())
+		LIMIT 200`, decisionAt.UTC(), executionAccountID)
 	if err != nil {
 		return nil, dbUnavailable("list decision orderbook snapshots", err)
 	}

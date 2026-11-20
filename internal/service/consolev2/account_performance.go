@@ -128,8 +128,12 @@ func (reader *Reader) AccountPerformance(ctx context.Context, accountID string) 
  FROM performance_base
  GROUP BY execution_account_id,market_source,market_id,condition_id,token_id,outcome_index,NULLIF(outcome_name,'')
  ), batch AS MATERIALIZED (
- SELECT decision_at FROM strategy_orderbook_snapshot_batches
- WHERE decision_at<=$%d AND created_at<=$%d ORDER BY decision_at DESC LIMIT 1
+ SELECT a.execution_account_id,b.decision_at,b.execution_account_id AS batch_account_id
+ FROM performance_accounts a LEFT JOIN LATERAL (
+ SELECT s.decision_at,s.execution_account_id FROM strategy_orderbook_snapshot_batches s
+ WHERE s.execution_account_id IN (a.execution_account_id,'') AND s.decision_at<=$%d AND s.created_at<=$%d
+ ORDER BY s.decision_at DESC,(s.execution_account_id<>'') DESC LIMIT 1
+ ) b ON TRUE
  ), quoted AS (
  SELECT a.*,q.observed_at,
  CASE WHEN batch.decision_at IS NULL THEN 'missing_batch'
@@ -141,8 +145,9 @@ func (reader *Reader) AccountPerformance(ctx context.Context, accountID string) 
  WHEN q.observed_at<$%d THEN 'stale_quote'
  ELSE 'complete' END AS quote_state,
  (q.best_bid+q.best_ask)/2 AS mid
- FROM assets a LEFT JOIN batch ON TRUE
+ FROM assets a LEFT JOIN batch ON batch.execution_account_id=a.execution_account_id
  LEFT JOIN strategy_orderbook_snapshots q ON q.decision_at=batch.decision_at
+ AND q.execution_account_id=batch.batch_account_id
  AND q.market_source=a.market_source AND q.market_id=a.market_id AND q.condition_id=a.condition_id
  AND q.token_id=a.token_id AND q.outcome_index=a.outcome_index
  ), valuation AS (
@@ -186,12 +191,13 @@ func (reader *Reader) AccountPerformance(ctx context.Context, accountID string) 
  COALESCE(c.peak_holding_cost,0) AS peak_holding_cost,COALESCE(c.cumulative_invested_cost,0) AS cumulative_invested_cost,
  COALESCE(c.realized_pnl,0) AS realized_pnl,COALESCE(d.drawdown,0) AS drawdown,
  CASE WHEN COALESCE(v.priced_asset_count,0)=COALESCE(v.asset_count,0) THEN COALESCE(v.priced_value,0) END AS market_value,
- (SELECT decision_at FROM batch) AS snapshot_decision_at,v.snapshot_observed_at,
+ bt.decision_at AS snapshot_decision_at,v.snapshot_observed_at,
  COALESCE(v.missing_batch,FALSE) AS missing_batch,COALESCE(v.missing_quote,FALSE) AS missing_quote,
  COALESCE(v.invalid_quote,FALSE) AS invalid_quote,COALESCE(v.stale_quote,FALSE) AS stale_quote,
  COALESCE(v.future_quote,FALSE) AS future_quote
  FROM performance_accounts a LEFT JOIN valuation v USING(execution_account_id)
  LEFT JOIN accounting c USING(execution_account_id) LEFT JOIN drawdown d USING(execution_account_id)
+ LEFT JOIN batch bt USING(execution_account_id)
  )
  SELECT execution_account_id,market_source,asset_count,priced_asset_count,current_cost::text,peak_holding_cost::text,
  cumulative_invested_cost::text,realized_pnl::text,market_value::text,(market_value-current_cost)::text,
