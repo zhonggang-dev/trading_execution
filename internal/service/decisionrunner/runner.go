@@ -266,6 +266,7 @@ func (runner *Runner) logResult(boundary time.Time, result decisioncycle.RunResu
 		"snapshot_id", result.PredictionSnapshotID,
 		"prediction_source_unavailable", result.PredictionSourceUnavailable,
 		"degraded_venues", result.DegradedVenues,
+		"venue_elapsed_ms", venueElapsedMillis(result),
 		"recovered_rejected", result.Recovery.Rejected,
 		"recovered_unknown", result.Recovery.Unknown,
 		"accounts_ok", accountsOK,
@@ -285,6 +286,15 @@ func (runner *Runner) logResult(boundary time.Time, result decisioncycle.RunResu
 	runner.logger.Info("decision cycle completed", attributes...)
 }
 
+// venueElapsedMillis reports how long each venue lane of the cycle took.
+func venueElapsedMillis(result decisioncycle.RunResult) map[string]int64 {
+	elapsed := make(map[string]int64, len(result.VenueElapsed))
+	for venue, duration := range result.VenueElapsed {
+		elapsed[string(venue)] = duration.Milliseconds()
+	}
+	return elapsed
+}
+
 type bindingRunSummary struct {
 	ModelID                   string `json:"model_id"`
 	PredictionModelID         string `json:"prediction_model_id"`
@@ -302,6 +312,7 @@ type bindingRunSummary struct {
 	InputUnavailable          bool   `json:"input_unavailable,omitempty"`
 	VenueBooksUnavailable     bool   `json:"venue_books_unavailable,omitempty"`
 	NotRun                    bool   `json:"not_run,omitempty"`
+	LeaderGated               int    `json:"leader_gated,omitempty"`
 	FailureStage              string `json:"failure_stage,omitempty"`
 	Failed                    bool   `json:"failed"`
 }
@@ -326,6 +337,7 @@ func bindingRunSummaries(result decisioncycle.RunResult) []bindingRunSummary {
 			InputUnavailable:          run.InputUnavailable,
 			VenueBooksUnavailable:     run.VenueBooksUnavailable,
 			NotRun:                    run.NotRun,
+			LeaderGated:               run.LeaderGated,
 			FailureStage:              run.FailureStage,
 			Failed:                    run.Error != nil || run.EntryBlockReason != "",
 		})

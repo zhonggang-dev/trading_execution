@@ -610,11 +610,11 @@ func TestLoadDecisionAccountsDerivesTheProductionTopology(t *testing.T) {
 		t.Fatalf("model = %q / %q", cycle.PredictionModelID, cycle.PredictionSourceMode)
 	}
 	want := []domain.StrategyExecutionBinding{
-		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main", MarketSource: domain.MarketSourcePolymarket},
-		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: "strategy_pending_b", ExecutionAccountID: "wallet-1", MarketSource: domain.MarketSourcePolymarket},
-		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6", MarketSource: domain.MarketSourcePolymarket},
-		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7", MarketSource: domain.MarketSourcePolymarket},
-		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi},
+		{PredictionModelID: "v4.1 flash", PredictionRun: 1, ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", PredictionRun: 1, ModelID: "v4.1 flash", StrategyID: "strategy_pending_b", ExecutionAccountID: "wallet-1", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", PredictionRun: 1, ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", PredictionRun: 1, ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", PredictionRun: 1, ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi},
 	}
 	if got := cycle.Bindings(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("Bindings() =\n%#v\nwant\n%#v", got, want)
@@ -648,8 +648,8 @@ func TestLoadDecisionAccountsPerAccountPredictionModel(t *testing.T) {
 	t.Setenv("DECISION_CYCLE_ACCOUNTS_JSON", `[
 		{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"brier_mid_edge_once","mode":"ACTIVE"},
 		{"execution_account_id":"wallet-1","market_source":"POLYMARKET","prediction_model_id":" qwen3.8-27b ","strategy_id":"brier_mid_edge_once","mode":"PAUSED"},
-		{"execution_account_id":"wallet-6","market_source":"POLYMARKET","prediction_model_id":"qwen3.8-27b","strategy_id":"multfactor_v2","mode":"ACTIVE"},
-		{"execution_account_id":"wallet-7","market_source":"POLYMARKET","prediction_model_id":"","strategy_id":"multfactor_v2","mode":"ACTIVE"}
+		{"execution_account_id":"wallet-6","market_source":"POLYMARKET","prediction_model_id":"qwen3.8-27b","prediction_run":2,"strategy_id":"multfactor_v2","mode":"ACTIVE"},
+		{"execution_account_id":"wallet-7","market_source":"POLYMARKET","prediction_model_id":"","prediction_run":0,"strategy_id":"multfactor_v2","mode":"ACTIVE"}
 	]`)
 	config, err := Load()
 	if err != nil {
@@ -657,10 +657,10 @@ func TestLoadDecisionAccountsPerAccountPredictionModel(t *testing.T) {
 	}
 	cycle := config.DecisionCycle
 	want := []domain.StrategyExecutionBinding{
-		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main", MarketSource: domain.MarketSourcePolymarket},
-		{PredictionModelID: "qwen3.8-27b", ModelID: "qwen3.8-27b", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "wallet-1", MarketSource: domain.MarketSourcePolymarket},
-		{PredictionModelID: "qwen3.8-27b", ModelID: "qwen3.8-27b", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-6", MarketSource: domain.MarketSourcePolymarket},
-		{PredictionModelID: "v4.1 flash", ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", PredictionRun: 1, ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "main", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "qwen3.8-27b", PredictionRun: 1, ModelID: "qwen3.8-27b", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "wallet-1", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "qwen3.8-27b", PredictionRun: 2, ModelID: "qwen3.8-27b", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-6", MarketSource: domain.MarketSourcePolymarket},
+		{PredictionModelID: "v4.1 flash", PredictionRun: 1, ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7", MarketSource: domain.MarketSourcePolymarket},
 	}
 	if got := cycle.Bindings(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("Bindings() =\n%#v\nwant\n%#v", got, want)
@@ -766,6 +766,8 @@ func TestLoadRejectsInvalidDecisionAccounts(t *testing.T) {
 		{name: "every account paused", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","strategy_id":"s","mode":"PAUSED"}]`, want: "cannot pause every account"},
 		{name: "missing model", model: " ", want: "DECISION_CYCLE_PREDICTION_MODEL_ID must contain 1-200 bytes"},
 		{name: "model too long", model: strings.Repeat("m", 201), want: "DECISION_CYCLE_PREDICTION_MODEL_ID must contain 1-200 bytes"},
+		{name: "account prediction run too large", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","prediction_run":4,"strategy_id":"s","mode":"ACTIVE"}]`, want: `account "main" prediction_run must be between 1 and 3`},
+		{name: "account prediction run negative", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","prediction_run":-1,"strategy_id":"s","mode":"ACTIVE"}]`, want: `account "main" prediction_run must be between 1 and 3`},
 		{name: "account model too long", accounts: `[{"execution_account_id":"main","market_source":"POLYMARKET","prediction_model_id":"` + strings.Repeat("m", 201) + `","strategy_id":"s","mode":"ACTIVE"}]`, want: `account "main" prediction_model_id must contain at most 200 bytes`},
 		{name: "unknown source mode", mode: "REDIS", want: "DECISION_CYCLE_PREDICTION_SOURCE_MODE must be exactly DIRECT or SANDBOX"},
 		{name: "Kalshi account without credential", accounts: `[` + kalshiRow + `]`, kalshi: `[]`, want: `KALSHI account "kalshi:main" has no credential`},

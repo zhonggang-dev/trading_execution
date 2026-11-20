@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,11 +57,15 @@ func (source fakePredictionSource) Snapshot(context.Context, time.Time, time.Dur
 
 // fakeOrderBookSource 表示后端使用的 fakeOrderBookSource 类型。
 type fakeOrderBookSource struct {
+	mu sync.Mutex
+	// targets are the targets of the last capture; calls holds every capture.
 	targets []domain.BookTarget
+	calls   [][]domain.BookTarget
 	books   []domain.OrderBookSnapshot
 }
 
 type fakeOrderBookSnapshotRecorder struct {
+	mu      sync.Mutex
 	batches []domain.OrderBookSnapshotBatch
 	err     error
 }
@@ -69,6 +74,8 @@ func (recorder *fakeOrderBookSnapshotRecorder) ClaimBatch(
 	_ context.Context,
 	batch domain.OrderBookSnapshotBatch,
 ) (domain.OrderBookSnapshotBatch, bool, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	if recorder.err != nil {
 		return domain.OrderBookSnapshotBatch{}, false, recorder.err
 	}
@@ -79,7 +86,10 @@ func (recorder *fakeOrderBookSnapshotRecorder) ClaimBatch(
 // Capture 返回模拟行情快照。Like a real source it only returns books of the
 // requested tokens; a token without a configured book is left to alignBooks.
 func (source *fakeOrderBookSource) Capture(_ context.Context, _ time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, error) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
 	source.targets = targets
+	source.calls = append(source.calls, append([]domain.BookTarget(nil), targets...))
 	requested := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		requested[target.TokenID] = struct{}{}
@@ -95,12 +105,14 @@ func (source *fakeOrderBookSource) Capture(_ context.Context, _ time.Time, targe
 
 // fakeStrategy 表示后端使用的 fakeStrategy 类型。
 type fakeStrategy struct {
+	mu       sync.Mutex
 	request  domain.StrategyDecisionRequest
 	response domain.StrategyDecisionResponse
 }
 
 // matrixStrategy 表示后端使用的 matrixStrategy 类型。
 type matrixStrategy struct {
+	mu       sync.Mutex
 	requests []domain.StrategyDecisionRequest
 }
 
@@ -123,7 +135,9 @@ func (contextHijackStrategy) Decide(_ context.Context, request domain.StrategyDe
 
 // Decide 记录策略输入并返回模拟决策。
 func (strategy *matrixStrategy) Decide(_ context.Context, request domain.StrategyDecisionRequest) (domain.StrategyDecisionResponse, error) {
+	strategy.mu.Lock()
 	strategy.requests = append(strategy.requests, request)
+	strategy.mu.Unlock()
 	evaluations := make([]domain.StrategyEvaluation, 0)
 	for _, prediction := range request.Predictions {
 		for _, outcome := range prediction.Outcomes {
@@ -155,6 +169,8 @@ func (strategy *matrixStrategy) Decide(_ context.Context, request domain.Strateg
 
 // Decide 记录策略输入并返回模拟决策。
 func (strategy *fakeStrategy) Decide(_ context.Context, request domain.StrategyDecisionRequest) (domain.StrategyDecisionResponse, error) {
+	strategy.mu.Lock()
+	defer strategy.mu.Unlock()
 	strategy.request = request
 	strategy.response.CycleID = request.CycleID
 	strategy.response.InputID = request.InputID
@@ -164,6 +180,8 @@ func (strategy *fakeStrategy) Decide(_ context.Context, request domain.StrategyD
 
 // fakeRecorder 表示后端使用的 fakeRecorder 类型。
 type fakeRecorder struct {
+	mu                       sync.Mutex
+	inputs                   map[string]domain.StrategyDecisionRequest
 	inputRecorded            bool
 	outputRecorded           bool
 	inputError               error
@@ -181,12 +199,37 @@ type fakeRecorder struct {
 
 // ClaimInput 模拟幂等认领并保存测试数据。
 func (recorder *fakeRecorder) ClaimInput(_ context.Context, request domain.StrategyDecisionRequest) (domain.StrategyDecisionRequest, bool, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	recorder.inputRecorded = true
+	if recorder.inputError == nil {
+		if recorder.inputs == nil {
+			recorder.inputs = make(map[string]domain.StrategyDecisionRequest)
+		}
+		if stored, exists := recorder.inputs[request.CycleID]; exists {
+			if stored.InputID != request.InputID {
+				return domain.StrategyDecisionRequest{}, false, port.ErrDecisionConflict
+			}
+			return stored, false, nil
+		}
+		recorder.inputs[request.CycleID] = request
+	}
 	return request, true, recorder.inputError
+}
+
+// FindInput returns the input claimed earlier for the cycle, like the
+// PostgreSQL recorder does on a replay of the boundary.
+func (recorder *fakeRecorder) FindInput(_ context.Context, cycleID string) (domain.StrategyDecisionRequest, bool, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	stored, found := recorder.inputs[cycleID]
+	return stored, found, nil
 }
 
 // ClaimOutput 模拟幂等认领并保存测试数据。
 func (recorder *fakeRecorder) ClaimOutput(_ context.Context, response domain.StrategyDecisionResponse, intents []domain.OrderIntent, submissionEnabled bool) (domain.StrategyDecisionResponse, bool, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	recorder.outputRecorded = true
 	recorder.claimedOutputs = append(recorder.claimedOutputs, response)
 	recorder.claimedIntents = append(recorder.claimedIntents, intents...)
@@ -204,6 +247,8 @@ func (recorder *fakeRecorder) ClaimOutput(_ context.Context, response domain.Str
 }
 
 func (recorder *fakeRecorder) CountUnresolvedIntentsForAccounts(_ context.Context, executionAccountIDs []string) (int, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	if recorder.unresolvedCountError != nil {
 		return 0, recorder.unresolvedCountError
 	}
@@ -224,11 +269,14 @@ func (recorder *fakeRecorder) CountUnresolvedIntentsForAccounts(_ context.Contex
 }
 
 type coverageBuyExitStrategy struct {
+	mu       sync.Mutex
 	requests []domain.StrategyDecisionRequest
 }
 
 func (strategy *coverageBuyExitStrategy) Decide(_ context.Context, request domain.StrategyDecisionRequest) (domain.StrategyDecisionResponse, error) {
+	strategy.mu.Lock()
 	strategy.requests = append(strategy.requests, request)
+	strategy.mu.Unlock()
 	evaluations := make([]domain.StrategyEvaluation, 0, len(request.Predictions)*2)
 	for _, prediction := range request.Predictions {
 		for _, outcome := range prediction.Outcomes {
@@ -268,6 +316,8 @@ func (strategy *coverageBuyExitStrategy) Decide(_ context.Context, request domai
 }
 
 func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, activeAccountIDs []string, cycleID string, side domain.Side, limit int) ([]domain.DecisionIntentDelivery, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	recorder.claimAccountCalls = append(recorder.claimAccountCalls, append([]string(nil), activeAccountIDs...))
 	recorder.claimSideCalls = append(recorder.claimSideCalls, side)
 	active := make(map[string]struct{}, len(activeAccountIDs))
@@ -292,6 +342,8 @@ func (recorder *fakeRecorder) ClaimPendingIntents(_ context.Context, activeAccou
 }
 
 func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, activeAccountIDs []string, _ time.Time, side domain.Side, limit int) (int, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	recorder.requeueCalls++
 	recorder.requeueAccountCalls = append(recorder.requeueAccountCalls, append([]string(nil), activeAccountIDs...))
 	recorder.requeueSideCalls = append(recorder.requeueSideCalls, side)
@@ -319,6 +371,8 @@ func (recorder *fakeRecorder) RequeueStaleSubmitting(_ context.Context, activeAc
 }
 
 func (recorder *fakeRecorder) CompleteIntent(_ context.Context, clientOrderID string, attempt int, completion domain.DecisionIntentCompletion) error {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	for index := range recorder.deliveries {
 		delivery := &recorder.deliveries[index]
 		if delivery.ClientOrderID == clientOrderID && delivery.Attempt == attempt {
@@ -333,6 +387,8 @@ func (recorder *fakeRecorder) CompleteIntent(_ context.Context, clientOrderID st
 }
 
 func (recorder *fakeRecorder) ListIntents(_ context.Context, cycleID string) ([]domain.DecisionIntentDelivery, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	result := make([]domain.DecisionIntentDelivery, 0)
 	for _, delivery := range recorder.deliveries {
 		if delivery.CycleID == cycleID {
@@ -344,11 +400,14 @@ func (recorder *fakeRecorder) ListIntents(_ context.Context, cycleID string) ([]
 
 // fakeExecutor 表示后端使用的 fakeExecutor 类型。
 type fakeExecutor struct {
+	mu      sync.Mutex
 	intents []domain.OrderIntent
 }
 
 // Submit 记录模拟订单提交。
 func (executor *fakeExecutor) Submit(_ context.Context, intent domain.OrderIntent) (execution.SubmitResult, error) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
 	executor.intents = append(executor.intents, intent)
 	return execution.SubmitResult{Order: domain.Order{ID: "order-1", Intent: intent, Status: domain.OrderStatusAcknowledged}, Created: true}, nil
 }
@@ -741,11 +800,20 @@ func TestRunRoutesIndependentModelMarketsIntoFourWallets(t *testing.T) {
 	if len(result.Runs) != 4 || len(strategy.requests) != 4 {
 		t.Fatalf("runs/requests = %d/%d, want 4/4", len(result.Runs), len(strategy.requests))
 	}
-	if len(bookSource.targets) != 4 {
-		t.Fatalf("independent orderbook targets = %d, want four outcome tokens", len(bookSource.targets))
+	if len(bookSource.calls) != 4 {
+		t.Fatalf("orderbook captures = %d, want one per account", len(bookSource.calls))
 	}
-	if len(snapshotRecorder.batches) != 1 || snapshotRecorder.batches[0].SnapshotCount != 4 {
-		t.Fatalf("shared orderbook batches = %#v, want one four-token capture", snapshotRecorder.batches)
+	if len(snapshotRecorder.batches) != 4 {
+		t.Fatalf("orderbook batches = %#v, want one per account", snapshotRecorder.batches)
+	}
+	for _, batch := range snapshotRecorder.batches {
+		wantMarket := "market-echo"
+		if batch.ExecutionAccountID == "wallet-2" || batch.ExecutionAccountID == "wallet-3" {
+			wantMarket = "market-gemini"
+		}
+		if batch.SnapshotCount != 2 || batch.Snapshots[0].MarketID != wantMarket || batch.Snapshots[1].MarketID != wantMarket {
+			t.Fatalf("batch of %s = %#v, want only the two %s outcomes", batch.ExecutionAccountID, batch, wantMarket)
+		}
 	}
 	seenAccounts := make(map[string]struct{}, 4)
 	for _, request := range strategy.requests {
@@ -800,9 +868,12 @@ func TestRunSnapshotPersistenceFailureBlocksNewStrategyButRecoversOldIntents(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.Run(context.Background(), decisionAt)
-	if err == nil || !strings.Contains(err.Error(), "claim shared orderbook snapshot batch") {
+	result, err := service.Run(context.Background(), decisionAt)
+	if err == nil || !strings.Contains(err.Error(), "claim orderbook snapshot batch of account-test-v2") {
 		t.Fatalf("Run() error = %v", err)
+	}
+	if len(result.Runs) != 1 || result.Runs[0].FailureStage != FailureStageOrderBooks || result.Runs[0].Error == nil {
+		t.Fatalf("runs = %#v, want the account stopped at its orderbook batch", result.Runs)
 	}
 	if len(strategy.requests) != 0 || recorder.inputRecorded || recorder.outputRecorded {
 		t.Fatalf("new strategy work after snapshot failure: strategy=%d input=%t output=%t",
@@ -1089,11 +1160,13 @@ func TestAccountEntryGateRoutesOnlyV41FlashPredictionsToWallet6AndWallet7(t *tes
 	oldGeminiPrediction.SourceJobID = "job-old-gemini"
 	oldGeminiPrediction.SandboxID = "sandbox-gemini"
 	oldGeminiPrediction.Model.Name = "gemini-3.6-flash"
+	// wallet-6 and wallet-7 lead their strategy groups; the sell-only echo
+	// accounts follow and have no BUY predictions to gate.
 	bindings := []domain.StrategyExecutionBinding{
-		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main"},
-		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-1"},
 		{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-6"},
 		{PredictionModelID: "v4.1 flash", ModelID: "deepseek_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
+		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "main"},
+		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-1"},
 	}
 	strategy := &matrixStrategy{}
 	service, err := newTestService(Params{
@@ -1412,7 +1485,7 @@ func TestRunRoutesCompletedResultsForDifferentModelsWithoutSyntheticPairs(t *tes
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{
 			{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main"},
-			{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2"},
+			{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-2"},
 		},
 		Venue: "polymarket-paper",
 	})
@@ -1515,7 +1588,7 @@ func TestRunRoutesIndependentCompletedGenerations(t *testing.T) {
 		RequireCompleteModelCoverage: true,
 		Bindings: []domain.StrategyExecutionBinding{
 			{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main"},
-			{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2"},
+			{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-2"},
 		},
 		Venue: "polymarket-paper",
 	})
@@ -2675,12 +2748,14 @@ func testExecutionBinding() domain.StrategyExecutionBinding {
 	}
 }
 
+// fourWalletBindings gives every wallet its own strategy, so no wallet waits
+// for another model's leader (see the leader gate tests for that rule).
 func fourWalletBindings() []domain.StrategyExecutionBinding {
 	return []domain.StrategyExecutionBinding{
 		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "main"},
 		{PredictionModelID: "echo-producer-v7", ModelID: "echo", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-1"},
-		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV1, ExecutionAccountID: "wallet-2"},
-		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-3"},
+		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: "gemini_strategy_a", ExecutionAccountID: "wallet-2"},
+		{PredictionModelID: "gemini-3.6-flash", ModelID: "gemini_masked", StrategyID: "gemini_strategy_b", ExecutionAccountID: "wallet-3"},
 	}
 }
 
@@ -3214,18 +3289,28 @@ func TestRunGivesEachAccountOnlyItsOwnVenue(t *testing.T) {
 			}
 		}
 	}
+	// Each account captures only its own venue's books.
 	var kalshiLotTarget bool
 	kalshiTargets := 0
-	for _, target := range bookSource.targets {
-		if target.MarketSource.Normalize() == domain.MarketSourceKalshi {
-			kalshiTargets++
-		}
-		if target.TokenID == "kalshi:KXLOT:YES" && target.OutcomeID == "YES" {
-			kalshiLotTarget = true
+	if len(bookSource.calls) != 2 {
+		t.Fatalf("book captures = %#v, want one per account", bookSource.calls)
+	}
+	for _, call := range bookSource.calls {
+		venue := call[0].MarketSource.Normalize()
+		for _, target := range call {
+			if target.MarketSource.Normalize() != venue {
+				t.Fatalf("one capture mixes venues: %#v", call)
+			}
+			if venue == domain.MarketSourceKalshi {
+				kalshiTargets++
+			}
+			if target.TokenID == "kalshi:KXLOT:YES" && target.OutcomeID == "YES" {
+				kalshiLotTarget = true
+			}
 		}
 	}
 	if kalshiTargets != 3 || !kalshiLotTarget {
-		t.Fatalf("book targets = %#v, want both Kalshi outcomes and the Kalshi lot token", bookSource.targets)
+		t.Fatalf("book targets = %#v, want both Kalshi outcomes and the Kalshi lot token", bookSource.calls)
 	}
 	if len(result.Runs) != 2 {
 		t.Fatalf("runs = %#v", result.Runs)
@@ -3423,10 +3508,11 @@ func TestNewAllowsAccountsToShareModelAndStrategy(t *testing.T) {
 	}
 }
 
-// TestPolymarketAccountsRunAndDeliverBeforeKalshiAccounts keeps a slow Kalshi
-// call from delaying Polymarket: "kalshi:main" sorts before "main" by name,
-// but every Polymarket account runs and delivers first.
-func TestPolymarketAccountsRunAndDeliverBeforeKalshiAccounts(t *testing.T) {
+// TestNormalizeBindingsKeepsConfigurationOrder: accounts run in configuration
+// order inside each venue lane (the venues run in parallel). Durable delivery
+// recovery, which runs before the lanes, still drains Polymarket accounts
+// first.
+func TestNormalizeBindingsKeepsConfigurationOrder(t *testing.T) {
 	bindings, err := normalizeBindings([]domain.StrategyExecutionBinding{
 		{ModelID: "v4.1 flash", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi},
 		{ModelID: "v4.1 flash", StrategyID: domain.StrategyIDMultfactorV2, ExecutionAccountID: "wallet-7"},
@@ -3440,7 +3526,7 @@ func TestPolymarketAccountsRunAndDeliverBeforeKalshiAccounts(t *testing.T) {
 	for _, binding := range bindings {
 		order = append(order, binding.ExecutionAccountID)
 	}
-	if got := strings.Join(order, ","); got != "main,wallet-6,wallet-7,kalshi:main" {
+	if got := strings.Join(order, ","); got != "kalshi:main,wallet-7,main,wallet-6" {
 		t.Fatalf("binding order = %s", got)
 	}
 	if got := strings.Join(executionAccountIDs(bindings), ","); got != "main,wallet-6,wallet-7,kalshi:main" {

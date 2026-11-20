@@ -43,6 +43,12 @@ func (recorder *replayDecisionRecorder) ClaimInput(_ context.Context, request do
 	return request, true, nil
 }
 
+// FindInput 返回同一决策周期已冻结的算法输入。
+func (recorder *replayDecisionRecorder) FindInput(_ context.Context, cycleID string) (domain.StrategyDecisionRequest, bool, error) {
+	stored, found := recorder.inputs[cycleID]
+	return stored, found, nil
+}
+
 // ClaimOutput 幂等保存同一决策周期首次通过校验的算法输出。
 func (recorder *replayDecisionRecorder) ClaimOutput(_ context.Context, response domain.StrategyDecisionResponse, intents []domain.OrderIntent, submissionEnabled bool) (domain.StrategyDecisionResponse, bool, error) {
 	if stored, ok := recorder.outputs[response.CycleID]; ok {

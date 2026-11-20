@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,13 +60,17 @@ func isolationSnapshot() domain.PredictionSnapshot {
 // exitStrategy skips every prediction outcome and exits every lot. Accounts in
 // block wait for their context to end, like a stuck strategy service.
 type exitStrategy struct {
+	mu       sync.Mutex
 	requests []domain.StrategyDecisionRequest
 	block    map[string]bool
 }
 
 func (strategy *exitStrategy) Decide(ctx context.Context, request domain.StrategyDecisionRequest) (domain.StrategyDecisionResponse, error) {
+	strategy.mu.Lock()
 	strategy.requests = append(strategy.requests, request)
-	if strategy.block[request.Context.ExecutionAccountID] {
+	blocked := strategy.block[request.Context.ExecutionAccountID]
+	strategy.mu.Unlock()
+	if blocked {
 		<-ctx.Done()
 		return domain.StrategyDecisionResponse{}, ctx.Err()
 	}
@@ -124,6 +129,8 @@ func newAppendingRecorder(preloaded ...domain.DecisionIntentDelivery) appendingR
 func (recorder appendingRecorder) ClaimOutput(
 	_ context.Context, response domain.StrategyDecisionResponse, intents []domain.OrderIntent, submissionEnabled bool,
 ) (domain.StrategyDecisionResponse, bool, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	recorder.outputRecorded = true
 	recorder.claimedOutputs = append(recorder.claimedOutputs, response)
 	recorder.claimedIntents = append(recorder.claimedIntents, intents...)
@@ -141,11 +148,14 @@ func (recorder appendingRecorder) ClaimOutput(
 
 // scriptedExecutor acknowledges every intent except the scripted ones.
 type scriptedExecutor struct {
+	mu       sync.Mutex
 	intents  []domain.OrderIntent
 	statuses map[string]domain.OrderStatus // client_order_id -> status; "" = no durable order id
 }
 
 func (executor *scriptedExecutor) Submit(_ context.Context, intent domain.OrderIntent) (port.OrderSubmitResult, error) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
 	executor.intents = append(executor.intents, intent)
 	status, scripted := executor.statuses[intent.ClientOrderID]
 	if !scripted {
@@ -257,10 +267,28 @@ func runFor(t *testing.T, result RunResult, account string) BindingRunResult {
 	return BindingRunResult{}
 }
 
+// assertCalled checks which accounts reached the strategy. The two venues run
+// as parallel lanes, so only the order inside each venue is deterministic.
 func assertCalled(t *testing.T, strategy *exitStrategy, want ...string) {
 	t.Helper()
-	if got := strings.Join(strategy.calledAccounts(), ","); got != strings.Join(want, ",") {
-		t.Fatalf("strategy called for %q, want %q", got, strings.Join(want, ","))
+	assertVenueOrder(t, strategy.calledAccounts(), want)
+}
+
+func assertVenueOrder(t *testing.T, got, want []string) {
+	t.Helper()
+	byVenue := func(accounts []string, kalshi bool) string {
+		kept := make([]string, 0, len(accounts))
+		for _, account := range accounts {
+			if domain.IsKalshiExecutionAccount(account) == kalshi {
+				kept = append(kept, account)
+			}
+		}
+		return strings.Join(kept, ",")
+	}
+	for _, kalshi := range []bool{false, true} {
+		if byVenue(got, kalshi) != byVenue(want, kalshi) {
+			t.Fatalf("strategy called for %q, want %q (order compared per venue)", strings.Join(got, ","), strings.Join(want, ","))
+		}
 	}
 }
 
@@ -327,8 +355,14 @@ func TestRunExcludesAccountWithBrokenInputAndOthersStillSell(t *testing.T) {
 					t.Fatalf("excluded account %s submitted %#v", testCase.broken, intent)
 				}
 			}
-			if len(fixture.snapshots.batches) != 1 {
-				t.Fatalf("snapshot batches = %d, want 1", len(fixture.snapshots.batches))
+			// Every healthy account froze its own books; the broken one captured nothing.
+			if len(fixture.snapshots.batches) != len(healthy) {
+				t.Fatalf("snapshot batches = %d, want one per healthy account", len(fixture.snapshots.batches))
+			}
+			for _, batch := range fixture.snapshots.batches {
+				if batch.ExecutionAccountID == testCase.broken {
+					t.Fatalf("excluded account %s captured books", testCase.broken)
+				}
 			}
 		})
 	}
@@ -351,9 +385,11 @@ func TestRunExcludesOnlyAccountsWithConflictingLotIdentity(t *testing.T) {
 				t.Fatalf("run %s = %#v, want a target conflict", account, run)
 			}
 		}
-		for _, target := range fixture.books.targets {
-			if target.TokenID == "orphan-token" {
-				t.Fatalf("conflicting token %#v was captured", target)
+		for _, call := range fixture.books.calls {
+			for _, target := range call {
+				if target.TokenID == "orphan-token" {
+					t.Fatalf("conflicting token %#v was captured", target)
+				}
 			}
 		}
 	})
@@ -374,26 +410,41 @@ func TestRunExcludesOnlyAccountsWithConflictingLotIdentity(t *testing.T) {
 	})
 }
 
-func TestRunSharedTargetsMatchAccountUnion(t *testing.T) {
+// TestRunCapturesEachAccountsOwnTargets: every account captures exactly its
+// own predictions and lots, in condition/outcome order, and freezes them as its
+// own batch; nothing is captured once for the whole cycle.
+func TestRunCapturesEachAccountsOwnTargets(t *testing.T) {
 	fixture := newIsolationFixture()
 	if _, err := fixture.run(t, context.Background()); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	// Two Polymarket outcomes, two Kalshi outcomes and the Kalshi lot token, in
-	// condition/outcome order, exactly as the former global target build.
-	var tokens []string
-	for _, target := range fixture.books.targets {
-		tokens = append(tokens, target.TokenID)
+	want := map[string]string{
+		"main":                 "yes-token,no-token",
+		"wallet-6":             "yes-token,no-token",
+		"wallet-7":             "yes-token,no-token",
+		isolationKalshiAccount: "kalshi:KXLOT:YES,kalshi:KXTEST:YES,kalshi:KXTEST:NO",
 	}
-	if got := strings.Join(tokens, ","); got != "yes-token,no-token,kalshi:KXLOT:YES,kalshi:KXTEST:YES,kalshi:KXTEST:NO" {
-		t.Fatalf("targets = %s", got)
+	if len(fixture.snapshots.batches) != len(want) || len(fixture.books.calls) != len(want) {
+		t.Fatalf("batches/captures = %d/%d, want one per account", len(fixture.snapshots.batches), len(fixture.books.calls))
+	}
+	for _, batch := range fixture.snapshots.batches {
+		tokens := make([]string, 0, len(batch.Snapshots))
+		for _, snapshot := range batch.Snapshots {
+			tokens = append(tokens, snapshot.TokenID)
+		}
+		if got := strings.Join(tokens, ","); got != want[batch.ExecutionAccountID] {
+			t.Fatalf("batch of %s = %s, want %s", batch.ExecutionAccountID, got, want[batch.ExecutionAccountID])
+		}
+		if batch.PredictionSnapshotID != "predsnap-mixed-venue" || batch.TargetCount != batch.SnapshotCount {
+			t.Fatalf("batch = %#v", batch)
+		}
 	}
 }
 
 // venueFailingBookSource returns ERROR books with the given code for one
 // venue and the configured books for the other.
 type venueFailingBookSource struct {
-	fakeOrderBookSource
+	*fakeOrderBookSource
 	venue domain.MarketSource
 	code  string
 }
@@ -424,7 +475,7 @@ func TestRunDegradedVenueSkipsOnlyItsAccounts(t *testing.T) {
 	t.Run("Kalshi capture failed", func(t *testing.T) {
 		fixture := newIsolationFixture()
 		fixture.params.OrderBookSource = &venueFailingBookSource{
-			fakeOrderBookSource: *fixture.books, venue: domain.MarketSourceKalshi, code: domain.OrderBookErrorVenueCaptureFailed,
+			fakeOrderBookSource: fixture.books, venue: domain.MarketSourceKalshi, code: domain.OrderBookErrorVenueCaptureFailed,
 		}
 		result, err := fixture.run(t, context.Background())
 		if err == nil || !strings.Contains(err.Error(), isolationKalshiAccount) {
@@ -441,14 +492,24 @@ func TestRunDegradedVenueSkipsOnlyItsAccounts(t *testing.T) {
 		if lots["lot-main"] != domain.SideSell || lots["lot-w6"] != domain.SideSell || lots["lot-w7"] != domain.SideSell {
 			t.Fatalf("submitted lots = %#v, want every Polymarket exit delivered", lots)
 		}
-		if len(fixture.snapshots.batches) != 1 || fixture.snapshots.batches[0].ErrorCount != 3 {
-			t.Fatalf("batches = %#v, want one batch holding the three failed Kalshi books", fixture.snapshots.batches)
+		// The failed capture is still frozen as the Kalshi account's batch.
+		if len(fixture.snapshots.batches) != 4 {
+			t.Fatalf("batches = %d, want one per account", len(fixture.snapshots.batches))
+		}
+		for _, batch := range fixture.snapshots.batches {
+			wantErrors := 0
+			if batch.ExecutionAccountID == isolationKalshiAccount {
+				wantErrors = 3
+			}
+			if batch.ErrorCount != wantErrors {
+				t.Fatalf("batch of %s has %d ERROR books, want %d", batch.ExecutionAccountID, batch.ErrorCount, wantErrors)
+			}
 		}
 	})
 	t.Run("Polymarket capture failed", func(t *testing.T) {
 		fixture := newIsolationFixture()
 		fixture.params.OrderBookSource = &venueFailingBookSource{
-			fakeOrderBookSource: *fixture.books, venue: domain.MarketSourcePolymarket, code: domain.OrderBookErrorVenueCaptureFailed,
+			fakeOrderBookSource: fixture.books, venue: domain.MarketSourcePolymarket, code: domain.OrderBookErrorVenueCaptureFailed,
 		}
 		result, err := fixture.run(t, context.Background())
 		if err == nil || !strings.Contains(err.Error(), "wallet-6") {
@@ -467,7 +528,7 @@ func TestRunDegradedVenueSkipsOnlyItsAccounts(t *testing.T) {
 	t.Run("an ordinary ERROR book does not degrade the venue", func(t *testing.T) {
 		fixture := newIsolationFixture()
 		fixture.params.OrderBookSource = &venueFailingBookSource{
-			fakeOrderBookSource: *fixture.books, venue: domain.MarketSourceKalshi, code: "KALSHI_MARKET_NOT_TRADABLE",
+			fakeOrderBookSource: fixture.books, venue: domain.MarketSourceKalshi, code: "KALSHI_MARKET_NOT_TRADABLE",
 		}
 		result, err := fixture.run(t, context.Background())
 		if err != nil {
@@ -545,15 +606,88 @@ func TestRunCycleDeadlineMarksRemainingAccountsNotRun(t *testing.T) {
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run() error = %v, want the cycle deadline", err)
 	}
-	assertCalled(t, fixture.strategy, "main", "wallet-6")
+	// The Kalshi lane does not wait behind the stuck Polymarket account.
+	assertCalled(t, fixture.strategy, "main", "wallet-6", isolationKalshiAccount)
 	if run := runFor(t, result, "wallet-6"); run.StrategyTimedOut || run.FailureStage != FailureStageStrategy {
 		t.Fatalf("wallet-6 run = %#v, want a strategy failure that is not its own timeout", run)
 	}
-	for _, account := range []string{"wallet-7", isolationKalshiAccount} {
-		run := runFor(t, result, account)
-		if !run.NotRun || run.FailureStage != FailureStageCycleDeadline || !errors.Is(run.Error, context.DeadlineExceeded) {
-			t.Fatalf("run %s = %#v, want not run", account, run)
+	run := runFor(t, result, "wallet-7")
+	if !run.NotRun || run.FailureStage != FailureStageCycleDeadline || !errors.Is(run.Error, context.DeadlineExceeded) {
+		t.Fatalf("run wallet-7 = %#v, want not run", run)
+	}
+	if run := runFor(t, result, isolationKalshiAccount); run.Error != nil || len(run.Intents) != 1 {
+		t.Fatalf("Kalshi run = %#v, want its exit delivered in its own lane", run)
+	}
+}
+
+// blockingVenueBookSource blocks every capture of one venue until the
+// capture's context ends, like a venue that stopped answering.
+type blockingVenueBookSource struct {
+	*fakeOrderBookSource
+	venue domain.MarketSource
+}
+
+func (source *blockingVenueBookSource) Capture(ctx context.Context, decisionAt time.Time, targets []domain.BookTarget) ([]domain.OrderBookSnapshot, error) {
+	for _, target := range targets {
+		if target.MarketSource.Normalize() == source.venue {
+			<-ctx.Done()
+			return nil, ctx.Err()
 		}
+	}
+	return source.fakeOrderBookSource.Capture(ctx, decisionAt, targets)
+}
+
+// TestRunPolymarketLaneFinishesWhileKalshiLaneIsStuck: the two venues run in
+// parallel, so a Kalshi capture that never returns does not delay any
+// Polymarket account, and the cycle deadline still ends the stuck lane.
+func TestRunPolymarketLaneFinishesWhileKalshiLaneIsStuck(t *testing.T) {
+	fixture := newIsolationFixture()
+	fixture.params.OrderBookSource = &blockingVenueBookSource{fakeOrderBookSource: fixture.books, venue: domain.MarketSourceKalshi}
+	// The Kalshi account is configured first: if the venues ran one after
+	// the other, its stuck capture would leave every Polymarket account
+	// NotRun at the deadline.
+	bindings := isolationBindings()
+	reordered := append([]domain.StrategyExecutionBinding{bindings[len(bindings)-1]}, bindings[:len(bindings)-1]...)
+	if reordered[0].ExecutionAccountID != isolationKalshiAccount {
+		t.Fatalf("first binding = %s, want the Kalshi account", reordered[0].ExecutionAccountID)
+	}
+	fixture.params.Bindings = reordered
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	result, err := fixture.run(t, ctx)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), isolationKalshiAccount) {
+		t.Fatalf("Run() error = %v, want the Kalshi account's cycle deadline", err)
+	}
+	assertCalled(t, fixture.strategy, "main", "wallet-6", "wallet-7")
+	for _, account := range []string{"main", "wallet-6", "wallet-7"} {
+		if run := runFor(t, result, account); run.Error != nil || len(run.Intents) != 1 {
+			t.Fatalf("run %s = %#v, want its exit delivered", account, run)
+		}
+	}
+	if run := runFor(t, result, isolationKalshiAccount); run.FailureStage != FailureStageOrderBooks ||
+		!errors.Is(run.Error, context.DeadlineExceeded) {
+		t.Fatalf("Kalshi run = %#v, want its capture ended by the cycle deadline", run)
+	}
+	if result.VenueElapsed[domain.MarketSourcePolymarket] >= result.VenueElapsed[domain.MarketSourceKalshi] {
+		t.Fatalf("venue elapsed = %#v, want the Polymarket lane done before the stuck Kalshi lane", result.VenueElapsed)
+	}
+}
+
+// TestRunCycleCancellationIsReturned: cancelling the whole cycle while both
+// lanes run is still returned to the caller.
+func TestRunCycleCancellationIsReturned(t *testing.T) {
+	fixture := newIsolationFixture()
+	fixture.strategy.block["wallet-6"] = true
+	fixture.strategy.block[isolationKalshiAccount] = true
+	fixture.params.StrategyTimeout = time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	result, err := fixture.run(t, ctx)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want the cancellation", err)
+	}
+	if run := runFor(t, result, "wallet-7"); !run.NotRun || !errors.Is(run.Error, context.Canceled) {
+		t.Fatalf("wallet-7 run = %#v, want not run after the cancellation", run)
 	}
 }
 
@@ -701,12 +835,19 @@ func TestRunPredictionSourceUnavailableIsExitOnly(t *testing.T) {
 			if fixture.executor.buyCount() != 0 {
 				t.Fatalf("exit-only cycle submitted %d BUY orders", fixture.executor.buyCount())
 			}
-			if len(fixture.snapshots.batches) != 1 || fixture.snapshots.batches[0].PredictionSnapshotID != wantSnapshotID {
-				t.Fatalf("batches = %#v", fixture.snapshots.batches)
+			if len(fixture.snapshots.batches) != 4 {
+				t.Fatalf("batches = %#v, want one per account", fixture.snapshots.batches)
 			}
-			for _, target := range fixture.books.targets {
-				if target.TokenID == "kalshi:KXTEST:YES" {
-					t.Fatal("an exit-only cycle captured a prediction-only token")
+			for _, batch := range fixture.snapshots.batches {
+				if batch.PredictionSnapshotID != wantSnapshotID || batch.SnapshotCount != 1 {
+					t.Fatalf("batch = %#v, want only the account's lot under the local snapshot id", batch)
+				}
+			}
+			for _, call := range fixture.books.calls {
+				for _, target := range call {
+					if target.TokenID == "kalshi:KXTEST:YES" {
+						t.Fatal("an exit-only cycle captured a prediction-only token")
+					}
 				}
 			}
 		})
@@ -762,43 +903,73 @@ func TestRunPredictionUnavailableKeepsConfiguredSellOnlyReason(t *testing.T) {
 	}
 }
 
-// firstWriterSnapshotRecorder keeps the first batch of a decision_at, like
-// the PostgreSQL recorder, and rejects a different one.
+// firstWriterSnapshotRecorder keeps the first batch of a (decision_at,
+// account), like the PostgreSQL recorder, and rejects a different one.
 type firstWriterSnapshotRecorder struct {
-	stored map[time.Time]domain.OrderBookSnapshotBatch
+	mu     sync.Mutex
+	stored map[string]domain.OrderBookSnapshotBatch
 }
 
 func (recorder *firstWriterSnapshotRecorder) ClaimBatch(_ context.Context, batch domain.OrderBookSnapshotBatch) (domain.OrderBookSnapshotBatch, bool, error) {
-	if existing, exists := recorder.stored[batch.DecisionAt]; exists {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	key := batch.DecisionAt.Format(time.RFC3339) + "/" + batch.ExecutionAccountID
+	if existing, exists := recorder.stored[key]; exists {
 		if existing.SnapshotSetID != batch.SnapshotSetID || existing.PredictionSnapshotID != batch.PredictionSnapshotID {
 			return domain.OrderBookSnapshotBatch{}, false, port.ErrOrderBookSnapshotConflict
 		}
 		return existing, false, nil
 	}
-	recorder.stored[batch.DecisionAt] = batch
+	recorder.stored[key] = batch
 	return batch, true, nil
 }
 
 // TestRunReplayAfterExitOnlyCycleNeverEntries replays the same boundary with
-// predictions available again: the first-writer batch claim rejects it, so
-// the boundary can never be upgraded to an entry cycle.
+// predictions available again: every account reuses the input frozen by the
+// exit-only attempt (no predictions, the same books), captures nothing new,
+// and so the boundary can never be upgraded to an entry cycle.
 func TestRunReplayAfterExitOnlyCycleNeverEntries(t *testing.T) {
 	fixture := newIsolationFixture()
-	recorder := &firstWriterSnapshotRecorder{stored: map[time.Time]domain.OrderBookSnapshotBatch{}}
+	recorder := &firstWriterSnapshotRecorder{stored: map[string]domain.OrderBookSnapshotBatch{}}
 	fixture.params.SnapshotRecorder = recorder
 	fixture.params.PredictionSource = unavailablePredictionSource()
 	if _, err := fixture.run(t, context.Background()); !errors.Is(err, port.ErrPredictionSourceUnavailable) {
 		t.Fatalf("first Run() error = %v", err)
 	}
-	calls := len(fixture.strategy.requests)
-	fixture.params.PredictionSource = fakePredictionSource{snapshot: isolationSnapshot()}
-	_, err := fixture.run(t, context.Background())
-	if !errors.Is(err, port.ErrOrderBookSnapshotConflict) {
-		t.Fatalf("replay Run() error = %v, want the snapshot batch conflict", err)
+	firstRequests := make(map[string]domain.StrategyDecisionRequest)
+	for _, request := range fixture.strategy.requests {
+		firstRequests[request.Context.ExecutionAccountID] = request
 	}
-	if len(fixture.strategy.requests) != calls || fixture.executor.buyCount() != 0 {
-		t.Fatalf("replay called the strategy %d more times / submitted %d BUY orders",
-			len(fixture.strategy.requests)-calls, fixture.executor.buyCount())
+	captures, batches := len(fixture.books.calls), len(recorder.stored)
+	fixture.params.PredictionSource = fakePredictionSource{snapshot: isolationSnapshot()}
+	result, err := fixture.run(t, context.Background())
+	if err != nil {
+		t.Fatalf("replay Run() error = %v", err)
+	}
+	if len(fixture.books.calls) != captures || len(recorder.stored) != batches {
+		t.Fatalf("replay captured books again: captures %d->%d, batches %d->%d",
+			captures, len(fixture.books.calls), batches, len(recorder.stored))
+	}
+	replayed := fixture.strategy.requests[len(firstRequests):]
+	if len(replayed) != len(firstRequests) {
+		t.Fatalf("replay strategy calls = %d, want %d", len(replayed), len(firstRequests))
+	}
+	for _, request := range replayed {
+		first := firstRequests[request.Context.ExecutionAccountID]
+		if request.InputID != first.InputID || len(request.Predictions) != 0 {
+			t.Fatalf("replayed request of %s = %s with %d predictions, want the stored exit-only input %s",
+				request.Context.ExecutionAccountID, request.InputID, len(request.Predictions), first.InputID)
+		}
+	}
+	if fixture.executor.buyCount() != 0 {
+		t.Fatalf("replay submitted %d BUY orders", fixture.executor.buyCount())
+	}
+	for _, run := range result.Runs {
+		if run.PredictionCount != 0 || run.EntrySubmissionEnabled ||
+			run.EntryBlockReason != domain.StrategyEntryBlockPredictionSourceUnavailable {
+			t.Fatalf("replayed run %s = %d predictions, entry %v/%q, want the stored exit-only state",
+				run.Context.ExecutionAccountID, run.PredictionCount, run.EntrySubmissionEnabled, run.EntryBlockReason)
+		}
 	}
 }
 

@@ -13,7 +13,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// OrderBookSnapshotRecorder stores one complete shared capture per decision boundary.
+// OrderBookSnapshotRecorder stores one complete capture per decision boundary
+// and execution account (migration 0053). Rows with an empty account are the
+// legacy batches shared by every account of a boundary.
 type OrderBookSnapshotRecorder struct {
 	db  *sql.DB
 	now func() time.Time
@@ -38,7 +40,7 @@ func (recorder *OrderBookSnapshotRecorder) ClaimBatch(
 	batch domain.OrderBookSnapshotBatch,
 ) (stored domain.OrderBookSnapshotBatch, created bool, resultErr error) {
 	validated, err := domain.NewOrderBookSnapshotBatch(
-		batch.DecisionAt, batch.PredictionSnapshotID, batch.TargetCount, batch.Snapshots,
+		batch.DecisionAt, batch.ExecutionAccountID, batch.PredictionSnapshotID, batch.TargetCount, batch.Snapshots,
 	)
 	if err != nil || validated.SnapshotSetID != batch.SnapshotSetID ||
 		validated.SnapshotCount != batch.SnapshotCount || validated.OKCount != batch.OKCount ||
@@ -60,12 +62,12 @@ func (recorder *OrderBookSnapshotRecorder) ClaimBatch(
 	createdAt := recorder.now().UTC()
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO strategy_orderbook_snapshot_batches (
-			decision_at, prediction_snapshot_id, snapshot_set_id,
+			decision_at, execution_account_id, prediction_snapshot_id, snapshot_set_id,
 			target_count, snapshot_count, ok_count, empty_count,
 			missing_count, error_count, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		ON CONFLICT (decision_at) DO NOTHING`,
-		validated.DecisionAt, validated.PredictionSnapshotID, validated.SnapshotSetID,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		ON CONFLICT (decision_at, execution_account_id) DO NOTHING`,
+		validated.DecisionAt, validated.ExecutionAccountID, validated.PredictionSnapshotID, validated.SnapshotSetID,
 		validated.TargetCount, validated.SnapshotCount, validated.OKCount, validated.EmptyCount,
 		validated.MissingCount, validated.ErrorCount, createdAt)
 	if err != nil {
@@ -75,14 +77,14 @@ func (recorder *OrderBookSnapshotRecorder) ClaimBatch(
 		return domain.OrderBookSnapshotBatch{}, false, fmt.Errorf("claim orderbook snapshot batch: %w", err)
 	}
 	if !oneRow(result) {
-		existing, err := loadOrderBookSnapshotBatchHeader(ctx, tx, validated.DecisionAt)
+		existing, err := loadOrderBookSnapshotBatchHeader(ctx, tx, validated.DecisionAt, validated.ExecutionAccountID)
 		if err != nil {
 			return domain.OrderBookSnapshotBatch{}, false, err
 		}
 		if !sameOrderBookSnapshotBatch(existing, validated) {
 			return domain.OrderBookSnapshotBatch{}, false, port.ErrOrderBookSnapshotConflict
 		}
-		storedSnapshots, err := loadOrderBookSnapshots(ctx, tx, validated.DecisionAt)
+		storedSnapshots, err := loadOrderBookSnapshots(ctx, tx, validated.DecisionAt, validated.ExecutionAccountID)
 		if err != nil {
 			return domain.OrderBookSnapshotBatch{}, false, err
 		}
@@ -110,17 +112,17 @@ func (recorder *OrderBookSnapshotRecorder) ClaimBatch(
 				decision_at, market_source, market_id, condition_id, token_id,
 				outcome_index, outcome_id, status, error_code, source_at, observed_at,
 				tick_size, min_order_size, best_bid, best_ask, depth_limit,
-				bids, asks, created_at
+				bids, asks, created_at, execution_account_id
 			) VALUES (
 				$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
 				$12::numeric,$13::numeric,$14::numeric,$15::numeric,$16,
-				$17::jsonb,$18::jsonb,$19
+				$17::jsonb,$18::jsonb,$19,$20
 			)`,
 			validated.DecisionAt, snapshot.MarketSource, snapshot.MarketID, snapshot.ConditionID, snapshot.TokenID,
 			snapshot.OutcomeIndex, snapshot.OutcomeID, snapshot.Status, snapshot.ErrorCode,
 			nullTime(snapshot.SourceAt), snapshot.ObservedAt, nullableOrderBookDecimal(snapshot.TickSize),
 			nullableOrderBookDecimal(snapshot.MinOrderSize), nullableOrderBookDecimal(snapshot.BestBid), nullableOrderBookDecimal(snapshot.BestAsk),
-			snapshot.DepthLimit, bids, asks, createdAt); err != nil {
+			snapshot.DepthLimit, bids, asks, createdAt, validated.ExecutionAccountID); err != nil {
 			if isUniqueViolation(err) {
 				return domain.OrderBookSnapshotBatch{}, false, port.ErrOrderBookSnapshotConflict
 			}
@@ -134,15 +136,17 @@ func (recorder *OrderBookSnapshotRecorder) ClaimBatch(
 	return validated, true, nil
 }
 
-func loadOrderBookSnapshots(ctx context.Context, tx *sql.Tx, decisionAt time.Time) ([]domain.OrderBookSnapshot, error) {
+func loadOrderBookSnapshots(
+	ctx context.Context, tx *sql.Tx, decisionAt time.Time, executionAccountID string,
+) ([]domain.OrderBookSnapshot, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT market_source, market_id, condition_id, token_id, outcome_index,
 			outcome_id, status, error_code, source_at, observed_at,
 			tick_size::text, min_order_size::text, best_bid::text, best_ask::text,
 			depth_limit, bids, asks
 		FROM strategy_orderbook_snapshots
-		WHERE decision_at=$1
-		ORDER BY market_source, condition_id, outcome_index, token_id`, decisionAt.UTC())
+		WHERE decision_at=$1 AND execution_account_id=$2
+		ORDER BY market_source, condition_id, outcome_index, token_id`, decisionAt.UTC(), executionAccountID)
 	if err != nil {
 		return nil, fmt.Errorf("list stored orderbook snapshots: %w", err)
 	}
@@ -227,15 +231,17 @@ func sameStoredTime(left, right time.Time) bool {
 	return left.UTC().Truncate(time.Microsecond).Equal(right.UTC().Truncate(time.Microsecond))
 }
 
-func loadOrderBookSnapshotBatchHeader(ctx context.Context, tx *sql.Tx, decisionAt time.Time) (domain.OrderBookSnapshotBatch, error) {
+func loadOrderBookSnapshotBatchHeader(
+	ctx context.Context, tx *sql.Tx, decisionAt time.Time, executionAccountID string,
+) (domain.OrderBookSnapshotBatch, error) {
 	var batch domain.OrderBookSnapshotBatch
 	err := tx.QueryRowContext(ctx, `
-		SELECT decision_at, prediction_snapshot_id, snapshot_set_id,
+		SELECT decision_at, execution_account_id, prediction_snapshot_id, snapshot_set_id,
 			target_count, snapshot_count, ok_count, empty_count,
 			missing_count, error_count, created_at
 		FROM strategy_orderbook_snapshot_batches
-		WHERE decision_at=$1 FOR UPDATE`, decisionAt.UTC()).Scan(
-		&batch.DecisionAt, &batch.PredictionSnapshotID, &batch.SnapshotSetID,
+		WHERE decision_at=$1 AND execution_account_id=$2 FOR UPDATE`, decisionAt.UTC(), executionAccountID).Scan(
+		&batch.DecisionAt, &batch.ExecutionAccountID, &batch.PredictionSnapshotID, &batch.SnapshotSetID,
 		&batch.TargetCount, &batch.SnapshotCount, &batch.OKCount, &batch.EmptyCount,
 		&batch.MissingCount, &batch.ErrorCount, &batch.CreatedAt,
 	)
@@ -249,7 +255,7 @@ func loadOrderBookSnapshotBatchHeader(ctx context.Context, tx *sql.Tx, decisionA
 }
 
 func sameOrderBookSnapshotBatch(left, right domain.OrderBookSnapshotBatch) bool {
-	return left.DecisionAt.Equal(right.DecisionAt) &&
+	return left.DecisionAt.Equal(right.DecisionAt) && left.ExecutionAccountID == right.ExecutionAccountID &&
 		left.PredictionSnapshotID == right.PredictionSnapshotID && left.SnapshotSetID == right.SnapshotSetID &&
 		left.TargetCount == right.TargetCount && left.SnapshotCount == right.SnapshotCount &&
 		left.OKCount == right.OKCount && left.EmptyCount == right.EmptyCount &&

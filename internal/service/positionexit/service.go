@@ -501,13 +501,13 @@ type validateInputParams struct {
 	expectedDecisionAt time.Time
 }
 
-// predictionsForExitBinding 按上游生产者模型筛选退出预测，再投影为策略与执行侧稳定的逻辑模型。
-// 只修改预测副本，原始 PIT snapshot 始终保留上游 producer identity。
+// predictionsForExitBinding 按上游生产者模型和预测序号筛选退出预测，再投影为策略与执行侧稳定的逻辑模型。
+// 缺少该序号时不使用其他序号补齐。只修改预测副本，原始 PIT snapshot 始终保留上游 producer identity。
 func predictionsForExitBinding(predictions []domain.Prediction, binding domain.StrategyExecutionBinding) []domain.Prediction {
 	binding = binding.Normalize()
 	result := make([]domain.Prediction, 0)
 	for _, prediction := range predictions {
-		if strings.TrimSpace(prediction.Model.Name) == binding.PredictionModelID {
+		if binding.SelectsPrediction(prediction) {
 			cloned := prediction
 			cloned.Model.Name = binding.ModelID
 			result = append(result, cloned)

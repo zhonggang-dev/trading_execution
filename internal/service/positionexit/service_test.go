@@ -612,3 +612,22 @@ func sellResponse(request domain.PositionExitRequest) domain.PositionExitRespons
 		}},
 	}
 }
+
+// TestPredictionsForExitBindingSelectsOnlyItsRun: the exit input of an account
+// carries only its own model run, projected to its logical model; another run
+// never substitutes a missing one.
+func TestPredictionsForExitBindingSelectsOnlyItsRun(t *testing.T) {
+	first := domain.Prediction{PredictionID: "run-1", MarketID: "market-1", Model: domain.PredictionModel{Name: "flash"}}
+	second := first
+	second.PredictionID, second.PredictionRun = "run-2", 2
+	binding := domain.StrategyExecutionBinding{
+		PredictionModelID: "flash", PredictionRun: 2, ModelID: "logical", StrategyID: "brier_mid_edge_once", ExecutionAccountID: "wallet-2",
+	}
+	selected := predictionsForExitBinding([]domain.Prediction{first, second}, binding)
+	if len(selected) != 1 || selected[0].PredictionID != "run-2" || selected[0].Model.Name != "logical" {
+		t.Fatalf("selected = %#v, want only run 2", selected)
+	}
+	if selected := predictionsForExitBinding([]domain.Prediction{first}, binding); len(selected) != 0 {
+		t.Fatalf("selected = %#v, want no substitute for the missing run", selected)
+	}
+}

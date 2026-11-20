@@ -109,6 +109,8 @@ type Params struct {
 	RequireCompleteModelCoverage bool
 	// Bindings has one entry per execution account. Each account trades one
 	// venue (MarketSource) and only receives that venue's predictions and lots.
+	// The order is the execution order inside each venue, and the first active
+	// account of a (venue, strategy) group is that group's leader.
 	Bindings              []domain.StrategyExecutionBinding
 	PredictionSourceModes map[string]domain.PredictionSourceMode
 	Venue                 string
@@ -168,10 +170,16 @@ type Service struct {
 	predictionSourceModes        map[string]domain.PredictionSourceMode
 	activeBindings               []domain.StrategyExecutionBinding
 	// strategyBindings are the active bindings that still call the strategy;
-	// strategyEntryEnabledBindings additionally may emit BUY intents and are
-	// the only bindings whose prediction models a cycle has to select.
-	strategyBindings                 []domain.StrategyExecutionBinding
-	strategyEntryEnabledBindings     []domain.StrategyExecutionBinding
+	// strategyEntryEnabledBindings additionally may emit BUY intents. Their
+	// prediction models, plus their group leaders', are the ones a cycle
+	// selects (predictionModels).
+	strategyBindings             []domain.StrategyExecutionBinding
+	strategyEntryEnabledBindings []domain.StrategyExecutionBinding
+	// leaders maps every follower account to the leader of its (venue,
+	// strategy) group. predictionModels are the source models a cycle selects:
+	// those of the strategy accounts that may buy, plus their leaders'.
+	leaders                          map[string]domain.StrategyExecutionBinding
+	predictionModels                 []string
 	entryEnabledBindings             []domain.StrategyExecutionBinding
 	activeExecutionAccountIDs        []string
 	entryEnabledExecutionAccountIDs  []string
@@ -226,6 +234,9 @@ type BindingRunResult struct {
 	NotRun bool
 	// StrategyTimedOut marks an account whose own strategy call budget expired.
 	StrategyTimedOut bool
+	// LeaderGated counts the BUY predictions held back this cycle because the
+	// group leader's prediction of the same Sandbox had not arrived.
+	LeaderGated int
 	// FailureStage names where a failed account stopped (FailureStage*).
 	FailureStage           string
 	EntrySubmissionEnabled bool
@@ -258,8 +269,10 @@ type RunResult struct {
 	// DegradedVenues lists, in order, the venues whose whole book capture
 	// failed this cycle.
 	DegradedVenues []domain.MarketSource
-	Recovery       RecoveryResult
-	Runs           []BindingRunResult
+	// VenueElapsed is how long each venue lane took; lanes run in parallel.
+	VenueElapsed map[domain.MarketSource]time.Duration
+	Recovery     RecoveryResult
+	Runs         []BindingRunResult
 }
 
 // New 校验依赖和配置后创建当前服务实例。
@@ -315,6 +328,15 @@ func New(params Params) (*Service, error) {
 		return nil, fmt.Errorf("strategy-disabled accounts cannot exclude every active decision binding")
 	}
 	strategyEntryEnabledBindings := filterSubmissionEnabledBindings(entryEnabledBindings, strategyDisabledAccountSet)
+	leaders := groupLeaders(activeBindings)
+	selectionBindings := append([]domain.StrategyExecutionBinding(nil), strategyEntryEnabledBindings...)
+	for _, binding := range strategyEntryEnabledBindings {
+		if leader, follower := leaders[binding.ExecutionAccountID]; follower {
+			// A sell-only or paused leader still gates its followers, so its
+			// model must be selected even though it may not buy.
+			selectionBindings = append(selectionBindings, leader)
+		}
+	}
 	if params.Venue == "" {
 		return nil, fmt.Errorf("execution venue is required")
 	}
@@ -373,6 +395,8 @@ func New(params Params) (*Service, error) {
 		activeBindings:                   activeBindings,
 		strategyBindings:                 strategyBindings,
 		strategyEntryEnabledBindings:     strategyEntryEnabledBindings,
+		leaders:                          leaders,
+		predictionModels:                 configuredPredictionModels(selectionBindings),
 		entryEnabledBindings:             entryEnabledBindings,
 		activeExecutionAccountIDs:        executionAccountIDs(activeBindings),
 		entryEnabledExecutionAccountIDs:  executionAccountIDs(entryEnabledBindings),
@@ -389,14 +413,22 @@ func New(params Params) (*Service, error) {
 	}, nil
 }
 
-// Run 采集一次冻结决策快照，并只为未隔离的绑定调用策略和提交订单。
+// Run 为每个未隔离的账户冻结决策输入、调用策略并提交订单。
 //
-// Failures are scoped to what they affect. A broken account (lots or book
-// targets) is excluded on its own; a venue whose whole book capture fails
-// keeps only its accounts out of the strategy; one strategy call that exceeds
-// its budget fails only its account; an unavailable prediction source makes
-// the cycle exit-only. Shared dependencies (recovery infrastructure, a
-// malformed prediction snapshot, the snapshot batch claim, the cycle
+// Shared work runs first and in order: durable delivery recovery, the
+// prediction snapshot, every account's lots and the cross-account token
+// identity check. Then the Polymarket and Kalshi accounts run as two parallel
+// lanes; inside a lane accounts run one after another in configuration order.
+// Each account captures its own books (its predictions plus its lots) right
+// before its strategy call and freezes them as its own snapshot batch; a
+// replay of the boundary reuses the account's frozen input instead.
+//
+// Failures are scoped to what they affect. A broken account (lots, book
+// targets, its capture or its snapshot batch) is excluded on its own; a venue
+// capture that fails as a whole keeps only that account out of the strategy;
+// one strategy call that exceeds its budget fails only its account; an
+// unavailable prediction source makes the cycle exit-only. Shared dependencies
+// (recovery infrastructure, a malformed prediction snapshot, the cycle
 // deadline) still fail the whole cycle. The returned error joins every
 // problem, so a partly failed cycle is never reported as healthy.
 func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResult, error) {
@@ -418,47 +450,249 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 	if err != nil {
 		return result, err
 	}
-	snapshotID := predictions.snapshotID
-	selectedPredictions := predictions.selected
 	predictionUnavailable := predictions.unavailable != nil
-	result.PredictionSnapshotID = snapshotID
+	result.PredictionSnapshotID = predictions.snapshotID
 	result.PredictionSourceUnavailable = predictionUnavailable
 	if predictionUnavailable {
 		runErrors = append(runErrors, predictions.unavailable)
 	}
 	routedAccounts := service.routedAccounts()
-	inputs, err := service.prepareAccountInputs(ctx, decisionAt, routedAccounts, selectedPredictions)
+	inputs, err := service.prepareAccountInputs(ctx, decisionAt, routedAccounts, predictions)
 	if err != nil {
 		return result, err
 	}
-	targets, err := service.sharedTargets(selectedPredictions, routedAccounts, inputs)
-	if err != nil {
+	if err := service.excludeTargetConflicts(predictions.selected, routedAccounts, inputs); err != nil {
 		return result, err
 	}
-	books, err := service.orderBookSource.Capture(ctx, decisionAt, targets)
-	if err != nil {
-		return result, wrapError("capture orderbooks", err)
+	cycle := accountCycle{
+		decisionAt: decisionAt, predictions: predictions, predictionUnavailable: predictionUnavailable,
+		routedAccounts: routedAccounts, inputs: inputs,
 	}
+	runs := make([]BindingRunResult, len(service.bindings))
+	accountErrors := make([]error, len(service.bindings))
+	lanes := service.venueLanes()
+	laneElapsed := make([]time.Duration, len(lanes))
+	var wg sync.WaitGroup
+	for laneIndex, lane := range lanes {
+		wg.Add(1)
+		// Each lane writes only its own result slots, so no lock is needed;
+		// accounts never repeat across lanes.
+		go func(laneIndex int, lane venueLane) {
+			defer wg.Done()
+			startedAt := time.Now()
+			for _, index := range lane.bindingIndexes {
+				runs[index], accountErrors[index] = service.runAccount(ctx, cycle, service.bindings[index])
+			}
+			laneElapsed[laneIndex] = time.Since(startedAt)
+		}(laneIndex, lane)
+	}
+	wg.Wait()
+	result.Runs = runs
+	result.VenueElapsed = make(map[domain.MarketSource]time.Duration, len(lanes))
+	for laneIndex, lane := range lanes {
+		result.VenueElapsed[lane.venue] = laneElapsed[laneIndex]
+	}
+	degradedVenues := make(map[domain.MarketSource]struct{})
+	for index, run := range runs {
+		if run.VenueBooksUnavailable {
+			degradedVenues[service.bindings[index].MarketSource.Normalize()] = struct{}{}
+		}
+		if accountErrors[index] != nil {
+			runErrors = append(runErrors, bindingRunError(service.bindings[index], accountErrors[index]))
+		}
+	}
+	result.DegradedVenues = sortedMarketSources(degradedVenues)
+	return result, errors.Join(runErrors...)
+}
+
+// accountCycle is the shared, read-only input every account of one cycle
+// runs from. Lanes only read it.
+type accountCycle struct {
+	decisionAt            time.Time
+	predictions           cyclePredictions
+	predictionUnavailable bool
+	routedAccounts        map[string]struct{}
+	inputs                map[string]*accountInput
+}
+
+// venueLane is one venue's accounts, as indexes into service.bindings in
+// configuration order.
+type venueLane struct {
+	venue          domain.MarketSource
+	bindingIndexes []int
+}
+
+// venueLanes groups the configured accounts by venue, keeping configuration
+// order inside each venue and ordering the lanes by first appearance.
+func (service *Service) venueLanes() []venueLane {
+	lanes := make([]venueLane, 0, 2)
+	position := make(map[domain.MarketSource]int, 2)
+	for index, binding := range service.bindings {
+		venue := binding.MarketSource.Normalize()
+		laneIndex, exists := position[venue]
+		if !exists {
+			laneIndex = len(lanes)
+			position[venue] = laneIndex
+			lanes = append(lanes, venueLane{venue: venue})
+		}
+		lanes[laneIndex].bindingIndexes = append(lanes[laneIndex].bindingIndexes, index)
+	}
+	return lanes
+}
+
+// runAccount runs one account of the cycle: configuration skips, input
+// failures, its own book capture and snapshot batch, then the strategy call
+// and delivery. The returned error is the account's own failure.
+func (service *Service) runAccount(
+	ctx context.Context, cycle accountCycle, binding domain.StrategyExecutionBinding,
+) (BindingRunResult, error) {
+	executionContext := binding.Context()
+	if _, disabled := service.submissionDisabledAccountSet[binding.ExecutionAccountID]; disabled {
+		return BindingRunResult{
+			Context: executionContext, PredictionModelID: binding.PredictionModelID,
+			PredictionCount:        len(predictionsForBinding(cycle.predictions.selected, binding)),
+			OrderSubmissionEnabled: false, AccountSubmissionDisabled: true,
+		}, nil
+	}
+	if _, disabled := service.strategyDisabledAccountSet[binding.ExecutionAccountID]; disabled {
+		// The account stays active for reconciliation and durable delivery,
+		// but this cycle sends nothing about it to the strategy.
+		return BindingRunResult{
+			Context: executionContext, PredictionModelID: binding.PredictionModelID,
+			PredictionCount:        len(predictionsForBinding(cycle.predictions.selected, binding)),
+			OrderSubmissionEnabled: false, AccountStrategyDisabled: true,
+		}, nil
+	}
+	if _, routed := cycle.routedAccounts[binding.ExecutionAccountID]; !routed {
+		// The venue route cannot place orders (Kalshi maintenance-only):
+		// reconciliation and recovery go on, but nothing is asked of the
+		// strategy for this account in this cycle.
+		return BindingRunResult{
+			Context: executionContext, PredictionModelID: binding.PredictionModelID,
+			PredictionCount:        len(predictionsForBinding(cycle.predictions.selected, binding)),
+			OrderSubmissionEnabled: false, RouteUnavailable: true,
+		}, nil
+	}
+	input, prepared := cycle.inputs[binding.ExecutionAccountID]
+	if !prepared {
+		input = &accountInput{failure: &accountFailure{
+			stage: FailureStageInput, err: fmt.Errorf("account input was not prepared"),
+		}}
+	}
+	run := BindingRunResult{
+		Context: executionContext, PredictionModelID: binding.PredictionModelID,
+		PredictionCount: len(input.predictions), PositionCount: len(input.positions),
+		LeaderGated:            input.leaderGated,
+		OrderSubmissionEnabled: service.submitEnabled,
+	}
+	fail := func(stage string, err error) (BindingRunResult, error) {
+		run.FailureStage = stage
+		run.Error = err
+		return run, err
+	}
+	switch {
+	case input.failure != nil:
+		// A broken account is excluded, never treated as flat: no strategy
+		// call, no BUY and no SELL until its data is consistent again.
+		run.InputUnavailable = true
+		return fail(input.failure.stage,
+			fmt.Errorf("account input unavailable (%s): %w", input.failure.stage, input.failure.err))
+	case ctx.Err() != nil:
+		run.NotRun = true
+		return fail(FailureStageCycleDeadline, fmt.Errorf("decision cycle ended before this account ran: %w", ctx.Err()))
+	}
+	params := runBindingParams{
+		decisionAt: cycle.decisionAt, predictionSnapshotID: cycle.predictions.snapshotID, binding: executionContext,
+		predictions: input.predictions, positions: input.positions, submitEnabled: service.submitEnabled,
+	}
+	predictionUnavailable := cycle.predictionUnavailable
+	stored, found, err := service.recorder.FindInput(ctx, cycleID(executionContext, cycle.decisionAt))
+	if err != nil {
+		return fail(FailureStageInput, fmt.Errorf("find stored strategy input: %w", err))
+	}
+	if found {
+		// A replay of this boundary: the first frozen input, including its
+		// books, wins. Nothing is captured again, so a replay can never see
+		// different market data or predictions than the first attempt.
+		service.log().Info("decision cycle reuses stored strategy input",
+			"decision_at", cycle.decisionAt, "execution_account_id", binding.ExecutionAccountID,
+			"cycle_id", stored.CycleID, "input_id", stored.InputID)
+		params.storedRequest = &stored
+		params.predictions, params.positions = stored.Predictions, stored.Positions
+		run.PredictionCount, run.PositionCount = len(stored.Predictions), len(stored.Positions)
+		// An input frozen while the prediction source was down stays exit-only
+		// with the same reason, so its stored output replays unchanged.
+		predictionUnavailable = stored.PredictionSnapshotID == unavailablePredictionSnapshotID(cycle.decisionAt)
+	} else {
+		books, captureErr := service.captureAccountBooks(ctx, cycle, binding, input.targets)
+		if captureErr != nil {
+			return fail(FailureStageOrderBooks, captureErr)
+		}
+		if venueCaptureFailed(books) {
+			run.VenueBooksUnavailable = true
+			return fail(FailureStageOrderBooks,
+				fmt.Errorf("%s orderbooks unavailable this cycle", binding.MarketSource.Normalize()))
+		}
+		bindingBooks, selectErr := booksForTargets(input.targets, books)
+		if selectErr != nil {
+			return fail(FailureStageOrderBooks, selectErr)
+		}
+		params.books = bindingBooks
+	}
+	accountEntryDisabled := service.accountEntryDisabled(binding)
+	// Coverage is about the model delivering results, so predictions held by
+	// the leader gate still count: waiting for the leader is not a coverage
+	// incident. The same count is used on a replay of a stored input so the
+	// replayed entry policy matches the first attempt.
+	var bindingCoverageErr error
+	if service.requireCompleteModelCoverage && len(input.predictions)+input.leaderGated == 0 {
+		bindingCoverageErr = fmt.Errorf(
+			"prediction snapshot has no fresh result for configured model %q", binding.PredictionModelID,
+		)
+	}
+	params.allowEntries = !predictionUnavailable && bindingCoverageErr == nil && !accountEntryDisabled
+	params.entryBlockReason = entryBlockReason(predictionUnavailable, bindingCoverageErr, accountEntryDisabled)
+	result, runErr := service.runBinding(ctx, params)
+	result.PredictionModelID = binding.PredictionModelID
+	result.LeaderGated = input.leaderGated
+	result.Error = runErr
+	return result, runErr
+}
+
+// captureAccountBooks captures the books of one account's targets, aligns
+// them to the targets and freezes them as the account's snapshot batch of the
+// boundary. Any failure belongs to this account only.
+func (service *Service) captureAccountBooks(
+	ctx context.Context, cycle accountCycle, binding domain.StrategyExecutionBinding, targets []domain.BookTarget,
+) ([]domain.OrderBookSnapshot, error) {
+	captureStartedAt := time.Now()
+	books, err := service.orderBookSource.Capture(ctx, cycle.decisionAt, targets)
+	if err != nil {
+		return nil, wrapError("capture orderbooks", err)
+	}
+	captureElapsed := time.Since(captureStartedAt)
 	books, err = alignBooks(targets, books, service.now().UTC())
 	if err != nil {
-		return result, err
+		return nil, err
 	}
-	batch, err := domain.NewOrderBookSnapshotBatch(decisionAt, snapshotID, len(targets), books)
+	batch, err := domain.NewOrderBookSnapshotBatch(
+		cycle.decisionAt, binding.ExecutionAccountID, cycle.predictions.snapshotID, len(targets), books,
+	)
 	if err != nil {
-		return result, fmt.Errorf("build shared orderbook snapshot batch: %w", err)
+		return nil, fmt.Errorf("build account orderbook snapshot batch: %w", err)
 	}
 	persistStartedAt := time.Now()
 	storedBatch, created, err := service.snapshotRecorder.ClaimBatch(ctx, batch)
 	if err != nil {
-		return result, fmt.Errorf("claim shared orderbook snapshot batch for decision_at %s: %w", decisionAt.Format(time.RFC3339), err)
+		return nil, fmt.Errorf("claim orderbook snapshot batch of %s for decision_at %s: %w",
+			binding.ExecutionAccountID, cycle.decisionAt.Format(time.RFC3339), err)
 	}
 	if !sameClaimedOrderBookSnapshotBatch(storedBatch, batch) {
-		return result, fmt.Errorf("claimed shared orderbook snapshot batch identity is invalid")
+		return nil, fmt.Errorf("claimed orderbook snapshot batch identity is invalid")
 	}
-	degradedVenues := degradedOrderBookVenues(books)
-	result.DegradedVenues = sortedMarketSources(degradedVenues)
-	service.logger.Info("Shared orderbook snapshot batch persisted",
-		"decision_at", decisionAt,
+	service.log().Info("Account orderbook snapshot batch persisted",
+		"decision_at", cycle.decisionAt,
+		"execution_account_id", batch.ExecutionAccountID,
 		"prediction_snapshot_id", batch.PredictionSnapshotID,
 		"snapshot_set_id", batch.SnapshotSetID,
 		"snapshot_count", batch.SnapshotCount,
@@ -466,109 +700,11 @@ func (service *Service) Run(ctx context.Context, decisionAt time.Time) (RunResul
 		"empty_count", batch.EmptyCount,
 		"missing_count", batch.MissingCount,
 		"error_count", batch.ErrorCount,
-		"degraded_venues", result.DegradedVenues,
 		"created", created,
+		"capture_elapsed_ms", captureElapsed.Milliseconds(),
 		"elapsed_ms", time.Since(persistStartedAt).Milliseconds(),
 	)
-	result.Runs = make([]BindingRunResult, 0, len(service.bindings))
-	for _, binding := range service.bindings {
-		executionContext := binding.Context()
-		_, bindingSubmissionDisabled := service.submissionDisabledAccountSet[binding.ExecutionAccountID]
-		if bindingSubmissionDisabled {
-			result.Runs = append(result.Runs, BindingRunResult{
-				Context: executionContext, PredictionModelID: binding.PredictionModelID,
-				PredictionCount:        len(predictionsForBinding(selectedPredictions, binding)),
-				OrderSubmissionEnabled: false, AccountSubmissionDisabled: true,
-			})
-			continue
-		}
-		if _, bindingStrategyDisabled := service.strategyDisabledAccountSet[binding.ExecutionAccountID]; bindingStrategyDisabled {
-			// The account stays active for reconciliation and durable delivery,
-			// but this cycle sends nothing about it to the strategy.
-			result.Runs = append(result.Runs, BindingRunResult{
-				Context: executionContext, PredictionModelID: binding.PredictionModelID,
-				PredictionCount:        len(predictionsForBinding(selectedPredictions, binding)),
-				OrderSubmissionEnabled: false, AccountStrategyDisabled: true,
-			})
-			continue
-		}
-		if _, routed := routedAccounts[binding.ExecutionAccountID]; !routed {
-			// The venue route cannot place orders (Kalshi maintenance-only):
-			// reconciliation and recovery go on, but nothing is asked of the
-			// strategy for this account in this cycle.
-			result.Runs = append(result.Runs, BindingRunResult{
-				Context: executionContext, PredictionModelID: binding.PredictionModelID,
-				PredictionCount:        len(predictionsForBinding(selectedPredictions, binding)),
-				OrderSubmissionEnabled: false, RouteUnavailable: true,
-			})
-			continue
-		}
-		bindingSubmissionEnabled := service.submitEnabled
-		input, prepared := inputs[binding.ExecutionAccountID]
-		if !prepared {
-			input = &accountInput{failure: &accountFailure{
-				stage: FailureStageInput, err: fmt.Errorf("account input was not prepared"),
-			}}
-		}
-		run := BindingRunResult{
-			Context: executionContext, PredictionModelID: binding.PredictionModelID,
-			PredictionCount: len(input.predictions), PositionCount: len(input.positions),
-			OrderSubmissionEnabled: bindingSubmissionEnabled,
-		}
-		venue := binding.MarketSource.Normalize()
-		var skipErr error
-		switch _, venueDegraded := degradedVenues[venue]; {
-		case input.failure != nil:
-			// A broken account is excluded, never treated as flat: no strategy
-			// call, no BUY and no SELL until its data is consistent again.
-			run.InputUnavailable = true
-			run.FailureStage = input.failure.stage
-			skipErr = fmt.Errorf("account input unavailable (%s): %w", input.failure.stage, input.failure.err)
-		case venueDegraded:
-			run.VenueBooksUnavailable = true
-			run.FailureStage = FailureStageOrderBooks
-			skipErr = fmt.Errorf("%s orderbooks unavailable this cycle", venue)
-		case ctx.Err() != nil:
-			run.NotRun = true
-			run.FailureStage = FailureStageCycleDeadline
-			skipErr = fmt.Errorf("decision cycle ended before this account ran: %w", ctx.Err())
-		}
-		if skipErr != nil {
-			run.Error = skipErr
-			result.Runs = append(result.Runs, run)
-			runErrors = append(runErrors, bindingRunError(binding, skipErr))
-			continue
-		}
-		accountEntryDisabled := service.accountEntryDisabled(binding)
-		var bindingCoverageErr error
-		if service.requireCompleteModelCoverage && len(input.predictions) == 0 {
-			bindingCoverageErr = fmt.Errorf(
-				"prediction snapshot has no fresh result for configured model %q", binding.PredictionModelID,
-			)
-		}
-		bindingBooks, selectErr := booksForTargets(input.targets, books)
-		if selectErr != nil {
-			run.FailureStage = FailureStageOrderBooks
-			run.Error = selectErr
-			result.Runs = append(result.Runs, run)
-			runErrors = append(runErrors, bindingRunError(binding, selectErr))
-			continue
-		}
-		run, runErr := service.runBinding(ctx, runBindingParams{
-			decisionAt: decisionAt, predictionSnapshotID: snapshotID, binding: executionContext,
-			predictions: input.predictions, positions: input.positions, books: bindingBooks,
-			allowEntries:     !predictionUnavailable && bindingCoverageErr == nil && !accountEntryDisabled,
-			entryBlockReason: entryBlockReason(predictionUnavailable, bindingCoverageErr, accountEntryDisabled),
-			submitEnabled:    bindingSubmissionEnabled,
-		})
-		run.PredictionModelID = binding.PredictionModelID
-		run.Error = runErr
-		result.Runs = append(result.Runs, run)
-		if runErr != nil {
-			runErrors = append(runErrors, bindingRunError(binding, runErr))
-		}
-	}
-	return result, errors.Join(runErrors...)
+	return books, nil
 }
 
 // bindingRunError names the account so a partly failed cycle says which
@@ -585,7 +721,7 @@ func (service *Service) accountEntryDisabled(binding domain.StrategyExecutionBin
 }
 
 func sameClaimedOrderBookSnapshotBatch(left, right domain.OrderBookSnapshotBatch) bool {
-	return left.DecisionAt.Equal(right.DecisionAt) &&
+	return left.DecisionAt.Equal(right.DecisionAt) && left.ExecutionAccountID == right.ExecutionAccountID &&
 		left.PredictionSnapshotID == right.PredictionSnapshotID && left.SnapshotSetID == right.SnapshotSetID &&
 		left.TargetCount == right.TargetCount && left.SnapshotCount == right.SnapshotCount &&
 		left.OKCount == right.OKCount && left.EmptyCount == right.EmptyCount &&
@@ -662,20 +798,29 @@ type runBindingParams struct {
 	allowEntries         bool
 	entryBlockReason     string
 	submitEnabled        bool
+	// storedRequest, when set, is the input already frozen for this cycle; it
+	// is replayed as is instead of building a new one.
+	storedRequest *domain.StrategyDecisionRequest
 }
 
 // runBinding 为单个绑定冻结输入、调用策略、持久化输出并提交订单意图。
 func (service *Service) runBinding(ctx context.Context, params runBindingParams) (BindingRunResult, error) {
-	request, err := (domain.StrategyDecisionRequestParams{
-		CycleID:              cycleID(params.binding, params.decisionAt),
-		Context:              params.binding,
-		DecisionAt:           params.decisionAt,
-		GeneratedAt:          service.now().UTC(),
-		PredictionSnapshotID: params.predictionSnapshotID,
-		Predictions:          params.predictions,
-		Positions:            params.positions,
-		OrderBooks:           params.books,
-	}).Build()
+	var request domain.StrategyDecisionRequest
+	var err error
+	if params.storedRequest != nil {
+		request = *params.storedRequest
+	} else {
+		request, err = (domain.StrategyDecisionRequestParams{
+			CycleID:              cycleID(params.binding, params.decisionAt),
+			Context:              params.binding,
+			DecisionAt:           params.decisionAt,
+			GeneratedAt:          service.now().UTC(),
+			PredictionSnapshotID: params.predictionSnapshotID,
+			Predictions:          params.predictions,
+			Positions:            params.positions,
+			OrderBooks:           params.books,
+		}).Build()
+	}
 	run := BindingRunResult{
 		Context: params.binding, PredictionCount: len(params.predictions), PositionCount: len(params.positions),
 		OrderSubmissionEnabled: params.submitEnabled,
@@ -685,7 +830,7 @@ func (service *Service) runBinding(ctx context.Context, params runBindingParams)
 		run.FailureStage = FailureStageInput
 		return run, err
 	}
-	proposedCycleID := request.CycleID
+	proposedCycleID := cycleID(params.binding, params.decisionAt)
 	request, _, err = service.recorder.ClaimInput(ctx, request)
 	run.Request = request
 	if err != nil {
@@ -1209,26 +1354,33 @@ func normalizeBindings(bindings []domain.StrategyExecutionBinding) ([]domain.Str
 		seenAccounts[binding.ExecutionAccountID] = struct{}{}
 		result[index] = binding
 	}
-	// Polymarket accounts run (and deliver) before Kalshi accounts, so a slow
-	// Kalshi strategy call or delivery does not delay a Polymarket one. Venue
-	// isolation itself comes from Run: lots are loaded per account, and a venue
-	// whose whole capture failed only keeps its own accounts out of the cycle.
-	// Within a venue the order is the historical model/strategy/account order.
-	sort.Slice(result, func(i, j int) bool {
-		leftKalshi := result[i].MarketSource == domain.MarketSourceKalshi
-		rightKalshi := result[j].MarketSource == domain.MarketSourceKalshi
-		if leftKalshi != rightKalshi {
-			return !leftKalshi
-		}
-		if result[i].ModelID != result[j].ModelID {
-			return result[i].ModelID < result[j].ModelID
-		}
-		if result[i].StrategyID != result[j].StrategyID {
-			return result[i].StrategyID < result[j].StrategyID
-		}
-		return result[i].ExecutionAccountID < result[j].ExecutionAccountID
-	})
+	// The configuration order is kept: it is the execution order inside each
+	// venue lane (Run runs the two venues in parallel), and it decides which
+	// account leads its (venue, strategy) group.
 	return result, nil
+}
+
+// groupLeaders returns, for every follower account, the leader of its group:
+// the first account in configuration order with the same venue and strategy.
+// A group of one account has no follower. Only active (not quarantined)
+// accounts form groups; whether the leader may buy does not matter.
+func groupLeaders(bindings []domain.StrategyExecutionBinding) map[string]domain.StrategyExecutionBinding {
+	type groupKey struct {
+		venue    domain.MarketSource
+		strategy string
+	}
+	first := make(map[groupKey]domain.StrategyExecutionBinding, len(bindings))
+	leaders := make(map[string]domain.StrategyExecutionBinding)
+	for _, binding := range bindings {
+		key := groupKey{venue: binding.MarketSource.Normalize(), strategy: binding.StrategyID}
+		leader, exists := first[key]
+		if !exists {
+			first[key] = binding
+			continue
+		}
+		leaders[binding.ExecutionAccountID] = leader
+	}
+	return leaders
 }
 
 // normalizeBoundAccounts validates one account-level switch list against the
@@ -1330,6 +1482,22 @@ func selectAvailablePredictions(
 	sourceModes map[string]domain.PredictionSourceMode,
 	freshAfter time.Time,
 ) ([]domain.Prediction, error) {
+	fresh, err := filterAvailablePredictions(predictions, modelIDs, sourceModes, freshAfter)
+	if err != nil {
+		return nil, err
+	}
+	return domain.SelectEffectivePredictions(fresh, modelIDs)
+}
+
+// filterAvailablePredictions keeps the predictions of the configured models
+// that come from their configured result channel and are fresh, before any
+// revision is chosen.
+func filterAvailablePredictions(
+	predictions []domain.Prediction,
+	modelIDs []string,
+	sourceModes map[string]domain.PredictionSourceMode,
+	freshAfter time.Time,
+) ([]domain.Prediction, error) {
 	configuredModes := make(map[string]domain.PredictionSourceMode, len(modelIDs))
 	for _, rawModelID := range modelIDs {
 		modelID := strings.TrimSpace(rawModelID)
@@ -1358,7 +1526,7 @@ func selectAvailablePredictions(
 		}
 		fresh = append(fresh, prediction)
 	}
-	return domain.SelectEffectivePredictions(fresh, modelIDs)
+	return fresh, nil
 }
 
 func normalizePredictionSourceModes(
@@ -1385,30 +1553,18 @@ func normalizePredictionSourceModes(
 	return result, nil
 }
 
-// predictionsForBinding 选择一个上游预测模型、且属于该账户平台的 Market，再投影为
-// Python 和执行层使用的业务模型名。只修改副本，原始 PIT snapshot 始终保留上游
-// producer identity。
+// predictionsForBinding 选择该账户的上游预测模型和预测序号、且属于该账户平台的 Market，
+// 再投影为 Python 和执行层使用的业务模型名。缺少该序号的预测时不使用其他序号补齐。
+// 只修改副本，原始 PIT snapshot 始终保留上游 producer identity。
 func predictionsForBinding(predictions []domain.Prediction, binding domain.StrategyExecutionBinding) []domain.Prediction {
 	source := binding.MarketSource.Normalize()
-	selected := predictionsForModel(predictions, binding.PredictionModelID)
-	result := make([]domain.Prediction, 0, len(selected))
-	for _, prediction := range selected {
-		if prediction.MarketSource.Normalize() != source {
+	result := make([]domain.Prediction, 0)
+	for _, prediction := range predictions {
+		if prediction.MarketSource.Normalize() != source || !binding.SelectsPrediction(prediction) {
 			continue
 		}
 		prediction.Model.Name = binding.ModelID
 		result = append(result, prediction)
-	}
-	return result
-}
-
-// predictionsForModel 筛选属于指定模型的预测记录。
-func predictionsForModel(predictions []domain.Prediction, modelID string) []domain.Prediction {
-	result := make([]domain.Prediction, 0)
-	for _, prediction := range predictions {
-		if strings.TrimSpace(prediction.Model.Name) == modelID {
-			result = append(result, prediction)
-		}
 	}
 	return result
 }

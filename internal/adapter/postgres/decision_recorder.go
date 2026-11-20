@@ -85,6 +85,26 @@ func (recorder *DecisionRecorder) ClaimInput(
 	return stored, false, nil
 }
 
+// FindInput returns the frozen input of a cycle. A stored input whose content
+// hash no longer matches its payload is an error, never a miss.
+func (recorder *DecisionRecorder) FindInput(
+	ctx context.Context,
+	cycleID string,
+) (domain.StrategyDecisionRequest, bool, error) {
+	stored, err := recorder.loadInput(ctx, cycleID)
+	if errors.Is(err, port.ErrDecisionRunNotFound) {
+		return domain.StrategyDecisionRequest{}, false, nil
+	}
+	if err != nil {
+		return domain.StrategyDecisionRequest{}, false, err
+	}
+	storedID, err := domain.ComputeStrategyInputID(stored)
+	if err != nil || storedID != stored.InputID || stored.CycleID != cycleID {
+		return domain.StrategyDecisionRequest{}, false, port.ErrDecisionConflict
+	}
+	return stored, true, nil
+}
+
 func (recorder *DecisionRecorder) loadInput(ctx context.Context, cycleID string) (domain.StrategyDecisionRequest, error) {
 	var payload []byte
 	err := recorder.db.QueryRowContext(ctx, `

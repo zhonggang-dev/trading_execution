@@ -100,6 +100,9 @@ func (client *Client) Snapshot(ctx context.Context, decisionAt time.Time, lookba
 	if envelope.Code != "LIVE_PREDICTION_SNAPSHOT_FOUND" {
 		return domain.PredictionSnapshot{}, fmt.Errorf("unexpected prediction snapshot response code %q", envelope.Code)
 	}
+	if err := decodePredictionRuns(body, envelope.Data.Predictions); err != nil {
+		return domain.PredictionSnapshot{}, err
+	}
 	envelope.Data, err = envelope.Data.NormalizeVenueIdentities()
 	if err != nil {
 		return domain.PredictionSnapshot{}, fmt.Errorf("normalize prediction snapshot venue identity: %w", err)
@@ -114,4 +117,35 @@ func (client *Client) Snapshot(ctx context.Context, decisionAt time.Time, lookba
 // temporarily unavailable: rate limiting and server-side failures.
 func unavailableStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status >= 500
+}
+
+// decodePredictionRuns reads each prediction's optional prediction_run. The
+// field is not part of the strategy wire format (domain.Prediction hides it),
+// so it is decoded from the same body in a second, narrow pass. A missing
+// field or 0 means the first run; a negative run is a malformed snapshot.
+func decodePredictionRuns(body []byte, predictions []domain.Prediction) error {
+	var runs struct {
+		Data struct {
+			Predictions []struct {
+				PredictionRun *int `json:"prediction_run"`
+			} `json:"predictions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &runs); err != nil {
+		return fmt.Errorf("decode prediction snapshot prediction_run: %w", err)
+	}
+	if len(runs.Data.Predictions) != len(predictions) {
+		return fmt.Errorf("decode prediction snapshot prediction_run: prediction count mismatch")
+	}
+	for index, entry := range runs.Data.Predictions {
+		run := 1
+		if entry.PredictionRun != nil && *entry.PredictionRun != 0 {
+			run = *entry.PredictionRun
+		}
+		if run < 1 {
+			return fmt.Errorf("prediction %q has invalid prediction_run %d", predictions[index].PredictionID, run)
+		}
+		predictions[index].PredictionRun = run
+	}
+	return nil
 }

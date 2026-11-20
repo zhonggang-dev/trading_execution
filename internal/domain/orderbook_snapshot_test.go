@@ -1,6 +1,9 @@
 package domain
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"slices"
 	"testing"
 	"time"
@@ -14,7 +17,7 @@ func TestNewOrderBookSnapshotBatchCanonicalizesOrderAndCountsStatuses(t *testing
 		testBatchBook(decisionAt, "token-missing", 1, OrderBookStatusMissing),
 		testBatchBook(decisionAt, "token-empty", 0, OrderBookStatusEmpty),
 	}
-	batch, err := NewOrderBookSnapshotBatch(decisionAt, "predsnap-1", len(books), books)
+	batch, err := NewOrderBookSnapshotBatch(decisionAt, "", "predsnap-1", len(books), books)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +38,7 @@ func TestNewOrderBookSnapshotBatchCanonicalizesOrderAndCountsStatuses(t *testing
 
 	reversed := slices.Clone(books)
 	slices.Reverse(reversed)
-	retry, err := NewOrderBookSnapshotBatch(decisionAt, "predsnap-1", len(reversed), reversed)
+	retry, err := NewOrderBookSnapshotBatch(decisionAt, "", "predsnap-1", len(reversed), reversed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +52,7 @@ func TestNewOrderBookSnapshotBatchCanonicalizesOrderAndCountsStatuses(t *testing
 	equivalentDecimals[1].BestAsk = "0.510"
 	equivalentDecimals[1].Bids[0] = PriceLevel{Price: "0.490", Size: "10.00"}
 	equivalentDecimals[1].Asks[0] = PriceLevel{Price: "0.510", Size: "11.00"}
-	equivalent, err := NewOrderBookSnapshotBatch(decisionAt, "predsnap-1", len(equivalentDecimals), equivalentDecimals)
+	equivalent, err := NewOrderBookSnapshotBatch(decisionAt, "", "predsnap-1", len(equivalentDecimals), equivalentDecimals)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +66,7 @@ func TestNewOrderBookSnapshotBatchCanonicalizesOrderAndCountsStatuses(t *testing
 	lexicallyDifferent[1].BestAsk = "00.510"
 	lexicallyDifferent[1].Bids[0] = PriceLevel{Price: "+00.490", Size: "010.00"}
 	lexicallyDifferent[1].Asks[0] = PriceLevel{Price: "00.510", Size: "011.00"}
-	lexicallyEquivalent, err := NewOrderBookSnapshotBatch(decisionAt, "predsnap-1", len(lexicallyDifferent), lexicallyDifferent)
+	lexicallyEquivalent, err := NewOrderBookSnapshotBatch(decisionAt, "", "predsnap-1", len(lexicallyDifferent), lexicallyDifferent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +75,7 @@ func TestNewOrderBookSnapshotBatchCanonicalizesOrderAndCountsStatuses(t *testing
 	}
 	changed := slices.Clone(books)
 	changed[1].ObservedAt = changed[1].ObservedAt.Add(time.Nanosecond)
-	conflict, err := NewOrderBookSnapshotBatch(decisionAt, "predsnap-1", len(changed), changed)
+	conflict, err := NewOrderBookSnapshotBatch(decisionAt, "", "predsnap-1", len(changed), changed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +86,7 @@ func TestNewOrderBookSnapshotBatchCanonicalizesOrderAndCountsStatuses(t *testing
 
 func TestNewOrderBookSnapshotBatchAcceptsEmptyCapture(t *testing.T) {
 	batch, err := NewOrderBookSnapshotBatch(
-		time.Date(2026, 9, 9, 4, 30, 0, 0, time.UTC), "predsnap-empty", 0, nil,
+		time.Date(2026, 9, 9, 4, 30, 0, 0, time.UTC), "", "predsnap-empty", 0, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -96,15 +99,15 @@ func TestNewOrderBookSnapshotBatchAcceptsEmptyCapture(t *testing.T) {
 func TestNewOrderBookSnapshotBatchRejectsDuplicateAndConflictingShape(t *testing.T) {
 	decisionAt := time.Date(2026, 9, 9, 4, 40, 0, 0, time.UTC)
 	book := testBatchBook(decisionAt, "token-duplicate", 0, OrderBookStatusOK)
-	if _, err := NewOrderBookSnapshotBatch(decisionAt, "predsnap-duplicate", 2, []OrderBookSnapshot{book, book}); err == nil {
+	if _, err := NewOrderBookSnapshotBatch(decisionAt, "", "predsnap-duplicate", 2, []OrderBookSnapshot{book, book}); err == nil {
 		t.Fatal("duplicate token identity was accepted")
 	}
-	if _, err := NewOrderBookSnapshotBatch(decisionAt, "predsnap-count", 2, []OrderBookSnapshot{book}); err == nil {
+	if _, err := NewOrderBookSnapshotBatch(decisionAt, "", "predsnap-count", 2, []OrderBookSnapshot{book}); err == nil {
 		t.Fatal("target/snapshot count mismatch was accepted")
 	}
 	failed := testBatchBook(decisionAt, "token-error", 1, OrderBookStatusError)
 	failed.Bids = []PriceLevel{{Price: "0.49", Size: "1"}}
-	if _, err := NewOrderBookSnapshotBatch(decisionAt, "predsnap-failed-shape", 1, []OrderBookSnapshot{failed}); err == nil {
+	if _, err := NewOrderBookSnapshotBatch(decisionAt, "", "predsnap-failed-shape", 1, []OrderBookSnapshot{failed}); err == nil {
 		t.Fatal("failed snapshot with price levels was accepted")
 	}
 }
@@ -128,4 +131,38 @@ func testBatchBook(decisionAt time.Time, tokenID string, outcomeIndex int, statu
 		book.ErrorCode = "TEST_" + string(status)
 	}
 	return book
+}
+
+// TestNewOrderBookSnapshotBatchAccountIdentity: the account is part of the
+// content identity, and a legacy shared batch (empty account) keeps exactly
+// the identity it had before accounts existed.
+func TestNewOrderBookSnapshotBatchAccountIdentity(t *testing.T) {
+	decisionAt := time.Date(2026, 9, 9, 4, 30, 0, 0, time.UTC)
+	legacy, err := NewOrderBookSnapshotBatch(decisionAt, "", "predsnap-1", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(struct {
+		DecisionAt           time.Time           `json:"decision_at"`
+		PredictionSnapshotID string              `json:"prediction_snapshot_id"`
+		Snapshots            []OrderBookSnapshot `json:"snapshots"`
+	}{DecisionAt: decisionAt, PredictionSnapshotID: "predsnap-1", Snapshots: []OrderBookSnapshot{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(payload)
+	if want := "orderbook-snapshot-set-" + hex.EncodeToString(digest[:]); legacy.SnapshotSetID != want {
+		t.Fatalf("legacy snapshot_set_id = %s, want %s", legacy.SnapshotSetID, want)
+	}
+	main, err := NewOrderBookSnapshotBatch(decisionAt, " main ", "predsnap-1", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := NewOrderBookSnapshotBatch(decisionAt, "wallet-1", "predsnap-1", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main.ExecutionAccountID != "main" || main.SnapshotSetID == legacy.SnapshotSetID || main.SnapshotSetID == other.SnapshotSetID {
+		t.Fatalf("account identities: main=%#v other=%s legacy=%s", main, other.SnapshotSetID, legacy.SnapshotSetID)
+	}
 }

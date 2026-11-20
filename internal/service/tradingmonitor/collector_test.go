@@ -467,3 +467,23 @@ func TestSchedulerInitialGraceAndActionableFailuresNotifyCorrectly(t *testing.T)
 		})
 	}
 }
+
+// TestPredictionCoverageCountsOnlyTheAccountsRun: an account on run 2 counts
+// only run-2 predictions; run 1 of the same model never covers it.
+func TestPredictionCoverageCountsOnlyTheAccountsRun(t *testing.T) {
+	p := fixtureParams()
+	p.Bindings[0].PredictionRun = 2
+	first := validPrediction("market-a", domain.MarketSourcePolymarket, testNow.Add(-time.Hour))
+	second := validPrediction("market-b", domain.MarketSourcePolymarket, testNow.Add(-time.Hour))
+	second.PredictionRun = 2
+	p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: []domain.Prediction{first, second}}}
+	check := find(t, collect(t, p), "prediction.coverage", p.Bindings[0].Scope())
+	if check.Evidence["effective_markets"] != "1" {
+		t.Fatal(check)
+	}
+	p.Predictions = predictionFixture{snapshot: domain.PredictionSnapshot{Predictions: []domain.Prediction{first}}}
+	check = find(t, collect(t, p), "prediction.coverage", p.Bindings[0].Scope())
+	if check.Evidence["effective_markets"] != "0" {
+		t.Fatal(check)
+	}
+}

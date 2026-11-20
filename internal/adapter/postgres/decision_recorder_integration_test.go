@@ -410,3 +410,36 @@ func integrationDecisionRequestForAccount(
 	}
 	return request
 }
+
+// TestDecisionRecorderFindInputPostgresIntegration: a replay finds the frozen
+// input of its cycle, a fresh cycle finds nothing, and a stored payload that
+// no longer matches its hash is an error rather than a miss.
+func TestDecisionRecorderFindInputPostgresIntegration(t *testing.T) {
+	databaseURL := os.Getenv("TRADING_EXECUTION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TRADING_EXECUTION_TEST_DATABASE_URL is not set")
+	}
+	db := newIntegrationDatabase(t, databaseURL)
+	decisionAt := time.Date(2026, 11, 20, 4, 10, 0, 0, time.UTC)
+	recorder, err := NewDecisionRecorder(db, func() time.Time { return decisionAt.Add(time.Minute) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := integrationDecisionRequest(t, decisionAt, "snapshot-find-input", decisionAt.Add(time.Second))
+	if _, found, err := recorder.FindInput(context.Background(), request.CycleID); err != nil || found {
+		t.Fatalf("FindInput() before claim = found %t, error %v", found, err)
+	}
+	if _, _, err := recorder.ClaimInput(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	stored, found, err := recorder.FindInput(context.Background(), request.CycleID)
+	if err != nil || !found || stored.InputID != request.InputID || len(stored.OrderBooks) != len(request.OrderBooks) {
+		t.Fatalf("FindInput() = found %t, input %q, error %v", found, stored.InputID, err)
+	}
+	if _, err := db.Exec(`UPDATE strategy_decision_runs SET input_payload=jsonb_set(input_payload,'{prediction_snapshot_id}','"tampered"') WHERE cycle_id=$1`, request.CycleID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := recorder.FindInput(context.Background(), request.CycleID); !errors.Is(err, port.ErrDecisionConflict) {
+		t.Fatalf("FindInput() of a tampered input error = %v", err)
+	}
+}
