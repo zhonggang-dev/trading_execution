@@ -242,6 +242,31 @@ func TestLiveActiveAccountAuthorizationPostgresIntegration(t *testing.T) {
 		}
 	}
 
+	t.Run("additional API order authorization", func(t *testing.T) {
+		const drawdownStrategyID = "wallet_drawdown"
+		drawdown := ExpectedActiveExecutionAccount{ExecutionAccountID: accountID, StrategyID: drawdownStrategyID}
+		both := []ExpectedActiveExecutionAccount{expected[0], drawdown}
+		if err := CheckLiveActiveAccountAuthorization(context.Background(), db, both); err == nil || !strings.Contains(err.Error(), `has no enabled binding for strategy "wallet_drawdown"`) {
+			t.Fatalf("missing drawdown authorization error = %v", err)
+		}
+		if _, err := db.Exec(`
+			INSERT INTO execution_strategy_bindings (model_id, strategy_id, execution_account_id, enabled)
+			VALUES ('wallet_drawdown','wallet_drawdown',$1,TRUE)`, accountID); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if _, err := db.Exec(`DELETE FROM execution_strategy_bindings WHERE execution_account_id=$1 AND strategy_id=$2`, accountID, drawdownStrategyID); err != nil {
+				t.Error(err)
+			}
+		})
+		if err := CheckLiveActiveAccountAuthorization(context.Background(), db, both); err != nil {
+			t.Fatalf("prediction and drawdown authorization on the same account: %v", err)
+		}
+		if err := CheckLiveActiveAccountAuthorization(context.Background(), db, append(both, drawdown)); err == nil || !strings.Contains(err.Error(), "repeats authorization") {
+			t.Fatalf("duplicate expected authorization error = %v", err)
+		}
+	})
+
 	t.Run("unexpected enabled route on active account", func(t *testing.T) {
 		if _, err := db.Exec(`
 			INSERT INTO execution_strategy_bindings (

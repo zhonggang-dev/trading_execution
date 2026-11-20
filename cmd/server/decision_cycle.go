@@ -228,44 +228,56 @@ func orderReportHook(reporter *strategyreport.Reporter) func(context.Context) er
 	return reporter.Sync
 }
 
-// validateDecisionAccounts proves that the Polymarket wallet file holds
-// exactly the configured Polymarket accounts. Kalshi accounts have no wallet
-// and are checked against their credentials by the Kalshi composition.
+// validateDecisionAccounts checks the prediction runner's wallet subset.
 func validateDecisionAccounts(cycleConfig config.DecisionCycle, accountIDs []string) error {
+	_, err := validatePolymarketWalletAccounts(cycleConfig, accountIDs, nil)
+	return err
+}
+
+// validatePolymarketWalletAccounts checks the complete set required for order
+// execution and returns the wallet IDs that belong to prediction scheduling.
+func validatePolymarketWalletAccounts(cycleConfig config.DecisionCycle, accountIDs []string,
+	apiOrderAccounts []config.APIOrderAccount,
+) ([]string, error) {
 	available := make(map[string]struct{}, len(accountIDs))
 	for index, raw := range accountIDs {
 		accountID := strings.TrimSpace(raw)
 		if accountID == "" {
-			return fmt.Errorf("wallet file execution account %d is empty", index)
+			return nil, fmt.Errorf("wallet file execution account %d is empty", index)
 		}
 		if _, duplicate := available[accountID]; duplicate {
-			return fmt.Errorf("wallet file contains duplicate execution account %q", accountID)
+			return nil, fmt.Errorf("wallet file contains duplicate execution account %q", accountID)
 		}
 		available[accountID] = struct{}{}
 	}
-	if len(available) == 0 {
-		return fmt.Errorf("live execution requires at least one wallet-file execution account")
-	}
-	bound := make(map[string]struct{}, len(cycleConfig.Accounts))
+	bound := make(map[string]struct{}, len(cycleConfig.Accounts)+len(apiOrderAccounts))
+	predictionWalletIDs := make([]string, 0, len(cycleConfig.Accounts))
 	for _, account := range cycleConfig.AccountsForSource(domain.MarketSourcePolymarket) {
 		accountID := strings.TrimSpace(account.ExecutionAccountID)
 		if accountID == "" {
-			return fmt.Errorf("decision-cycle account execution account is empty")
+			return nil, fmt.Errorf("decision-cycle account execution account is empty")
 		}
 		if _, duplicate := bound[accountID]; duplicate {
-			return fmt.Errorf("decision-cycle accounts repeat execution account %q", accountID)
+			return nil, fmt.Errorf("decision-cycle accounts repeat execution account %q", accountID)
+		}
+		if _, exists := available[accountID]; !exists {
+			return nil, fmt.Errorf("Polymarket account %q is absent from the wallet file", accountID)
 		}
 		bound[accountID] = struct{}{}
-		if _, exists := available[accountID]; !exists {
-			return fmt.Errorf("Polymarket account %q is absent from the wallet file", accountID)
+		predictionWalletIDs = append(predictionWalletIDs, accountID)
+	}
+	for _, account := range apiOrderAccounts {
+		if _, exists := available[account.ExecutionAccountID]; !exists {
+			return nil, fmt.Errorf("Polymarket API order account %q is absent from the wallet file", account.ExecutionAccountID)
 		}
+		bound[account.ExecutionAccountID] = struct{}{}
 	}
 	for accountID := range available {
 		if _, exists := bound[accountID]; !exists {
-			return fmt.Errorf("wallet file execution account %q is not a POLYMARKET account in DECISION_CYCLE_ACCOUNTS_JSON", accountID)
+			return nil, fmt.Errorf("wallet file execution account %q is not a POLYMARKET account in DECISION_CYCLE_ACCOUNTS_JSON or POLYMARKET_API_ORDER_ACCOUNTS_JSON", accountID)
 		}
 	}
-	return nil
+	return predictionWalletIDs, nil
 }
 
 // venueAccountGate serializes intent delivery per execution account. A

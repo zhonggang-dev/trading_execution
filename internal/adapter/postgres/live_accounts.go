@@ -80,7 +80,7 @@ func checkSubmitRiskTriggerMarker(ctx context.Context, db *sql.DB, marker, missi
 
 // CheckLiveActiveAccountAuthorization verifies the three independent durable
 // activation gates for every active account: the globally enabled strategy
-// binding set is exactly the expected active routes, every risk policy is
+// binding set is exactly the expected prediction and API order authorizations, every risk policy is
 // enabled, and every mandatory ACCOUNT control is unpaused.
 // Venue funding/allowance/placement and reconciliation are checked separately
 // by the live composition after this database-only gate succeeds.
@@ -92,7 +92,6 @@ func CheckLiveActiveAccountAuthorization(
 	if db == nil || len(accounts) == 0 {
 		return fmt.Errorf("postgres and active execution accounts are required")
 	}
-	seen := make(map[string]struct{}, len(accounts))
 	expectedBindings := make(map[string]struct{}, len(accounts))
 	normalized := make([]ExpectedActiveExecutionAccount, 0, len(accounts))
 	for _, expected := range accounts {
@@ -101,11 +100,11 @@ func CheckLiveActiveAccountAuthorization(
 		if accountID == "" || strategyID == "" {
 			return fmt.Errorf("active execution account authorization is incomplete")
 		}
-		if _, duplicate := seen[accountID]; duplicate {
-			return fmt.Errorf("active execution account %q is duplicated", accountID)
+		key := strategyID + "\x00" + accountID
+		if _, duplicate := expectedBindings[key]; duplicate {
+			return fmt.Errorf("active execution account %q repeats authorization for strategy %q", accountID, strategyID)
 		}
-		seen[accountID] = struct{}{}
-		expectedBindings[strategyID+"\x00"+accountID] = struct{}{}
+		expectedBindings[key] = struct{}{}
 		normalized = append(normalized, ExpectedActiveExecutionAccount{
 			ExecutionAccountID: accountID,
 			StrategyID:         strategyID,

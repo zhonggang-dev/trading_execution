@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,8 +31,53 @@ func TestLoadSafeDefaults(t *testing.T) {
 	if config.Kalshi.MarketDataEnabled {
 		t.Fatalf("Kalshi market data must be disabled without explicit credentials: %#v", config.Kalshi)
 	}
-	if len(config.DecisionCycle.Accounts) != 0 || len(config.Kalshi.LiveAccounts) != 0 {
+	if len(config.DecisionCycle.Accounts) != 0 || len(config.Kalshi.LiveAccounts) != 0 || len(config.Polymarket.APIOrderAccounts) != 0 {
 		t.Fatalf("paper defaults must not configure accounts: %#v / %#v", config.DecisionCycle.Accounts, config.Kalshi.LiveAccounts)
+	}
+}
+
+func TestLoadPolymarketAPIOrderAccounts(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("POLYMARKET_API_ORDER_ACCOUNTS_JSON", `[
+		{"execution_account_id":" wallet-10 ","strategy_id":" wallet_drawdown "},
+		{"execution_account_id":"main","strategy_id":"wallet_drawdown"},
+		{"execution_account_id":"main","strategy_id":"strategy-v1"}
+	]`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []APIOrderAccount{
+		{ExecutionAccountID: "wallet-10", StrategyID: "wallet_drawdown"},
+		{ExecutionAccountID: "main", StrategyID: "wallet_drawdown"},
+		{ExecutionAccountID: "main", StrategyID: domain.StrategyIDMultfactorV1},
+	}
+	if !reflect.DeepEqual(cfg.Polymarket.APIOrderAccounts, want) || len(cfg.DecisionCycle.Accounts) != 0 {
+		t.Fatalf("API order accounts = %#v, decision accounts = %#v", cfg.Polymarket.APIOrderAccounts, cfg.DecisionCycle.Accounts)
+	}
+}
+
+func TestLoadRejectsInvalidPolymarketAPIOrderAccounts(t *testing.T) {
+	tests := map[string]string{
+		"null":             `null`,
+		"not an array":     `{}`,
+		"trailing input":   `[] []`,
+		"null row":         `[null]`,
+		"missing account":  `[{"strategy_id":"wallet_drawdown"}]`,
+		"missing strategy": `[{"execution_account_id":"wallet-10"}]`,
+		"invalid strategy": `[{"execution_account_id":"wallet-10","strategy_id":"wallet drawdown"}]`,
+		"Kalshi account":   `[{"execution_account_id":"kalshi:wallet-10","strategy_id":"wallet_drawdown"}]`,
+		"unknown field":    `[{"execution_account_id":"wallet-10","strategy_id":"wallet_drawdown","model_id":"drawdown"}]`,
+		"duplicate grant":  `[{"execution_account_id":"main","strategy_id":"strategy-v1"},{"execution_account_id":" main ","strategy_id":"multfactor_v1"}]`,
+	}
+	for name, value := range tests {
+		t.Run(name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("POLYMARKET_API_ORDER_ACCOUNTS_JSON", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "POLYMARKET_API_ORDER_ACCOUNTS_JSON") {
+				t.Fatalf("Load() error = %v", err)
+			}
+		})
 	}
 }
 
@@ -852,7 +898,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"EXECUTION_API_TOKEN", "POSITION_EXIT_JOB_TOKEN", "EXECUTION_MODE", "EXECUTION_VENUE", "EXECUTION_ALLOW_MARKET_ORDERS",
 		"EXECUTION_MAX_ORDER_NOTIONAL",
 		"ORDER_COORDINATOR_INTERVAL", "ORDER_COORDINATOR_BATCH_SIZE",
-		"POLYMARKET_LIVE_TRADING_ENABLED", "POLYMARKET_ACCOUNTS_FILE", "POLYMARKET_CLOB_URL",
+		"POLYMARKET_LIVE_TRADING_ENABLED", "POLYMARKET_ACCOUNTS_FILE", "POLYMARKET_API_ORDER_ACCOUNTS_JSON", "POLYMARKET_CLOB_URL",
 		"POLYMARKET_GEOBLOCK_URL", "POLYMARKET_FRONTEND_ONLY_API_COUNTRIES", "POLYMARKET_GAMMA_URL",
 		"POLYMARKET_DATA_API_URL", "POLYGON_RPC_URL", "POLYMARKET_REQUEST_TIMEOUT",
 		"POLYMARKET_STARTUP_TIMEOUT", "POLYMARKET_MAX_CLOCK_SKEW", "POLYMARKET_HEARTBEAT_INTERVAL",

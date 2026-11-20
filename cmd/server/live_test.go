@@ -13,6 +13,7 @@ import (
 
 	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarket"
 	postgresadapter "github.com/UniPat-AI/trading_execution/internal/adapter/postgres"
+	"github.com/UniPat-AI/trading_execution/internal/config"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
 	"github.com/UniPat-AI/trading_execution/internal/service/accountmaintenance"
 	"github.com/UniPat-AI/trading_execution/internal/service/reconciliation"
@@ -235,6 +236,66 @@ func TestLiveAccountAuthorizationsFollowConfiguredPolymarketAccounts(t *testing.
 	}
 	if _, err := liveAccountAuthorizations(nil, bindings); err == nil {
 		t.Fatal("empty active account set accepted")
+	}
+}
+
+func TestAPIOrderWalletsAreExcludedFromPredictionScheduling(t *testing.T) {
+	cycle := config.DecisionCycle{Accounts: polymarketAccounts("main", "wallet-1")}
+	apiOrders := []config.APIOrderAccount{
+		{ExecutionAccountID: "main", StrategyID: "wallet_drawdown"},
+		{ExecutionAccountID: "wallet-10", StrategyID: "wallet_drawdown"},
+	}
+	walletIDs := []string{"main", "wallet-1", "wallet-10"}
+	predictionIDs, err := validatePolymarketWalletAccounts(cycle, walletIDs, apiOrders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"main", "wallet-1"}; !reflect.DeepEqual(predictionIDs, want) {
+		t.Fatalf("prediction accounts = %#v, want %#v", predictionIDs, want)
+	}
+	if err := validateDecisionAccounts(cycle, predictionIDs); err != nil {
+		t.Fatalf("prediction runner rejected its account subset: %v", err)
+	}
+	got, err := liveAccountAuthorizations(walletIDs, cycle.Bindings(), apiOrders...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []postgresadapter.ExpectedActiveExecutionAccount{
+		{ExecutionAccountID: "main", StrategyID: domain.StrategyIDMultfactorV1},
+		{ExecutionAccountID: "main", StrategyID: "wallet_drawdown"},
+		{ExecutionAccountID: "wallet-1", StrategyID: domain.StrategyIDMultfactorV1},
+		{ExecutionAccountID: "wallet-10", StrategyID: "wallet_drawdown"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("live account authorizations = %#v, want %#v", got, want)
+	}
+	if _, err := validatePolymarketWalletAccounts(cycle, []string{"main", "wallet-1"}, apiOrders); err == nil || !strings.Contains(err.Error(), "API order account") {
+		t.Fatalf("missing API wallet error = %v", err)
+	}
+	if _, err := validatePolymarketWalletAccounts(cycle, append(walletIDs, "wallet-9"), apiOrders); err == nil || !strings.Contains(err.Error(), "wallet-9") {
+		t.Fatalf("unconfigured wallet error = %v", err)
+	}
+	duplicate := config.APIOrderAccount{ExecutionAccountID: "main", StrategyID: domain.StrategyIDMultfactorV1}
+	if _, err := liveAccountAuthorizations(walletIDs, cycle.Bindings(), append(apiOrders, duplicate)...); err == nil || !strings.Contains(err.Error(), "already has an authorization") {
+		t.Fatalf("duplicate authorization across prediction and API order types error = %v", err)
+	}
+}
+
+func TestAPIOrderWalletsWithKalshiOnlyPrediction(t *testing.T) {
+	cycle := config.DecisionCycle{Accounts: []config.DecisionAccount{{
+		ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi,
+		StrategyID: domain.StrategyIDMultfactorV1, Mode: config.DecisionAccountActive,
+	}}}
+	apiOrders := []config.APIOrderAccount{{ExecutionAccountID: "wallet-10", StrategyID: "wallet_drawdown"}}
+	predictionIDs, err := validatePolymarketWalletAccounts(cycle, []string{"wallet-10"}, apiOrders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(predictionIDs) != 0 {
+		t.Fatalf("prediction wallets = %#v, want an empty slice", predictionIDs)
+	}
+	if err := validateDecisionAccounts(cycle, predictionIDs); err != nil {
+		t.Fatalf("prediction runner rejected Kalshi-only configuration: %v", err)
 	}
 }
 

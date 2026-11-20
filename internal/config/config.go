@@ -170,6 +170,7 @@ type Polymarket struct {
 	LiveTradingEnabled       bool
 	AutoRedeemEnabled        bool
 	AccountsFile             string
+	APIOrderAccounts         []APIOrderAccount
 	CLOBURL                  string
 	RelayerURL               string
 	GeoblockURL              string
@@ -229,6 +230,12 @@ type Polymarket struct {
 	// venue expiry before any decision.
 	UnacceptedAutoResolve  string
 	UnacceptedResolveGrace time.Duration
+}
+
+// APIOrderAccount grants one order strategy ID without configuring prediction scheduling.
+type APIOrderAccount struct {
+	ExecutionAccountID string `json:"execution_account_id"`
+	StrategyID         string `json:"strategy_id"`
 }
 
 // Kalshi keeps authenticated market-data credentials outside the repository.
@@ -677,6 +684,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	apiOrderAccounts, err := decodePolymarketAPIOrderAccounts(os.Getenv("POLYMARKET_API_ORDER_ACCOUNTS_JSON"))
+	if err != nil {
+		return Config{}, err
+	}
 	pipelineMonitor, err := pipelinemonitor.LoadConfig(os.Getenv)
 	pipelineMonitorError := ""
 	if err != nil {
@@ -724,6 +735,7 @@ func Load() (Config, error) {
 			LiveTradingEnabled: liveTradingEnabled,
 			AutoRedeemEnabled:  autoRedeemEnabled,
 			AccountsFile:       strings.TrimSpace(os.Getenv("POLYMARKET_ACCOUNTS_FILE")),
+			APIOrderAccounts:   apiOrderAccounts,
 			CLOBURL:            env("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
 			RelayerURL:         env("POLYMARKET_RELAYER_URL", "https://relayer-v2.polymarket.com"),
 			GeoblockURL:        env("POLYMARKET_GEOBLOCK_URL", "https://polymarket.com/api/geoblock"),
@@ -1185,6 +1197,40 @@ func decodeDecisionAccounts(value string) ([]DecisionAccount, error) {
 		account.PredictionModelID = strings.TrimSpace(account.PredictionModelID)
 		account.StrategyID = domain.CanonicalStrategyID(account.StrategyID)
 		account.Mode = DecisionAccountMode(strings.ToUpper(strings.TrimSpace(string(account.Mode))))
+	}
+	return accounts, nil
+}
+
+func decodePolymarketAPIOrderAccounts(value string) ([]APIOrderAccount, error) {
+	const variable = "POLYMARKET_API_ORDER_ACCOUNTS_JSON"
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+	var accounts []APIOrderAccount
+	if err := decoder.Decode(&accounts); err != nil {
+		return nil, fmt.Errorf("%s must be a JSON array: %w", variable, err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF || accounts == nil {
+		return nil, fmt.Errorf("%s must contain exactly one JSON array", variable)
+	}
+	seen := make(map[APIOrderAccount]struct{}, len(accounts))
+	for index := range accounts {
+		account := &accounts[index]
+		account.ExecutionAccountID = strings.TrimSpace(account.ExecutionAccountID)
+		account.StrategyID = domain.CanonicalStrategyID(account.StrategyID)
+		if account.ExecutionAccountID == "" || domain.IsKalshiExecutionAccount(account.ExecutionAccountID) {
+			return nil, fmt.Errorf("%s row %d requires a Polymarket execution_account_id", variable, index)
+		}
+		if err := domain.ValidateStrategyID(account.StrategyID); err != nil {
+			return nil, fmt.Errorf("%s account %q: %w", variable, account.ExecutionAccountID, err)
+		}
+		if _, duplicate := seen[*account]; duplicate {
+			return nil, fmt.Errorf("%s repeats authorization for account %q and strategy %q", variable, account.ExecutionAccountID, account.StrategyID)
+		}
+		seen[*account] = struct{}{}
 	}
 	return accounts, nil
 }
