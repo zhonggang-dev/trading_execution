@@ -105,3 +105,41 @@ func assertL1Headers(t *testing.T, request *http.Request, method, nonce string) 
 		t.Errorf("POLY_SIGNATURE has invalid shape")
 	}
 }
+
+func TestCredentialBootstrapperDeriveOnlyNeverCreates(t *testing.T) {
+	var creates atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/auth/api-key":
+			creates.Add(1)
+			writer.WriteHeader(http.StatusOK)
+		case "/auth/derive-api-key":
+			assertL1Headers(t, request, http.MethodGet, "0")
+			_ = json.NewEncoder(writer).Encode(map[string]string{
+				"apiKey": "derived-key", "secret": "c2VjcmV0", "passphrase": "derived-passphrase",
+			})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	bootstrapper, err := NewCredentialBootstrapper(CredentialBootstrapParams{
+		BaseURL: server.URL, DeriveOnly: true,
+		Now: func() time.Time { return time.Unix(1_700_000_000, 0) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := NewEOASigner(testPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := bootstrapper.CreateOrDerive(context.Background(), signer, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creates.Load() != 0 || credentials.Key != "derived-key" {
+		t.Fatalf("creates/credentials = %d/%#v", creates.Load(), credentials)
+	}
+}
