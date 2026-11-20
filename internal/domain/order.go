@@ -87,6 +87,7 @@ type OrderIntent struct {
 	WorstPrice         Decimal           `json:"worst_price,omitempty"`
 	Size               Decimal           `json:"size"`
 	TimeInForce        TimeInForce       `json:"time_in_force"`
+	PostOnly           bool              `json:"post_only,omitempty"`
 	ExpiresAt          *time.Time        `json:"expires_at,omitempty"`
 	Metadata           map[string]string `json:"metadata,omitempty"`
 	// DecisionQuotes 和 DecisionMeta 只用于审计，不参与 Equivalent 比较。
@@ -244,6 +245,10 @@ func (intent OrderIntent) Validate() error {
 		intent.TimeInForce != TimeInForceFAK {
 		return fmt.Errorf("unsupported time_in_force %q", intent.TimeInForce)
 	}
+	if intent.PostOnly && (intent.Venue != "polymarket" || intent.Type != OrderTypeLimit ||
+		(intent.TimeInForce != TimeInForceGTC && intent.TimeInForce != TimeInForceGTD)) {
+		return fmt.Errorf("post_only requires a Polymarket GTC or GTD limit order")
+	}
 	if intent.Type == OrderTypeMarket && (intent.TimeInForce == TimeInForceGTC || intent.TimeInForce == TimeInForceGTD) {
 		return fmt.Errorf("market order does not support %s", intent.TimeInForce)
 	}
@@ -270,7 +275,7 @@ func (intent OrderIntent) Equivalent(other OrderIntent) bool {
 		left.OutcomeID != right.OutcomeID || left.TokenID != right.TokenID || left.TargetLotID != right.TargetLotID || !sameBool(left.ExpectedNegRisk, right.ExpectedNegRisk) ||
 		!sameTime(left.MarketSnapshotAt, right.MarketSnapshotAt) || !sameTime(left.SignalAt, right.SignalAt) || left.Side != right.Side || left.Type != right.Type ||
 		!left.Price.Equal(right.Price) || !left.WorstPrice.Equal(right.WorstPrice) || !left.Size.Equal(right.Size) ||
-		left.TimeInForce != right.TimeInForce || !sameTime(left.ExpiresAt, right.ExpiresAt) {
+		left.TimeInForce != right.TimeInForce || left.PostOnly != right.PostOnly || !sameTime(left.ExpiresAt, right.ExpiresAt) {
 		return false
 	}
 	return maps.Equal(left.Metadata, right.Metadata)

@@ -193,7 +193,7 @@ func (builder orderBuilder) build(ctx context.Context, order domain.Order, accou
 		Owner:     account.API.Key,
 		OrderType: orderType,
 		DeferExec: false,
-		PostOnly:  false,
+		PostOnly:  order.Intent.PostOnly,
 	}, "0x" + hex.EncodeToString(orderIDDigest), nil
 }
 

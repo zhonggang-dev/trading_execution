@@ -1,19 +1,19 @@
-// Package walletdrawdown samples one Polymarket wallet's equity on a fixed
-// slot, measures the drop from the highest equity inside a trailing window and
-// notifies a Feishu chat when it exceeds a threshold. It is read-only towards
-// trading: it never places, cancels or pauses anything.
+// Package walletdrawdown samples one Polymarket account's trading PnL on a fixed
+// slot, measures the drop from the highest PnL inside a trailing window and
+// notifies a Feishu chat when it exceeds a threshold.
 package walletdrawdown
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/UniPat-AI/trading_execution/internal/adapter/polymarketdata"
 	"github.com/UniPat-AI/trading_execution/internal/domain"
+	"github.com/UniPat-AI/trading_execution/internal/service/accountcoremetrics"
 )
 
 // Config holds the tunables; all of them come from the environment.
@@ -54,8 +54,6 @@ type PositionValue struct {
 	Shares      domain.Decimal `json:"shares"`
 	Price       domain.Decimal `json:"price"`
 	Value       string         `json:"value"`
-	Redeemable  bool           `json:"redeemable"`
-	ChainShares bool           `json:"chain_shares,omitempty"`
 }
 
 // Sample is one persisted row.
@@ -63,12 +61,12 @@ type Sample struct {
 	AccountID      string          `json:"execution_account_id"`
 	SlotAt         time.Time       `json:"slot_at"`
 	SampledAt      time.Time       `json:"sampled_at"`
-	CashPUSD       string          `json:"cash_pusd"`
-	CashBlock      uint64          `json:"cash_block"`
 	PositionsValue string          `json:"positions_value"`
-	Equity         string          `json:"equity"`
+	RealizedPnL    string          `json:"realized_pnl"`
+	UnrealizedPnL  string          `json:"unrealized_pnl"`
+	TotalPnL       string          `json:"total_pnl"`
 	WindowMinutes  int             `json:"window_minutes"`
-	PeakEquity     *string         `json:"window_peak_equity,omitempty"`
+	PeakPnL        *string         `json:"window_peak_pnl,omitempty"`
 	PeakAt         *time.Time      `json:"window_peak_at,omitempty"`
 	Drawdown       *string         `json:"drawdown,omitempty"`
 	Threshold      string          `json:"threshold_usd"`
@@ -79,7 +77,7 @@ type Sample struct {
 
 // Store persists samples.
 type Store interface {
-	WalletAddress(ctx context.Context, accountID string) (string, error)
+	orderOperationStore
 	LoadSample(ctx context.Context, accountID string, slot time.Time) (Sample, bool, error)
 	// WindowSamples returns samples with sampled_at >= from and slot_at < before.
 	WindowSamples(ctx context.Context, accountID string, from, before time.Time) ([]Sample, error)
@@ -91,11 +89,9 @@ type Store interface {
 	MarkNotified(ctx context.Context, accountID string, slot time.Time, notified bool, failure string) error
 }
 
-// Sources reads the wallet's current state.
-type Sources interface {
-	Cash(ctx context.Context, wallet string) (domain.ExternalBalance, error)
-	Positions(ctx context.Context, wallet string) ([]polymarketdata.PositionMark, error)
-	ChainShares(ctx context.Context, wallet, tokenID string) (domain.Decimal, error)
+// PnLSource returns a marked snapshot of the account's trading ledger.
+type PnLSource interface {
+	Query(context.Context, string) (accountcoremetrics.Response, error)
 }
 
 // Notifier posts a card.
@@ -105,14 +101,15 @@ type Notifier interface {
 
 // Report is printed by the command after each run.
 type Report struct {
-	Outcome string  `json:"outcome"`
-	Sample  *Sample `json:"sample,omitempty"`
-	Notify  string  `json:"notify"`
+	Outcome string       `json:"outcome"`
+	Sample  *Sample      `json:"sample,omitempty"`
+	Notify  string       `json:"notify"`
+	Trade   *TradeReport `json:"trade,omitempty"`
 }
 
 // Run takes one sample, stores it and notifies when needed. A nil notifier or
-// dryRun suppresses delivery; dryRun also suppresses every write.
-func Run(ctx context.Context, cfg Config, store Store, src Sources, notifier Notifier, now time.Time, dryRun bool) (Report, error) {
+// trader disables that action. A dry run suppresses all writes and actions.
+func Run(ctx context.Context, cfg Config, store Store, src PnLSource, notifier Notifier, trader *Trader, now time.Time, dryRun bool) (Report, error) {
 	if err := cfg.Validate(); err != nil {
 		return Report{}, err
 	}
@@ -128,11 +125,7 @@ func Run(ctx context.Context, cfg Config, store Store, src Sources, notifier Not
 		// A previous attempt stored the sample but failed to deliver: retry.
 		return deliver(ctx, cfg, store, notifier, existing, now, report)
 	}
-	wallet, err := store.WalletAddress(ctx, cfg.AccountID)
-	if err != nil {
-		return Report{}, err
-	}
-	sample, err := takeSample(ctx, cfg, src, wallet, slot, now)
+	sample, err := takeSample(ctx, cfg, src, slot, now)
 	if err != nil {
 		return Report{}, err
 	}
@@ -156,10 +149,17 @@ func Run(ctx context.Context, cfg Config, store Store, src Sources, notifier Not
 		report.Outcome = "slot_already_sampled"
 		return report, nil
 	}
-	if !sample.Exceeded || notifier == nil {
-		return report, nil
+	var notifyErr, tradeErr error
+	if sample.Exceeded && notifier != nil {
+		report, notifyErr = deliverWithHistory(ctx, cfg, store, notifier, sample, history, now, report)
 	}
-	return deliverWithHistory(ctx, cfg, store, notifier, sample, history, now, report)
+	// Only the process that inserted the sample can start a trade. Re-running
+	// a slot can retry Feishu delivery without submitting any new order.
+	if trader != nil && startsTradeEpisode(sample, history) {
+		trade, err := trader.buy(ctx, store, sample)
+		report.Trade, tradeErr = &trade, err
+	}
+	return report, errors.Join(notifyErr, tradeErr)
 }
 
 func deliver(ctx context.Context, cfg Config, store Store, notifier Notifier, sample Sample, now time.Time, report Report) (Report, error) {
@@ -205,80 +205,66 @@ func deliverWithHistory(ctx context.Context, cfg Config, store Store, notifier N
 	return report, nil
 }
 
-func takeSample(ctx context.Context, cfg Config, src Sources, wallet string, slot, now time.Time) (Sample, error) {
-	cash, err := src.Cash(ctx, wallet)
+func takeSample(ctx context.Context, cfg Config, src PnLSource, slot, now time.Time) (Sample, error) {
+	response, err := src.Query(ctx, cfg.AccountID)
 	if err != nil {
-		return Sample{}, fmt.Errorf("read wallet cash: %w", err)
+		return Sample{}, fmt.Errorf("read trading PnL: %w", err)
 	}
-	cashRat, err := ratOf(string(cash.Amount))
-	if err != nil {
-		return Sample{}, fmt.Errorf("wallet cash: %w", err)
+	if len(response.Items) != 1 || response.Items[0].ExecutionAccountID != cfg.AccountID {
+		return Sample{}, fmt.Errorf("trading PnL account %s missing from snapshot", cfg.AccountID)
 	}
-	marks, err := src.Positions(ctx, wallet)
-	if err != nil {
-		return Sample{}, fmt.Errorf("read wallet positions: %w", err)
+	metrics := response.Items[0]
+	if metrics.ValuationState != "complete" || metrics.TotalPnL == nil || metrics.UnrealizedPnL == nil || metrics.MarketValue == nil {
+		return Sample{}, fmt.Errorf("trading PnL valuation incomplete for %s (%d of %d positions priced)", cfg.AccountID, metrics.PricedAssetCount, metrics.AssetCount)
 	}
-	total := new(big.Rat)
-	values := make([]PositionValue, 0, len(marks))
-	for _, mark := range marks {
-		price, err := ratOf(string(mark.CurrentPrice))
-		if err != nil {
-			return Sample{}, fmt.Errorf("position %s price: %w", mark.TokenID, err)
+	values := make([]PositionValue, 0, len(metrics.ValuationAssets))
+	for _, asset := range metrics.ValuationAssets {
+		if asset.Price == nil || asset.MarketValue == nil {
+			return Sample{}, fmt.Errorf("trading PnL missing valuation for token %s", asset.TokenID)
 		}
-		shares := mark.Shares
-		chain := false
-		// A settled winner is worth its payout until redeemed; the indexer may
-		// still list it after redemption already moved the cash on chain, so
-		// the share count comes from chain to avoid counting it twice.
-		if mark.Redeemable && price.Sign() > 0 {
-			shares, err = src.ChainShares(ctx, wallet, mark.TokenID)
-			if err != nil {
-				return Sample{}, fmt.Errorf("read on-chain shares for %s: %w", mark.TokenID, err)
-			}
-			chain = true
+		row := PositionValue{
+			TokenID: asset.TokenID, ConditionID: asset.ConditionID,
+			Shares: domain.Decimal(asset.RemainingShares), Price: domain.Decimal(*asset.Price), Value: *asset.MarketValue,
 		}
-		sharesRat, err := ratOf(string(shares))
-		if err != nil {
-			return Sample{}, fmt.Errorf("position %s shares: %w", mark.TokenID, err)
+		if asset.MarketQuestion != nil {
+			row.Title = *asset.MarketQuestion
 		}
-		value := new(big.Rat).Mul(sharesRat, price)
-		total.Add(total, value)
-		values = append(values, PositionValue{
-			TokenID: mark.TokenID, ConditionID: mark.ConditionID, Title: mark.Title, Outcome: mark.Outcome,
-			Shares: shares, Price: mark.CurrentPrice, Value: money(value), Redeemable: mark.Redeemable, ChainShares: chain,
-		})
+		if asset.OutcomeName != nil {
+			row.Outcome = *asset.OutcomeName
+		}
+		values = append(values, row)
 	}
 	sort.Slice(values, func(i, j int) bool { return values[i].TokenID < values[j].TokenID })
 	return Sample{
-		AccountID: cfg.AccountID, SlotAt: slot, SampledAt: now, CashPUSD: money(cashRat), CashBlock: cash.BlockNumber,
-		PositionsValue: money(total), Equity: money(new(big.Rat).Add(cashRat, total)),
-		WindowMinutes: int(cfg.Window / time.Minute), Threshold: cfg.Threshold.FloatString(2), Positions: values,
+		AccountID: cfg.AccountID, SlotAt: slot, SampledAt: now,
+		PositionsValue: *metrics.MarketValue, RealizedPnL: metrics.RealizedPnL, UnrealizedPnL: *metrics.UnrealizedPnL,
+		TotalPnL: *metrics.TotalPnL, WindowMinutes: int(cfg.Window / time.Minute),
+		Threshold: cfg.Threshold.FloatString(2), Positions: values,
 	}, nil
 }
 
-// evaluate sets the window peak, drawdown and exceeded flag. Without any
-// earlier sample inside the window there is nothing to compare against.
+// evaluate compares only PnL samples within the trailing time window.
 func evaluate(cfg Config, sample *Sample, history []Sample) error {
 	if len(history) == 0 {
 		return nil
 	}
-	equity, err := ratOf(sample.Equity)
+	pnl, err := ratOf(sample.TotalPnL)
 	if err != nil {
 		return err
 	}
-	peak, peakAt := new(big.Rat).Set(equity), sample.SampledAt
+	peak, peakAt := new(big.Rat).Set(pnl), sample.SampledAt
 	for _, h := range history {
-		value, err := ratOf(h.Equity)
+		value, err := ratOf(h.TotalPnL)
 		if err != nil {
-			return fmt.Errorf("history sample %s equity: %w", h.SlotAt.Format(time.RFC3339), err)
+			return fmt.Errorf("history sample %s PnL: %w", h.SlotAt.Format(time.RFC3339), err)
 		}
 		if value.Cmp(peak) > 0 {
 			peak, peakAt = value, h.SampledAt
 		}
 	}
-	drawdown := new(big.Rat).Sub(peak, equity)
+	drawdown := new(big.Rat).Sub(peak, pnl)
 	peakText, drawdownText := money(peak), money(drawdown)
-	sample.PeakEquity, sample.PeakAt, sample.Drawdown = &peakText, &peakAt, &drawdownText
+	sample.PeakPnL, sample.PeakAt, sample.Drawdown = &peakText, &peakAt, &drawdownText
 	sample.Exceeded = drawdown.Cmp(cfg.Threshold) > 0
 	return nil
 }

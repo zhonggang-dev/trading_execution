@@ -528,8 +528,14 @@ func (client *TradingClient) PlacePrepared(ctx context.Context, order domain.Ord
 	responseBody, _, err := client.doAuthenticated(ctx, account, http.MethodPost, "/order", nil, placement.body, true)
 	if err != nil {
 		var venueError *port.VenueError
-		if errors.As(err, &venueError) && venueError.Kind == port.VenueErrorAmbiguous {
-			venueError.VenueOrderID = expectedOrderID
+		if errors.As(err, &venueError) {
+			if venueError.HTTPStatus == http.StatusRequestTimeout || venueError.HTTPStatus == http.StatusConflict {
+				venueError.Kind = port.VenueErrorAmbiguous
+				venueError.Code = "CLOB_POST_OUTCOME_UNKNOWN"
+			}
+			if venueError.Kind == port.VenueErrorAmbiguous {
+				venueError.VenueOrderID = expectedOrderID
+			}
 		}
 		return port.VenueOrder{}, err
 	}

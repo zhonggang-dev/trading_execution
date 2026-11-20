@@ -96,6 +96,7 @@ func (client *Client) ListMarkets(ctx context.Context, filter domain.MarketListF
 			Volume:      item.VolumeNum.decimal(),
 			Liquidity:   item.LiquidityNum.decimal(),
 			Outcomes:    snapshot.Outcomes,
+			NegRisk:     snapshot.NegRisk,
 		})
 	}
 	page := domain.MarketListingPage{Markets: listings, Fetched: len(raw)}

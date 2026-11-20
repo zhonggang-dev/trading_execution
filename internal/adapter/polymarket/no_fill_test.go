@@ -69,6 +69,22 @@ func preparedPayload(t *testing.T, client *TradingClient, order domain.Order) (*
 	return placement, payload
 }
 
+func TestPostOnlyGTCSellPayload(t *testing.T) {
+	server := newIOCTestServer(t)
+	defer server.Close()
+
+	client := newTestTradingClient(t, server.URL, time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC))
+	order := adapterOrder()
+	order.Intent.Side = domain.SideSell
+	order.Intent.TargetLotID = "lot-1"
+	order.Intent.TimeInForce = domain.TimeInForceGTC
+	order.Intent.PostOnly = true
+	_, payload := preparedPayload(t, client, order)
+	if !payload.PostOnly || payload.OrderType != "GTC" || payload.Order.Side != "SELL" {
+		t.Fatalf("post-only sell payload = %#v", payload)
+	}
+}
+
 // TestEmulatedIOCDefaultIsUnchangedGTC: with the switch off (default) the
 // signed request is byte-for-byte the historical GTC request without expiry.
 func TestEmulatedIOCDefaultIsUnchangedGTC(t *testing.T) {

@@ -298,23 +298,30 @@ func TestAcceptedPlacementWithMismatchedOrderIDIsAmbiguous(t *testing.T) {
 	}
 }
 
-// TestPlacementDuringExchangePauseIsDefinitiveRejection 验证交易所暂停时下单返回的 503 被视为确定拒绝，而普通 503 仍为结果不明。
-func TestPlacementDuringExchangePauseIsDefinitiveRejection(t *testing.T) {
+func TestPlacementHTTPErrorClassification(t *testing.T) {
 	now := time.Date(2026, 10, 29, 18, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name     string
 		message  string
 		wantKind port.VenueErrorKind
 		wantCode string
+		status   int
 	}{
 		{name: "observed pause", message: "trading is disabled", wantKind: port.VenueErrorRejected, wantCode: "CLOB_TRADING_PAUSED"},
 		{name: "documented pause", message: "Trading is currently disabled. Check polymarket.com for updates", wantKind: port.VenueErrorRejected, wantCode: "CLOB_TRADING_PAUSED"},
 		{name: "cancel-only", message: "Trading is currently cancel-only. New orders are not accepted, but cancels are allowed.", wantKind: port.VenueErrorRejected, wantCode: "CLOB_TRADING_PAUSED"},
 		{name: "post-only", message: "post-only mode: only post-only orders and cancels are allowed", wantKind: port.VenueErrorRejected, wantCode: "CLOB_TRADING_PAUSED"},
 		{name: "generic unavailable", message: "upstream unavailable", wantKind: port.VenueErrorAmbiguous, wantCode: "CLOB_SERVER_ERROR"},
+		{name: "FOK insufficient depth", message: "order couldn't be fully filled. FOK orders are fully filled or killed.", status: http.StatusBadRequest, wantKind: port.VenueErrorRejected, wantCode: "CLOB_FOK_NOT_FILLED"},
+		{name: "request timeout", message: "request timeout", status: http.StatusRequestTimeout, wantKind: port.VenueErrorAmbiguous, wantCode: "CLOB_POST_OUTCOME_UNKNOWN"},
+		{name: "conflict", message: "conflict", status: http.StatusConflict, wantKind: port.VenueErrorAmbiguous, wantCode: "CLOB_POST_OUTCOME_UNKNOWN"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
+			status := testCase.status
+			if status == 0 {
+				status = http.StatusServiceUnavailable
+			}
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				switch request.URL.Path {
 				case "/version":
@@ -325,7 +332,7 @@ func TestPlacementDuringExchangePauseIsDefinitiveRejection(t *testing.T) {
 					writeTestJSON(writer, map[string]any{"neg_risk": false})
 				case "/order":
 					writer.Header().Set("Content-Type", "application/json")
-					writer.WriteHeader(http.StatusServiceUnavailable)
+					writer.WriteHeader(status)
 					_ = json.NewEncoder(writer).Encode(map[string]any{"error": testCase.message})
 				default:
 					http.NotFound(writer, request)
@@ -337,8 +344,11 @@ func TestPlacementDuringExchangePauseIsDefinitiveRejection(t *testing.T) {
 			_, err := client.Place(context.Background(), adapterOrder())
 			var venueError *port.VenueError
 			if !errors.As(err, &venueError) || venueError.Kind != testCase.wantKind ||
-				venueError.Code != testCase.wantCode || venueError.HTTPStatus != http.StatusServiceUnavailable {
+				venueError.Code != testCase.wantCode || venueError.HTTPStatus != status {
 				t.Fatalf("Place() error = %#v, want kind %s code %s", err, testCase.wantKind, testCase.wantCode)
+			}
+			if venueError.Kind == port.VenueErrorAmbiguous && venueError.VenueOrderID == "" {
+				t.Fatal("ambiguous placement omitted its signed order ID")
 			}
 		})
 	}

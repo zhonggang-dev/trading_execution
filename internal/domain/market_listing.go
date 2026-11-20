@@ -13,6 +13,7 @@ type MarketListing struct {
 	Volume      Decimal         `json:"volume"`
 	Liquidity   Decimal         `json:"liquidity"`
 	Outcomes    []MarketOutcome `json:"outcomes"`
+	NegRisk     bool            `json:"-"`
 }
 
 // MarketListFilter 描述一页市场列表请求。结果按流动性升序，

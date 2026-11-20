@@ -1,0 +1,13 @@
+[Unit]
+Description=Submit due Polymarket wallet drawdown sell orders
+After=network-online.target trading-execution.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/trading-execution/env
+EnvironmentFile=/etc/trading-execution/wallet-drawdown.env
+ExecStart=/opt/trading-execution/wallet-drawdown/current/walletdrawdown --sell-due --timeout=2m
+TimeoutStartSec=135s
+NoNewPrivileges=yes
+ProtectSystem=strict

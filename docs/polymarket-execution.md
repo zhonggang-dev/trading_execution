@@ -65,6 +65,51 @@ placement readiness——都必须透传这个能力接口，否则执行层只�
 下单响应返回后执行层立刻撤掉未成交部分。IOC 绝不会被改成 FAK：FAK/FOK BUY 的 maker notional 是 pUSD 预算，
 盘口好于限价时会买到多于 `size` 的 shares；GTC 按股数成交，最多买 `size` 股，价差体现为少花钱。
 
+## main 钱包回撤买入
+
+回撤监控使用账户交易盈亏。每次采样将账本里的已实现盈亏，与未平仓份额按当时报价计算的市值减剩余成本相加。平仓、市场结算和赎回依照原账本的入账状态计算。窗口回撤为同口径历史样本的盈亏高点减本期盈亏。报价不全时，本次采样中止。
+
+升级监控前应用 `0052_wallet_drawdown_trading_pnl.sql`。历史总资产采样保存在原表，盈亏监控从首条新采样开始累计基线。
+
+`walletdrawdown` 通过 `WALLET_DRAWDOWN_EXECUTION_URL` 启用交易。该变量使用执行服务的本机 HTTP 地址，命令复用 `EXECUTION_API_TOKEN`。启用前应用迁移 `0049_wallet_drawdown_order_operations.sql`，并按现有实盘风控为 `main` 启用独立的 `wallet_drawdown` 策略绑定。
+
+```sql
+INSERT INTO execution_strategy_bindings (model_id, strategy_id, execution_account_id, enabled)
+VALUES ('wallet_drawdown', 'wallet_drawdown', 'main', TRUE)
+ON CONFLICT (model_id, strategy_id, execution_account_id) DO UPDATE SET enabled = TRUE;
+```
+
+每轮回撤首次严格超过 50 美元且满足告警阈值时，由成功写入该采样槽的进程调用 `thinmarket.Service.Find`。它按候选顺序经 `POST /api/v1/orders` 提交原生 `BUY LIMIT FOK`。最高价格是卖一价，交易预算是卖一价乘该档份额，手续费另计。成交价更好时实际买入份额可以增加。只有执行服务返回明确拒单且零成交时才换下一盘。成交或状态待确认时结束本轮提交，由现有订单协调器继续核对。任务输出的 `trade` 包含尝试顺序和订单状态。
+
+同一轮持续超限只触发一次。同一采样槽重跑可补发飞书通知。`--dry-run` 只采样和计算，交易开关取决于上述环境变量。
+
+每次尝试在调用下单接口前写入 `wallet_drawdown_order_operations`。表记录回撤采样槽、顺序、买卖方向、盘口和提交结果。进程在提交期间中断时，行保留在 `PREPARED`。接口未能返回可关联订单时，行记为 `SUBMIT_UNCONFIRMED`。可关联到执行订单时，以执行订单的最新状态和成交记录为准。
+
+```sql
+SELECT op.slot_at, s.drawdown, op.attempt, op.side, op.market_id, op.token_id,
+       op.price, op.size, op.price * op.size AS requested_notional, op.submission_state,
+       o.order_id, o.status, o.filled_size, o.filled_notional, o.total_fees, o.failure_code
+FROM wallet_drawdown_order_operations AS op
+JOIN wallet_drawdown_samples AS s USING (execution_account_id, slot_at)
+LEFT JOIN execution_orders AS o USING (client_order_id, execution_account_id)
+WHERE op.execution_account_id = 'main'
+ORDER BY op.slot_at DESC, op.attempt;
+```
+
+### 回撤买单的延迟卖出
+
+应用 `0050_wallet_drawdown_sell_links.sql` 后，使用独立的 `wallet-drawdown-sell.timer` 调用同一个二进制的 `--sell-due` 模式。定时器每次运行结束后等 30 秒再检查，到期时间按最后一笔确认买入成交时间加 5 分钟计算。可用 `--sell-due --dry-run` 查看本轮可挂出的卖单。
+
+每个买单按全部已成交份额和实际买入成本计算统一目标价，买入手续费计入成本。限价向上对齐最小报价单位，使整笔买入对应的预计卖出金额减买入成本最接近且至少为 60 美元。报价须低于该批卖单计算时的卖一。没有合适报价时等待下一轮。卖出端手续费以实际账本记录为准。
+
+每个开放持仓批次以全部剩余份额提交一笔 `SELL LIMIT GTC`。达到限价的买盘可以立即成交，未成交份额继续挂在原限价。每次提交前关联原买单和目标 lot 写入操作表。活动卖单及结果待确认的卖单由原执行链路处理，确定拒单后可在后续轮次重查盘口。份额精度超出交易所限制时由任务报告。
+
+### 按回撤卖单报价提交公开买单
+
+应用 `0051_wallet_drawdown_follow_buy_links.sql` 后，在卖出任务环境文件中将 `WALLET_DRAWDOWN_FOLLOW_BUY_ACCOUNT` 设为目标执行账户 ID，例如 `wallet-10`。该账户通过 Trading Execution 的正常账户配置和风控策略绑定授权 `wallet_drawdown`。
+
+任务每轮检查已进入 `LIVE` 或 `PARTIALLY_FILLED` 的回撤 GTC 卖单，用卖单限价和已入账的剩余份额提交一笔公开 `BUY LIMIT IOC`。交易所根据公开盘口撮合，未成交余量立即撤销。每笔买入先写操作表，用 `source_sell_client_order_id` 关联来源卖单。每笔来源卖单只触发一次买单尝试，提交结果不明确时沿用现有订单对账。通过 `--sell-due --dry-run` 可预览。
+
 ## HTTP、限流和错误
 
 默认参数：单请求 5 秒超时、8 QPS、burst 4；均可注入配置。适配器没有对 POST/DELETE 自动重试。
