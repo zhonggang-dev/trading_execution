@@ -41,6 +41,13 @@ type TradingClientParams struct {
 	// trusted before it is re-read. Polymarket can enable or change fees on a
 	// market, so a reservation must not rely on a schedule cached forever.
 	FeeScheduleTTL time.Duration
+	// RecordedFills reads fills this order already persisted. Re-observing a
+	// recorded fill validates its fee against the fee curve recorded with it
+	// (the curve in force when it was matched), not today's curve: Polymarket
+	// changes market fee rates, and a later rate must neither fail nor rewrite
+	// a fill that was correctly accounted under the earlier one. Nil keeps the
+	// current-schedule-only behaviour.
+	RecordedFills RecordedFillReader
 	// IOCOrderType is the CLOB order type that carries an emulated IOC: GTC
 	// (default, no venue expiry) or GTD (expires IOCOrderLifetime after the
 	// exchange clock). IOCOrderLifetime defaults to five minutes and must stay
@@ -61,6 +68,7 @@ type TradingClient struct {
 	limiter     *tokenBucket
 	builder     orderBuilder
 	feeEvidence FillFeeEvidenceSource
+	recorded    RecordedFillReader
 	now         func() time.Time
 
 	versionMu      sync.Mutex
@@ -394,6 +402,7 @@ func NewTradingClient(params TradingClientParams) (*TradingClient, error) {
 		timeout:        params.RequestTimeout,
 		limiter:        limiter,
 		feeEvidence:    params.FeeEvidence,
+		recorded:       params.RecordedFills,
 		now:            params.Now,
 		feeSchedules:   make(map[string]cachedFeeSchedule),
 		feeScheduleTTL: params.FeeScheduleTTL,
@@ -1394,12 +1403,24 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 	if len(fills) == 0 {
 		return fills, nil
 	}
-	schedule, err := client.getMarketFeeSchedule(ctx, order.Intent.ConditionID, order.Intent.TokenID)
+	recordedSchedules, err := client.recordedFeeSchedules(ctx, order.ID)
 	if err != nil {
 		return nil, err
 	}
+	var current *marketFeeSchedule
 	for index := range fills {
 		observed := fills[index]
+		schedule, recorded := recordedSchedules[observed.VenueFillID]
+		if !recorded {
+			if current == nil {
+				fetched, fetchErr := client.getMarketFeeSchedule(ctx, order.Intent.ConditionID, order.Intent.TokenID)
+				if fetchErr != nil {
+					return nil, fetchErr
+				}
+				current = &fetched
+			}
+			schedule = *current
+		}
 		enriched, evidenceErr := client.attachFillFeeEvidence(ctx, account, order, observed, schedule)
 		if evidenceErr != nil {
 			return nil, fmt.Errorf("CLOB trade %s fee evidence: %w", observed.VenueFillID, evidenceErr)
@@ -1407,6 +1428,44 @@ func (client *TradingClient) ListOrderFills(ctx context.Context, order domain.Or
 		fills[index] = enriched
 	}
 	return fills, nil
+}
+
+// RecordedFillReader lists the fills already persisted for one local order.
+type RecordedFillReader interface {
+	ListOrderFills(ctx context.Context, orderID string) ([]domain.Fill, error)
+}
+
+// recordedFeeSchedules returns, per venue fill id, the V2 fee curve persisted
+// with fills this order already recorded from Polygon OrderFilled evidence.
+// The curve is part of the stored fill identity, so a re-observation must be
+// validated and rebuilt with it; the on-chain fee is still checked against it.
+func (client *TradingClient) recordedFeeSchedules(ctx context.Context, orderID string) (map[string]marketFeeSchedule, error) {
+	result := make(map[string]marketFeeSchedule)
+	if client.recorded == nil || strings.TrimSpace(orderID) == "" {
+		return result, nil
+	}
+	fills, err := client.recorded.ListOrderFills(ctx, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("read recorded fills for fee schedule: %w", err)
+	}
+	for _, fill := range fills {
+		if fill.FeeSource != v2OrderFilledFeeSource || strings.TrimSpace(fill.VenueFillID) == "" {
+			continue
+		}
+		if sign, signErr := fill.PlatformFeeRate.Sign(); signErr != nil || sign < 0 {
+			return nil, fmt.Errorf("recorded fill %s has an invalid platform fee rate", fill.VenueFillID)
+		}
+		if err := validateFeeExponent(fill.FeeExponent); err != nil {
+			return nil, fmt.Errorf("recorded fill %s: %w", fill.VenueFillID, err)
+		}
+		schedule := marketFeeSchedule{Rate: fill.PlatformFeeRate, Exponent: fill.FeeExponent, TakerOnly: true}
+		if previous, exists := result[fill.VenueFillID]; exists &&
+			(!previous.Rate.Equal(schedule.Rate) || !previous.Exponent.Equal(schedule.Exponent)) {
+			return nil, fmt.Errorf("recorded fill %s has conflicting fee schedules", fill.VenueFillID)
+		}
+		result[fill.VenueFillID] = schedule
+	}
+	return result, nil
 }
 
 // preferTradeObservation 合并同一成交分量的重复观察并保留更终局状态。
