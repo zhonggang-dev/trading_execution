@@ -201,6 +201,10 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 	if cfg.Polymarket.IOCOrderType == "GTD" && !noFillSchema {
 		logger.Warn("emulated IOC uses GTD but its venue expiry cannot be recorded without migration 0046")
 	}
+	fillLedger, err := postgresadapter.NewFillLedger(postgresadapter.FillLedgerParams{DB: database})
+	if err != nil {
+		return nil, err
+	}
 	tradingClient, err := polymarket.NewTradingClient(polymarket.TradingClientParams{
 		BaseURL:        cfg.Polymarket.CLOBURL,
 		HTTPClient:     clobHTTP,
@@ -208,6 +212,7 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		FeeEvidence:    feeEvidence,
 		RequestTimeout: cfg.Polymarket.RequestTimeout,
 		FeeScheduleTTL: cfg.Polymarket.FeeScheduleTTL,
+		RecordedFills:  fillLedger,
 		// Zero keeps the adapter defaults (8/s, burst 4).
 		RequestsPerSecond: float64(cfg.Polymarket.RequestsPerSecond),
 		Burst:             cfg.Polymarket.Burst,
@@ -285,10 +290,6 @@ func buildLiveRuntime(params buildLiveRuntimeParams) (*liveRuntime, error) {
 		DB:               database,
 		MaxBuyFeeRateBPS: cfg.Polymarket.MaxBuyFeeRateBPS,
 	})
-	if err != nil {
-		return nil, err
-	}
-	fillLedger, err := postgresadapter.NewFillLedger(postgresadapter.FillLedgerParams{DB: database})
 	if err != nil {
 		return nil, err
 	}
