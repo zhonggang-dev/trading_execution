@@ -134,10 +134,11 @@ func TestReaderAgainstMigratedTradingSchema(t *testing.T) {
 	now := decisionAt.Add(1 * time.Hour)
 	reader := New(db, RuntimeConfig{
 		StartedAt: decisionAt, Now: func() time.Time { return now },
-		Bindings: []Binding{{ModelID: "echo", StrategyID: "multfactor_v2", ExecutionAccountID: accountID, SourceMode: "DIRECT"}},
+		Bindings: []Binding{{ModelID: "echo", PredictionRun: 2, StrategyID: "multfactor_v2", ExecutionAccountID: accountID, SourceMode: "DIRECT"}},
 	})
 	runtime, err := reader.Runtime(ctx)
 	if err != nil || runtime.AccountDataState != "available" || len(runtime.Accounts) != 1 ||
+		runtime.Accounts[0].PredictionRun != 2 ||
 		runtime.Accounts[0].DatabaseBindingEnabled == nil || *runtime.Accounts[0].DatabaseBindingEnabled ||
 		runtime.Accounts[0].RiskPolicyEnabled == nil || *runtime.Accounts[0].RiskPolicyEnabled ||
 		runtime.Accounts[0].AccountPaused == nil || !*runtime.Accounts[0].AccountPaused ||

@@ -105,7 +105,7 @@ func TestConsoleV2RuntimeUsesReadOnlyTokenAndSafeRunnerProjection(t *testing.T) 
 	fake := &fakeConsoleV2Service{resource: consolev2.Runtime{
 		ObservedAt: time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC),
 		Runner:     consolev2.RuntimeRunner{Enabled: true, Running: true, State: "running", IntervalSeconds: 600},
-		Bindings:   []consolev2.Binding{{PredictionModelID: "masked-source", ModelID: "deepseek_masked", StrategyID: "multfactor_v2", ExecutionAccountID: "wallet-7", SourceMode: "SANDBOX"}},
+		Bindings:   []consolev2.Binding{{PredictionModelID: "masked-source", PredictionRun: 2, ModelID: "deepseek_masked", StrategyID: "multfactor_v2", ExecutionAccountID: "wallet-7", SourceMode: "SANDBOX"}},
 		Submission: consolev2.RuntimeSubmission{OrderSubmissionEnabled: false, EntrySubmissionDisabled: true},
 	}}
 	server := testConsoleV2Server(t, fake)
@@ -122,6 +122,7 @@ func TestConsoleV2RuntimeUsesReadOnlyTokenAndSafeRunnerProjection(t *testing.T) 
 	body := response.Body.String()
 	if response.Code != http.StatusOK || !strings.Contains(body, `"state":"running"`) ||
 		!strings.Contains(body, `"prediction_model_id":"masked-source"`) ||
+		!strings.Contains(body, `"prediction_run":2`) ||
 		strings.Contains(body, "strategyToken") || strings.Contains(body, "secret") {
 		t.Fatalf("runtime status=%d body=%s", response.Code, body)
 	}

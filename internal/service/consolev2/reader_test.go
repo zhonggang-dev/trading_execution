@@ -12,7 +12,7 @@ func TestRuntimeUsesRunnerSnapshotAndSafeConfig(t *testing.T) {
 	reader := New(nil, RuntimeConfig{
 		StartedAt: now.Add(-time.Minute), Now: func() time.Time { return now },
 		RunnerEnabled: true, RunnerInterval: 10 * time.Minute,
-		Bindings:               []Binding{{PredictionModelID: "source", ModelID: "logical", StrategyID: "multfactor_v2", ExecutionAccountID: "wallet-1", SourceMode: "DIRECT"}},
+		Bindings:               []Binding{{PredictionModelID: "source", PredictionRun: 2, ModelID: "logical", StrategyID: "multfactor_v2", ExecutionAccountID: "wallet-1", SourceMode: "DIRECT"}},
 		OrderSubmissionEnabled: true,
 		RunnerSnapshot: func() RunnerSnapshot {
 			return RunnerSnapshot{LoopStarted: true, LoopRunning: true, InFlight: true, NextDueAt: now.Add(10 * time.Minute), LastError: ""}
@@ -24,7 +24,7 @@ func TestRuntimeUsesRunnerSnapshotAndSafeConfig(t *testing.T) {
 	}
 	if !runtime.Runner.Enabled || !runtime.Runner.Running || runtime.Runner.State != "running" ||
 		runtime.Runner.IntervalSeconds != 600 || !runtime.Runner.InFlight ||
-		len(runtime.Bindings) != 1 || runtime.Bindings[0].SourceMode != "DIRECT" ||
+		len(runtime.Bindings) != 1 || runtime.Bindings[0].SourceMode != "DIRECT" || runtime.Bindings[0].PredictionRun != 2 ||
 		!runtime.Submission.OrderSubmissionEnabled {
 		t.Fatalf("runtime projection = %#v", runtime)
 	}

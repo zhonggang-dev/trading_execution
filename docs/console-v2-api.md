@@ -61,7 +61,7 @@ is invoked.
   `in_flight`, schedule timestamps, `has_last_error`, a stable
   `last_error_code`, and skipped boundaries), the configured 10-minute interval,
   and the configured binding identities
-  (`prediction_model_id`, logical `model_id`, `strategy_id`,
+  (`prediction_model_id`, `prediction_run`, logical `model_id`, `strategy_id`,
   `execution_account_id`, `source_mode`). Disabled runners report `state` as
   `disabled`; an enabled runner that has not started reports `not_started`.
   The legacy `live_runtime_status` cycle/monitor/prediction rows are not used
@@ -70,7 +70,8 @@ is invoked.
   `BOUNDARY_SKIPPED` when `has_last_error` is true.
   Raw runner error text is retained in server logs and is never returned to the browser.
   `account_data_state` is `available` or `unavailable`; when available,
-  `accounts[]` keeps configured binding identity beside nullable database
+  `accounts[]` keeps configured binding identity (including `prediction_run`)
+  beside nullable database
   binding/policy/control facts, latest durable cycle/reconciliation status,
   and bounded open issue/order counts. Database failure preserves runner and
   config fields while marking this account projection unavailable. The
@@ -129,6 +130,10 @@ is invoked.
   (`UNKNOWN`, `RECONCILING`, and `MANUAL_REVIEW` remain visible when present).
   Filters are `q`, `model_id`, `strategy_id`, `execution_account_id`,
   `market_source`, `side`, `status`, `from`, `to`, `limit`, and `offset`.
+  Items are ordered by placement time (`created_at DESC, order_id DESC`), and
+  explicit `from`/`to` bound `created_at`. Without `from`, the default
+  visibility window stays "updated within the recent window or non-terminal",
+  so an order placed earlier but filled or reviewed recently is not hidden.
   Each order also contains an `evidence_summary` computed from all durable
   fills, reservations, and open reconciliation issues for that order. It
   separates `none`/`observed`/`finality_pending`/`confirmed` fill evidence
@@ -222,6 +227,11 @@ and fill tables, position lots, reconciliation tables, and
   `data.accounts[{execution_account_id,market_source}]` plus `observed_at`.
   Venue membership comes from the validated live composition, intersected with
   registered accounts. No wallet address or Kalshi API key identity is selected.
+  An account with a configured decision binding additionally carries
+  `strategy_id`, `mode`, `prediction_model_id`, `source_mode`, and
+  `prediction_run` (1-3: which repeated prediction of the model it consumes;
+  `DECISION_CYCLE_ACCOUNTS_JSON` default 1). Accounts without a binding omit
+  all five fields rather than reporting a fabricated mode or run.
 - `GET /api/v1/console/v2/ledger-activities` accepts `execution_account_id`
   (`account` alias), `activity_type`, `q`, `from`, `to`, `limit`, `offset`.
   Its standard Page envelope has the legacy ledger row field names, plus

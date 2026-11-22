@@ -24,7 +24,7 @@ func assertAccountPortfolioProjection(t *testing.T, ctx context.Context, db *sql
 	exec(`UPDATE position_lots SET outcome_index=0,outcome_name='Yes' WHERE lot_id=$1`, lots[2])
 	// A missing legacy PM market_source is unambiguously derived from its venue.
 	exec(`UPDATE execution_orders SET intent=intent-'market_source' WHERE order_id=$1`, orders[0])
-	reader := New(db, RuntimeConfig{ManagedAccounts: []ManagedAccount{{ExecutionAccountID: account, MarketSource: "POLYMARKET"}}, Bindings: []Binding{{ExecutionAccountID: account, MarketSource: "POLYMARKET", Mode: "PAUSED", StrategyID: "current-strategy", PredictionModelID: "current-model", SourceMode: "SANDBOX"}}})
+	reader := New(db, RuntimeConfig{ManagedAccounts: []ManagedAccount{{ExecutionAccountID: account, MarketSource: "POLYMARKET"}}, Bindings: []Binding{{ExecutionAccountID: account, MarketSource: "POLYMARKET", Mode: "PAUSED", StrategyID: "current-strategy", PredictionModelID: "current-model", PredictionRun: 3, SourceMode: "SANDBOX"}}})
 	page, err := reader.PortfolioHoldings(ctx, ListFilter{ExecutionAccountID: account, Limit: 1})
 	if err != nil || page.Total != 1 || len(page.Items) != 1 {
 		t.Fatalf("portfolio grouping=%#v err=%v", page, err)
@@ -71,11 +71,11 @@ func assertAccountPortfolioProjection(t *testing.T, ctx context.Context, db *sql
 		t.Fatalf("legacy model/source grouping changed: %#v %v", legacy, err)
 	}
 	directory, err := reader.Accounts(ctx)
-	if err != nil || len(directory.Accounts) != 1 || directory.Accounts[0].Mode != "PAUSED" || directory.Accounts[0].StrategyID != "current-strategy" || directory.Accounts[0].PredictionModelID != "current-model" || directory.Accounts[0].SourceMode != "SANDBOX" {
+	if err != nil || len(directory.Accounts) != 1 || directory.Accounts[0].Mode != "PAUSED" || directory.Accounts[0].StrategyID != "current-strategy" || directory.Accounts[0].PredictionModelID != "current-model" || directory.Accounts[0].SourceMode != "SANDBOX" || directory.Accounts[0].PredictionRun != 3 {
 		t.Fatalf("account metadata=%#v %v", directory, err)
 	}
 	legacyDirectory, err := New(db, RuntimeConfig{ManagedAccounts: []ManagedAccount{{ExecutionAccountID: account, MarketSource: "POLYMARKET"}}}).Accounts(ctx)
-	if err != nil || legacyDirectory.Accounts[0].Mode != "" {
+	if err != nil || legacyDirectory.Accounts[0].Mode != "" || legacyDirectory.Accounts[0].PredictionRun != 0 {
 		t.Fatalf("missing config fabricated ACTIVE: %#v %v", legacyDirectory, err)
 	}
 

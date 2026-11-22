@@ -35,7 +35,7 @@ func TestConsoleV2RuntimeConfigProjectsBindingsAndRunnerSnapshot(t *testing.T) {
 		OrderSubmissionEnabled: true,
 		PredictionModelID:      "source-model", PredictionSourceMode: domain.PredictionSourceModeSandbox,
 		Accounts: []config.DecisionAccount{
-			{ExecutionAccountID: "wallet-1", MarketSource: domain.MarketSourcePolymarket,
+			{ExecutionAccountID: "wallet-1", MarketSource: domain.MarketSourcePolymarket, PredictionRun: 2,
 				StrategyID: domain.StrategyIDMultfactorV2, Mode: config.DecisionAccountPaused},
 			{ExecutionAccountID: "kalshi:main", MarketSource: domain.MarketSourceKalshi,
 				StrategyID: "brier_mid_edge_once", Mode: config.DecisionAccountActive},
@@ -52,7 +52,9 @@ func TestConsoleV2RuntimeConfigProjectsBindingsAndRunnerSnapshot(t *testing.T) {
 		value.Bindings[0].ModelID != "source-model" || value.Bindings[0].SourceMode != "SANDBOX" ||
 		value.Bindings[0].MarketSource != "POLYMARKET" || value.Bindings[0].Mode != "PAUSED" ||
 		value.Bindings[1].ExecutionAccountID != "kalshi:main" || value.Bindings[1].MarketSource != "KALSHI" ||
-		value.Bindings[1].Mode != "ACTIVE" || !value.Submission.OrderSubmissionEnabled {
+		value.Bindings[1].Mode != "ACTIVE" || !value.Submission.OrderSubmissionEnabled ||
+		// An account without an explicit run consumes the first run.
+		value.Bindings[0].PredictionRun != 2 || value.Bindings[1].PredictionRun != 1 {
 		t.Fatalf("runtime projection = %#v", value)
 	}
 	// The retired switches keep their neutral values in the console contract.

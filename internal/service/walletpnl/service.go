@@ -69,6 +69,7 @@ type Service struct {
 	now       func() time.Time
 	ttl       time.Duration
 	corrector *Corrector
+	since     map[string]time.Time
 	mu        sync.Mutex
 	cache     map[string]cacheEntry
 	inflight  map[string]*pending
@@ -82,6 +83,9 @@ type Params struct {
 	Now       func() time.Time
 	// Corrector 可选：扣掉已知幽灵持仓（WALLET_PNL_CORRECTIONS_JSON）。
 	Corrector *Corrector
+	// AccountSince 可选：账户 → 官方盈亏曲线起点（WALLET_PNL_ACCOUNT_SINCE_JSON，
+	// 由 ParseAccountSince 校验）。起点之前的点去掉，之后以起点为 0 重新计。
+	AccountSince map[string]time.Time
 }
 
 type cacheEntry struct {
@@ -119,7 +123,14 @@ func New(params Params) (*Service, error) {
 	if params.Now == nil {
 		params.Now = time.Now
 	}
-	return &Service{addresses: params.Addresses, source: params.Source, allowed: allowed, now: params.Now, ttl: params.TTL, corrector: params.Corrector, cache: make(map[string]cacheEntry), inflight: make(map[string]*pending)}, nil
+	since := make(map[string]time.Time, len(params.AccountSince))
+	for account, at := range params.AccountSince {
+		if _, ok := allowed[account]; !ok {
+			return nil, fmt.Errorf("wallet PnL account since: account %q is not managed", account)
+		}
+		since[account] = at.UTC()
+	}
+	return &Service{addresses: params.Addresses, source: params.Source, allowed: allowed, now: params.Now, ttl: params.TTL, corrector: params.Corrector, since: since, cache: make(map[string]cacheEntry), inflight: make(map[string]*pending)}, nil
 }
 
 // ListAccounts reads the authoritative registrations for the managed
@@ -175,7 +186,7 @@ func (service *Service) Query(ctx context.Context, query Query) (Result, error) 
 	service.mu.Lock()
 	if entry, ok := service.cache[key]; ok && now.Before(entry.expiresAt) {
 		service.mu.Unlock()
-		return cloneResultFor(entry.result, query.ExecutionAccountID), nil
+		return service.forAccount(entry.result, query.ExecutionAccountID)
 	}
 	call := service.inflight[key]
 	if call == nil {
@@ -218,7 +229,10 @@ func (service *Service) Query(ctx context.Context, query Query) (Result, error) 
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		return cloneResultFor(call.result, query.ExecutionAccountID), call.err
+		if call.err != nil {
+			return Result{}, call.err
+		}
+		return service.forAccount(call.result, query.ExecutionAccountID)
 	case <-ctx.Done():
 		service.mu.Lock()
 		call.waiters--
@@ -264,6 +278,22 @@ func cloneResult(result Result) Result {
 	}
 	result.Points = points
 	return result
+}
+
+// forAccount 复制按地址缓存的序列并绑定当前账户；配置了起点的账户在副本上
+// 重新计基，缓存里始终是官方（含幽灵持仓修正后的）原始序列。
+func (service *Service) forAccount(result Result, accountID string) (Result, error) {
+	result = cloneResultFor(result, accountID)
+	since, ok := service.since[accountID]
+	if !ok {
+		return result, nil
+	}
+	points, err := rebaseSince(result.Points, since)
+	if err != nil {
+		return Result{}, err
+	}
+	result.Points = points
+	return result, nil
 }
 
 func cloneResultFor(result Result, accountID string) Result {
