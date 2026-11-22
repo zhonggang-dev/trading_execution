@@ -3,7 +3,9 @@ package consolev2
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestActiveAccountScopeRequiresKnownActiveMode(t *testing.T) {
@@ -90,5 +92,42 @@ func TestActiveAccountScopeExactCountPaginationAndExplicitPausedAccount(t *testi
 	accounts, err = f.reader.selectedManagedAccountsInTx(ctx, tx, "flat", "")
 	if err != nil || len(accounts) != 1 || accounts[0].Mode != "PAUSED" {
 		t.Fatal(accounts, err)
+	}
+}
+
+// 订单列表按下单时间倒序，显式 from/to 也按下单时间；默认可见范围仍按最近变化，
+// 早下单、近期才更新的订单不被隐藏，但排在后面。
+func TestOrdersSortAndFilterByCreatedAt(t *testing.T) {
+	f := prepareCoreFacts(t)
+	f.exec(t, `DELETE FROM execution_orders`)
+	day := 24 * time.Hour
+	for _, o := range []struct {
+		id               string
+		created, updated time.Time
+	}{
+		{"old-created-recently-updated", f.now.Add(-20 * day), f.now.Add(-time.Hour)},
+		{"newest-created", f.now.Add(-2 * day), f.now.Add(-2 * day)},
+		{"middle-created", f.now.Add(-5 * day), f.now.Add(-4 * day)},
+		{"created-long-ago-updated-recently", f.now.Add(-60 * day), f.now.Add(-time.Minute)},
+	} {
+		f.exec(t, `INSERT INTO execution_orders(order_id,client_order_id,execution_account_id,venue,market_id,token_id,intent,status,filled_size,created_at,updated_at) VALUES($1,$1,'pm','polymarket','m','t','{}','FILLED',0,$2,$3)`, o.id, o.created, o.updated)
+	}
+	ctx := context.Background()
+	page, err := f.reader.Orders(ctx, ListFilter{ExecutionAccountID: "pm", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, item := range page.Items {
+		got = append(got, item.OrderID)
+	}
+	want := "newest-created,middle-created,old-created-recently-updated,created-long-ago-updated-recently"
+	if strings.Join(got, ",") != want || page.Total != 4 {
+		t.Fatalf("default order %v total=%d", got, page.Total)
+	}
+	from, to := f.now.Add(-6*day), f.now.Add(-3*day)
+	page, err = f.reader.Orders(ctx, ListFilter{ExecutionAccountID: "pm", Limit: 10, From: &from, To: &to})
+	if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].OrderID != "middle-created" {
+		t.Fatalf("created_at range %+v %v", page, err)
 	}
 }

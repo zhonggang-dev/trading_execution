@@ -17,6 +17,8 @@ type ManagedAccount struct {
 	Mode               string `json:"mode,omitempty"`
 	PredictionModelID  string `json:"prediction_model_id,omitempty"`
 	SourceMode         string `json:"source_mode,omitempty"`
+	// PredictionRun is present only for accounts with a configured binding.
+	PredictionRun int `json:"prediction_run,omitempty"`
 }
 
 type AccountDirectory struct {
@@ -89,6 +91,7 @@ func (reader *Reader) managedAccountsInTx(ctx context.Context, tx *sql.Tx) ([]Ma
 				}
 				bindingFound = true
 				account.StrategyID, account.Mode, account.PredictionModelID, account.SourceMode = binding.StrategyID, binding.Mode, binding.PredictionModelID, binding.SourceMode
+				account.PredictionRun = binding.PredictionRun
 			}
 			accounts = append(accounts, account)
 		}

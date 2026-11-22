@@ -103,14 +103,17 @@ func (reader *Reader) Orders(ctx context.Context, filter ListFilter) (Page[Order
 		conditions = append(conditions, "(o.order_id ILIKE "+placeholder+" OR o.client_order_id ILIKE "+placeholder+
 			" OR o.venue_order_id ILIKE "+placeholder+" OR o.market_id ILIKE "+placeholder+" OR o.token_id ILIKE "+placeholder+")")
 	}
+	// 显式 from/to 与列表排序同为下单时间 created_at。未给 from 时的默认
+	// 可见范围仍是「近期有变化或未终结」：它决定哪些订单不被隐藏，不是日期筛选，
+	// 按 updated_at 才不会漏掉早下单、近期才成交/复核的订单。
 	if filter.From != nil {
-		conditions = append(conditions, "o.updated_at >= "+arg(filter.From.UTC()))
+		conditions = append(conditions, "o.created_at >= "+arg(filter.From.UTC()))
 	} else {
 		conditions = append(conditions, "(o.updated_at >= "+arg(boundedSince(filter, now))+
 			" OR o.status NOT IN ('FILLED','REJECTED','CANCELLED'))")
 	}
 	if filter.To != nil {
-		conditions = append(conditions, "o.updated_at <= "+arg(filter.To.UTC()))
+		conditions = append(conditions, "o.created_at <= "+arg(filter.To.UTC()))
 	}
 	where := strings.Join(conditions, " AND ")
 	tx, err := reader.beginReadTx(ctx, "orders")
@@ -127,7 +130,7 @@ func (reader *Reader) Orders(ctx context.Context, filter ListFilter) (Page[Order
 	listArgs := append([]any(nil), args...)
 	limit, offset := pageLimitOffset(filter, &listArgs)
 	query := orderBaseProjection + " WHERE " + where +
-		" ORDER BY o.updated_at DESC, o.order_id DESC LIMIT " + limit + " OFFSET " + offset
+		" ORDER BY o.created_at DESC, o.order_id DESC LIMIT " + limit + " OFFSET " + offset
 	rows, err := tx.QueryContext(ctx, query, listArgs...)
 	if err != nil {
 		return Page[Order]{}, dbUnavailable("list orders", err)

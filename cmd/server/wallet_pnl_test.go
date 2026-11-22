@@ -42,3 +42,21 @@ func TestBuildWalletPnLServiceRequiresPolymarketAccounts(t *testing.T) {
 		t.Fatalf("Kalshi-only service=%v error=%v, want unconfigured", service, err)
 	}
 }
+
+func TestBuildWalletPnLServiceAccountSince(t *testing.T) {
+	live := &liveRuntime{polymarketAccounts: []string{"wallet-2", "wallet-3"}}
+	cfg := config.Config{Polymarket: config.Polymarket{
+		DataAPIURL: "https://data.example.invalid", RequestTimeout: time.Second,
+		WalletPnLAccountSinceJSON: `{"wallet-2":"2026-11-20T12:34:14Z","wallet-3":"2026-11-20T12:34:14Z"}`,
+	}}
+	if service, err := buildWalletPnLService(new(sql.DB), cfg, live); err != nil || service == nil {
+		t.Fatalf("valid since service=%v error=%v", service, err)
+	}
+	// 写错的起点只停用官方盈亏曲线，交易服务照常启动。
+	for _, raw := range []string{`{"wallet-9":"2026-11-20T12:34:14Z"}`, `{"wallet-2":"yesterday"}`, `not json`} {
+		cfg.Polymarket.WalletPnLAccountSinceJSON = raw
+		if service, err := buildWalletPnLService(new(sql.DB), cfg, live); err != nil || service != nil {
+			t.Fatalf("invalid since %q service=%v error=%v, want disabled", raw, service, err)
+		}
+	}
+}

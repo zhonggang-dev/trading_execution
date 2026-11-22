@@ -251,8 +251,11 @@ ORDER BY configured.execution_account_id, configured.model_id, configured.strate
 			entryBlockReason,
 		)
 		account.OrderSubmissionState = runtimeAccountState(account.ExecutionAccountID, submissionDisabled, nil, !reader.config.OrderSubmissionEnabled)
-		if mode := runtimeBindingMode(reader.config.Bindings, account.ModelID, account.StrategyID, account.ExecutionAccountID); mode != "" {
-			account.SourceMode = mode
+		if binding, ok := runtimeBinding(reader.config.Bindings, account.ModelID, account.StrategyID, account.ExecutionAccountID); ok {
+			if binding.SourceMode != "" {
+				account.SourceMode = binding.SourceMode
+			}
+			account.PredictionRun = binding.PredictionRun
 		}
 		accounts = append(accounts, account)
 	}
@@ -280,13 +283,13 @@ func (reader *Reader) submissionDisabledAccounts() []string {
 	return result
 }
 
-func runtimeBindingMode(bindings []Binding, modelID, strategyID, accountID string) string {
+func runtimeBinding(bindings []Binding, modelID, strategyID, accountID string) (Binding, bool) {
 	for _, binding := range bindings {
 		if binding.ModelID == modelID && binding.StrategyID == strategyID && binding.ExecutionAccountID == accountID {
-			return binding.SourceMode
+			return binding, true
 		}
 	}
-	return ""
+	return Binding{}, false
 }
 
 func runtimeAccountState(accountID string, disabledAccounts, strategyDisabled []string, globallyDisabled bool) string {

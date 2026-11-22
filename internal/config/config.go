@@ -181,13 +181,16 @@ type Polymarket struct {
 	// WalletPnLCorrectionsJSON 是官方钱包盈亏曲线的已知错账修正（原样 JSON，
 	// 由 walletpnl.ParseCorrections 校验）。为空表示不修正。
 	WalletPnLCorrectionsJSON string
-	RequestTimeout           time.Duration
-	StartupTimeout           time.Duration
-	MaxClockSkew             time.Duration
-	HeartbeatInterval        time.Duration
-	HeartbeatCallTimeout     time.Duration
-	HeartbeatStaleAfter      time.Duration
-	ReconciliationInterval   time.Duration
+	// WalletPnLAccountSinceJSON 是官方钱包盈亏曲线的按账户起点（原样 JSON 对象，
+	// 账户 → RFC3339，由 walletpnl.ParseAccountSince 校验）。为空表示不启用。
+	WalletPnLAccountSinceJSON string
+	RequestTimeout            time.Duration
+	StartupTimeout            time.Duration
+	MaxClockSkew              time.Duration
+	HeartbeatInterval         time.Duration
+	HeartbeatCallTimeout      time.Duration
+	HeartbeatStaleAfter       time.Duration
+	ReconciliationInterval    time.Duration
 	// ReconciliationScheduleOffset pins scheduled reconciliation to wall-clock
 	// instants congruent to the offset modulo ReconciliationInterval. Nil keeps
 	// the legacy start-relative ticker.
@@ -747,6 +750,7 @@ func Load() (Config, error) {
 			DataAPIURL:                   env("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com"),
 			PolygonRPCURL:                strings.TrimSpace(os.Getenv("POLYGON_RPC_URL")),
 			WalletPnLCorrectionsJSON:     strings.TrimSpace(os.Getenv("WALLET_PNL_CORRECTIONS_JSON")),
+			WalletPnLAccountSinceJSON:    strings.TrimSpace(os.Getenv("WALLET_PNL_ACCOUNT_SINCE_JSON")),
 			RequestTimeout:               polymarketRequestTimeout,
 			StartupTimeout:               startupTimeout,
 			MaxClockSkew:                 maxClockSkew,

@@ -280,7 +280,13 @@ func buildWalletPnLService(database *sql.DB, cfg config.Config, live *liveRuntim
 		slog.Error("wallet PnL disabled: invalid corrections", "error", err)
 		return nil, nil
 	}
-	return walletpnl.New(walletpnl.Params{Addresses: addresses, Source: source, Accounts: live.polymarketAccounts, TTL: 5 * time.Minute, Corrector: corrector})
+	since, err := walletpnl.ParseAccountSince(cfg.Polymarket.WalletPnLAccountSinceJSON, live.polymarketAccounts)
+	if err != nil {
+		// 与修正配置相同：起点写错只停用官方盈亏曲线，不回退成含复用前历史的原值。
+		slog.Error("wallet PnL disabled: invalid account since", "error", err)
+		return nil, nil
+	}
+	return walletpnl.New(walletpnl.Params{Addresses: addresses, Source: source, Accounts: live.polymarketAccounts, TTL: 5 * time.Minute, Corrector: corrector, AccountSince: since})
 }
 
 // buildWalletPnLCorrector 解析 WALLET_PNL_CORRECTIONS_JSON。未配置时返回 nil，
@@ -316,8 +322,8 @@ func consoleV2RuntimeConfig(cfg config.Config, live *liveRuntime, startedAt time
 	}
 	for _, binding := range cfg.DecisionCycle.Bindings() {
 		bindings = append(bindings, consolev2.Binding{
-			PredictionModelID: binding.PredictionModelID,
-			ModelID:           binding.ModelID, StrategyID: binding.StrategyID,
+			PredictionModelID: binding.PredictionModelID, PredictionRun: binding.PredictionRun,
+			ModelID: binding.ModelID, StrategyID: binding.StrategyID,
 			ExecutionAccountID: binding.ExecutionAccountID, SourceMode: string(cfg.DecisionCycle.PredictionSourceMode),
 			MarketSource: string(binding.MarketSource), Mode: accountModes[binding.ExecutionAccountID],
 		})

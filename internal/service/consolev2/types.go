@@ -113,7 +113,10 @@ type RunnerSnapshot struct {
 
 // Binding is the runtime binding identity exposed to the console.
 type Binding struct {
-	PredictionModelID  string `json:"prediction_model_id"`
+	PredictionModelID string `json:"prediction_model_id"`
+	// PredictionRun is which repeated prediction of PredictionModelID the
+	// account consumes (1-3). Additive; zero is omitted for old fixtures.
+	PredictionRun      int    `json:"prediction_run,omitempty"`
 	ModelID            string `json:"model_id"`
 	StrategyID         string `json:"strategy_id"`
 	ExecutionAccountID string `json:"execution_account_id"`
@@ -142,6 +145,7 @@ type RuntimeAccount struct {
 	ModelID                   string     `json:"model_id"`
 	StrategyID                string     `json:"strategy_id"`
 	SourceMode                string     `json:"source_mode,omitempty"`
+	PredictionRun             int        `json:"prediction_run,omitempty"`
 	ConfiguredBinding         bool       `json:"configured_binding"`
 	DatabaseBindingEnabled    *bool      `json:"database_binding_enabled"`
 	RiskPolicyEnabled         *bool      `json:"risk_policy_enabled"`
