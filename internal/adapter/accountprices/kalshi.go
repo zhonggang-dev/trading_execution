@@ -246,6 +246,7 @@ func (s *Source) fillKalshiGaps(ctx context.Context, w h.Window, series *h.Serie
 			return e
 		}
 		tradePoints := []h.Point{}
+		seen := map[int64]bool{}
 		for _, trade := range trades {
 			at, ok := timestamp(trade["created_time"])
 			if !ok || at.Before(g.from.Truncate(time.Second)) || at.After(ceilHistorySecond(g.to)) {
@@ -256,9 +257,19 @@ func (s *Source) fillKalshiGaps(ctx context.Context, w h.Window, series *h.Serie
 			}
 			// The API accepts whole-second bounds. Query a superset, then
 			// exclude later fractions rather than using future transactions.
-			if at.Before(g.from) || at.After(g.to) {
+			// The gap starts at an existing anchor point: trades at that exact
+			// instant are already represented by it, and a second point at the
+			// same instant would shadow the anchor's extended validity.
+			if !at.After(g.from) || at.After(g.to) {
 				continue
 			}
+			if seen[at.UnixNano()] {
+				// Same-instant prints cannot be ordered in time; one point (the
+				// first the API lists) represents the instant, as the durable
+				// store keys points by (asset, point_at).
+				continue
+			}
+			seen[at.UnixNano()] = true
 			price := text(trade["yes_price_dollars"])
 			if !h.ValidPrice(price) {
 				return fmt.Errorf("invalid Kalshi trade price")
