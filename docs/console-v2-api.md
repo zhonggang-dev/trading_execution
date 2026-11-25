@@ -126,6 +126,11 @@ is invoked.
   order-owned `market_question` and `outcome_name` frozen in `intent`, and
   created/updated times. These labels are never looked up from current market
   data; missing historical fields remain JSON `null`.
+  `predicted_probability` is the nullable decimal string frozen in
+  `intent.metadata.predicted_probability` at submission: the strategy's
+  probability for the bought outcome. Missing, non-numeric, NaN/Inf, or
+  out-of-`[0,1]` values are returned as `null`; it is never recomputed from
+  current predictions. The trace `order` object carries the same field.
   The default view covers recent orders and includes all non-terminal statuses
   (`UNKNOWN`, `RECONCILING`, and `MANUAL_REVIEW` remain visible when present).
   Filters are `q`, `model_id`, `strategy_id`, `execution_account_id`,

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 )
 
@@ -18,7 +20,8 @@ SELECT o.order_id, o.client_order_id, NULLIF(o.venue_order_id,''), o.status,
        COALESCE(o.intent->>'side',''),
 	       COALESCE(NULLIF(o.intent->>'price',''), NULLIF(o.intent->>'worst_price',''), ''),
        COALESCE(o.intent->>'size',''), o.filled_size::text,
-       NULLIF(o.average_fill_price::text,''), o.created_at, o.updated_at
+       NULLIF(o.average_fill_price::text,''), o.created_at, o.updated_at,
+       o.intent->'metadata'->>'predicted_probability'
 `
 
 const orderBaseProjection = orderBaseSelect + `
@@ -188,31 +191,31 @@ func (reader *Reader) loadOrder(ctx context.Context, orderID string) (Order, err
 
 func scanOrderBase(row rowScanner) (Order, error) {
 	var item Order
-	var venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice sql.NullString
+	var venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice, predictedProbability sql.NullString
 	if err := row.Scan(&item.OrderID, &item.ClientOrderID, &venueOrderID, &item.Status,
 		&item.ExecutionAccountID, &modelID, &strategyID, &item.Venue, &marketSource,
 		&item.MarketID, &conditionID, &item.TokenID, &marketQuestion, &outcomeName, &side, &price, &shares,
-		&item.FilledShares, &averageFillPrice, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		&item.FilledShares, &averageFillPrice, &item.CreatedAt, &item.UpdatedAt, &predictedProbability); err != nil {
 		return Order{}, err
 	}
-	populateOrderBase(&item, venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice)
+	populateOrderBase(&item, venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice, predictedProbability)
 	return item, nil
 }
 
 func scanOrder(row rowScanner) (Order, error) {
 	var item Order
-	var venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice sql.NullString
+	var venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice, predictedProbability sql.NullString
 	var fillEvidenceState, accountingState, reservationState sql.NullString
 	var totalFills, confirmedFills, appliedFills, pendingFills, openIssues int64
 	if err := row.Scan(&item.OrderID, &item.ClientOrderID, &venueOrderID, &item.Status,
 		&item.ExecutionAccountID, &modelID, &strategyID, &item.Venue, &marketSource,
 		&item.MarketID, &conditionID, &item.TokenID, &marketQuestion, &outcomeName, &side, &price, &shares,
-		&item.FilledShares, &averageFillPrice, &item.CreatedAt, &item.UpdatedAt,
+		&item.FilledShares, &averageFillPrice, &item.CreatedAt, &item.UpdatedAt, &predictedProbability,
 		&totalFills, &confirmedFills, &appliedFills, &pendingFills,
 		&fillEvidenceState, &accountingState, &openIssues, &reservationState); err != nil {
 		return Order{}, err
 	}
-	populateOrderBase(&item, venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice)
+	populateOrderBase(&item, venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice, predictedProbability)
 	if totalFills < 0 || confirmedFills < 0 || appliedFills < 0 || pendingFills < 0 || openIssues < 0 ||
 		totalFills > int64(maxInt()) || confirmedFills > int64(maxInt()) || appliedFills > int64(maxInt()) ||
 		pendingFills > int64(maxInt()) || openIssues > int64(maxInt()) {
@@ -230,7 +233,7 @@ func scanOrder(row rowScanner) (Order, error) {
 	return item, nil
 }
 
-func populateOrderBase(item *Order, venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice sql.NullString) {
+func populateOrderBase(item *Order, venueOrderID, modelID, strategyID, marketSource, conditionID, marketQuestion, outcomeName, side, price, shares, averageFillPrice, predictedProbability sql.NullString) {
 	item.VenueOrderID = venueOrderID.String
 	item.ModelID = modelID.String
 	item.StrategyID = strategyID.String
@@ -242,8 +245,28 @@ func populateOrderBase(item *Order, venueOrderID, modelID, strategyID, marketSou
 	item.Price = price.String
 	item.Shares = shares.String
 	item.AverageFillPrice = averageFillPrice.String
+	item.PredictedProbability = orderPredictedProbability(predictedProbability)
 	item.CreatedAt = item.CreatedAt.UTC()
 	item.UpdatedAt = item.UpdatedAt.UTC()
+}
+
+// orderPredictedProbability normalizes the probability frozen in
+// intent.metadata.predicted_probability (the strategy's probability for the
+// bought outcome). Missing, non-numeric, NaN/Inf, or out-of-[0,1] values are
+// returned as nil so the JSON field is null rather than a guessed number.
+func orderPredictedProbability(raw sql.NullString) *string {
+	if !raw.Valid {
+		return nil
+	}
+	value, err := strconv.ParseFloat(strings.TrimSpace(raw.String), 64)
+	if err != nil || math.IsNaN(value) || value < 0 || value > 1 {
+		return nil
+	}
+	if value == 0 {
+		value = 0 // normalize -0 to 0
+	}
+	text := strconv.FormatFloat(value, 'f', -1, 64)
+	return &text
 }
 
 func loadOrderEvidence(ctx context.Context, tx *sql.Tx, orderIDs []string) (map[string]OrderEvidenceSummary, error) {
