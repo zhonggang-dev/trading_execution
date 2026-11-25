@@ -253,28 +253,32 @@ type DecisionCycleDetail struct {
 }
 
 type Order struct {
-	OrderID            string               `json:"order_id"`
-	ClientOrderID      string               `json:"client_order_id"`
-	VenueOrderID       string               `json:"venue_order_id,omitempty"`
-	Status             string               `json:"status"`
-	ExecutionAccountID string               `json:"execution_account_id"`
-	ModelID            string               `json:"model_id,omitempty"`
-	StrategyID         string               `json:"strategy_id,omitempty"`
-	Venue              string               `json:"venue"`
-	MarketSource       string               `json:"market_source,omitempty"`
-	MarketID           string               `json:"market_id"`
-	ConditionID        string               `json:"condition_id,omitempty"`
-	TokenID            string               `json:"token_id"`
-	MarketQuestion     *string              `json:"market_question"`
-	OutcomeName        *string              `json:"outcome_name"`
-	Side               string               `json:"side,omitempty"`
-	Price              string               `json:"price,omitempty"`
-	Shares             string               `json:"shares,omitempty"`
-	FilledShares       string               `json:"filled_shares"`
-	AverageFillPrice   string               `json:"average_fill_price,omitempty"`
-	CreatedAt          time.Time            `json:"created_at"`
-	UpdatedAt          time.Time            `json:"updated_at"`
-	EvidenceSummary    OrderEvidenceSummary `json:"evidence_summary"`
+	OrderID            string  `json:"order_id"`
+	ClientOrderID      string  `json:"client_order_id"`
+	VenueOrderID       string  `json:"venue_order_id,omitempty"`
+	Status             string  `json:"status"`
+	ExecutionAccountID string  `json:"execution_account_id"`
+	ModelID            string  `json:"model_id,omitempty"`
+	StrategyID         string  `json:"strategy_id,omitempty"`
+	Venue              string  `json:"venue"`
+	MarketSource       string  `json:"market_source,omitempty"`
+	MarketID           string  `json:"market_id"`
+	ConditionID        string  `json:"condition_id,omitempty"`
+	TokenID            string  `json:"token_id"`
+	MarketQuestion     *string `json:"market_question"`
+	OutcomeName        *string `json:"outcome_name"`
+	Side               string  `json:"side,omitempty"`
+	Price              string  `json:"price,omitempty"`
+	Shares             string  `json:"shares,omitempty"`
+	FilledShares       string  `json:"filled_shares"`
+	AverageFillPrice   string  `json:"average_fill_price,omitempty"`
+	// PredictedProbability is the strategy's probability for the bought
+	// outcome, frozen in intent.metadata at submission; null when missing or
+	// outside [0,1].
+	PredictedProbability *string              `json:"predicted_probability"`
+	CreatedAt            time.Time            `json:"created_at"`
+	UpdatedAt            time.Time            `json:"updated_at"`
+	EvidenceSummary      OrderEvidenceSummary `json:"evidence_summary"`
 }
 
 // OrderEvidenceSummary is computed from durable fill/reservation/issue rows
