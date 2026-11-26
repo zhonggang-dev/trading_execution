@@ -37,7 +37,8 @@ func run(parent context.Context, args []string, out io.Writer) error {
 	}
 	flags := flag.NewFlagSet("accountpricehistory "+command, flag.ContinueOnError)
 	dbEnv := flags.String("database-env", "TRADING_EXECUTION_DATABASE_URL", "environment variable containing connection; never supply a URL on the command line")
-	maxWindows := flags.Int("max-windows", 100, "maximum windows per run; rerun resumes remaining windows")
+	maxWindows := flags.Int("max-windows", 0, "maximum windows per run (default 100); rerun resumes remaining windows")
+	allWindows := flags.Bool("all-windows", false, "process all planned windows within the run timeout")
 	timeout := flags.Duration("timeout", 45*time.Minute, "total bounded run duration")
 	dryRun := flags.Bool("dry-run", false, "only report planned reads; do not collect or save market data")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -45,6 +46,9 @@ func run(parent context.Context, args []string, out io.Writer) error {
 	}
 	if flags.NArg() != 0 || *timeout <= 0 || *timeout > 6*time.Hour {
 		return fmt.Errorf("invalid command budget")
+	}
+	if *allWindows && *maxWindows != 0 {
+		return fmt.Errorf("all-windows cannot be combined with a window limit")
 	}
 	dsn := os.Getenv(*dbEnv)
 	if dsn == "" {
@@ -90,7 +94,10 @@ func run(parent context.Context, args []string, out io.Writer) error {
 			Items   []assetCoverage `json:"items"`
 		}{data.Version, result})
 	}
-	report, e := h.Run(ctx, store, source, h.SyncOptions{Now: time.Now().UTC(), MaxWindows: *maxWindows, Workers: 2, DryRun: *dryRun || command == "plan"})
+	report, e := h.Run(ctx, store, source, h.SyncOptions{
+		Now: time.Now().UTC(), MaxWindows: *maxWindows, AllWindows: *allWindows,
+		Workers: 2, DryRun: *dryRun || command == "plan",
+	})
 	if err = json.NewEncoder(out).Encode(report); err != nil {
 		return err
 	}

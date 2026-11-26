@@ -12,6 +12,7 @@ import (
 type SyncOptions struct {
 	Now        time.Time
 	MaxWindows int
+	AllWindows bool
 	Workers    int
 	DryRun     bool
 }
@@ -223,13 +224,16 @@ func Run(ctx context.Context, store Store, source Source, options SyncOptions) (
 	if options.Now.IsZero() {
 		options.Now = time.Now().UTC()
 	}
-	if options.MaxWindows == 0 {
+	if options.AllWindows && options.MaxWindows != 0 {
+		return SyncReport{}, fmt.Errorf("all windows cannot be combined with a window limit")
+	}
+	if !options.AllWindows && options.MaxWindows == 0 {
 		options.MaxWindows = 100
 	}
 	if options.Workers == 0 {
 		options.Workers = 2
 	}
-	if options.Workers < 1 || options.Workers > 2 || options.MaxWindows < 1 || options.MaxWindows > 10000 {
+	if options.Workers < 1 || options.Workers > 2 || options.MaxWindows < 0 || options.MaxWindows > MaxWindows {
 		return SyncReport{}, fmt.Errorf("invalid history sync budget")
 	}
 	report := SyncReport{StartedAt: time.Now().UTC(), DryRun: options.DryRun}
@@ -261,7 +265,7 @@ func Run(ctx context.Context, store Store, source Source, options SyncOptions) (
 	}
 	jobs := Plan(targets, data, options.Now)
 	report.Planned = len(jobs)
-	if len(jobs) > options.MaxWindows {
+	if !options.AllWindows && len(jobs) > options.MaxWindows {
 		report.Deferred = len(jobs) - options.MaxWindows
 		jobs = jobs[:options.MaxWindows]
 	}

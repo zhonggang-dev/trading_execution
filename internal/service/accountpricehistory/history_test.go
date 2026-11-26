@@ -121,6 +121,44 @@ func TestSyncDryRunAndFailedWindowsNeverBecomeComplete(t *testing.T) {
 	}
 }
 
+func TestSyncWindowBudget(t *testing.T) {
+	const planned = 300
+	at := time.Date(2026, 11, 5, 8, 0, 0, 0, time.UTC)
+	now := at.Add(2 * time.Hour)
+	targets := make([]Window, planned)
+	for i := range targets {
+		asset := testAsset()
+		asset.TokenID = fmt.Sprint(i + 1)
+		targets[i] = Window{Asset: asset, From: at, To: at, RequiredAt: []time.Time{at}}
+	}
+	source := sourceFunc(func(_ context.Context, w Window) (Result, error) {
+		return Result{Window: w, Series: Series{Coverage: []Coverage{
+			{From: w.From, To: w.To, State: "complete"},
+		}}}, nil
+	})
+	for _, tc := range []struct {
+		name       string
+		maxWindows int
+		allWindows bool
+		wantSaved  int
+	}{
+		{name: "default", wantSaved: 100},
+		{name: "explicit limit", maxWindows: 250, wantSaved: 250},
+		{name: "all windows", allWindows: true, wantSaved: planned},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &memoryStore{targets: targets}
+			report, err := Run(context.Background(), store, source, SyncOptions{
+				Now: now, MaxWindows: tc.maxWindows, AllWindows: tc.allWindows,
+			})
+			if err != nil || report.Planned != planned || report.Saved != tc.wantSaved ||
+				report.Deferred != planned-tc.wantSaved || len(store.saves) != tc.wantSaved {
+				t.Fatalf("window budget mismatch: report=%+v persisted=%d err=%v", report, len(store.saves), err)
+			}
+		})
+	}
+}
+
 func TestPriceAtCannotResurrectOlderPriceAfterNewObservationExpires(t *testing.T) {
 	at := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	until := at.Add(10 * time.Hour)
