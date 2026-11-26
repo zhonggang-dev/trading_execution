@@ -42,21 +42,21 @@ func TestOrderPredictedProbability(t *testing.T) {
 func TestPopulateOrderBaseMapsPredictedProbabilityToJSON(t *testing.T) {
 	var present, absent Order
 	empty := sql.NullString{}
-	populateOrderBase(&present, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, sql.NullString{String: " 0.75 ", Valid: true})
-	populateOrderBase(&absent, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, sql.NullString{String: "1.5", Valid: true})
+	populateOrderBase(&present, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, sql.NullString{String: " 0.75 ", Valid: true}, sql.NullString{String: `["Politics"]`, Valid: true})
+	populateOrderBase(&absent, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, empty, sql.NullString{String: "1.5", Valid: true}, empty)
 
 	encoded, err := json.Marshal(present)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(encoded), `"predicted_probability":"0.75"`) {
+	if !strings.Contains(string(encoded), `"predicted_probability":"0.75"`) || !strings.Contains(string(encoded), `"domains":["Politics"]`) {
 		t.Fatalf("order JSON = %s", encoded)
 	}
 	encoded, err = json.Marshal(absent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(encoded), `"predicted_probability":null`) {
+	if !strings.Contains(string(encoded), `"predicted_probability":null`) || !strings.Contains(string(encoded), `"domains":[]`) {
 		t.Fatalf("order JSON = %s", encoded)
 	}
 }
@@ -68,4 +68,31 @@ func derefString(value *string) string {
 		return "<nil>"
 	}
 	return *value
+}
+
+func TestOrderDomains(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  sql.NullString
+		want string
+	}{
+		{"null", sql.NullString{}, ""},
+		{"empty array", sql.NullString{String: "[]", Valid: true}, ""},
+		{"single", sql.NullString{String: `["Politics"]`, Valid: true}, "Politics"},
+		{"trim dedupe keep order", sql.NullString{String: `[" Culture ","Politics","Culture",""]`, Valid: true}, "Culture|Politics"},
+		{"non-string entries dropped", sql.NullString{String: `["Finance",1,null,{"a":1}]`, Valid: true}, "Finance"},
+		{"not an array", sql.NullString{String: `"Politics"`, Valid: true}, ""},
+		{"malformed", sql.NullString{String: `[`, Valid: true}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := orderDomains(tc.raw)
+			if got == nil {
+				t.Fatalf("orderDomains returned nil; want a non-nil slice so JSON is []")
+			}
+			if joined := strings.Join(got, "|"); joined != tc.want {
+				t.Fatalf("orderDomains(%q) = %q, want %q", tc.raw.String, joined, tc.want)
+			}
+		})
+	}
 }

@@ -131,6 +131,12 @@ is invoked.
   probability for the bought outcome. Missing, non-numeric, NaN/Inf, or
   out-of-`[0,1]` values are returned as `null`; it is never recomputed from
   current predictions. The trace `order` object carries the same field.
+  `domains` is the string array recorded in `intent.decision_meta.domains` at
+  submission: the market's domains in the prediction snapshot used for the buy
+  decision (the internal domain taxonomy, e.g. `Politics`, `World/Geopolitics`).
+  Always an array; blanks and duplicates are dropped; empty for sells, manual
+  orders and orders created before 2026-10-30. The trace `order` object
+  carries the same field.
   The default view covers recent orders and includes all non-terminal statuses
   (`UNKNOWN`, `RECONCILING`, and `MANUAL_REVIEW` remain visible when present).
   Filters are `q`, `model_id`, `strategy_id`, `execution_account_id`,

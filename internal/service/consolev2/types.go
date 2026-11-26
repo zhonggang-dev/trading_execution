@@ -275,10 +275,14 @@ type Order struct {
 	// PredictedProbability is the strategy's probability for the bought
 	// outcome, frozen in intent.metadata at submission; null when missing or
 	// outside [0,1].
-	PredictedProbability *string              `json:"predicted_probability"`
-	CreatedAt            time.Time            `json:"created_at"`
-	UpdatedAt            time.Time            `json:"updated_at"`
-	EvidenceSummary      OrderEvidenceSummary `json:"evidence_summary"`
+	PredictedProbability *string `json:"predicted_probability"`
+	// Domains are the market's domains recorded in intent.decision_meta.domains
+	// at buy time (the prediction snapshot's classification). Always an array;
+	// empty for sells and for orders created before the field existed.
+	Domains         []string             `json:"domains"`
+	CreatedAt       time.Time            `json:"created_at"`
+	UpdatedAt       time.Time            `json:"updated_at"`
+	EvidenceSummary OrderEvidenceSummary `json:"evidence_summary"`
 }
 
 // OrderEvidenceSummary is computed from durable fill/reservation/issue rows
