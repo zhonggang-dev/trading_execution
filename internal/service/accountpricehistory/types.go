@@ -43,6 +43,8 @@ type Window struct {
 	To         time.Time   `json:"to"`
 	RequiredAt []time.Time `json:"required_at,omitempty"`
 	RefreshAt  *time.Time  `json:"refresh_at,omitempty"`
+	// PrimaryHoldingAtHour is scheduling metadata from the verified lot replay.
+	PrimaryHoldingAtHour bool `json:"-"`
 }
 type Point struct {
 	At                time.Time  `json:"at"`

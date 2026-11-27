@@ -46,6 +46,13 @@ type SyncReport struct {
 // The newest completed hour has its own bounded official refresh checkpoint;
 // an admissible older point alone must not stand in for hourly collection.
 func Plan(targets []Window, data Dataset, now time.Time) []Window {
+	return planWindows(targets, data, now, false)
+}
+
+// When the hour is handled by the first phase, only the older and event
+// requirements belong to the backfill phase.
+func planWindows(targets []Window, data Dataset, now time.Time, hourHandled bool) []Window {
+	hour := now.UTC().Truncate(time.Hour)
 	legacy := []Window{}
 	result := []Window{}
 	refreshes := map[string]bool{}
@@ -56,14 +63,14 @@ func Plan(targets []Window, data Dataset, now time.Time) []Window {
 		}
 		missing := []time.Time{}
 		series := data.Series[target.Asset.Key()]
-		if !refreshes[target.Asset.Key()] {
+		if !hourHandled && !refreshes[target.Asset.Key()] {
 			if refresh, ok := hourlyRefresh(target, series, now); ok {
 				result = append(result, refresh)
 				refreshes[target.Asset.Key()] = true
 			}
 		}
 		for _, at := range RequiredTimes(target) {
-			if !at.Before(now) {
+			if !at.Before(now) || (hourHandled && at.Equal(hour)) {
 				continue
 			}
 			if _, ok := PriceAt(series, at); !ok {
@@ -92,34 +99,90 @@ func Plan(targets []Window, data Dataset, now time.Time) []Window {
 	return result
 }
 
+func hourlyRefresh(target Window, series Series, now time.Time) (Window, bool) {
+	window, ok := hourlyWindow(target, now.UTC().Truncate(time.Hour))
+	return window, ok && needsHourlyRefresh(series, *window.RefreshAt)
+}
+
+func hourlyWindow(target Window, hour time.Time) (Window, bool) {
+	if hour.Before(target.From) || hour.After(target.To) {
+		return Window{}, false
+	}
+	for _, at := range target.RequiredAt {
+		if at.Equal(hour) {
+			return Window{Asset: target.Asset, From: hour, To: hour, RequiredAt: []time.Time{hour},
+				RefreshAt: &hour, PrimaryHoldingAtHour: target.PrimaryHoldingAtHour}, true
+		}
+	}
+	return Window{}, false
+}
+
 // Only a real successful refresh of this exact hour is an hourly checkpoint.
 // Broad historical coverage may have reused a <=1h point without reading the
 // latest official value for the new hour, so it is insufficient here.
-func hourlyRefresh(target Window, series Series, now time.Time) (Window, bool) {
-	hour := now.UTC().Truncate(time.Hour)
-	needed := false
-	for _, at := range RequiredTimes(target) {
-		if at.Equal(hour) {
-			needed = true
-			break
-		}
-	}
-	if !needed {
-		return Window{}, false
-	}
+func needsHourlyRefresh(series Series, hour time.Time) bool {
 	for _, terminal := range series.Settlements {
 		if terminal.Source == "OFFICIAL_SETTLEMENT" && terminal.SourceReference != "" && !terminal.EffectiveAt.After(hour) && ValidPrice(terminal.Price) {
-			return Window{}, false
+			return false
 		}
 	}
 	if _, priced := PriceAt(series, hour); priced {
 		for _, coverage := range series.Coverage {
 			if coverage.State == "complete" && coverage.Reason == "hourly_refresh" && coverage.From.Equal(hour) && coverage.To.Equal(hour) && !coverage.FetchedAt.Before(hour) {
-				return Window{}, false
+				return false
 			}
 		}
 	}
-	return Window{Asset: target.Asset, From: hour, To: hour, RequiredAt: []time.Time{hour}, RefreshAt: &hour}, true
+	return true
+}
+
+type hourlyPlan struct {
+	primaryMissing []Window
+	otherMissing   []Window
+	priced         []Window
+	data           Dataset
+}
+
+func planHourly(ctx context.Context, store Store, targets []Window, hour time.Time) (hourlyPlan, error) {
+	windows := []Window{}
+	indices := map[string]int{}
+	for _, target := range targets {
+		window, ok := hourlyWindow(target, hour)
+		if !ok {
+			continue
+		}
+		key := window.Asset.Key()
+		if i, exists := indices[key]; exists {
+			windows[i].PrimaryHoldingAtHour = windows[i].PrimaryHoldingAtHour || window.PrimaryHoldingAtHour
+			continue
+		}
+		indices[key] = len(windows)
+		windows = append(windows, window)
+	}
+	if len(windows) == 0 {
+		return hourlyPlan{}, nil
+	}
+	data, err := store.Load(ctx, windows)
+	if err != nil {
+		return hourlyPlan{}, fmt.Errorf("load latest hour price history: %w", err)
+	}
+	plan := hourlyPlan{data: data}
+	for _, window := range windows {
+		series := data.Series[window.Asset.Key()]
+		if !needsHourlyRefresh(series, hour) {
+			continue
+		}
+		_, available := PriceAt(series, hour)
+		switch {
+		case !available && window.PrimaryHoldingAtHour:
+			plan.primaryMissing = append(plan.primaryMissing, window)
+		case !available:
+			plan.otherMissing = append(plan.otherMissing, window)
+		default:
+			plan.priced = append(plan.priced, window)
+		}
+	}
+	return plan, nil
 }
 
 // planLegacy subtracts committed range coverage and revisits two recent hours.
@@ -251,6 +314,12 @@ func Run(ctx context.Context, store Store, source Source, options SyncOptions) (
 		return report, err
 	}
 	report.Targets = len(targets)
+	if options.AllWindows {
+		if err := syncHourly(ctx, store, source, targets, options, &report); err != nil {
+			report.FinishedAt = time.Now().UTC()
+			return report, err
+		}
+	}
 	data, err := store.Load(ctx, targets)
 	if err != nil {
 		return report, err
@@ -263,27 +332,85 @@ func Run(ctx context.Context, store Store, source Source, options SyncOptions) (
 			return report, err
 		}
 	}
-	jobs := Plan(targets, data, options.Now)
-	report.Planned = len(jobs)
+	jobs := planWindows(targets, data, options.Now, options.AllWindows)
+	report.Planned += len(jobs)
 	if !options.AllWindows && len(jobs) > options.MaxWindows {
 		report.Deferred = len(jobs) - options.MaxWindows
 		jobs = jobs[:options.MaxWindows]
 	}
-	if options.DryRun {
-		report.FinishedAt = time.Now().UTC()
-		return report, nil
+	if !options.DryRun && len(jobs) > 0 {
+		err = runWindows(ctx, store, source, jobs, data, options.Workers, &report)
 	}
-	if len(jobs) == 0 {
-		report.FinishedAt = time.Now().UTC()
-		return report, nil
+	report.FinishedAt = time.Now().UTC()
+	if err != nil {
+		return report, err
 	}
+	if report.Missing > 0 {
+		return report, fmt.Errorf("history sync has missing price windows")
+	}
+	if report.Failed > 0 {
+		return report, fmt.Errorf("history sync has failed windows")
+	}
+	return report, nil
+}
+
+func syncHourly(ctx context.Context, store Store, source Source, targets []Window, options SyncOptions, report *SyncReport) error {
+	hour := options.Now.UTC().Truncate(time.Hour)
+	plan, err := planHourly(ctx, store, targets, hour)
+	if err != nil {
+		return err
+	}
+	for _, group := range []struct {
+		windows []Window
+		repair  bool
+	}{
+		{plan.primaryMissing, true},
+		{plan.otherMissing, true},
+		{plan.priced, false},
+	} {
+		report.Planned += len(group.windows)
+		if options.DryRun || len(group.windows) == 0 {
+			continue
+		}
+		missing, failed := report.Missing, report.Failed
+		if err := runWindows(ctx, store, source, group.windows, plan.data, options.Workers, report); err != nil {
+			return err
+		}
+		if !group.repair || (report.Missing == missing && report.Failed == failed) {
+			continue
+		}
+		// Recheck what was durably saved. Only still-missing marks get one
+		// ordinary repair. Repairs use the existing evidence rules and
+		// leave the failed official refresh eligible for a future retry.
+		data, err := store.Load(ctx, group.windows)
+		if err != nil {
+			return fmt.Errorf("load latest hour repair history: %w", err)
+		}
+		repairs := []Window{}
+		for _, w := range group.windows {
+			if _, ok := PriceAt(data.Series[w.Asset.Key()], hour); !ok {
+				w.RefreshAt = nil
+				repairs = append(repairs, w)
+			}
+		}
+		report.Planned += len(repairs)
+		if len(repairs) > 0 {
+			if err := runWindows(ctx, store, source, repairs, data, options.Workers, report); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func runWindows(ctx context.Context, store Store, source Source, jobs []Window, data Dataset, workerCount int, report *SyncReport) error {
 	if source == nil {
-		return report, fmt.Errorf("history source required")
+		return fmt.Errorf("history source required")
 	}
 	var mu sync.Mutex
 	var workers sync.WaitGroup
 	queue := make(chan Window)
-	for i := 0; i < options.Workers; i++ {
+	for i := 0; i < workerCount; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
@@ -339,17 +466,7 @@ send:
 	}
 	close(queue)
 	workers.Wait()
-	report.FinishedAt = time.Now().UTC()
-	if ctx.Err() != nil {
-		return report, ctx.Err()
-	}
-	if report.Missing > 0 {
-		return report, fmt.Errorf("history sync has missing price windows")
-	}
-	if report.Failed > 0 {
-		return report, fmt.Errorf("history sync has failed windows")
-	}
-	return report, nil
+	return ctx.Err()
 }
 
 // Expose only the SQLSTATE interface. Error text may contain SQL, connection
