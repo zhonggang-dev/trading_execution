@@ -69,6 +69,8 @@ func BuildRequirements(ctx context.Context, facts consolev2.CohortMetricFacts) (
 		return nil, fmt.Errorf("historical requirements lack complete ledger facts")
 	}
 	asOf := facts.ObservedAt.UTC()
+	hour := asOf.Truncate(time.Hour)
+	primaryAtHour := map[string]bool{}
 	assets := map[string]Asset{}
 	holdings := map[string][]Window{}
 	required := map[string]map[int64]time.Time{}
@@ -188,6 +190,9 @@ func BuildRequirements(ctx context.Context, facts consolev2.CohortMetricFacts) (
 				if quantity.Sign() <= 0 {
 					continue
 				}
+				if id == "main" && at.Equal(hour) {
+					primaryAtHour[key] = true
+				}
 				if required[key] == nil {
 					required[key] = map[int64]time.Time{}
 				}
@@ -224,6 +229,9 @@ func BuildRequirements(ctx context.Context, facts consolev2.CohortMetricFacts) (
 			for _, at := range required[key] {
 				if !at.Before(window.From) && !at.After(window.To) {
 					window.RequiredAt = append(window.RequiredAt, at)
+					if at.Equal(hour) && primaryAtHour[key] {
+						window.PrimaryHoldingAtHour = true
+					}
 				}
 			}
 			if len(window.RequiredAt) > 0 {
