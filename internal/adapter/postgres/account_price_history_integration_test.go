@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +46,84 @@ func historyTestAsset() h.Asset {
 	n := "Yes"
 	return h.Asset{MarketSource: "POLYMARKET", MarketID: "1", ConditionID: "condition", TokenID: "token", OutcomeIndex: &i, OutcomeName: &n}
 }
+
+func TestPostgresIntegrationHistoryWorkerBatchesKeepAssetWindowsTogether(t *testing.T) {
+	db := historyStoreDatabase(t)
+	store := NewAccountPriceHistoryStore(db)
+	worker := NewAccountPriceHistoryWorkerStore(db)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	asset := historyTestAsset()
+	first := h.Window{Asset: asset, From: at, To: at.Add(time.Hour)}
+	later := h.Window{Asset: asset, From: at.Add(4 * time.Hour), To: at.Add(5 * time.Hour)}
+	for _, window := range []h.Window{first, later} {
+		err := store.Save(ctx, h.Result{Window: window, Series: h.Series{
+			Points: []h.Point{{At: window.From, Price: "0.4", ResolutionSeconds: 3600, Source: "PM_HISTORY", FetchedAt: window.From}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	windows := []h.Window{first}
+	for i := range 256 {
+		window := first
+		window.Asset.TokenID = strconv.Itoa(i)
+		windows = append(windows, window)
+	}
+	windows = append(windows, later)
+
+	expected, err := store.Load(ctx, windows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := worker.Load(ctx, windows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual.Version != expected.Version || !reflect.DeepEqual(actual.Series, expected.Series) ||
+		len(actual.Series[asset.Key()].Points) != 2 {
+		t.Fatalf("worker batch results differ from the bounded read: expected version %s, got %s", expected.Version, actual.Version)
+	}
+}
+
+func TestPostgresIntegrationHistoryWorkerSplitsDenseReads(t *testing.T) {
+	db := historyStoreDatabase(t)
+	store := NewAccountPriceHistoryStore(db)
+	worker := NewAccountPriceHistoryWorkerStore(db)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	first := h.Window{Asset: historyTestAsset(), From: at, To: at.Add(time.Hour)}
+	second := first
+	second.Asset.TokenID = "other-token"
+	windows := []h.Window{first, second}
+	for _, window := range windows {
+		err := store.Save(ctx, h.Result{Window: window, Series: h.Series{
+			Points: []h.Point{{At: at, Price: "0.4", ResolutionSeconds: 3600, Source: "PM_HISTORY", FetchedAt: at}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Padding is ignored by the point decoder. Each asset stays within 64 MiB,
+	// while the same two assets cannot fit in one projection read.
+	if _, err := db.Exec(`UPDATE account_price_history_points SET point = point || jsonb_build_object('padding',repeat('x',33*1024*1024))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(ctx, windows); err != historyReadBudgetError("history effective input byte budget exceeded") {
+		t.Fatalf("bounded reader error = %v", err)
+	}
+	data, err := worker.Load(ctx, windows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, window := range windows {
+		p, ok := h.PriceAt(data.Series[window.Asset.Key()], at)
+		if !ok || p.Price != "0.4" {
+			t.Fatalf("worker lost point for %s: %+v", window.Asset.TokenID, p)
+		}
+	}
+}
+
 func TestPostgresIntegrationHistoryAppendOnlyRevisionAndBoundedProjection(t *testing.T) {
 	db := historyStoreDatabase(t)
 	store := NewAccountPriceHistoryStore(db)

@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"time"
 
 	history "github.com/UniPat-AI/trading_execution/internal/service/accountpricehistory"
@@ -42,7 +41,7 @@ func localHistorySettlements(ctx context.Context, tx *sql.Tx, requests string, o
 		}
 		count++
 		if count > 20000 {
-			return nil, fmt.Errorf("local settlement input budget exceeded")
+			return nil, historyReadBudgetError("local settlement input budget exceeded")
 		}
 		at = at.UTC()
 		result[key] = append(result[key], history.Settlement{EffectiveAt: at, Price: price, Source: "OFFICIAL_SETTLEMENT", SourceReference: "LOCAL_POSITION:" + account + ":" + token + ":" + source, FetchedAt: at})
