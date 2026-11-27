@@ -7,7 +7,10 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -23,10 +26,19 @@ const sameHistoryAnchor = `(stored.point->>'price')::numeric=(EXCLUDED.point->>'
  AND (stored.point->>'resolution_seconds')::integer=(EXCLUDED.point->>'resolution_seconds')::integer`
 const mergedHistoryValidity = `CASE WHEN ` + sameHistoryAnchor + ` THEN GREATEST(stored.valid_until,EXCLUDED.valid_until) ELSE EXCLUDED.valid_until END`
 
-type AccountPriceHistoryStore struct{ db *sql.DB }
+type AccountPriceHistoryStore struct {
+	db         *sql.DB
+	batchReads bool
+}
 
 func NewAccountPriceHistoryStore(db *sql.DB) *AccountPriceHistoryStore {
 	return &AccountPriceHistoryStore{db: db}
+}
+
+// NewAccountPriceHistoryWorkerStore batches projection reads for the standalone
+// history worker, which loads targets across all accounts.
+func NewAccountPriceHistoryWorkerStore(db *sql.DB) *AccountPriceHistoryStore {
+	return &AccountPriceHistoryStore{db: db, batchReads: true}
 }
 func (s *AccountPriceHistoryStore) Lock(ctx context.Context) (func(), bool, error) {
 	conn, err := s.db.Conn(ctx)
@@ -175,8 +187,92 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 	if len(windows) == 0 {
 		return out, nil
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+	var digests [][32]byte
+	if s.batchReads {
+		digests, err = loadHistoryWorkerBatches(ctx, tx, windows, &out)
+	} else {
+		digests, err = loadHistoryBatch(ctx, tx, windows, &out)
+	}
+	if err != nil {
+		return out, err
+	}
+	sort.Slice(digests, func(i, j int) bool { return bytes.Compare(digests[i][:], digests[j][:]) < 0 })
+	fingerprint := sha256.New()
+	for _, digest := range digests {
+		_, _ = fingerprint.Write(digest[:])
+	}
+	out.Version = fmt.Sprintf("%x", fingerprint.Sum(nil))
+	if err = tx.Commit(); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+type historyReadBudgetError string
+
+func (err historyReadBudgetError) Error() string { return string(err) }
+
+func loadHistoryWorkerBatches(ctx context.Context, tx *sql.Tx, windows []history.Window, out *history.Dataset) ([][32]byte, error) {
+	const batchWindows = 256
+	// Keep all windows of each asset together so overlapping windows retain the
+	// original DISTINCT behavior and local settlements can be merged once.
+	assetGroups := make(map[string]int)
+	var groups [][]history.Window
+	for _, window := range windows {
+		key := window.Asset.Key()
+		group, ok := assetGroups[key]
+		if !ok {
+			group = len(groups)
+			assetGroups[key] = group
+			groups = append(groups, nil)
+		}
+		groups[group] = append(groups[group], window)
+	}
+	var digests [][32]byte
+	for start := 0; start < len(groups); {
+		end := start + 1
+		count := len(groups[start])
+		for end < len(groups) && count+len(groups[end]) <= batchWindows {
+			count += len(groups[end])
+			end++
+		}
+		if err := loadHistoryWorkerGroupRange(ctx, tx, groups[start:end], out, &digests); err != nil {
+			return nil, err
+		}
+		start = end
+	}
+	return digests, nil
+}
+
+func loadHistoryWorkerGroupRange(ctx context.Context, tx *sql.Tx, groups [][]history.Window, out *history.Dataset, digests *[][32]byte) error {
+	batch := history.Dataset{Series: make(map[string]history.Series, len(groups)), ObservedAt: out.ObservedAt}
+	batchDigests, err := loadHistoryBatch(ctx, tx, slices.Concat(groups...), &batch)
+	if err == nil {
+		maps.Copy(out.Series, batch.Series)
+		*digests = append(*digests, batchDigests...)
+		return nil
+	}
+	// A dense batch can still hit a projection budget. Narrow it by assets
+	// until each read fits or a single asset proves too large.
+	var budgetErr historyReadBudgetError
+	if len(groups) == 1 || !errors.As(err, &budgetErr) {
+		return err
+	}
+	middle := len(groups) / 2
+	if err := loadHistoryWorkerGroupRange(ctx, tx, groups[:middle], out, digests); err != nil {
+		return err
+	}
+	return loadHistoryWorkerGroupRange(ctx, tx, groups[middle:], out, digests)
+}
+
+func loadHistoryBatch(ctx context.Context, tx *sql.Tx, windows []history.Window, out *history.Dataset) ([][32]byte, error) {
 	if len(windows) > history.MaxWindows {
-		return out, fmt.Errorf("history window budget exceeded")
+		return nil, historyReadBudgetError("history window budget exceeded")
 	}
 	type request struct {
 		Key   string        `json:"key"`
@@ -187,16 +283,11 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 	rs := make([]request, 0, len(windows))
 	for _, w := range windows {
 		if e := w.Asset.Validate(); e != nil {
-			return out, e
+			return nil, e
 		}
 		rs = append(rs, request{Key: w.Asset.Key(), Asset: w.Asset, From: w.From.Add(-time.Hour), To: w.To})
 	}
 	raw, _ := json.Marshal(rs)
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
-	if err != nil {
-		return out, err
-	}
-	defer tx.Rollback()
 	// Read projections, never the growing raw audit window stream. The point
 	// budget applies to unique effective inputs, not number of hourly runs.
 	// Retain the latest eligible predecessor too: an expired newer anchor must
@@ -217,7 +308,7 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
  SELECT asset_key,history_id,kind,payload FROM input LIMIT 2020001`
 	rows, err := tx.QueryContext(ctx, query, string(raw))
 	if err != nil {
-		return out, err
+		return nil, err
 	}
 	defer rows.Close()
 	points, payloadBytes := 0, 0
@@ -226,62 +317,62 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 		var key, kind, payload string
 		var id int64
 		if err = rows.Scan(&key, &id, &kind, &payload); err != nil {
-			return out, err
+			return nil, err
 		}
 		payloadBytes += len(payload) + len(key) + len(kind)
 		if payloadBytes > 64<<20 {
-			return out, fmt.Errorf("history effective input byte budget exceeded")
+			return nil, historyReadBudgetError("history effective input byte budget exceeded")
 		}
 		series := out.Series[key]
 		switch kind {
 		case "point":
 			var p history.Point
 			if err = json.Unmarshal([]byte(payload), &p); err != nil {
-				return out, fmt.Errorf("invalid history point projection")
+				return nil, fmt.Errorf("invalid history point projection")
 			}
 			series.Points = append(series.Points, p)
 			points++
 		case "settlement":
 			var p history.Settlement
 			if err = json.Unmarshal([]byte(payload), &p); err != nil {
-				return out, fmt.Errorf("invalid history settlement projection")
+				return nil, fmt.Errorf("invalid history settlement projection")
 			}
 			series.Settlements = append(series.Settlements, p)
 		case "coverage":
 			var p history.Coverage
 			if err = json.Unmarshal([]byte(payload), &p); err != nil {
-				return out, fmt.Errorf("invalid history coverage projection")
+				return nil, fmt.Errorf("invalid history coverage projection")
 			}
 			series.Coverage = append(series.Coverage, p)
 		}
 		if points > history.MaxPoints {
-			return out, fmt.Errorf("history effective input budget exceeded")
+			return nil, historyReadBudgetError("history effective input budget exceeded")
 		}
 		out.Series[key] = series
 		digests = append(digests, sha256.Sum256([]byte(key+"\x00"+kind+"\x00"+payload)))
 	}
 	if err = rows.Err(); err != nil {
-		return out, err
+		return nil, err
 	}
 	if err = rows.Close(); err != nil {
-		return out, err
+		return nil, err
 	}
 	local, err := localHistorySettlements(ctx, tx, string(raw), out.ObservedAt)
 	if err != nil {
-		return out, err
+		return nil, err
 	}
 	for key, values := range local {
 		series := out.Series[key]
 		merged, e := history.MergeSettlements(series.Settlements, values, out.ObservedAt)
 		if e != nil {
-			return out, e
+			return nil, e
 		}
 		series.Settlements = merged
 		out.Series[key] = series
 		encoded, _ := json.Marshal(merged)
 		payloadBytes += len(encoded)
 		if payloadBytes > 64<<20 {
-			return out, fmt.Errorf("history settlement input budget exceeded")
+			return nil, historyReadBudgetError("history settlement input budget exceeded")
 		}
 		digests = append(digests, sha256.Sum256([]byte(key+"\x00local_settlement\x00"+string(encoded))))
 	}
@@ -289,21 +380,12 @@ func (s *AccountPriceHistoryStore) Load(ctx context.Context, windows []history.W
 		var e error
 		series.Settlements, e = history.MergeSettlements(series.Settlements, nil, out.ObservedAt)
 		if e != nil {
-			return out, e
+			return nil, e
 		}
 		history.SortSeries(&series)
 		out.Series[key] = series
 	}
-	sort.Slice(digests, func(i, j int) bool { return bytes.Compare(digests[i][:], digests[j][:]) < 0 })
-	fingerprint := sha256.New()
-	for _, digest := range digests {
-		_, _ = fingerprint.Write(digest[:])
-	}
-	out.Version = fmt.Sprintf("%x", fingerprint.Sum(nil))
-	if err = tx.Commit(); err != nil {
-		return out, err
-	}
-	return out, nil
+	return digests, nil
 }
 
 func latestHistoryPoints(points []history.Point) []history.Point {

@@ -64,7 +64,7 @@ func run(parent context.Context, args []string, out io.Writer) error {
 	defer db.Close()
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
-	store := postgres.NewAccountPriceHistoryStore(db)
+	store := postgres.NewAccountPriceHistoryWorkerStore(db)
 	ctx, cancel := context.WithTimeout(parent, *timeout)
 	defer cancel()
 	source, err := accountprices.New(accountprices.Params{PMBaseURL: os.Getenv("ACCOUNT_HISTORY_PM_BASE_URL"), GammaBaseURL: os.Getenv("ACCOUNT_HISTORY_GAMMA_BASE_URL"), KalshiBaseURL: os.Getenv("ACCOUNT_HISTORY_KALSHI_BASE_URL")})
